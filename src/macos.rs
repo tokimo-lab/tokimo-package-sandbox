@@ -11,10 +11,27 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(crate) struct SeatbeltKeepAlive {
+    _profile_tmp: Option<tempfile::TempDir>,
+}
+
 pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     if user_cmd.is_empty() {
         return Err(Error::validation("empty command"));
     }
+    let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
+    let (mut cmd, keepalive) = build_seatbelt_command(&argv, cfg)?;
+    pipe_stdio(&mut cmd);
+    let stdin_bytes = cfg.stdin.as_deref();
+    let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
+    drop(keepalive);
+    Ok(result)
+}
+
+pub(crate) fn build_seatbelt_command(
+    inner_argv: &[&str],
+    cfg: &SandboxConfig,
+) -> Result<(Command, SeatbeltKeepAlive)> {
     let work_dir = cfg
         .work_dir
         .canonicalize()
@@ -27,11 +44,10 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-f").arg(&profile_path);
-    for a in user_cmd {
-        cmd.arg(a.as_ref());
+    for a in inner_argv {
+        cmd.arg(a);
     }
 
-    // env: clear then apply user-provided
     cmd.env_clear();
     let mut saw_path = false;
     for (k, v) in &cfg.env {
@@ -56,7 +72,6 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
     } else {
         cmd.current_dir(&work_dir);
     }
-    pipe_stdio(&mut cmd);
 
     let limits = cfg.limits;
     unsafe {
@@ -66,10 +81,27 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
         });
     }
 
-    let stdin_bytes = cfg.stdin.as_deref();
-    let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
-    drop(profile_tmp);
-    Ok(result)
+    Ok((
+        cmd,
+        SeatbeltKeepAlive {
+            _profile_tmp: Some(profile_tmp),
+        },
+    ))
+}
+
+pub(crate) fn spawn_session_shell(
+    cfg: &SandboxConfig,
+) -> Result<(std::process::Child, Box<dyn std::any::Any + Send>)> {
+    use std::process::Stdio;
+    let argv = ["/bin/bash", "--noprofile", "--norc"];
+    let (mut cmd, keepalive) = build_seatbelt_command(&argv, cfg)?;
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::exec(format!("spawn sandbox-exec session shell failed: {}", e)))?;
+    Ok((child, Box::new(keepalive)))
 }
 
 fn build_profile(work_dir: &Path, cfg: &SandboxConfig) -> Result<String> {

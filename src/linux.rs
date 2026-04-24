@@ -27,6 +27,12 @@ const HIDE_HOME_DIRS: &[&str] = &[
     ".git-credentials",
 ];
 
+/// Keep-alive holder for resources that must outlive the spawned child
+/// (e.g., the seccomp BPF tempdir whose fd is dup'd into the child).
+pub(crate) struct BwrapKeepAlive {
+    _seccomp_tmp: Option<tempfile::TempDir>,
+}
+
 pub(crate) fn run(cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     if cmd.is_empty() {
         return Err(Error::validation("empty command"));
@@ -43,11 +49,39 @@ pub(crate) fn run(cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<Execut
     ))
 }
 
+/// Build a bwrap-wrapped Command running `inner_argv` inside the sandbox.
+/// Returns the Command (with stdio still inheritable / unconfigured) and a
+/// keep-alive handle that must live until the child exits.
+pub(crate) fn build_bwrap_command(
+    inner_argv: &[&str],
+    cfg: &SandboxConfig,
+) -> Result<(Command, BwrapKeepAlive)> {
+    let bwrap = which("bwrap").ok_or_else(|| {
+        Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into())
+    })?;
+    let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg)?;
+    Ok((cmd, keepalive))
+}
+
 fn run_with_bwrap(
     bwrap: &Path,
     user_cmd: &[impl AsRef<str>],
     cfg: &SandboxConfig,
 ) -> Result<ExecutionResult> {
+    let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
+    let (mut cmd, keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg)?;
+    pipe_stdio(&mut cmd);
+    let stdin_bytes = cfg.stdin.as_deref();
+    let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
+    drop(keepalive);
+    Ok(result)
+}
+
+fn build_bwrap_command_inner(
+    bwrap: &Path,
+    inner_argv: &[&str],
+    cfg: &SandboxConfig,
+) -> Result<(Command, BwrapKeepAlive)> {
     let work_dir = cfg
         .work_dir
         .canonicalize()
@@ -209,11 +243,9 @@ fn run_with_bwrap(
 
     // The command to run.
     cmd.arg("--");
-    for a in user_cmd {
-        cmd.arg(a.as_ref());
+    for a in inner_argv {
+        cmd.arg(a);
     }
-
-    pipe_stdio(&mut cmd);
 
     // rlimits + dup seccomp fd into slot 3 (pre_exec, post-fork pre-exec).
     let limits = cfg.limits;
@@ -240,10 +272,12 @@ fn run_with_bwrap(
         });
     }
 
-    let stdin_bytes = cfg.stdin.as_deref();
-    let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
-    drop(seccomp_tmp);
-    Ok(result)
+    Ok((
+        cmd,
+        BwrapKeepAlive {
+            _seccomp_tmp: Some(seccomp_tmp),
+        },
+    ))
 }
 
 fn run_with_firejail(
@@ -309,4 +343,26 @@ fn run_with_firejail(
     }
     let stdin_bytes = cfg.stdin.as_deref();
     spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)
+}
+
+/// Spawn a long-running bash inside the sandbox with stdin/stdout/stderr piped.
+/// Used by `Session` for persistent multi-exec sessions.
+pub(crate) fn spawn_session_shell(
+    cfg: &SandboxConfig,
+) -> Result<(std::process::Child, Box<dyn std::any::Any + Send>)> {
+    use std::process::Stdio;
+    if which("bwrap").is_none() {
+        return Err(Error::ToolNotFound(
+            "`bwrap` is required for Session on Linux (apt install bubblewrap)".into(),
+        ));
+    }
+    let argv = ["/bin/bash", "--noprofile", "--norc"];
+    let (mut cmd, keepalive) = build_bwrap_command(&argv, cfg)?;
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| Error::exec(format!("spawn bwrap session shell failed: {}", e)))?;
+    Ok((child, Box::new(keepalive)))
 }

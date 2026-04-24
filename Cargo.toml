@@ -48,3 +48,7 @@ path = "examples/rm_rf_test.rs"
 [[example]]
 name = "shell"
 path = "examples/shell.rs"
+
+[[example]]
+name = "session"
+path = "examples/session.rs"

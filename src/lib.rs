@@ -10,6 +10,7 @@
 mod config;
 mod error;
 mod result;
+mod session;
 
 #[cfg(unix)]
 mod common;
@@ -28,6 +29,7 @@ mod windows;
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
 pub use error::{Error, Result};
 pub use result::ExecutionResult;
+pub use session::{ExecOutput, Session};
 
 /// Execute `cmd` inside the sandbox configured by `cfg`.
 ///

@@ -30,87 +30,7 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
     if user_cmd.is_empty() {
         return Err(Error::validation("empty command"));
     }
-    if !wsl_available() {
-        return Err(Error::ToolNotFound(
-            "WSL is not available. Install WSL2 (`wsl --install`). safebox on Windows requires WSL2 for real isolation.".into(),
-        ));
-    }
-
-    let bwrap_inside = wsl_has_bwrap();
-    if !bwrap_inside && std::env::var("SAFEBOX_WSL_NO_BWRAP").ok().as_deref() != Some("1") {
-        return Err(Error::ToolNotFound(
-            "bubblewrap is not installed inside WSL. Run `wsl -e sudo apt install -y bubblewrap`, or set SAFEBOX_WSL_NO_BWRAP=1 to use WSL-only isolation (no FS sandbox within WSL).".into(),
-        ));
-    }
-
-    let work_dir_wsl =
-        windows_to_wsl_path(&cfg.work_dir).ok_or_else(|| Error::validation("bad work_dir path"))?;
-
-    let mut inner = String::new();
-    if bwrap_inside {
-        inner.push_str("exec bwrap --unshare-all --die-with-parent");
-        for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-            inner.push_str(&format!(" --ro-bind {} {}", p, p));
-        }
-        for p in [
-            "/etc/ld.so.cache",
-            "/etc/ld.so.conf",
-            "/etc/resolv.conf",
-            "/etc/nsswitch.conf",
-            "/etc/hosts",
-            "/etc/ssl/certs",
-        ] {
-            inner.push_str(&format!(" --ro-bind-try {} {}", p, p));
-        }
-        inner.push_str(" --dir /home --dir /root");
-        inner.push_str(&format!(" --bind {} /tmp", shell_quote(&work_dir_wsl)));
-        inner.push_str(" --dev /dev --proc /proc");
-
-        for m in &cfg.extra_mounts {
-            let src = windows_to_wsl_path(&m.host)
-                .ok_or_else(|| Error::validation(format!("bad mount {}", m.host.display())))?;
-            let dst = m
-                .guest
-                .as_ref()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| src.clone());
-            let flag = if m.read_only { "--ro-bind" } else { "--bind" };
-            inner.push_str(&format!(" {} {} {}", flag, shell_quote(&src), shell_quote(&dst)));
-        }
-
-        match cfg.network {
-            NetworkPolicy::Blocked => inner.push_str(" --unshare-net"),
-            NetworkPolicy::AllowAll => inner.push_str(" --share-net"),
-        }
-        inner.push_str(" --clearenv");
-        inner.push_str(" --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        inner.push_str(" --setenv HOME /tmp --setenv TMPDIR /tmp --setenv SAFEBOX 1");
-        for (k, v) in &cfg.env {
-            inner.push_str(&format!(
-                " --setenv {} {}",
-                shell_quote(&k.to_string_lossy()),
-                shell_quote(&v.to_string_lossy())
-            ));
-        }
-        let cwd = cfg
-            .cwd
-            .as_ref()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| "/tmp".to_string());
-        inner.push_str(&format!(" --chdir {}", shell_quote(&cwd)));
-        inner.push_str(" --");
-    } else {
-        // WSL-only fallback: no bwrap. Still isolated from the Windows host via
-        // the WSL VM, and we chdir into work_dir.
-        inner.push_str(&format!("cd {} && ", shell_quote(&work_dir_wsl)));
-        inner.push_str("exec");
-    }
-
-    for a in user_cmd {
-        inner.push(' ');
-        inner.push_str(&shell_quote(a.as_ref()));
-    }
-
+    let inner = build_inner_script(cfg, Some(user_cmd))?;
     let mut wsl = Command::new("wsl");
     hide(&mut wsl);
     wsl.args(["-e", "bash", "-lc", &inner])
@@ -224,4 +144,111 @@ fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Build the bash -lc script that re-execs the user command (or, if `user_cmd`
+/// is None, an interactive bash) inside WSL under bwrap.
+fn build_inner_script(
+    cfg: &SandboxConfig,
+    user_cmd: Option<&[impl AsRef<str>]>,
+) -> Result<String> {
+    if !wsl_available() {
+        return Err(Error::ToolNotFound(
+            "WSL is not available. Install WSL2 (`wsl --install`). tokimo-package-sandbox on Windows requires WSL2 for real isolation.".into(),
+        ));
+    }
+    let bwrap_inside = wsl_has_bwrap();
+    if !bwrap_inside && std::env::var("SAFEBOX_WSL_NO_BWRAP").ok().as_deref() != Some("1") {
+        return Err(Error::ToolNotFound(
+            "bubblewrap is not installed inside WSL. Run `wsl -e sudo apt install -y bubblewrap`, or set SAFEBOX_WSL_NO_BWRAP=1 to use WSL-only isolation.".into(),
+        ));
+    }
+
+    let work_dir_wsl = windows_to_wsl_path(&cfg.work_dir)
+        .ok_or_else(|| Error::validation("bad work_dir path"))?;
+
+    let mut inner = String::new();
+    if bwrap_inside {
+        inner.push_str("exec bwrap --unshare-all --die-with-parent");
+        for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
+            inner.push_str(&format!(" --ro-bind {} {}", p, p));
+        }
+        for p in [
+            "/etc/ld.so.cache",
+            "/etc/ld.so.conf",
+            "/etc/resolv.conf",
+            "/etc/nsswitch.conf",
+            "/etc/hosts",
+            "/etc/ssl/certs",
+        ] {
+            inner.push_str(&format!(" --ro-bind-try {} {}", p, p));
+        }
+        inner.push_str(" --dir /home --dir /root");
+        inner.push_str(&format!(" --bind {} /tmp", shell_quote(&work_dir_wsl)));
+        inner.push_str(" --dev /dev --proc /proc");
+        for m in &cfg.extra_mounts {
+            let src = windows_to_wsl_path(&m.host)
+                .ok_or_else(|| Error::validation(format!("bad mount {}", m.host.display())))?;
+            let dst = m
+                .guest
+                .as_ref()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| src.clone());
+            let flag = if m.read_only { "--ro-bind" } else { "--bind" };
+            inner.push_str(&format!(" {} {} {}", flag, shell_quote(&src), shell_quote(&dst)));
+        }
+        match cfg.network {
+            NetworkPolicy::Blocked => inner.push_str(" --unshare-net"),
+            NetworkPolicy::AllowAll => inner.push_str(" --share-net"),
+        }
+        inner.push_str(" --clearenv");
+        inner.push_str(" --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        inner.push_str(" --setenv HOME /tmp --setenv TMPDIR /tmp --setenv SAFEBOX 1");
+        for (k, v) in &cfg.env {
+            inner.push_str(&format!(
+                " --setenv {} {}",
+                shell_quote(&k.to_string_lossy()),
+                shell_quote(&v.to_string_lossy())
+            ));
+        }
+        let cwd = cfg
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "/tmp".to_string());
+        inner.push_str(&format!(" --chdir {}", shell_quote(&cwd)));
+        inner.push_str(" --");
+    } else {
+        inner.push_str(&format!("cd {} && ", shell_quote(&work_dir_wsl)));
+        inner.push_str("exec");
+    }
+
+    match user_cmd {
+        Some(argv) => {
+            for a in argv {
+                inner.push(' ');
+                inner.push_str(&shell_quote(a.as_ref()));
+            }
+        }
+        None => {
+            inner.push_str(" /bin/bash --noprofile --norc");
+        }
+    }
+    Ok(inner)
+}
+
+pub(crate) fn spawn_session_shell(
+    cfg: &SandboxConfig,
+) -> Result<(std::process::Child, Box<dyn std::any::Any + Send>)> {
+    let inner = build_inner_script::<&str>(cfg, None)?;
+    let mut wsl = Command::new("wsl");
+    hide(&mut wsl);
+    wsl.args(["-e", "bash", "-lc", &inner])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = wsl
+        .spawn()
+        .map_err(|e| Error::exec(format!("spawn wsl session shell failed: {}", e)))?;
+    Ok((child, Box::new(()) as Box<dyn std::any::Any + Send>))
 }
