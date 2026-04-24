@@ -17,6 +17,8 @@ mod session;
 mod common;
 
 #[cfg(target_os = "linux")]
+mod bridge;
+#[cfg(target_os = "linux")]
 mod l4;
 #[cfg(target_os = "linux")]
 mod linux;

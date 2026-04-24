@@ -173,6 +173,8 @@ pub(crate) struct ProxyConfig {
     pub allow_hosts: Vec<HostPattern>,
     /// true for `Gated`; false for `Observed` (report but never block on host rules).
     pub enforce_allow: bool,
+    #[cfg(target_os = "linux")]
+    pub bridge: Option<Arc<crate::bridge::L4L7Bridge>>,
 }
 
 impl ProxyConfig {
@@ -210,6 +212,10 @@ impl Drop for ProxyHandle {
 pub(crate) fn start_proxy(cfg: ProxyConfig) -> io::Result<ProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
+    #[cfg(target_os = "linux")]
+    if let Some(b) = cfg.bridge.as_ref() {
+        b.set_proxy_port(addr.port());
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     thread::Builder::new()
@@ -240,6 +246,14 @@ fn handle_client(mut client: TcpStream, cfg: ProxyConfig) -> io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     client.set_write_timeout(Some(Duration::from_secs(30)))?;
 
+    #[cfg(target_os = "linux")]
+    let client_pid = cfg
+        .bridge
+        .as_ref()
+        .and_then(|b| client.peer_addr().ok().and_then(|pa| b.resolve_pid(pa)));
+    #[cfg(not(target_os = "linux"))]
+    let client_pid: Option<(u32, String)> = None;
+
     let headers = match read_headers(&mut client)? {
         Some(h) => h,
         None => return Ok(()),
@@ -259,9 +273,9 @@ fn handle_client(mut client: TcpStream, cfg: ProxyConfig) -> io::Result<()> {
     }
 
     if method == "CONNECT" {
-        return handle_connect(client, cfg, &target);
+        return handle_connect(client, cfg, &target, client_pid);
     }
-    handle_plain(client, cfg, &method, &target, &version, &text)
+    handle_plain(client, cfg, &method, &target, &version, &text, client_pid)
 }
 
 fn read_headers(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
@@ -288,7 +302,12 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn handle_connect(mut client: TcpStream, cfg: ProxyConfig, target: &str) -> io::Result<()> {
+fn handle_connect(
+    mut client: TcpStream,
+    cfg: ProxyConfig,
+    target: &str,
+    client_pid: Option<(u32, String)>,
+) -> io::Result<()> {
     let (host, port) = split_host_port(target).unwrap_or_else(|| (target.to_string(), 443));
 
     // Peek at TLS ClientHello to extract SNI (best-effort) before deciding.
@@ -299,6 +318,10 @@ fn handle_connect(mut client: TcpStream, cfg: ProxyConfig, target: &str) -> io::
     let mut ev = NetEvent::blank(Layer::L7Sni);
     ev.host = Some(host.clone());
     ev.port = Some(port);
+    if let Some((pid, comm)) = &client_pid {
+        ev.pid = Some(*pid);
+        ev.comm = if comm.is_empty() { None } else { Some(comm.clone()) };
+    }
     let sink_verdict = cfg.sink.on_event(&ev);
     if !allowed_by_pattern || matches!(sink_verdict, Verdict::Deny(_)) {
         let reason = match sink_verdict {
@@ -332,6 +355,10 @@ fn handle_connect(mut client: TcpStream, cfg: ProxyConfig, target: &str) -> io::
         ev2.host = Some(host.clone());
         ev2.port = Some(port);
         ev2.sni = Some(sni.clone());
+        if let Some((pid, comm)) = &client_pid {
+            ev2.pid = Some(*pid);
+            ev2.comm = if comm.is_empty() { None } else { Some(comm.clone()) };
+        }
         let v = cfg.sink.on_event(&ev2);
         if !cfg.host_allowed(sni) || matches!(v, Verdict::Deny(_)) {
             // We already replied 200; the only way to signal denial now is
@@ -365,6 +392,7 @@ fn handle_plain(
     target: &str,
     version: &str,
     full_headers_text: &str,
+    client_pid: Option<(u32, String)>,
 ) -> io::Result<()> {
     let host_from_hdr = header_value(full_headers_text, "host");
     let (host, port, path) = match parse_http_target(target, host_from_hdr.as_deref()) {
@@ -396,6 +424,10 @@ fn handle_plain(
     ev.http_method = Some(method.to_string());
     ev.http_path = Some(path.clone());
     ev.http_url = Some(url);
+    if let Some((pid, comm)) = &client_pid {
+        ev.pid = Some(*pid);
+        ev.comm = if comm.is_empty() { None } else { Some(comm.clone()) };
+    }
     let v = cfg.sink.on_event(&ev);
     if !cfg.host_allowed(&host) || matches!(v, Verdict::Deny(_)) {
         let reason = match v {

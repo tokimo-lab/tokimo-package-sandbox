@@ -8,6 +8,7 @@ use crate::l4::{self, L4Config, L4Handle};
 use crate::net_observer::{self, ProxyConfig, ProxyHandle};
 use crate::seccomp::generate_bpf_file;
 use crate::{Error, ExecutionResult, Result};
+use std::sync::Arc;
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -245,16 +246,19 @@ fn build_bwrap_command_inner(
         }
         NetworkPolicy::Observed { sink } => {
             cmd.args(["--share-net"]);
+            let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
             let handle = net_observer::start_proxy(ProxyConfig {
                 sink: sink.clone(),
                 allow_hosts: vec![],
                 enforce_allow: false,
+                bridge: Some(bridge.clone()),
             })
             .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
             let l4_cfg = L4Config {
                 sink: sink.clone(),
                 allow_hosts: vec![],
                 enforce_allow: false,
+                bridge: Some(bridge),
             };
             let l4_prep = match l4::prepare(l4_cfg.clone()) {
                 Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
@@ -274,16 +278,19 @@ fn build_bwrap_command_inner(
             dns_policy: _,
         } => {
             cmd.args(["--share-net"]);
+            let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
             let handle = net_observer::start_proxy(ProxyConfig {
                 sink: sink.clone(),
                 allow_hosts: allow_hosts.clone(),
                 enforce_allow: true,
+                bridge: Some(bridge.clone()),
             })
             .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
             let l4_cfg = L4Config {
                 sink: sink.clone(),
                 allow_hosts: allow_hosts.clone(),
                 enforce_allow: true,
+                bridge: Some(bridge),
             };
             let l4_prep = match l4::prepare(l4_cfg.clone()) {
                 Ok((ci, pend)) => Some((ci, pend, l4_cfg)),

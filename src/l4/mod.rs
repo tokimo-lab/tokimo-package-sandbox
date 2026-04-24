@@ -41,6 +41,7 @@ pub(crate) struct L4Config {
     pub allow_hosts: Vec<HostPattern>,
     /// true for `Gated`; false for `Observed`.
     pub enforce_allow: bool,
+    pub bridge: Option<Arc<crate::bridge::L4L7Bridge>>,
 }
 
 impl L4Config {
@@ -48,6 +49,13 @@ impl L4Config {
     /// the remote IP looks like localhost OR the sink explicitly overrides,
     /// since L4 has no hostname — allowlist matching is advisory for now.
     pub fn decide(&self, ev: &NetEvent) -> Verdict {
+        // Suppress connects that the L7 proxy will handle itself (to avoid
+        // duplicate events for the same user action).
+        if let (Some(bridge), Some(addr)) = (self.bridge.as_ref(), ev.remote) {
+            if bridge.is_proxy_target(&addr) {
+                return Verdict::Allow;
+            }
+        }
         let sink_verdict = self.sink.on_event(ev);
         if !self.enforce_allow {
             return Verdict::Allow; // Observed: never deny, whatever sink says.
