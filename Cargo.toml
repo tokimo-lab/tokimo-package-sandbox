@@ -60,3 +60,7 @@ path = "examples/parallel_in_session.rs"
 [[example]]
 name = "torture_test"
 path = "examples/torture_test.rs"
+
+[[example]]
+name = "edge_cases"
+path = "examples/edge_cases.rs"
