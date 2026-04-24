@@ -1,0 +1,50 @@
+[package]
+name = "tokimo-package-sandbox"
+version = "0.1.0"
+edition = "2021"
+authors = ["William Chan <root@williamchan.me>"]
+license = "MIT"
+description = "Cross-platform native sandbox for running arbitrary commands safely. Linux (bwrap + seccomp), macOS (Seatbelt), Windows (WSL2)."
+repository = "https://github.com/tokimo-lab/tokimo-package-sandbox"
+homepage = "https://github.com/tokimo-lab/tokimo-package-sandbox"
+documentation = "https://docs.rs/tokimo-package-sandbox"
+readme = "README.md"
+keywords = ["sandbox", "security", "isolation", "seccomp", "seatbelt"]
+categories = ["os"]
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+tempfile = "3.10"
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["process", "signal"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.29", features = ["process", "signal"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "rm_rf_test"
+path = "examples/rm_rf_test.rs"
+
+[[example]]
+name = "shell"
+path = "examples/shell.rs"

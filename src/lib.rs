@@ -1,0 +1,99 @@
+//! tokimo-package-sandbox — cross-platform command sandbox (Linux / macOS / Windows).
+//!
+//! ```no_run
+//! use tokimo_package_sandbox::{SandboxConfig, NetworkPolicy};
+//! let cfg = SandboxConfig::new("/tmp/work").network(NetworkPolicy::Blocked);
+//! let out = tokimo_package_sandbox::run(&["rm", "-rf", "/"], &cfg).unwrap();
+//! assert!(!out.success() || out.exit_code != 0);
+//! ```
+
+mod config;
+mod error;
+mod result;
+
+#[cfg(unix)]
+mod common;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod seccomp;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "windows")]
+mod windows;
+
+pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
+pub use error::{Error, Result};
+pub use result::ExecutionResult;
+
+/// Execute `cmd` inside the sandbox configured by `cfg`.
+///
+/// `cmd[0]` is the program, `cmd[1..]` are its arguments. The command is
+/// looked up via `PATH` inside the sandbox (not the host's `PATH`).
+pub fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    cfg.validate()?;
+
+    // Escape hatch for debugging.
+    if std::env::var("SAFEBOX_DISABLE").ok().as_deref() == Some("1") {
+        return run_without_sandbox(cmd, cfg);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return linux::run(cmd, cfg);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos::run(cmd, cfg);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows::run(cmd, cfg);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = cmd;
+        let _ = cfg;
+        Err(Error::validation("unsupported platform"))
+    }
+}
+
+#[cfg(unix)]
+fn run_without_sandbox<S: AsRef<str>>(
+    cmd: &[S],
+    cfg: &SandboxConfig,
+) -> Result<ExecutionResult> {
+    use std::process::Command;
+    if cmd.is_empty() {
+        return Err(Error::validation("empty command"));
+    }
+    let mut c = Command::new(cmd[0].as_ref());
+    for a in &cmd[1..] {
+        c.arg(a.as_ref());
+    }
+    c.env_clear();
+    for (k, v) in &cfg.env {
+        c.env(k, v);
+    }
+    if let Some(cwd) = &cfg.cwd {
+        c.current_dir(cwd);
+    } else {
+        c.current_dir(&cfg.work_dir);
+    }
+    common::pipe_stdio(&mut c);
+    common::spawn_run(&mut c, cfg.stdin.as_deref(), &cfg.limits, cfg.stream_stderr)
+}
+
+#[cfg(windows)]
+fn run_without_sandbox<S: AsRef<str>>(
+    cmd: &[S],
+    _cfg: &SandboxConfig,
+) -> Result<ExecutionResult> {
+    let _ = cmd;
+    Err(Error::validation(
+        "SAFEBOX_DISABLE is not supported on Windows",
+    ))
+}
