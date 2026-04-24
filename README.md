@@ -76,7 +76,23 @@ pub struct SandboxConfig {
 
 pub struct Mount { pub host: PathBuf, pub guest: Option<PathBuf>, pub read_only: bool }
 
-pub enum NetworkPolicy { Blocked, AllowAll }
+pub enum NetworkPolicy {
+    /// No network at all (default). Guest runs in an empty netns.
+    Blocked,
+    /// Full host network. Use only for trusted workloads.
+    AllowAll,
+    /// Linux. Full network + every HTTP/HTTPS request and every raw TCP/UDP
+    /// `connect()` / `sendto()` is reported to `sink`. Advisory only —
+    /// nothing is blocked. See `docs/network-observability.md`.
+    Observed { sink: Arc<dyn NetEventSink> },
+    /// Linux. Same as `Observed` plus host allowlist enforcement at L7 and
+    /// (where supported) at L4 via `Verdict::Deny`.
+    Gated {
+        sink: Arc<dyn NetEventSink>,
+        allow_hosts: Vec<HostPattern>,
+        dns_policy: DnsPolicy,
+    },
+}
 
 pub struct ResourceLimits {
     pub max_memory_mb: u64,
@@ -137,7 +153,44 @@ cargo run --example shell
 
 # Persistent session: open once, run many commands sharing state, close.
 cargo run --example session
+
+# Network observability: HTTP_PROXY-based L7 tap (curl/pip/wget visible).
+cargo run --example gated_network
+
+# Full L4 + L7 observer: every raw connect() / sendto() in the guest
+# is reported with (remote, pid, comm), plus HTTP/SNI from the proxy.
+cargo run --example l4_observer
 ```
+
+## Network observability
+
+Four network modes cover the common scenarios. Pick by what you need to
+*see* and what you need to *block*.
+
+| Mode | Reachable network | What the host sees | What the host can block | Linux cost | Use when |
+|---|---|---|---|---|---|
+| `Blocked` (default) | nothing | — | everything | 0 | build / test that must be hermetic |
+| `AllowAll` | full host net | nothing | nothing | 0 | trusted workloads, perf-sensitive |
+| `Observed { sink }` | full host net | every HTTP(S) request + every raw `connect()` / `sendto()` (remote IP:port, pid, comm, SNI, method, URL) | nothing (advisory) | L7 proxy + seccomp filter (~µs/syscall) | auditing an untrusted installer, "what did this script phone home to?" |
+| `Gated { sink, allow_hosts, .. }` | full host net, filtered | same as `Observed` | unknown hosts get `403` at L7; `Verdict::Deny` from sink blocks L4 connects (when the backend supports it) | same as Observed | letting an agent `pip install` from pypi.org but nothing else |
+
+Under the hood the Linux implementation layers three mechanisms and
+auto-selects based on what the kernel supports:
+
+| Layer | Mechanism | Covers | Needs |
+|---|---|---|---|
+| **L7** | transparent `HTTP_PROXY` inside the sandbox | HTTP method/URL + TLS SNI | nothing extra; tools that honor `HTTP_PROXY` |
+| **L4 primary** | `seccomp(SECCOMP_FILTER_FLAG_NEW_LISTENER)` + user-notify | any `connect()` / `sendto()`, synchronous deny | mainline kernel, no inherited seccomp filter |
+| **L4 fallback** | `SECCOMP_RET_TRACE` + `PTRACE_SEIZE` | same syscalls, observe-only | works on WSL2 and any container that already installed a seccomp notifier |
+
+L7 and L4 events are joined: the "client → proxy" L4 hop is suppressed,
+and the L7 event is enriched with `pid`/`comm` via `/proc/net/tcp`
+reverse-lookup, so one real request is one `NetEvent`.
+
+See [`docs/network-observability.md`](./docs/network-observability.md)
+for the full design and [`examples/l4_observer.rs`](./examples/l4_observer.rs)
+for a runnable end-to-end demo (`python`, `bash /dev/tcp`, `nc`, `curl`
+all produce events).
 
 ## Persistent sessions
 
@@ -193,6 +246,8 @@ No kernel cooperation means no real isolation. The three mechanisms used here (L
 ## Documentation
 
 - [`docs/db-as-filesystem.md`](./docs/db-as-filesystem.md) — pattern for exposing a database as a filesystem to sandboxed bash (materialize + diff-and-commit on exit)
+- [`docs/network-observability.md`](./docs/network-observability.md) — design + backend selection for `Observed` / `Gated` network modes
+- [`docs/api.md`](./docs/api.md) — extended API reference
 
 ## License
 
