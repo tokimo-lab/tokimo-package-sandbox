@@ -56,3 +56,7 @@ path = "examples/session.rs"
 [[example]]
 name = "parallel_in_session"
 path = "examples/parallel_in_session.rs"
+
+[[example]]
+name = "torture_test"
+path = "examples/torture_test.rs"

@@ -129,12 +129,33 @@ impl Session {
         // Heredoc-wrap user cmd to survive arbitrary content (incl. unbalanced
         // quotes). Random per-call delimiter avoids collisions.
         let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
+        // KEY TRICK: redirect bash's own stdout/stderr to per-call files for the
+        // duration of the eval. Any process backgrounded by the user command
+        // (e.g. `foo &`, `nohup ...`, daemons) inherits those file fds at fork
+        // time, so AFTER we restore bash's real stdout/stderr, those bg
+        // processes keep writing to the (soon-unlinked) files instead of
+        // polluting the pipe between bash and our reader thread. This makes
+        // exec() framing robust against AI-generated commands that contain
+        // arbitrary `&` usage — no parsing required.
+        let out_name = format!(".tps_fg_{}_{}.out", self.sid, id);
+        let err_name = format!(".tps_fg_{}_{}.err", self.sid, id);
         let script = format!(
-            "eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\"\n__sb_rc=$?\nprintf '\\n__SBOUT_{sid}_{id} %d\\n' \"$__sb_rc\"\nprintf '\\n__SBERR_{sid}_{id}\\n' >&2\n",
+            "__o=\"$TMPDIR/{out_name}\"; __e=\"$TMPDIR/{err_name}\"; \
+             exec 3>&1 4>&2 >\"$__o\" 2>\"$__e\"; \
+             eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\"; \
+             __sb_rc=$?; \
+             exec >&3 2>&4 3>&- 4>&-; \
+             cat \"$__o\"; \
+             printf '\\n__SBOUT_{sid}_{id} %d\\n' \"$__sb_rc\"; \
+             cat \"$__e\" >&2; \
+             printf '\\n__SBERR_{sid}_{id}\\n' >&2; \
+             rm -f \"$__o\" \"$__e\"\n",
             delim = delim,
             cmd = cmd,
             sid = self.sid,
             id = id,
+            out_name = out_name,
+            err_name = err_name,
         );
         stdin
             .write_all(script.as_bytes())
