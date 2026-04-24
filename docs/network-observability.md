@@ -342,14 +342,17 @@ impl NetEventSink for Chain {
 |---|---|---|
 | L7 HTTP / CONNECT 代理 | ✅ 已上 | `src/net_observer.rs`；`Observed` / `Gated` 自动注入 `HTTP_PROXY`。 |
 | L4 seccomp-notify backend | ✅ 已上 rootless | `src/l4/seccomp_notify.rs`。在 `pre_exec` 里装 cBPF filter + `SECCOMP_FILTER_FLAG_NEW_LISTENER`，把 listener fd 通过 `SCM_RIGHTS` 送回宿主；宿主线程 `ioctl NOTIF_RECV`，`process_vm_readv` 读 `struct sockaddr` → `NetEvent { layer: L4 }`。Phase A = 观测语义；`Gated` 的 L4 deny 因为用户内存 TOCTOU 只能尽力而为。 |
+| L4 seccomp-trace backend (fallback) | ✅ 已上 rootless | `src/l4/seccomp_trace.rs`。在 WSL2 / 容器等 `NEW_LISTENER` 返回 `EBUSY` 的场景下作为自动降级。cBPF filter 对 `connect` / `sendto` 返回 `SECCOMP_RET_TRACE | tag`，宿主 `PTRACE_SEIZE` 子进程 +`PTRACE_O_TRACESECCOMP|FORK|VFORK|CLONE|EXEC|EXITKILL`，tracer 线程 `waitpid(-1, __WALL)`；SECCOMP 事件触发 `PTRACE_GETEVENTMSG` 取 tag、`PTRACE_GETREGS` 取 sockaddr 指针、`process_vm_readv` 读取 → `NetEvent { layer: L4 }`。观测语义；deny 在这个后端里目前是 no-op（想 deny 需要 GETREGS/SETREGS 两段停 dance，暂不做）。 |
 | L4 eBPF backend | 🧪 scaffold | `src/l4/ebpf.rs`（feature `ebpf`）。真正的 `cgroup/connect4/6` 程序需要独立 `tokimo-ebpf` crate + `bpf-linker`，且需要 root / `CAP_BPF`。 |
 | L3 ICMP | ❌ 未规划 | |
 
 ### L4 后端自动降级
 
-`NetworkPolicy::Observed{...}` / `Gated{...}` 启动时会先 `probe`：fork 一个子进程尝试装 `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter。若失败（最常见是 `EBUSY` —— WSL2、Docker、rootless Podman 等场景宿主已预置 seccomp filter），库会 `tracing::warn!` 一条
-`"L4 observer disabled, continuing with L7 only: ..."`
-然后继续跑 L7 代理，不会让 sandbox 启动失败。
+`NetworkPolicy::Observed{...}` / `Gated{...}` 启动时依次 `probe`：
+
+1. **seccomp-notify**（首选）：fork 子进程尝试装 `SECCOMP_FILTER_FLAG_NEW_LISTENER` filter。
+2. **seccomp-trace**（fallback）：如果上面因为 `EBUSY` 失败，再 fork 子进程尝试普通 `SECCOMP_SET_MODE_FILTER`（无 flags）+ 宿主端同 UID `PTRACE_SEIZE`。WSL2 / 容器这条路通常都能用。
+3. **L7-only**：两个都失败时，只留 L7 HTTP(S) 代理。不会让 sandbox 启动失败，只会 `tracing::warn!`。
 
 验证方式：
 ```sh
@@ -413,13 +416,14 @@ sysctl kernel.seccomp.actions_avail   # 看 user_notif 是否在列
 1. 启 L7 HTTP(S) proxy —— **正常工作**，所有尊重 `HTTP_PROXY` 的客户端
    （`curl`、`wget`、`requests`、`urllib`、大部分 HTTP lib）都会被抓到。
 2. 尝试起 L4 seccomp-notify backend —— probe 返回 `EBUSY`，打一条
-   `tracing::warn!("L4 observer disabled, continuing with L7 only: ...")`
+   `tracing::info!("seccomp-notify unsupported ..., falling back to seccomp-trace")`
    然后继续。
-3. 走 L4 绕过 HTTP_PROXY 的 raw TCP/UDP（`bash /dev/tcp`、`nc`、Python
-   `socket`、Go `net.Dial`）在本机观测不到，但**能联网**（`--share-net`
-   仍然生效）。这是本机的限制，不是 bug。
+3. 尝试起 L4 **seccomp-trace** backend —— 实测 WSL2 这条路能走通：
+   `connect()` / `sendto()` 返回 `SECCOMP_RET_TRACE`，宿主 `PTRACE_SEIZE`
+   抓住，走 `process_vm_readv` 读 `sockaddr` → L4 event。`bash /dev/tcp`、
+   `nc`、`python socket.connect()` 都能看到。
+4. 真 eBPF 需要 root + `CAP_BPF`，WSL2 默认没有，不可用。
 
-`cargo run --example l4_observer` 自带这个场景的 demo，并在末尾明确提示
-"zero L4 events"。
+`cargo run --example l4_observer` 会在同一次运行里同时验证 L4 + L7 事件。
 
 

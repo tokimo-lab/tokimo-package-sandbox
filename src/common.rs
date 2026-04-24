@@ -252,10 +252,26 @@ pub(crate) fn wait_with_io(
     limits: &ResourceLimits,
     stream_stderr: bool,
 ) -> Result<crate::ExecutionResult> {
+    wait_with_io_ext(child, stdin_bytes, limits, stream_stderr, None)
+}
+
+/// Like `wait_with_io` but when `exit_rx` is Some, the exit status is read
+/// from the channel instead of via `Child::wait()`. Used by the seccomp_trace
+/// L4 backend whose tracer thread reaps the child via `waitpid(-1, __WALL)`.
+pub(crate) fn wait_with_io_ext(
+    child: &mut Child,
+    stdin_bytes: Option<&[u8]>,
+    limits: &ResourceLimits,
+    stream_stderr: bool,
+    exit_rx: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>>,
+) -> Result<crate::ExecutionResult> {
     if let Some(bytes) = stdin_bytes {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(bytes);
         }
+    }
+    if let Some(rx) = exit_rx {
+        return wait_via_channel(child, rx, limits.timeout_secs, stream_stderr);
     }
     let (stdout, stderr, exit_code, timed_out, oom_killed) = wait_with_timeout(
         child,
@@ -269,6 +285,84 @@ pub(crate) fn wait_with_io(
         exit_code,
         timed_out,
         oom_killed,
+    })
+}
+
+fn wait_via_channel(
+    child: &mut Child,
+    exit_rx: std::sync::mpsc::Receiver<std::process::ExitStatus>,
+    timeout_secs: u64,
+    stream_stderr: bool,
+) -> Result<crate::ExecutionResult> {
+    // Drain stdio concurrently. Child::wait() must NOT be called — the
+    // tracer thread reaps via waitpid(-1).
+    let _ = child.stdin.take();
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        thread::spawn(move || {
+            let mut s = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match err.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if stream_stderr {
+                            let _ = std::io::stderr().write_all(&buf[..n]);
+                            let _ = std::io::stderr().flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            s
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut timed_out = false;
+    let status = loop {
+        match exit_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(s) => break Some(s),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    // Timeout: kill the child; tracer will see exit and send
+                    // status, but we won't wait much longer.
+                    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                    std::thread::sleep(Duration::from_secs(2));
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    timed_out = true;
+                    break exit_rx.recv_timeout(Duration::from_secs(5)).ok();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+        }
+    };
+
+    let stdout = stdout_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stderr = stderr_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+
+    let exit_code = status
+        .as_ref()
+        .and_then(|s| s.code())
+        .unwrap_or(-1);
+    Ok(crate::ExecutionResult {
+        stdout,
+        stderr: if timed_out {
+            format!("{}\nsandbox: killed after {}s timeout", stderr, timeout_secs)
+        } else {
+            stderr
+        },
+        exit_code,
+        timed_out,
+        oom_killed: false,
     })
 }
 

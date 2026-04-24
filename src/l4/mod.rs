@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub(crate) mod seccomp_notify;
+pub(crate) mod seccomp_trace;
 
 #[cfg(feature = "ebpf")]
 pub(crate) mod ebpf;
@@ -81,10 +82,12 @@ pub(crate) struct L4Handle {
 pub(crate) trait L4Backend: Send {}
 
 impl L4Backend for seccomp_notify::SeccompNotifyHandle {}
+impl L4Backend for seccomp_trace::SeccompTraceHandle {}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Backend {
     SeccompNotify,
+    SeccompTrace,
     #[cfg(feature = "ebpf")]
     Ebpf,
 }
@@ -101,7 +104,17 @@ pub(crate) fn prepare(cfg: L4Config) -> std::io::Result<(ChildInstall, Pending)>
     if ebpf::is_supported() {
         return ebpf::prepare(cfg);
     }
-    seccomp_notify::prepare(cfg)
+    match seccomp_notify::prepare(cfg.clone()) {
+        Ok(v) => Ok(v),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::info!(
+                "l4: seccomp-notify unsupported ({}), falling back to seccomp-trace",
+                e
+            );
+            seccomp_trace::prepare(cfg)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Child-side install payload. `Copy` so it can be moved into a `pre_exec`
@@ -115,6 +128,7 @@ pub(crate) struct ChildInstall {
 /// Parent-side pending state. Not Send-safe to clone; consume via `finalize`.
 pub(crate) enum Pending {
     SeccompNotify(seccomp_notify::Pending),
+    SeccompTrace(seccomp_trace::Pending),
     #[cfg(feature = "ebpf")]
     Ebpf(ebpf::Pending),
 }
@@ -126,22 +140,36 @@ pub(crate) enum Pending {
 pub(crate) unsafe fn child_install(ci: ChildInstall) -> std::io::Result<()> {
     match ci.backend {
         Backend::SeccompNotify => seccomp_notify::child_install(ci.child_fd),
+        Backend::SeccompTrace => seccomp_trace::child_install(),
         #[cfg(feature = "ebpf")]
         Backend::Ebpf => Ok(()),
     }
 }
 
 /// Parent-side finalizer. Spawns the notify-loop thread.
-pub(crate) fn finalize(pending: Pending, cfg: L4Config) -> std::io::Result<L4Handle> {
+///
+/// `child_pid` is only consulted by the trace backend; notify/ebpf
+/// ignore it. The returned `Option<Receiver<ExitStatus>>` is `Some` only
+/// for the trace backend — when present, the caller MUST use it instead
+/// of `Child::wait()` (the tracer thread reaps the child).
+pub(crate) fn finalize(
+    pending: Pending,
+    cfg: L4Config,
+    child_pid: i32,
+) -> std::io::Result<(L4Handle, Option<std::sync::mpsc::Receiver<std::process::ExitStatus>>)> {
     match pending {
         Pending::SeccompNotify(p) => {
             let h = seccomp_notify::start_parent(p, cfg)?;
-            Ok(L4Handle { _inner: Box::new(h) })
+            Ok((L4Handle { _inner: Box::new(h) }, None))
+        }
+        Pending::SeccompTrace(p) => {
+            let (h, rx) = seccomp_trace::start_parent(p, cfg, child_pid)?;
+            Ok((L4Handle { _inner: Box::new(h) }, Some(rx)))
         }
         #[cfg(feature = "ebpf")]
         Pending::Ebpf(p) => {
             let h = ebpf::start_parent(p, cfg)?;
-            Ok(L4Handle { _inner: Box::new(h) })
+            Ok((L4Handle { _inner: Box::new(h) }, None))
         }
     }
 }

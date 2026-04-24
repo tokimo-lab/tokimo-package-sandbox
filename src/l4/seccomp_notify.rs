@@ -598,7 +598,7 @@ fn notif_id_valid(listener_fd: RawFd, id: u64) -> bool {
 
 /// Read `len` bytes from the target process's address space. Returns
 /// `None` on failure (Yama ptrace restriction, target dead, etc.).
-fn read_sockaddr(pid: u32, remote_ptr: u64, len: usize, out: &mut [u8]) -> Option<usize> {
+pub(super) fn read_sockaddr(pid: u32, remote_ptr: u64, len: usize, out: &mut [u8]) -> Option<usize> {
     let local = libc::iovec {
         iov_base: out.as_mut_ptr() as *mut libc::c_void,
         iov_len: len,
@@ -637,12 +637,12 @@ fn read_via_proc_mem(pid: u32, remote_ptr: u64, len: usize, out: &mut [u8]) -> O
     }
 }
 
-fn read_comm(pid: u32) -> Option<String> {
+pub(super) fn read_comm(pid: u32) -> Option<String> {
     let s = std::fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
     Some(s.trim_end_matches('\n').to_string())
 }
 
-fn parse_sockaddr(buf: &[u8]) -> Option<SocketAddr> {
+pub(super) fn parse_sockaddr(buf: &[u8]) -> Option<SocketAddr> {
     if buf.len() < 2 {
         return None;
     }

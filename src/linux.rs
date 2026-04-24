@@ -94,12 +94,14 @@ fn run_with_bwrap(
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::exec(format!("spawn bwrap failed: {}", e)))?;
-        keepalive.finalize_l4()?;
-        let result = crate::common::wait_with_io(
+        let child_pid = child.id() as i32;
+        let exit_rx = keepalive.finalize_l4(child_pid)?;
+        let result = crate::common::wait_with_io_ext(
             &mut child,
             cfg.stdin.as_deref(),
             &cfg.limits,
             cfg.stream_stderr,
+            exit_rx,
         )?;
         drop(keepalive);
         Ok(result)
@@ -399,13 +401,22 @@ impl BwrapKeepAlive {
     /// Finalize L4 observer after `Command::spawn` returns. Must be called
     /// exactly once if the sandbox config requested L4 observation; noop
     /// otherwise.
-    pub(crate) fn finalize_l4(&mut self) -> Result<()> {
+    ///
+    /// For the seccomp-trace backend, returns `Some(Receiver<ExitStatus>)`;
+    /// the caller MUST use that to obtain the child's exit status instead of
+    /// `Child::wait()` (the tracer thread reaps the child via `waitpid`).
+    pub(crate) fn finalize_l4(
+        &mut self,
+        child_pid: i32,
+    ) -> Result<Option<std::sync::mpsc::Receiver<std::process::ExitStatus>>> {
         if let Some((pending, cfg)) = self.l4_pending.take() {
-            let handle = l4::finalize(pending, cfg)
+            let (handle, exit_rx) = l4::finalize(pending, cfg, child_pid)
                 .map_err(|e| Error::exec(format!("finalize L4 observer: {}", e)))?;
             self._l4 = Some(handle);
+            Ok(exit_rx)
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 }
 
@@ -498,6 +509,7 @@ pub(crate) fn spawn_session_shell(
     let child = cmd
         .spawn()
         .map_err(|e| Error::exec(format!("spawn bwrap session shell failed: {}", e)))?;
-    keepalive.finalize_l4()?;
+    let child_pid = child.id() as i32;
+    let _ = keepalive.finalize_l4(child_pid)?;
     Ok((child, Box::new(keepalive)))
 }
