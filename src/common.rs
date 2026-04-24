@@ -240,13 +240,25 @@ pub(crate) fn spawn_run(
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::exec(format!("spawn failed: {}", e)))?;
+    wait_with_io(&mut child, stdin_bytes, limits, stream_stderr)
+}
+
+/// Wait on an already-spawned child with stdin push and timeout/mem limits.
+/// Used by Linux path when pre/post-spawn coordination (e.g. L4 observer
+/// finalize) needs to happen BETWEEN `.spawn()` and `.wait()`.
+pub(crate) fn wait_with_io(
+    child: &mut Child,
+    stdin_bytes: Option<&[u8]>,
+    limits: &ResourceLimits,
+    stream_stderr: bool,
+) -> Result<crate::ExecutionResult> {
     if let Some(bytes) = stdin_bytes {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(bytes);
         }
     }
     let (stdout, stderr, exit_code, timed_out, oom_killed) = wait_with_timeout(
-        &mut child,
+        child,
         limits.timeout_secs,
         limits.max_memory_bytes(),
         stream_stderr,

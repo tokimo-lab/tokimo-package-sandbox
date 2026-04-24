@@ -2,15 +2,63 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::net_observer::{DnsPolicy, HostPattern, NetEventSink};
 
 /// Network policy inside the sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum NetworkPolicy {
     /// No network access at all. On Linux this uses a private network namespace.
     Blocked,
     /// Share the host network namespace. The sandbox can reach everything
     /// the host can reach.
     AllowAll,
+    /// L7-observable: the sandbox runs in the host netns, but an in-process
+    /// HTTP(S) proxy is started and the sandbox is pointed at it via
+    /// `HTTP_PROXY` / `HTTPS_PROXY`. Every HTTP request and every CONNECT
+    /// target (host, port, TLS SNI) is reported to `sink`. Nothing is ever
+    /// blocked in this mode — `sink` is advisory only.
+    ///
+    /// Linux only. Works with tools that honor the `HTTP_PROXY` convention
+    /// (curl, pip, python-requests, Node fetch, wget, go http, …). Sandboxed
+    /// binaries that dial raw sockets bypass this path; for kernel-level
+    /// enforcement see `docs/network-observability.md` Phase 1 (`Observed`
+    /// via eBPF cgroup/connect).
+    Observed {
+        sink: Arc<dyn NetEventSink>,
+    },
+    /// L7-observable **and** host allowlisted. Same proxy as `Observed`,
+    /// but any request whose host is not in `allow_hosts`, or whose
+    /// `sink.on_event` returns `Verdict::Deny`, gets `HTTP 403 Forbidden`.
+    ///
+    /// Linux only. `dns_policy` is advisory in the current implementation
+    /// (the proxy resolves upstream hosts directly) and is carried for API
+    /// compatibility with the upcoming slirp4netns path.
+    Gated {
+        sink: Arc<dyn NetEventSink>,
+        allow_hosts: Vec<HostPattern>,
+        dns_policy: DnsPolicy,
+    },
+}
+
+impl std::fmt::Debug for NetworkPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkPolicy::Blocked => f.write_str("Blocked"),
+            NetworkPolicy::AllowAll => f.write_str("AllowAll"),
+            NetworkPolicy::Observed { .. } => f.write_str("Observed { .. }"),
+            NetworkPolicy::Gated {
+                allow_hosts,
+                dns_policy,
+                ..
+            } => f
+                .debug_struct("Gated")
+                .field("allow_hosts", allow_hosts)
+                .field("dns_policy", dns_policy)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Default for NetworkPolicy {

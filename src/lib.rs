@@ -9,12 +9,15 @@
 
 mod config;
 mod error;
+mod net_observer;
 mod result;
 mod session;
 
 #[cfg(unix)]
 mod common;
 
+#[cfg(target_os = "linux")]
+mod l4;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -28,6 +31,9 @@ mod windows;
 
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
 pub use error::{Error, Result};
+pub use net_observer::{
+    DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict,
+};
 pub use result::ExecutionResult;
 pub use session::{ExecOutput, JobHandle, Session};
 

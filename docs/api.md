@@ -105,6 +105,8 @@ pub enum NetworkPolicy {
 }
 ```
 
+> 未来规划：新增 `Observed`（eBPF cgroup/connect 可观测）与 `Gated`（slirp4netns + L7 代理，域名级 allowlist）两档。见 [`network-observability.md`](./network-observability.md)。
+
 ### Blocked（默认，完全断网）
 
 | 平台 | 实现 |

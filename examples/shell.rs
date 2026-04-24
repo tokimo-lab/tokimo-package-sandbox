@@ -80,6 +80,9 @@ fn exec_interactive_bwrap(
         NetworkPolicy::AllowAll => {
             cmd.args(["--share-net"]);
         }
+        _ => {
+            cmd.args(["--share-net"]);
+        }
     }
     cmd.args(["--clearenv"]);
     cmd.args([

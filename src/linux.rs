@@ -4,6 +4,8 @@
 
 use crate::common::{pipe_stdio, spawn_run, which};
 use crate::config::{NetworkPolicy, SandboxConfig};
+use crate::l4::{self, L4Config, L4Handle};
+use crate::net_observer::{self, ProxyConfig, ProxyHandle};
 use crate::seccomp::generate_bpf_file;
 use crate::{Error, ExecutionResult, Result};
 
@@ -31,6 +33,9 @@ const HIDE_HOME_DIRS: &[&str] = &[
 /// (e.g., the seccomp BPF tempdir whose fd is dup'd into the child).
 pub(crate) struct BwrapKeepAlive {
     _seccomp_tmp: Option<tempfile::TempDir>,
+    _proxy: Option<ProxyHandle>,
+    _l4: Option<L4Handle>,
+    l4_pending: Option<(l4::Pending, L4Config)>,
 }
 
 pub(crate) fn run(cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
@@ -69,12 +74,40 @@ fn run_with_bwrap(
     cfg: &SandboxConfig,
 ) -> Result<ExecutionResult> {
     let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
-    let (mut cmd, keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg)?;
+    let (mut cmd, mut keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg)?;
     pipe_stdio(&mut cmd);
     let stdin_bytes = cfg.stdin.as_deref();
-    let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
-    drop(keepalive);
-    Ok(result)
+    // We need to spawn, then finalize L4 (recv listener fd), then wait.
+    // `spawn_run` does spawn+wait together, so break that apart here.
+    use std::process::Stdio;
+    let _ = stdin_bytes;
+    // Actually re-use spawn_run but finalize via a tiny wrapper — we know
+    // spawn_run calls spawn() internally. Simplest: let spawn_run spawn the
+    // child; pre_exec runs synchronously before exec in the child, so by
+    // the time `.spawn()` returns in the parent, the sendmsg has happened.
+    // spawn_run then waits. We can't interleave finalize_l4 easily without
+    // refactoring spawn_run. Instead: finalize the L4 observer's parent
+    // side in a thread BEFORE spawn_run waits — but we don't have the
+    // Child. Accept a small refactor: if L4 is pending, do manual spawn.
+    if keepalive.l4_pending.is_some() {
+        let _ = Stdio::piped();
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Error::exec(format!("spawn bwrap failed: {}", e)))?;
+        keepalive.finalize_l4()?;
+        let result = crate::common::wait_with_io(
+            &mut child,
+            cfg.stdin.as_deref(),
+            &cfg.limits,
+            cfg.stream_stderr,
+        )?;
+        drop(keepalive);
+        Ok(result)
+    } else {
+        let result = spawn_run(&mut cmd, stdin_bytes, &cfg.limits, cfg.stream_stderr)?;
+        drop(keepalive);
+        Ok(result)
+    }
 }
 
 fn build_bwrap_command_inner(
@@ -199,14 +232,70 @@ fn build_bwrap_command_inner(
     }
 
     // Network.
-    match cfg.network {
+    let (proxy_handle, l4_prep): (Option<ProxyHandle>, Option<(l4::ChildInstall, l4::Pending, L4Config)>) = match &cfg.network {
         NetworkPolicy::Blocked => {
             cmd.args(["--unshare-net"]);
+            (None, None)
         }
         NetworkPolicy::AllowAll => {
             cmd.args(["--share-net"]);
+            (None, None)
         }
-    }
+        NetworkPolicy::Observed { sink } => {
+            cmd.args(["--share-net"]);
+            let handle = net_observer::start_proxy(ProxyConfig {
+                sink: sink.clone(),
+                allow_hosts: vec![],
+                enforce_allow: false,
+            })
+            .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
+            let l4_cfg = L4Config {
+                sink: sink.clone(),
+                allow_hosts: vec![],
+                enforce_allow: false,
+            };
+            let l4_prep = match l4::prepare(l4_cfg.clone()) {
+                Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
+                Err(e) => {
+                    tracing::warn!(
+                        "sandbox: L4 observer disabled, continuing with L7 only: {}",
+                        e
+                    );
+                    None
+                }
+            };
+            (Some(handle), l4_prep)
+        }
+        NetworkPolicy::Gated {
+            sink,
+            allow_hosts,
+            dns_policy: _,
+        } => {
+            cmd.args(["--share-net"]);
+            let handle = net_observer::start_proxy(ProxyConfig {
+                sink: sink.clone(),
+                allow_hosts: allow_hosts.clone(),
+                enforce_allow: true,
+            })
+            .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
+            let l4_cfg = L4Config {
+                sink: sink.clone(),
+                allow_hosts: allow_hosts.clone(),
+                enforce_allow: true,
+            };
+            let l4_prep = match l4::prepare(l4_cfg.clone()) {
+                Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
+                Err(e) => {
+                    tracing::warn!(
+                        "sandbox: L4 observer disabled, continuing with L7 only: {}",
+                        e
+                    );
+                    None
+                }
+            };
+            (Some(handle), l4_prep)
+        }
+    };
 
     // Environment: clear default, set explicit.
     cmd.args(["--clearenv"]);
@@ -229,6 +318,17 @@ fn build_bwrap_command_inner(
     cmd.args(["--setenv", "TMPDIR", "/tmp"]);
     cmd.args(["--setenv", "SAFEBOX", "1"]);
 
+    // Point cooperating clients at the in-process L7 observer proxy.
+    if let Some(h) = &proxy_handle {
+        let proxy_url = format!("http://{}", h.addr());
+        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            cmd.args(["--setenv", k, &proxy_url]);
+        }
+        // Local services never hit the proxy.
+        cmd.args(["--setenv", "NO_PROXY", "localhost,127.0.0.1,::1"]);
+        cmd.args(["--setenv", "no_proxy", "localhost,127.0.0.1,::1"]);
+    }
+
     // cwd inside sandbox.
     let cwd_inside = cfg
         .cwd
@@ -249,6 +349,7 @@ fn build_bwrap_command_inner(
 
     // rlimits + dup seccomp fd into slot 3 (pre_exec, post-fork pre-exec).
     let limits = cfg.limits;
+    let l4_install = l4_prep.as_ref().map(|(ci, _, _)| *ci);
     unsafe {
         cmd.pre_exec(move || {
             use nix::libc::{close, dup2, fcntl, FD_CLOEXEC, F_GETFD, F_SETFD};
@@ -268,16 +369,44 @@ fn build_bwrap_command_inner(
                     close(src_fd);
                 }
             }
+            // L4 seccomp-notify install: MUST run BEFORE bwrap's own seccomp
+            // so the listener fd is created, SCM_RIGHTS'd to parent, and
+            // closed in child. Async-signal-safe raw libc only.
+            if let Some(ci) = l4_install {
+                l4::child_install(ci)?;
+            }
             Ok(())
         });
     }
+
+    // Stash the L4 pending state on the keepalive; caller must finalize
+    // AFTER `Command::spawn` returns (pre_exec has sent the listener fd).
+    let l4_pending_finalize: Option<(l4::Pending, L4Config)> =
+        l4_prep.map(|(_, p, c)| (p, c));
 
     Ok((
         cmd,
         BwrapKeepAlive {
             _seccomp_tmp: Some(seccomp_tmp),
+            _proxy: proxy_handle,
+            _l4: None,
+            l4_pending: l4_pending_finalize,
         },
     ))
+}
+
+impl BwrapKeepAlive {
+    /// Finalize L4 observer after `Command::spawn` returns. Must be called
+    /// exactly once if the sandbox config requested L4 observation; noop
+    /// otherwise.
+    pub(crate) fn finalize_l4(&mut self) -> Result<()> {
+        if let Some((pending, cfg)) = self.l4_pending.take() {
+            let handle = l4::finalize(pending, cfg)
+                .map_err(|e| Error::exec(format!("finalize L4 observer: {}", e)))?;
+            self._l4 = Some(handle);
+        }
+        Ok(())
+    }
 }
 
 fn run_with_firejail(
@@ -302,6 +431,11 @@ fn run_with_firejail(
             cmd.arg("--net=none");
         }
         NetworkPolicy::AllowAll => {}
+        NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => {
+            return Err(Error::validation(
+                "NetworkPolicy::Observed / Gated require bubblewrap (apt install bubblewrap); not supported via firejail fallback",
+            ));
+        }
     }
 
     for dir in HIDE_HOME_DIRS {
@@ -357,12 +491,13 @@ pub(crate) fn spawn_session_shell(
         ));
     }
     let argv = ["/bin/bash", "--noprofile", "--norc"];
-    let (mut cmd, keepalive) = build_bwrap_command(&argv, cfg)?;
+    let (mut cmd, mut keepalive) = build_bwrap_command(&argv, cfg)?;
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let child = cmd
         .spawn()
         .map_err(|e| Error::exec(format!("spawn bwrap session shell failed: {}", e)))?;
+    keepalive.finalize_l4()?;
     Ok((child, Box::new(keepalive)))
 }

@@ -200,6 +200,11 @@ fn build_inner_script(
         match cfg.network {
             NetworkPolicy::Blocked => inner.push_str(" --unshare-net"),
             NetworkPolicy::AllowAll => inner.push_str(" --share-net"),
+            NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => {
+                return Err(Error::validation(
+                    "NetworkPolicy::Observed / Gated are not supported on Windows (Linux-only; see docs/network-observability.md)",
+                ));
+            }
         }
         inner.push_str(" --clearenv");
         inner.push_str(" --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");

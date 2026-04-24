@@ -12,6 +12,11 @@ readme = "README.md"
 keywords = ["sandbox", "security", "isolation", "seccomp", "seatbelt"]
 categories = ["os"]
 
+[features]
+default = []
+# Opt-in eBPF L4 observer backend (currently scaffold only — see src/l4/ebpf.rs).
+ebpf = []
+
 [dependencies]
 anyhow = "1.0"
 thiserror = "1.0"
@@ -64,3 +69,11 @@ path = "examples/torture_test.rs"
 [[example]]
 name = "edge_cases"
 path = "examples/edge_cases.rs"
+
+[[example]]
+name = "gated_network"
+path = "examples/gated_network.rs"
+
+[[example]]
+name = "l4_observer"
+path = "examples/l4_observer.rs"

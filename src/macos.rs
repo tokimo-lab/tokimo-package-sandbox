@@ -155,6 +155,11 @@ fn build_profile(work_dir: &Path, cfg: &SandboxConfig) -> Result<String> {
             p.push_str("\n(deny network*)\n");
         }
         NetworkPolicy::AllowAll => {}
+        NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => {
+            return Err(Error::validation(
+                "NetworkPolicy::Observed / Gated are only implemented on Linux in this build",
+            ));
+        }
     }
 
     Ok(p)
