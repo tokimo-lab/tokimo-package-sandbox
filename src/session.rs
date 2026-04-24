@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::SandboxConfig;
 use crate::{Error, Result};
 
-/// Result of a single `Session::exec` call.
+/// Result of a single `Session::exec` (or `JobHandle::wait`) call.
 #[derive(Debug, Clone)]
 pub struct ExecOutput {
     pub stdout: String,
@@ -44,6 +45,8 @@ struct CallSlot {
     exit_code: i32,
     have_stdout: bool,
     have_stderr: bool,
+    /// Set true when a backgrounded job (spawn) emits its SBJOB sentinel.
+    job_done: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +66,7 @@ pub struct Session {
     readers: Vec<JoinHandle<()>>,
     _keepalive: Box<dyn std::any::Any + Send>,
     timeout: Duration,
+    work_dir: PathBuf,
 }
 
 impl Session {
@@ -89,6 +93,11 @@ impl Session {
         let r1 = spawn_reader(stdout, sid.clone(), Stream::Stdout, state.clone());
         let r2 = spawn_reader(stderr, sid.clone(), Stream::Stderr, state.clone());
 
+        let work_dir = cfg
+            .work_dir
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.work_dir.clone());
+
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
@@ -98,6 +107,7 @@ impl Session {
             readers: vec![r1, r2],
             _keepalive: keepalive,
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
+            work_dir,
         })
     }
 
@@ -175,6 +185,66 @@ impl Session {
         self.close_inner()
     }
 
+    /// Spawn `cmd` as a background job inside the session and return a
+    /// [`JobHandle`] **immediately**. The next `exec()` (or `spawn()`) is
+    /// not blocked by the running job — bash backgrounds it with `&` and
+    /// goes back to reading stdin.
+    ///
+    /// State (env, cwd, files) is fully shared; the job runs in the same
+    /// sandboxed bash as everything else. Output is captured to per-job
+    /// files in `work_dir` (so concurrent stdout/stderr from many jobs
+    /// don't interleave on the wire); call [`JobHandle::wait`] to block on
+    /// completion and read them.
+    ///
+    /// ```no_run
+    /// use tokimo_package_sandbox::{SandboxConfig, Session};
+    /// let mut sess = Session::open(&SandboxConfig::new("/tmp/work")).unwrap();
+    /// let slow = sess.spawn("sleep 2 && echo SLOW").unwrap();
+    /// let fast = sess.exec("echo FAST").unwrap();           // returns immediately
+    /// assert_eq!(fast.stdout.trim(), "FAST");
+    /// let r = slow.wait().unwrap();                          // blocks ~2s
+    /// assert_eq!(r.stdout.trim(), "SLOW");
+    /// ```
+    pub fn spawn(&mut self, cmd: &str) -> Result<JobHandle> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::exec("session is closed"))?;
+        self.counter += 1;
+        let id = self.counter;
+
+        let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
+        let out_name = format!(".tps_job_{}_{}.out", self.sid, id);
+        let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
+
+        // { ( eval USER_CMD ) >OUT 2>ERR ; rc=$? ; printf '\n__SBJOB_X_id rc\n' ; } &
+        // Subshell isolates the eval; outer brace group gets backgrounded as one unit
+        // so its completion sentinel fires after the user cmd really finished.
+        let script = format!(
+            "{{ ( eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" ) > \"$TMPDIR/{out_name}\" 2> \"$TMPDIR/{err_name}\" ; __sb_jrc=$? ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
+            delim = delim,
+            cmd = cmd,
+            sid = self.sid,
+            id = id,
+            out_name = out_name,
+            err_name = err_name,
+        );
+        stdin
+            .write_all(script.as_bytes())
+            .map_err(|e| Error::exec(format!("write to session stdin: {}", e)))?;
+        stdin
+            .flush()
+            .map_err(|e| Error::exec(format!("flush session stdin: {}", e)))?;
+
+        Ok(JobHandle {
+            id,
+            sid: self.sid.clone(),
+            state: self.state.clone(),
+            work_dir: self.work_dir.clone(),
+            timeout: self.timeout,
+        })
+    }
+
     fn close_inner(&mut self) -> Result<()> {
         if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.write_all(b"exit\n");
@@ -219,6 +289,87 @@ impl Drop for Session {
     }
 }
 
+/// A handle to a backgrounded job started via [`Session::spawn`]. Call
+/// [`JobHandle::wait`] to block until the job finishes and read its output.
+///
+/// `JobHandle` is independent of the `Session`'s `&mut` borrow: you can hand
+/// it to another thread that calls `wait()` while the original thread keeps
+/// issuing `exec()` / `spawn()` on the session. (However, dropping the
+/// `Session` kills the bash and therefore the bg job — so keep the session
+/// alive until you've collected results.)
+pub struct JobHandle {
+    id: u64,
+    sid: String,
+    state: Arc<(Mutex<SessionState>, Condvar)>,
+    work_dir: PathBuf,
+    timeout: Duration,
+}
+
+impl JobHandle {
+    /// Numeric id of this job (unique within the originating session).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Block until the job finishes (or the per-exec timeout elapses).
+    /// Reads its captured stdout/stderr files from the work directory and
+    /// returns them along with the exit code. The temp files are removed.
+    pub fn wait(self) -> Result<ExecOutput> {
+        self.wait_with_timeout(self.timeout)
+    }
+
+    /// Like [`wait`](Self::wait) but with an explicit timeout.
+    pub fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput> {
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.state;
+        let mut guard = lock
+            .lock()
+            .map_err(|_| Error::exec("session state poisoned"))?;
+        let exit_code = loop {
+            if let Some(slot) = guard.completed.get(&self.id) {
+                if slot.job_done {
+                    let slot = guard.completed.remove(&self.id).unwrap();
+                    break slot.exit_code;
+                }
+            }
+            if guard.early_eof {
+                return Err(Error::exec(
+                    "session shell exited before background job completed",
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::exec(format!(
+                    "background job {} timed out after {:?}",
+                    self.id, timeout
+                )));
+            }
+            let (g, _) = cv
+                .wait_timeout(guard, deadline - now)
+                .map_err(|_| Error::exec("session state poisoned"))?;
+            guard = g;
+        };
+        drop(guard);
+
+        let out_path = self
+            .work_dir
+            .join(format!(".tps_job_{}_{}.out", self.sid, self.id));
+        let err_path = self
+            .work_dir
+            .join(format!(".tps_job_{}_{}.err", self.sid, self.id));
+        let stdout_bytes = std::fs::read(&out_path).unwrap_or_default();
+        let stderr_bytes = std::fs::read(&err_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&err_path);
+
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            exit_code,
+        })
+    }
+}
+
 #[derive(Copy, Clone)]
 enum Stream {
     Stdout,
@@ -231,11 +382,14 @@ fn spawn_reader<R: Read + Send + 'static>(
     which: Stream,
     state: Arc<(Mutex<SessionState>, Condvar)>,
 ) -> JoinHandle<()> {
-    let pattern = match which {
-        Stream::Stdout => format!("\n__SBOUT_{}_", sid),
-        Stream::Stderr => format!("\n__SBERR_{}_", sid),
-    };
-    let pat_bytes = pattern.into_bytes();
+    // Stdout stream sees TWO sentinel kinds:
+    //   - "\n__SBOUT_<sid>_<id> <rc>\n"   (foreground exec result)
+    //   - "\n__SBJOB_<sid>_<id> <rc>\n"   (background job completion)
+    // Stderr stream sees only:
+    //   - "\n__SBERR_<sid>_<id>\n"        (foreground exec stderr terminator)
+    let pat_sbout = format!("\n__SBOUT_{}_", sid).into_bytes();
+    let pat_sbjob = format!("\n__SBJOB_{}_", sid).into_bytes();
+    let pat_sberr = format!("\n__SBERR_{}_", sid).into_bytes();
     let name = match which {
         Stream::Stdout => "tps-session-stdout",
         Stream::Stderr => "tps-session-stderr",
@@ -248,8 +402,6 @@ fn spawn_reader<R: Read + Send + 'static>(
             loop {
                 match r.read(&mut tmp) {
                     Ok(0) => {
-                        // EOF before completion → mark early_eof so blocked
-                        // exec() unblocks with an error.
                         let (lock, cv) = &*state;
                         if let Ok(mut g) = lock.lock() {
                             g.early_eof = true;
@@ -259,47 +411,79 @@ fn spawn_reader<R: Read + Send + 'static>(
                     }
                     Ok(n) => {
                         buf.extend_from_slice(&tmp[..n]);
-                        // Loop: extract every complete sentinel line.
-                        while let Some(pos) = find_subseq(&buf, &pat_bytes) {
-                            // Sentinel line spans from pos to next \n.
-                            let line_start = pos; // points at '\n'
+                        loop {
+                            // Find earliest sentinel of any kind on this stream.
+                            let (kind, pos) = match which {
+                                Stream::Stdout => {
+                                    let p_out = find_subseq(&buf, &pat_sbout);
+                                    let p_job = find_subseq(&buf, &pat_sbjob);
+                                    match (p_out, p_job) {
+                                        (Some(a), Some(b)) if a <= b => (SentKind::Out, a),
+                                        (Some(_), Some(b)) => (SentKind::Job, b),
+                                        (Some(a), None) => (SentKind::Out, a),
+                                        (None, Some(b)) => (SentKind::Job, b),
+                                        (None, None) => break,
+                                    }
+                                }
+                                Stream::Stderr => match find_subseq(&buf, &pat_sberr) {
+                                    Some(a) => (SentKind::Err, a),
+                                    None => break,
+                                },
+                            };
+                            // Sentinel line: from `pos` (the leading '\n') to next '\n'.
+                            let line_start = pos;
                             let after = &buf[line_start + 1..];
                             let nl = match after.iter().position(|&b| b == b'\n') {
                                 Some(i) => i,
-                                None => break, // line not yet complete
+                                None => break, // wait for more bytes
                             };
-                            let line_end = line_start + 1 + nl + 1; // include trailing \n
-                            let body = buf[..line_start].to_vec();
-                            let line =
-                                std::str::from_utf8(&buf[line_start..line_end]).unwrap_or("");
-                            // Parse "<\n>__SBOUT_<sid>_<id> <rc><\n>" or err equivalent.
-                            let trimmed = line.trim();
-                            // Strip the prefix matching pat_bytes (without leading \n).
-                            let prefix = &pat_bytes[1..]; // drop leading \n
-                            let prefix_str =
-                                std::str::from_utf8(prefix).unwrap_or("");
-                            let after_prefix = trimmed.strip_prefix(prefix_str).unwrap_or("");
+                            let line_end = line_start + 1 + nl + 1;
+                            let line = std::str::from_utf8(&buf[line_start..line_end])
+                                .unwrap_or("")
+                                .trim();
+                            let prefix = match kind {
+                                SentKind::Out => &pat_sbout[1..],
+                                SentKind::Err => &pat_sberr[1..],
+                                SentKind::Job => &pat_sbjob[1..],
+                            };
+                            let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+                            let after_prefix = line.strip_prefix(prefix_str).unwrap_or("");
                             let (id, rc) = parse_sentinel_tail(after_prefix);
-                            // Commit to slot.
-                            {
-                                let (lock, cv) = &*state;
-                                if let Ok(mut g) = lock.lock() {
-                                    let slot = g.completed.entry(id).or_default();
-                                    match which {
-                                        Stream::Stdout => {
-                                            slot.stdout = body;
-                                            slot.exit_code = rc;
-                                            slot.have_stdout = true;
-                                        }
-                                        Stream::Stderr => {
-                                            slot.stderr = body;
-                                            slot.have_stderr = true;
-                                        }
+
+                            let (lock, cv) = &*state;
+                            if let Ok(mut g) = lock.lock() {
+                                let slot = g.completed.entry(id).or_default();
+                                match kind {
+                                    SentKind::Out => {
+                                        // Body bytes before sentinel belong to this exec.
+                                        slot.stdout = buf[..line_start].to_vec();
+                                        slot.exit_code = rc;
+                                        slot.have_stdout = true;
                                     }
-                                    cv.notify_all();
+                                    SentKind::Err => {
+                                        slot.stderr = buf[..line_start].to_vec();
+                                        slot.have_stderr = true;
+                                    }
+                                    SentKind::Job => {
+                                        // Background job: its body went to a file,
+                                        // NOT to this stream. Don't consume body bytes;
+                                        // they belong to a concurrent foreground exec.
+                                        slot.exit_code = rc;
+                                        slot.job_done = true;
+                                    }
+                                }
+                                cv.notify_all();
+                            }
+
+                            // Drain bytes: SBOUT/SBERR consume body too; SBJOB only the line.
+                            match kind {
+                                SentKind::Out | SentKind::Err => {
+                                    buf.drain(..line_end);
+                                }
+                                SentKind::Job => {
+                                    buf.drain(line_start..line_end);
                                 }
                             }
-                            buf.drain(..line_end);
                         }
                     }
                     Err(_) => {
@@ -314,6 +498,13 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         })
         .expect("spawn reader thread")
+}
+
+#[derive(Copy, Clone)]
+enum SentKind {
+    Out,
+    Err,
+    Job,
 }
 
 fn parse_sentinel_tail(s: &str) -> (u64, i32) {

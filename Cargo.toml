@@ -52,3 +52,7 @@ path = "examples/shell.rs"
 [[example]]
 name = "session"
 path = "examples/session.rs"
+
+[[example]]
+name = "parallel_in_session"
+path = "examples/parallel_in_session.rs"
