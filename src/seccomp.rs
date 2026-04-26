@@ -11,7 +11,7 @@ use std::path::Path;
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
-    pub const SOCKET: u32 = 41;
+    #[allow(dead_code)] pub const SOCKET: u32 = 41;
     pub const PTRACE: u32 = 101;
     pub const MOUNT: u32 = 165;
     pub const UMOUNT2: u32 = 166;
@@ -26,7 +26,7 @@ mod nr {
 
 #[cfg(target_arch = "aarch64")]
 mod nr {
-    pub const SOCKET: u32 = 198;
+    #[allow(dead_code)] pub const SOCKET: u32 = 198;
     pub const PTRACE: u32 = 117;
     pub const MOUNT: u32 = 40;
     pub const UMOUNT2: u32 = 39;
@@ -41,7 +41,7 @@ mod nr {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod nr {
-    pub const SOCKET: u32 = 0;
+    #[allow(dead_code)] pub const SOCKET: u32 = 0;
     pub const PTRACE: u32 = 0;
     pub const MOUNT: u32 = 0;
     pub const UMOUNT2: u32 = 0;
@@ -54,6 +54,7 @@ mod nr {
     pub const UNSHARE: u32 = 0;
 }
 
+#[allow(dead_code)]
 const AF_UNIX: u32 = 1;
 const CLONE_NEWUSER: u32 = 0x10000000;
 
@@ -96,12 +97,16 @@ pub(crate) fn generate_bpf_file(path: &Path) -> Result<()> {
         f.push(deny);
     }
 
-    // socket(AF_UNIX)
-    f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 3, nr::SOCKET));
-    f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_ARGS));
-    f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 1, AF_UNIX));
-    f.push(deny);
-    f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_NR));
+    // socket(AF_UNIX): allow. The PID-1 docker-shim init relies on
+    // AF_UNIX SOCK_SEQPACKET for its control socket; AF_UNIX inside the
+    // user/network namespace cannot reach host services (host-side abstract
+    // sockets aren't visible, and only host paths we explicitly bind-mount
+    // are reachable as filesystem sockets).
+    // f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 3, nr::SOCKET));
+    // f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_ARGS));
+    // f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 1, AF_UNIX));
+    // f.push(deny);
+    // f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_NR));
 
     // clone(CLONE_NEWUSER)
     f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 4, nr::CLONE));

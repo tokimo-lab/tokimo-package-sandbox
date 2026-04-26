@@ -13,6 +13,14 @@ mod net_observer;
 mod result;
 mod session;
 
+pub mod init_protocol;
+
+#[cfg(target_os = "linux")]
+pub mod init_wire;
+
+#[cfg(target_os = "linux")]
+pub mod init_client;
+
 #[cfg(unix)]
 mod common;
 
@@ -37,7 +45,13 @@ pub use net_observer::{
     DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict,
 };
 pub use result::ExecutionResult;
-pub use session::{ExecOutput, JobHandle, Session};
+pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Session};
+
+#[cfg(target_os = "linux")]
+pub use linux::{SpawnedInit, locate_init_binary, spawn_init};
+
+#[cfg(target_os = "linux")]
+pub use init_client::{InitClient, SpawnInfo};
 
 /// Execute `cmd` inside the sandbox configured by `cfg`.
 ///

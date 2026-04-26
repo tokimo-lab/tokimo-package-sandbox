@@ -89,9 +89,7 @@ pub(crate) fn build_seatbelt_command(
     ))
 }
 
-pub(crate) fn spawn_session_shell(
-    cfg: &SandboxConfig,
-) -> Result<(std::process::Child, Box<dyn std::any::Any + Send>)> {
+pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
     use std::process::Stdio;
     let argv = ["/bin/bash", "--noprofile", "--norc"];
     let (mut cmd, keepalive) = build_seatbelt_command(&argv, cfg)?;
@@ -101,7 +99,7 @@ pub(crate) fn spawn_session_shell(
     let child = cmd
         .spawn()
         .map_err(|e| Error::exec(format!("spawn sandbox-exec session shell failed: {}", e)))?;
-    Ok((child, Box::new(keepalive)))
+    crate::session::shell_handle_from_child(child, Box::new(keepalive))
 }
 
 fn build_profile(work_dir: &Path, cfg: &SandboxConfig) -> Result<String> {

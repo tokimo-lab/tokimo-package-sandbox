@@ -18,11 +18,17 @@
 //! sandbox with stdin/stdout/stderr piped. Each `exec()` writes the command
 //! followed by sentinel-emitting tail to stdin and waits for the sentinels on
 //! stdout (carrying the exit code) and stderr.
+//!
+//! On Linux the bash is *not* spawned directly by the host; it runs as a
+//! grandchild of `tokimo-sandbox-init` (PID 1 inside the bwrap container) and
+//! the host talks to it via the SEQPACKET control socket. Two anonymous
+//! pipes inside the host bridge init's `Stdout`/`Stderr` events back into the
+//! exact same `Read` impl the sentinel parser already consumes — so the
+//! sentinel framing logic is unchanged.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,35 +63,169 @@ struct SessionState {
     early_eof: bool,
 }
 
+/// Factory for opening a PTY inside the same sandbox container as the shell.
+/// Stored on `ShellHandle` (and cloned into `Session`) so callers can request
+/// additional PTY children any time during the session's lifetime.
+///
+/// `None` on backends that don't support PTY (currently macOS/Windows).
+pub type OpenPtyFn = Box<
+    dyn Fn(u16, u16, &[String], &[(String, String)], Option<&str>) -> Result<PtyHandle>
+        + Send
+        + Sync,
+>;
+
+/// Factory for one-shot pipe-mode children. Spawns an independent process
+/// inside the same sandbox container (sharing PID namespace, mounts, env)
+/// without occupying the long-lived shell. Multiple concurrent calls are
+/// safe — each invocation gets its own child with its own `child_id`.
+///
+/// `None` on backends that don't have an init control socket (macOS/Windows
+/// fall back to `Session::exec` if a caller needs one-shot semantics there).
+pub type RunOneshotFn = Box<
+    dyn Fn(&str, Duration) -> Result<ExecOutput> + Send + Sync,
+>;
+
+/// A PTY child running inside the sandbox. Exposes the master fd directly for
+/// raw read/write (suitable for terminal_ws bidirectional copy). Resize/kill
+/// are routed through the init control socket. Drop kills the child.
+pub struct PtyHandle {
+    /// Host-side PTY master fd (kernel-allocated). Non-blocking is *not* set
+    /// — callers should configure it as appropriate (or read on a thread).
+    master: Option<std::os::fd::OwnedFd>,
+    /// Stable id of the child as known by the init server.
+    child_id: String,
+    /// Resize the controlling terminal. `Err` if init connection is dead.
+    resize_fn: Box<dyn Fn(u16, u16) -> Result<()> + Send + Sync>,
+    /// Best-effort SIGKILL the child (and its pgrp). Idempotent.
+    kill_fn: Box<dyn Fn() + Send + Sync>,
+    /// Block until the child exits or `deadline` elapses. Returns `Some(rc)`
+    /// on exit, `None` on timeout.
+    wait_fn: Box<dyn Fn(Duration) -> Option<i32> + Send + Sync>,
+    /// Holds the InitClient + any other resources that must outlive the
+    /// PtyHandle. Dropped last.
+    #[allow(dead_code)]
+    keepalive: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl PtyHandle {
+    /// Stable child id assigned by the init server.
+    pub fn child_id(&self) -> &str {
+        &self.child_id
+    }
+
+    /// Take ownership of the PTY master fd. After this, read/write/kill on
+    /// the host side are the caller's responsibility, but `resize` and the
+    /// kept-alive resources still work.
+    pub fn take_master(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.master.take()
+    }
+
+    /// Borrow the PTY master fd.
+    pub fn master_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.master.as_ref().map(|f| f.as_fd())
+    }
+
+    /// Resize the controlling terminal.
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        (self.resize_fn)(rows, cols)
+    }
+
+    /// Best-effort force-kill the child. Idempotent.
+    pub fn kill(&self) {
+        (self.kill_fn)();
+    }
+
+    /// Block until the child exits or `timeout` elapses.
+    pub fn wait(&self, timeout: Duration) -> Option<i32> {
+        (self.wait_fn)(timeout)
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        master: std::os::fd::OwnedFd,
+        child_id: String,
+        resize_fn: Box<dyn Fn(u16, u16) -> Result<()> + Send + Sync>,
+        kill_fn: Box<dyn Fn() + Send + Sync>,
+        wait_fn: Box<dyn Fn(Duration) -> Option<i32> + Send + Sync>,
+        keepalive: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            master: Some(master),
+            child_id,
+            resize_fn,
+            kill_fn,
+            wait_fn,
+            keepalive,
+        }
+    }
+}
+
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        // Best-effort kill (so the child doesn't outlive the handle).
+        (self.kill_fn)();
+    }
+}
+
+use std::os::fd::AsFd;
+
+/// Platform-agnostic container around the in-sandbox shell process. The
+/// platform-specific `spawn_session_shell` returns one of these — the
+/// `Session` itself is identical across platforms.
+pub(crate) struct ShellHandle {
+    pub stdin: Box<dyn Write + Send>,
+    pub stdout: Box<dyn Read + Send>,
+    pub stderr: Box<dyn Read + Send>,
+    /// Polled by `close_inner`: returns `true` when the shell process has
+    /// exited (or transport is dead). `false` means still running.
+    pub try_wait: Box<dyn FnMut() -> bool + Send>,
+    /// Best-effort force kill the shell. Idempotent.
+    pub kill: Box<dyn FnMut() + Send>,
+    /// Lifetime guard for any platform-specific resources (Child handle,
+    /// spawner thread, InitClient + pump, bwrap PDEATHSIG anchor, …).
+    /// Dropping the `ShellHandle` drops this last.
+    #[allow(dead_code)]
+    pub keepalive: Box<dyn std::any::Any + Send>,
+    /// Spawn additional PTY children inside the same sandbox. `None` on
+    /// platforms that don't support PTY.
+    pub open_pty: Option<Arc<OpenPtyFn>>,
+    /// Run a one-shot pipe-mode command without occupying the long-lived
+    /// shell. `None` on platforms without an init control socket.
+    pub run_oneshot: Option<Arc<RunOneshotFn>>,
+}
+
 pub struct Session {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    handle: Option<ShellHandle>,
+    stdin: Option<Box<dyn Write + Send>>,
     state: Arc<(Mutex<SessionState>, Condvar)>,
     sid: String,
     counter: u64,
     readers: Vec<JoinHandle<()>>,
-    _keepalive: Box<dyn std::any::Any + Send>,
     timeout: Duration,
     work_dir: PathBuf,
+    open_pty: Option<Arc<OpenPtyFn>>,
+    run_oneshot: Option<Arc<RunOneshotFn>>,
 }
 
 impl Session {
     /// Open a new persistent session. The sandbox shell is spawned eagerly.
     pub fn open(cfg: &SandboxConfig) -> Result<Self> {
         cfg.validate()?;
-        let (mut child, keepalive) = spawn_session_shell(cfg)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::exec("session shell missing stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::exec("session shell missing stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::exec("session shell missing stderr"))?;
+        let mut handle = spawn_session_shell(cfg)?;
+        let stdin = std::mem::replace(
+            &mut handle.stdin,
+            Box::new(std::io::sink()) as Box<dyn Write + Send>,
+        );
+        // Move stdout/stderr Read out so the spawned reader threads can own them.
+        let stdout = std::mem::replace(
+            &mut handle.stdout,
+            Box::new(std::io::empty()) as Box<dyn Read + Send>,
+        );
+        let stderr = std::mem::replace(
+            &mut handle.stderr,
+            Box::new(std::io::empty()) as Box<dyn Read + Send>,
+        );
 
         let sid = random_token();
         let state = Arc::new((Mutex::new(SessionState::default()), Condvar::new()));
@@ -98,17 +238,76 @@ impl Session {
             .canonicalize()
             .unwrap_or_else(|_| cfg.work_dir.clone());
 
+        let open_pty = handle.open_pty.clone();
+        let run_oneshot = handle.run_oneshot.clone();
+
         Ok(Self {
-            child: Some(child),
+            handle: Some(handle),
             stdin: Some(stdin),
             state,
             sid,
             counter: 0,
             readers: vec![r1, r2],
-            _keepalive: keepalive,
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
             work_dir,
+            open_pty,
+            run_oneshot,
         })
+    }
+
+    /// Run a command as an independent one-shot process inside the same
+    /// sandbox container, **without** occupying the long-lived shell.
+    ///
+    /// Multiple concurrent calls run in parallel: each is a separate child
+    /// of the sandbox `init` (PID 1), sharing namespaces / mounts / env but
+    /// not the long-lived shell's stdin/stdout. `cwd` and `env` overlay are
+    /// **not** persisted across calls — every invocation is a fresh process.
+    ///
+    /// Use this for read-only / idempotent commands (file reads, glob, grep,
+    /// curl, sleep, …) where shell-state persistence isn't needed.
+    /// Falls back to `Err(Validation)` on platforms without an init control
+    /// socket (macOS/Windows).
+    pub fn run_oneshot(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
+        let f = self
+            .run_oneshot
+            .as_ref()
+            .ok_or_else(|| Error::validation("Session::run_oneshot unsupported on this platform"))?;
+        f(cmd, timeout)
+    }
+
+    /// Clone the underlying one-shot factory (if available) so callers can
+    /// invoke it concurrently without holding any lock on `Session`.
+    ///
+    /// Returns `None` on platforms where one-shot execution is unsupported
+    /// (currently macOS / Windows).
+    #[must_use]
+    pub fn run_oneshot_factory(&self) -> Option<Arc<RunOneshotFn>> {
+        self.run_oneshot.clone()
+    }
+
+    /// Open a PTY child inside the same sandbox container as this session.
+    ///
+    /// `argv` is the command to run with a controlling terminal (typically
+    /// `["/bin/bash", "--login"]` or similar); `env` is appended to the
+    /// session's base environment; `cwd` defaults to the sandbox work_dir.
+    /// Returns a [`PtyHandle`] exposing the host-side master fd plus
+    /// resize/kill/wait controls. The handle's `Drop` kills the child.
+    ///
+    /// Returns `Err(Validation("Session::open_pty unsupported on this platform"))`
+    /// on macOS/Windows.
+    pub fn open_pty(
+        &self,
+        rows: u16,
+        cols: u16,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<PtyHandle> {
+        let f = self
+            .open_pty
+            .as_ref()
+            .ok_or_else(|| Error::validation("Session::open_pty unsupported on this platform"))?;
+        f(rows, cols, argv, env, cwd)
     }
 
     /// Override the per-`exec` timeout (defaults to `cfg.limits.timeout_secs`).
@@ -125,6 +324,13 @@ impl Session {
             .ok_or_else(|| Error::exec("session is closed"))?;
         self.counter += 1;
         let id = self.counter;
+        tracing::debug!(
+            sid = %self.sid,
+            exec_id = id,
+            cmd_len = cmd.len(),
+            timeout_ms = self.timeout.as_millis() as u64,
+            "Session::exec ENTER"
+        );
 
         // Heredoc-wrap user cmd to survive arbitrary content (incl. unbalanced
         // quotes). Random per-call delimiter avoids collisions.
@@ -139,12 +345,17 @@ impl Session {
         // arbitrary `&` usage — no parsing required.
         let out_name = format!(".tps_fg_{}_{}.out", self.sid, id);
         let err_name = format!(".tps_fg_{}_{}.err", self.sid, id);
+        // KEY: also save bash's real stdin to fd 5 and redirect fd 0 to
+        // /dev/null for the duration of the eval. This prevents user commands
+        // (e.g. `telnet`, `cat`, `read`) from STEALING bash's stdin pipe — if
+        // they did, our next `exec()` would write its script bytes to the
+        // hung user process instead of bash, deadlocking the session.
         let script = format!(
             "__o=\"$TMPDIR/{out_name}\"; __e=\"$TMPDIR/{err_name}\"; \
-             exec 3>&1 4>&2 >\"$__o\" 2>\"$__e\"; \
+             exec 3>&1 4>&2 5<&0 0</dev/null >\"$__o\" 2>\"$__e\"; \
              eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\"; \
              __sb_rc=$?; \
-             exec >&3 2>&4 3>&- 4>&-; \
+             exec 0<&5 5<&- >&3 2>&4 3>&- 4>&-; \
              cat \"$__o\"; \
              printf '\\n__SBOUT_{sid}_{id} %d\\n' \"$__sb_rc\"; \
              cat \"$__e\" >&2; \
@@ -188,9 +399,26 @@ impl Session {
             }
             let now = Instant::now();
             if now >= deadline {
+                // On timeout, the user command may have hung bash on a
+                // blocking read/syscall. Tear down the session entirely:
+                // close stdin (EOF causes bash to exit), then SIGKILL if it
+                // doesn't exit within 2s. The sandbox manager will rebuild a
+                // fresh session for the next exec.
+                let timeout = self.timeout;
+                let sid = self.sid.clone();
+                let exec_id = id;
+                guard.closed = true;
+                drop(guard);
+                tracing::warn!(
+                    sid = %sid,
+                    exec_id = exec_id,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Session::exec TIMED OUT — tearing down session"
+                );
+                let _ = self.close_inner();
                 return Err(Error::exec(format!(
                     "session exec timed out after {:?}",
-                    self.timeout
+                    timeout
                 )));
             }
             let (g, _) = cv
@@ -267,31 +495,37 @@ impl Session {
     }
 
     fn close_inner(&mut self) -> Result<()> {
+        tracing::debug!(
+            sid = %self.sid,
+            stdin_present = self.stdin.is_some(),
+            handle_present = self.handle.is_some(),
+            readers = self.readers.len(),
+            "Session::close_inner — sending exit to bash"
+        );
         if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.write_all(b"exit\n");
             let _ = stdin.flush();
-            drop(stdin);
+            drop(stdin); // closes underlying transport stdin (Op::Close on Linux).
         }
-        if let Some(mut child) = self.child.take() {
+        if let Some(mut handle) = self.handle.take() {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if Instant::now() >= deadline {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break;
-                        }
+                if (handle.try_wait)() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    (handle.kill)();
+                    let kill_deadline = Instant::now() + Duration::from_secs(2);
+                    while !(handle.try_wait)() && Instant::now() < kill_deadline {
                         thread::sleep(Duration::from_millis(50));
                     }
-                    Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
+                    break;
                 }
+                thread::sleep(Duration::from_millis(50));
             }
+            // Drop handle (and its keepalive) — releases bwrap PDEATHSIG anchor
+            // / Child handle / spawner thread.
+            drop(handle);
         }
         // Reader threads exit on EOF.
         for h in self.readers.drain(..) {
@@ -397,8 +631,8 @@ enum Stream {
     Stderr,
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
-    mut r: R,
+fn spawn_reader<R: Read + Send + ?Sized + 'static>(
+    r: Box<R>,
     sid: String,
     which: Stream,
     state: Arc<(Mutex<SessionState>, Condvar)>,
@@ -418,6 +652,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     thread::Builder::new()
         .name(name.into())
         .spawn(move || {
+            let mut r = r;
             let mut buf: Vec<u8> = Vec::with_capacity(8192);
             let mut tmp = [0u8; 4096];
             loop {
@@ -428,6 +663,16 @@ fn spawn_reader<R: Read + Send + 'static>(
                             g.early_eof = true;
                             cv.notify_all();
                         }
+                        // Loud signal: this is the "bash silently disappeared"
+                        // path (signal from outside, OOM, segfault, etc.).
+                        // Without this log it's near-impossible to tell apart
+                        // from a graceful close.
+                        tracing::error!(
+                            sid = %sid,
+                            stream = name,
+                            "session reader hit EOF — bash exited unexpectedly \
+                             (look for SIGTERM/SIGKILL/segfault around this time)"
+                        );
                         break;
                     }
                     Ok(n) => {
@@ -507,12 +752,18 @@ fn spawn_reader<R: Read + Send + 'static>(
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         let (lock, cv) = &*state;
                         if let Ok(mut g) = lock.lock() {
                             g.early_eof = true;
                             cv.notify_all();
                         }
+                        tracing::error!(
+                            sid = %sid,
+                            stream = name,
+                            error = %e,
+                            "session reader I/O error — bash pipe broken"
+                        );
                         break;
                     }
                 }
@@ -553,29 +804,72 @@ fn random_token() -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_session_shell(
-    cfg: &SandboxConfig,
-) -> Result<(Child, Box<dyn std::any::Any + Send>)> {
+fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     crate::linux::spawn_session_shell(cfg)
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_session_shell(
-    cfg: &SandboxConfig,
-) -> Result<(Child, Box<dyn std::any::Any + Send>)> {
+fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     crate::macos::spawn_session_shell(cfg)
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_session_shell(
-    cfg: &SandboxConfig,
-) -> Result<(Child, Box<dyn std::any::Any + Send>)> {
+fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     crate::windows::spawn_session_shell(cfg)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn spawn_session_shell(
-    _cfg: &SandboxConfig,
-) -> Result<(Child, Box<dyn std::any::Any + Send>)> {
+fn spawn_session_shell(_cfg: &SandboxConfig) -> Result<ShellHandle> {
     Err(Error::validation("Session: unsupported platform"))
+}
+
+/// Build a `ShellHandle` from a normal `std::process::Child` whose stdio is
+/// piped. Used by the macOS and Windows backends.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn shell_handle_from_child(
+    mut child: std::process::Child,
+    keepalive: Box<dyn std::any::Any + Send>,
+) -> Result<ShellHandle> {
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::exec("session shell missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::exec("session shell missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::exec("session shell missing stderr"))?;
+    let child = Arc::new(Mutex::new(Some(child)));
+    let try_wait_child = child.clone();
+    let kill_child = child.clone();
+    Ok(ShellHandle {
+        stdin: Box::new(stdin),
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+        try_wait: Box::new(move || {
+            let mut g = match try_wait_child.lock() {
+                Ok(g) => g,
+                Err(_) => return true,
+            };
+            match g.as_mut() {
+                None => true,
+                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+            }
+        }),
+        kill: Box::new(move || {
+            if let Ok(mut g) = kill_child.lock() {
+                if let Some(c) = g.as_mut() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    *g = None;
+                }
+            }
+        }),
+        keepalive: Box::new((child, keepalive)),
+        open_pty: None,
+        run_oneshot: None,
+    })
 }

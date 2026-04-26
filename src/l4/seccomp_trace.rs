@@ -381,7 +381,14 @@ fn run_tracer_loop(main_pid: i32, cfg: L4Config, shutdown: Shutdown, exit_tx: Se
         }
 
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            tracing::debug!("l4-trace: pid {} exited (main={})", pid, main_pid);
+            let signaled = libc::WIFSIGNALED(status);
+            let termsig = if signaled { libc::WTERMSIG(status) } else { 0 };
+            let exitcode = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+            let coredump = signaled && libc::WCOREDUMP(status);
+            tracing::debug!(
+                "l4-trace: pid {} exited (main={}) signaled={} termsig={} exitcode={} coredump={} raw_status=0x{:x}",
+                pid, main_pid, signaled, termsig, exitcode, coredump, status
+            );
             if pid == main_pid && !main_exit_sent {
                 let es = ExitStatus::from_raw(status);
                 let _ = exit_tx.send(es);

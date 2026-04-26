@@ -1,0 +1,209 @@
+//! Wire protocol for the host ↔ in-sandbox init control channel.
+//!
+//! Transport: `SOCK_SEQPACKET` Unix domain socket (one packet = one message).
+//! Encoding: UTF-8 JSON, optionally with a single fd attached as ancillary
+//! `SCM_RIGHTS` (used for PTY master fd transfer in the `Spawn(Pty)` reply).
+//!
+//! Per `plan.md`, packet payload size is capped at 64 KiB; init slices shell
+//! stdout/stderr to ~16 KiB chunks before emitting `Stdout` / `Stderr` events.
+
+use serde::{Deserialize, Serialize};
+
+/// Current protocol revision. Bumped on any breaking change to op / event
+/// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Maximum payload size (in bytes) of a single SEQPACKET message.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// Cap for a single Stdout/Stderr event emitted by init. Larger reads are
+/// fragmented into multiple events to stay below `MAX_FRAME_BYTES`.
+pub const STREAM_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Stdio mode requested when spawning a child.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum StdioMode {
+    /// Connect stdin/stdout/stderr to anonymous pipes; init pumps bytes
+    /// across the control channel via `Write` op + `Stdout`/`Stderr` events.
+    Pipes,
+    /// Allocate a PTY pair; the master fd is sent back to the host via
+    /// `SCM_RIGHTS` in the same packet as the `SpawnReply`. Init does NOT
+    /// pump bytes for PTY children — host owns the master directly.
+    Pty { rows: u16, cols: u16 },
+}
+
+/// Host → init request. The `id` field is echoed verbatim into the reply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum Op {
+    /// Mandatory first message. Init replies with its own `Hello` echoing
+    /// `protocol` + `features` + the actual `init_pid` (must be 1).
+    Hello {
+        id: String,
+        protocol: u32,
+        #[serde(default)]
+        features: Vec<String>,
+    },
+    /// Open a long-lived shell child (used by `Session` for the sentinel-
+    /// based REPL protocol). Equivalent to `Spawn { stdio: Pipes }` but
+    /// kept as a distinct op so init can apply shell-specific defaults if
+    /// needed in the future.
+    OpenShell {
+        id: String,
+        argv: Vec<String>,
+        #[serde(default)]
+        env_overlay: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// Spawn an arbitrary child.
+    Spawn {
+        id: String,
+        argv: Vec<String>,
+        #[serde(default)]
+        env_overlay: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
+        stdio: StdioMode,
+    },
+    /// Write `data_b64` (base64-encoded) to the named child's stdin (pipes
+    /// mode). For PTY children this is a no-op — host writes to the master
+    /// fd directly.
+    Write { id: String, child_id: String, data_b64: String },
+    /// Resize a PTY child: `ioctl(master, TIOCSWINSZ)` + `killpg(SIGWINCH)`.
+    Resize { id: String, child_id: String, rows: u16, cols: u16 },
+    /// Send a signal. `to_pgrp` defaults to true (use `killpg`).
+    Signal {
+        id: String,
+        child_id: String,
+        sig: i32,
+        #[serde(default = "default_true")]
+        to_pgrp: bool,
+    },
+    /// Wait for the child to exit. Reply carries exit code + signal.
+    /// Until exit, no immediate reply is sent — the eventual `Exit` event
+    /// is the completion signal. Multiple Wait calls are coalesced.
+    Wait { id: String, child_id: String },
+    /// Close stdin for the child (pipes) / close master fd (PTY).
+    Close { id: String, child_id: String },
+    /// Tear the whole sandbox down: send SIGTERM, then SIGKILL after a
+    /// short grace, then exit init (which lets bwrap collapse the namespace).
+    Shutdown {
+        id: String,
+        #[serde(default = "default_true")]
+        kill_all: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Init → host reply. `id` matches the originating `Op.id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum Reply {
+    /// Hello handshake reply. `init_pid` MUST be 1 (init self-asserts) — host
+    /// MUST verify before sending any further op.
+    Hello {
+        id: String,
+        ok: bool,
+        protocol: u32,
+        features: Vec<String>,
+        init_pid: i32,
+        #[serde(default)]
+        error: Option<ErrorReply>,
+    },
+    /// Reply to `OpenShell` / `Spawn`. For PTY mode, the master fd is
+    /// attached as `SCM_RIGHTS` ancillary in the same packet.
+    Spawn {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        child_id: Option<String>,
+        #[serde(default)]
+        pid: Option<i32>,
+        #[serde(default)]
+        error: Option<ErrorReply>,
+    },
+    /// Generic ack for `Write` / `Resize` / `Signal` / `Close` / `Shutdown`.
+    Ack {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        error: Option<ErrorReply>,
+    },
+}
+
+/// Structured error code returned in `Reply.error`. Per plan §11.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorReply {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ErrorCode {
+    InvalidCwd,
+    ExecNotFound,
+    PermissionDenied,
+    ForkFailed,
+    EnvProtected,
+    BadHandshake,
+    UnknownChild,
+    BadRequest,
+    Internal,
+}
+
+impl ErrorReply {
+    #[must_use]
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+/// Async event pushed from init to host. PTY children do not emit
+/// Stdout/Stderr — host reads/writes the master fd directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum Event {
+    Stdout {
+        child_id: String,
+        data_b64: String,
+    },
+    Stderr {
+        child_id: String,
+        data_b64: String,
+    },
+    Exit {
+        child_id: String,
+        code: i32,
+        signal: Option<i32>,
+    },
+}
+
+/// One framed message on the wire. Either a request (host → init), reply
+/// (init → host), or an unsolicited event (init → host). They all share
+/// the same JSON envelope; the `_kind_envelope` discriminator keeps parsing
+/// a single tagged enum on each side trivial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "envelope")]
+pub enum Frame {
+    Op(Op),
+    Reply(Reply),
+    Event(Event),
+}
+
+/// Names of the features advertised in the `Hello` handshake. Both sides
+/// hard-code the same list for v1 — versioning bumps `PROTOCOL_VERSION`.
+pub fn default_features() -> Vec<String> {
+    vec![
+        "pipes".into(),
+        "pty".into(),
+        "resize".into(),
+        "signal".into(),
+        "killpg".into(),
+        "openshell".into(),
+    ]
+}

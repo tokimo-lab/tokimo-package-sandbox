@@ -115,11 +115,36 @@ pub(crate) fn prepare(cfg: L4Config) -> std::io::Result<(ChildInstall, Pending)>
     match seccomp_notify::prepare(cfg.clone()) {
         Ok(v) => Ok(v),
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // The seccomp-trace fallback is fundamentally unreliable when the
+            // sandboxed process tree enters a new user namespace (which bwrap
+            // always does). Symptoms observed: tracees end up stuck in
+            // `ptrace_stop` while the host tracer's `waitpid(-1, __WALL)`
+            // returns 0 forever; the kernel does not deliver
+            // PTRACE_EVENT_SECCOMP for `connect`/`sendto`. Per seccomp(2),
+            // `RET_TRACE` with no notifying tracer present causes the syscall
+            // to be skipped and return `-ENOSYS`, which breaks ALL outbound
+            // TCP — including the loopback connection to our own L7 proxy.
+            // So we explicitly disable L4 observation when notify is
+            // unavailable; L7 proxy observation continues to work.
+            // To force-enable the fragile trace path for diagnosis, set
+            // `TOKIMO_SANDBOX_L4_TRACE=1`.
+            if std::env::var("TOKIMO_SANDBOX_L4_TRACE").as_deref() == Ok("1") {
+                tracing::warn!(
+                    "l4: seccomp-notify unsupported ({}); seccomp-trace forced ON via \
+                     TOKIMO_SANDBOX_L4_TRACE=1 (network may break across user-ns)",
+                    e
+                );
+                return seccomp_trace::prepare(cfg);
+            }
             tracing::info!(
-                "l4: seccomp-notify unsupported ({}), falling back to seccomp-trace",
+                "l4: seccomp-notify unsupported ({}); L4 observer disabled \
+                 (L7 proxy observer still active). Network connect/sendto pass through unfiltered.",
                 e
             );
-            seccomp_trace::prepare(cfg)
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "seccomp-notify unavailable and seccomp-trace fallback disabled",
+            ))
         }
         Err(e) => Err(e),
     }

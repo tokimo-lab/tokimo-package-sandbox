@@ -129,12 +129,13 @@ SandboxConfig::new(work_dir)
 
 - `mount` / `umount` / `pivot_root` / `chroot` (seccomp)
 - `ptrace` / `keyctl` / `kexec_load` (seccomp)
-- `socket(AF_UNIX)` — no talking to host daemons
 - `CLONE_NEWUSER` nesting
 - All filesystem writes outside the configured `work_dir`
 - Network, when `NetworkPolicy::Blocked` is used (default)
 - Memory (`RLIMIT_AS`), CPU seconds (`RLIMIT_CPU`), output file size (`RLIMIT_FSIZE`)
 - Wall-clock timeout (monitor thread SIGTERM → SIGKILL)
+
+> `socket(AF_UNIX)` is **allowed** so the in-sandbox `tokimo-sandbox-init` can talk to the host control socket bound at `/run/tk-sandbox/control.sock`. Only paths bwrap explicitly bound into the container are reachable; arbitrary host abstract sockets are not.
 
 Sensitive host dotfiles (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/.npmrc`, `~/.netrc`, various credentials) are tmpfs-blanked even if the user accidentally mounts `$HOME`.
 
@@ -217,9 +218,124 @@ assert!(out.stdout.contains("/sub"));         // cwd persists too
 sess.close()?;
 ```
 
-Under the hood: a long-running `bash --noprofile --norc` runs inside the sandbox with stdin/stdout/stderr piped. Each `exec()` writes the command followed by a randomized sentinel and waits for the sentinel to come back. Same isolation as `run()` — same bwrap / Seatbelt / WSL backend — just kept alive across calls.
+Under the hood: each `Session` boots a long-lived bwrap container whose **PID 1 is `tokimo-sandbox-init`**, a tiny single-binary process supervisor we ship. `Session::exec` runs commands as children of that init via a length-prefixed JSON protocol over a `SOCK_SEQPACKET` control socket; PTYs (interactive shells, `vim`, `top`) are handed back to the host as raw master fds via `SCM_RIGHTS`. AI tool calls and an interactive user terminal can therefore share the **same** sandbox: they see each other's processes (`ps`), files, and env. Same isolation as `run()` — just one container per session reused across many calls.
 
-You still get `exit_code`, `stdout`, `stderr` per call.
+## Architecture (Linux)
+
+```
+┌────────────────────────── host process (your program) ────────────────────────┐
+│                                                                                │
+│   Session ──────► InitClient                                                   │
+│      │                │                                                        │
+│      │                │ SOCK_SEQPACKET (length-prefixed JSON +                 │
+│      │                │   SCM_RIGHTS for stdin/out/err / PTY master fd)        │
+│      │                ▼                                                        │
+│      │        /var/run/tokimo/sandbox/<id>/control.sock                        │
+│      │                                                                        │
+│      │   spawns once per Session, kept alive across exec/open_pty calls        │
+│      ▼                                                                        │
+│   bwrap (--unshare-all --as-pid-1 --die-with-parent)                           │
+└────────┬───────────────────────────────────────────────────────────────────────┘
+         │  fork / execve PID 1 = /.tokimo-sandbox-init
+         ▼
+┌────────────────────── inside the sandbox (new namespaces) ──────────────────────┐
+│                                                                                  │
+│   PID 1: tokimo-sandbox-init                                                     │
+│     ├─ listens on /run/tk-sandbox/control.sock (SOCK_SEQPACKET)                  │
+│     ├─ signalfd → reaps every orphan via waitpid(WNOHANG)                        │
+│     ├─ Spawn(Pipes)  → fork + execve, host gets stdin/stdout/stderr fds          │
+│     ├─ Spawn(Pty)    → openpt + setsid + TIOCSCTTY, host gets master fd          │
+│     └─ OpenShell     → long-lived bash for sentinel-protocol exec()              │
+│                                                                                  │
+│   children (sharing one PID/mount/net/ipc/uts namespace, controlling tty, env):  │
+│     ├─ bash REPL (sentinel-protocol, used by Session::exec)                      │
+│     ├─ bash on PTY (tab #1)   ← visible to AI tools' `ps`                        │
+│     ├─ pip install …, curl …, vim, top, …                                        │
+│     └─ … (siblings, can signal each other, share files via cwd)                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Control protocol (v1):
+
+```jsonc
+client → init  { "op": "Hello", "protocol": 1, "features": [...] }
+init   → client { "ok": true,  "protocol": 1, "init_pid": 1, "features": [...] }
+
+client → init  { "op": "OpenShell", "argv": ["/bin/bash","--noprofile","--norc"], ... }
+init   → client { "ok": true, "result": { "shell_id": "...", "pid": 12 } }
+
+client → init  { "op": "Spawn", "argv": ["/bin/bash","-l"],
+                 "stdio": { "Pty": { "rows": 24, "cols": 80 } } }
+init   → client { "ok": true, "result": { "child_id": "...", "pid": 14 } }
+                  // SCM_RIGHTS: PTY master fd in same packet ancillary
+
+client → init  { "op": "Write",  "child_id": "...", "data_b64": "..." }
+client → init  { "op": "Resize", "child_id": "...", "rows": 30, "cols": 100 }
+client → init  { "op": "Signal", "child_id": "...", "sig": 15, "to_pgrp": true }
+client → init  { "op": "Shutdown", "kill_all": true }
+
+init   → client { "event": "Stdout"|"Stderr", "child_id": "...", "data_b64": "..." }
+init   → client { "event": "Exit",   "child_id": "...", "code": 0, "signal": null }
+```
+
+Why a long-lived PID 1 inside the sandbox?
+
+- **Shared namespace for AI tool + user terminal.** A tool call (`Session::exec`) and an interactive shell (`Session::open_pty`) become sibling processes inside the same container, with one shared PID table, mount tree, network namespace, and env. The user's `ps aux` shows what the AI is doing; the AI's `cat /proc/$$/environ` matches what the user sees.
+- **No orphan reaping bugs.** A PID 1 that calls `waitpid(WNOHANG)` on every `SIGCHLD` keeps the process table clean even when the AI fires off `&` background jobs.
+- **PTY job control works.** `setsid()` + `TIOCSCTTY` happen inside the container, so `bash`/`vim`/`top`/Ctrl-C all behave like a real terminal — no `cannot set terminal process group` warning.
+- **Single bwrap per agent.** Container startup cost (bwrap + seccomp install) is paid once, not per command.
+
+## Persistent sessions
+
+When you need to run **multiple commands that share state** — files, env vars, cwd, background jobs — open a `Session` instead of calling `run()` each time.
+
+```rust
+use tokimo_package_sandbox::{SandboxConfig, Session};
+
+let cfg = SandboxConfig::new("/tmp/work");
+let mut sess = Session::open(&cfg)?;
+
+sess.exec("touch hello")?;                    // create file
+let out = sess.exec("ls")?;                   // file is still there
+assert!(out.stdout.contains("hello"));
+
+sess.exec("export FOO=bar")?;
+let out = sess.exec("echo $FOO")?;
+assert_eq!(out.stdout.trim(), "bar");
+
+sess.close()?;
+```
+
+### Sharing one container with an interactive PTY
+
+`Session::open_pty` opens a controlling-tty bash inside the **same** init container as the `exec` shell. The host gets the PTY master fd back; ship its bytes over a WebSocket and the user's terminal sees the AI's running processes (and vice versa).
+
+```rust
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use tokimo_package_sandbox::{SandboxConfig, Session};
+
+let cfg = SandboxConfig::new("/tmp/work");
+let sess = Session::open(&cfg)?;
+
+// Run something in the background via the AI tool path.
+sess.exec("sleep 600 &")?;
+
+// Open an interactive shell sharing the same namespaces.
+let mut pty = sess.open_pty(24, 80, &["/bin/bash".into(), "-l".into()], &[], None)?;
+let master = pty.take_master().expect("master fd");
+let mut tty = unsafe { std::fs::File::from_raw_fd(master.as_raw_fd()) };
+std::mem::forget(master);
+
+tty.write_all(b"ps -ef\n")?;          // sees the `sleep 600` started by exec()
+tty.write_all(b"exit\n")?;
+
+let mut buf = String::new();
+tty.read_to_string(&mut buf)?;
+assert!(buf.contains("sleep 600"));
+```
+
+`pty.resize(rows, cols)` and `pty.kill()` are available; the master fd is plain bytes you can dup, splice, or pipe straight to a WebSocket.
 
 ## Why not Docker?
 

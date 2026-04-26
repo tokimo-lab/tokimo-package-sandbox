@@ -242,9 +242,7 @@ fn build_inner_script(
     Ok(inner)
 }
 
-pub(crate) fn spawn_session_shell(
-    cfg: &SandboxConfig,
-) -> Result<(std::process::Child, Box<dyn std::any::Any + Send>)> {
+pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
     let inner = build_inner_script::<&str>(cfg, None)?;
     let mut wsl = Command::new("wsl");
     hide(&mut wsl);
@@ -255,5 +253,5 @@ pub(crate) fn spawn_session_shell(
     let child = wsl
         .spawn()
         .map_err(|e| Error::exec(format!("spawn wsl session shell failed: {}", e)))?;
-    Ok((child, Box::new(()) as Box<dyn std::any::Any + Send>))
+    crate::session::shell_handle_from_child(child, Box::new(()) as Box<dyn std::any::Any + Send>)
 }
