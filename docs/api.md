@@ -135,7 +135,7 @@ pub enum NetworkPolicy {
 
 ```rust
 pub struct ResourceLimits {
-    pub max_memory_mb: u64,     // 默认 512
+    pub max_memory_mb: u64,     // 默认 512；0 表示不设置当前内存上限
     pub timeout_secs: u64,      // 默认 30
     pub max_file_size_mb: u64,  // 默认 64
     pub max_processes: u64,     // 默认 128
@@ -146,7 +146,7 @@ pub struct ResourceLimits {
 
 | 字段 | Linux / macOS | Windows |
 |---|---|---|
-| `max_memory_mb` | `RLIMIT_AS`（虚拟内存上限，`pre_exec` 设置）**加上**宿主侧轮询 `/proc/<pid>/status: VmRSS`（每 100 ms），超限则 kill 并置 `oom_killed=true`。子进程退出后也会读 `getrusage(RUSAGE_CHILDREN).ru_maxrss` 做峰值检查 | Job Object + 轮询 |
+| `max_memory_mb` | 非 0 时设置 `RLIMIT_AS`（虚拟内存上限，`pre_exec` 设置）**加上**宿主侧轮询 `/proc/<pid>/status: VmRSS`（每 100 ms），超限则 kill 并置 `oom_killed=true`。子进程退出后也会读 `getrusage(RUSAGE_CHILDREN).ru_maxrss` 做峰值检查。`0` 表示跳过当前内存上限，用于 Go/Node/JVM 等 mmap-heavy 工具链，真实 per-sandbox 资源限制需后续 backend 实现 | 当前 WSL backend 只做 wall-clock timeout；未来 native/backend 可按平台实现 |
 | `timeout_secs` | 宿主侧 wall-clock 监控线程：先 `SIGTERM`，2 秒 grace 后 `SIGKILL`。同时 `RLIMIT_CPU = timeout_secs + 5` 作为第二道保险 | 同样 wall-clock 轮询，到时 `child.kill()` |
 | `max_file_size_mb` | `RLIMIT_FSIZE` | — |
 | `max_processes` | **Linux 下故意不设 `RLIMIT_NPROC`**（见下） | — |
@@ -158,13 +158,13 @@ pub struct ResourceLimits {
 ### 内存限制的双重机制
 
 ```
-apply_rlimits()  →  RLIMIT_AS   (子进程 address space 硬上限)
+apply_rlimits()  →  RLIMIT_AS   (max_memory_mb 非 0 时设置的 address space 硬上限)
                     RLIMIT_CPU  (CPU 秒上限)
                     RLIMIT_FSIZE
                          ↓
                     exec 子进程
                          ↓
-wait_with_timeout()   每 100 ms:
+wait_with_timeout()   max_memory_mb 非 0 时每 100 ms:
                       ├─ try_wait()                     （正常退出？）
                       ├─ elapsed > timeout?             （墙钟超时）
                       └─ VmRSS > max_memory_mb?         （RSS 超限 → kill）

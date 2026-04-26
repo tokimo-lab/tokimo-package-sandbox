@@ -95,6 +95,7 @@ pub enum NetworkPolicy {
 }
 
 pub struct ResourceLimits {
+    /// 0 disables the current memory cap.
     pub max_memory_mb: u64,
     pub timeout_secs: u64,
     pub max_file_size_mb: u64,
@@ -132,7 +133,7 @@ SandboxConfig::new(work_dir)
 - `CLONE_NEWUSER` nesting
 - All filesystem writes outside the configured `work_dir`
 - Network, when `NetworkPolicy::Blocked` is used (default)
-- Memory (`RLIMIT_AS`), CPU seconds (`RLIMIT_CPU`), output file size (`RLIMIT_FSIZE`)
+- Memory when `max_memory_mb > 0` (`RLIMIT_AS` + best-effort RSS polling), CPU seconds (`RLIMIT_CPU`), output file size (`RLIMIT_FSIZE`)
 - Wall-clock timeout (monitor thread SIGTERM → SIGKILL)
 
 > `socket(AF_UNIX)` is **allowed** so the in-sandbox `tokimo-sandbox-init` can talk to the host control socket bound at `/run/tk-sandbox/control.sock`. Only paths bwrap explicitly bound into the container are reachable; arbitrary host abstract sockets are not.

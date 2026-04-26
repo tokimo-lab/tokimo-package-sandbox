@@ -25,9 +25,7 @@ pub enum NetworkPolicy {
     /// binaries that dial raw sockets bypass this path; for kernel-level
     /// enforcement see `docs/network-observability.md` Phase 1 (`Observed`
     /// via eBPF cgroup/connect).
-    Observed {
-        sink: Arc<dyn NetEventSink>,
-    },
+    Observed { sink: Arc<dyn NetEventSink> },
     /// L7-observable **and** host allowlisted. Same proxy as `Observed`,
     /// but any request whose host is not in `allow_hosts`, or whose
     /// `sink.on_event` returns `Verdict::Deny`, gets `HTTP 403 Forbidden`.
@@ -70,12 +68,25 @@ impl Default for NetworkPolicy {
 /// Resource limits applied to the sandboxed process.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {
-    /// Maximum resident set size, in megabytes.
-    /// Enforced via RLIMIT_AS on Unix and by polling plus Job Object on Windows.
+    /// Memory limit in megabytes.
+    ///
+    /// On Unix this is currently enforced as an address-space cap
+    /// (`RLIMIT_AS`) plus best-effort RSS polling for one-shot runs. Set to
+    /// `0` to skip the memory cap; useful for mmap-heavy runtimes such as Go,
+    /// Node, and JVM until a real per-sandbox resource backend is available.
     pub max_memory_mb: u64,
-    /// Wall-clock timeout in seconds.
+    /// Wall-clock timeout in seconds — used both as the default per-command
+    /// timeout for one-shot spawns and as the basis for RLIMIT_CPU
+    /// (`timeout_secs + 5`). Set to `0` to skip the RLIMIT_CPU cap; useful
+    /// for long-lived agent sessions where each `run_oneshot` call passes
+    /// its own per-call timeout and RLIMIT_CPU would otherwise SIGXCPU-kill
+    /// CPU-bound children (compilers, linkers) that legitimately exceed the
+    /// session's nominal default.
     pub timeout_secs: u64,
     /// Maximum file size the sandbox may create (RLIMIT_FSIZE on Unix).
+    /// Set to `0` to skip the cap; useful for coding agents that download
+    /// large toolchains (Zig/Rust/Node SDKs) where a hard FSIZE limit causes
+    /// SIGXFSZ during tar extraction of binaries larger than the cap.
     pub max_file_size_mb: u64,
     /// Maximum number of processes/threads the sandbox may spawn (RLIMIT_NPROC on Unix).
     pub max_processes: u64,
@@ -95,6 +106,18 @@ impl Default for ResourceLimits {
 impl ResourceLimits {
     pub(crate) fn max_memory_bytes(&self) -> u64 {
         self.max_memory_mb.saturating_mul(1024 * 1024)
+    }
+
+    pub(crate) fn has_memory_limit(&self) -> bool {
+        self.max_memory_mb > 0
+    }
+
+    pub(crate) fn has_file_size_limit(&self) -> bool {
+        self.max_file_size_mb > 0
+    }
+
+    pub(crate) fn has_cpu_time_limit(&self) -> bool {
+        self.timeout_secs > 0
     }
 }
 

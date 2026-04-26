@@ -50,7 +50,7 @@ pub(crate) fn get_process_memory(pid: u32) -> Option<u64> {
 }
 
 fn get_children_peak_rss_bytes() -> Option<u64> {
-    use nix::libc::{getrusage, rusage, RUSAGE_CHILDREN};
+    use nix::libc::{RUSAGE_CHILDREN, getrusage, rusage};
     let mut usage: rusage = unsafe { std::mem::zeroed() };
     let ret = unsafe { getrusage(RUSAGE_CHILDREN, &mut usage) };
     if ret != 0 {
@@ -120,7 +120,7 @@ pub(crate) fn wait_with_timeout(
                 let stderr = stderr_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
                 if let Some(peak) = get_children_peak_rss_bytes() {
-                    if peak > memory_limit_bytes {
+                    if memory_limit_bytes > 0 && peak > memory_limit_bytes {
                         return Ok((
                             stdout,
                             format!(
@@ -156,23 +156,25 @@ pub(crate) fn wait_with_timeout(
             ));
         }
 
-        if let Some(mem) = get_process_memory(child.id()) {
-            if mem > memory_limit_bytes {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.map(|h| h.join());
-                let _ = stderr_handle.map(|h| h.join());
-                return Ok((
-                    String::new(),
-                    format!(
-                        "sandbox: killed, memory {} MB > limit {} MB",
-                        mem / (1024 * 1024),
-                        memory_limit_bytes / (1024 * 1024)
-                    ),
-                    -1,
-                    false,
-                    true,
-                ));
+        if memory_limit_bytes > 0 {
+            if let Some(mem) = get_process_memory(child.id()) {
+                if mem > memory_limit_bytes {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_handle.map(|h| h.join());
+                    let _ = stderr_handle.map(|h| h.join());
+                    return Ok((
+                        String::new(),
+                        format!(
+                            "sandbox: killed, memory {} MB > limit {} MB",
+                            mem / (1024 * 1024),
+                            memory_limit_bytes / (1024 * 1024)
+                        ),
+                        -1,
+                        false,
+                        true,
+                    ));
+                }
             }
         }
         thread::sleep(check_interval);
@@ -211,22 +213,28 @@ fn kill_progressive(
 /// # Safety
 /// Runs after fork, before exec.
 pub(crate) unsafe fn apply_rlimits(limits: &ResourceLimits) {
-    use nix::libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE};
-    let mem = rlimit {
-        rlim_cur: limits.max_memory_bytes(),
-        rlim_max: limits.max_memory_bytes(),
-    };
-    setrlimit(RLIMIT_AS, &mem);
+    use nix::libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, rlimit, setrlimit};
+    if limits.has_memory_limit() {
+        let mem = rlimit {
+            rlim_cur: limits.max_memory_bytes(),
+            rlim_max: limits.max_memory_bytes(),
+        };
+        setrlimit(RLIMIT_AS, &mem);
+    }
     let cpu = rlimit {
         rlim_cur: limits.timeout_secs.saturating_add(5),
         rlim_max: limits.timeout_secs.saturating_add(5),
     };
-    setrlimit(RLIMIT_CPU, &cpu);
-    let fs = rlimit {
-        rlim_cur: limits.max_file_size_mb * 1024 * 1024,
-        rlim_max: limits.max_file_size_mb * 1024 * 1024,
-    };
-    setrlimit(RLIMIT_FSIZE, &fs);
+    if limits.has_cpu_time_limit() {
+        setrlimit(RLIMIT_CPU, &cpu);
+    }
+    if limits.has_file_size_limit() {
+        let fs = rlimit {
+            rlim_cur: limits.max_file_size_mb * 1024 * 1024,
+            rlim_max: limits.max_file_size_mb * 1024 * 1024,
+        };
+        setrlimit(RLIMIT_FSIZE, &fs);
+    }
     let _ = limits.max_processes; // reserved for future per-sandbox cgroup use
 }
 
@@ -237,9 +245,7 @@ pub(crate) fn spawn_run(
     limits: &ResourceLimits,
     stream_stderr: bool,
 ) -> Result<crate::ExecutionResult> {
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::exec(format!("spawn failed: {}", e)))?;
+    let mut child = cmd.spawn().map_err(|e| Error::exec(format!("spawn failed: {}", e)))?;
     wait_with_io(&mut child, stdin_bytes, limits, stream_stderr)
 }
 
@@ -273,12 +279,8 @@ pub(crate) fn wait_with_io_ext(
     if let Some(rx) = exit_rx {
         return wait_via_channel(child, rx, limits.timeout_secs, stream_stderr);
     }
-    let (stdout, stderr, exit_code, timed_out, oom_killed) = wait_with_timeout(
-        child,
-        limits.timeout_secs,
-        limits.max_memory_bytes(),
-        stream_stderr,
-    )?;
+    let (stdout, stderr, exit_code, timed_out, oom_killed) =
+        wait_with_timeout(child, limits.timeout_secs, limits.max_memory_bytes(), stream_stderr)?;
     Ok(crate::ExecutionResult {
         stdout,
         stderr,
@@ -349,10 +351,7 @@ fn wait_via_channel(
     let stdout = stdout_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
     let stderr = stderr_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
-    let exit_code = status
-        .as_ref()
-        .and_then(|s| s.code())
-        .unwrap_or(-1);
+    let exit_code = status.as_ref().and_then(|s| s.code()).unwrap_or(-1);
     Ok(crate::ExecutionResult {
         stdout,
         stderr: if timed_out {
