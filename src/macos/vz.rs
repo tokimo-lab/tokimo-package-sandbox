@@ -16,7 +16,6 @@
 //! - `TOKIMO_VZ_ROOTFS`  — path to rootfs directory (shared via virtiofs)
 //! - `TOKIMO_VZ_MEMORY`  — VM memory in MB (default 512)
 //! - `TOKIMO_VZ_CPUS`    — vCPU count (default 2)
-//! - `SAFEBOX_VZ=1`      — enable VZ backend
 
 #![cfg(target_os = "macos")]
 
@@ -44,13 +43,6 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn is_available() -> bool {
     is_supported()
-}
-
-pub(crate) fn is_enabled() -> bool {
-    std::env::var("SAFEBOX_VZ")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 /// One-shot command execution via VZ VM.

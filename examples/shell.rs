@@ -3,18 +3,9 @@
 //! Usage:   cargo run --example shell
 //!
 //! Linux   → bubblewrap (bwrap) container with PID/user namespace
-//! macOS   → sandbox-exec + Seatbelt profile
+//! macOS   → Virtualization.framework (interactive shell pending)
 //!
 //! Type commands, explore the sandboxed filesystem. Exit with `exit` or Ctrl-D.
-
-use std::path::{Path, PathBuf};
-
-/// Pick a persistent work dir so files survive across restarts.
-fn work_dir() -> PathBuf {
-    std::env::var("SAFEBOX_WORK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("tps-shell"))
-}
 
 // ---------------------------------------------------------------------------
 // Linux: bubblewrap
@@ -23,7 +14,14 @@ fn work_dir() -> PathBuf {
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    fn work_dir() -> PathBuf {
+        std::env::var("SAFEBOX_WORK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("tps-shell"))
+    }
 
     let work = work_dir();
     std::fs::create_dir_all(&work)?;
@@ -90,106 +88,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// macOS: sandbox-exec + Seatbelt
+// macOS: Virtualization.framework (interactive shell not yet supported)
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::fs;
-    use std::io::Write;
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let work = work_dir();
-    fs::create_dir_all(&work)?;
-    let work = work.canonicalize()?;
-
-    println!("safebox shell  (macOS / Seatbelt)");
-    println!("  work dir (host): {}", work.display());
-    println!("  HOME={}", work.display());
-    println!("  type `exit` or Ctrl-D to leave\n");
-
-    // Build Seatbelt profile for interactive use.
-    let profile = build_interactive_profile(&work);
-
-    // Write profile to a temp file. We'll exec() so the file is left behind;
-    // /tmp cleans itself on reboot.
-    let profile_path = std::env::temp_dir().join("tps-shell-profile.sb");
-    let mut f = fs::File::create(&profile_path)?;
-    f.write_all(profile.as_bytes())?;
-    f.flush()?;
-
-    let mut cmd = Command::new("/usr/bin/sandbox-exec");
-    cmd.arg("-f").arg(&profile_path);
-    cmd.arg("/bin/bash");
-    cmd.arg("--noprofile");
-    cmd.arg("--norc");
-    cmd.arg("-i");
-
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin");
-    cmd.env("HOME", work.to_str().unwrap_or("/tmp"));
-    cmd.env("TMPDIR", work.to_str().unwrap_or("/tmp"));
-    cmd.env("SAFEBOX", "1");
-    cmd.env("PS1", "(tps) \\w $ ");
-    if let Ok(term) = std::env::var("TERM") {
-        cmd.env("TERM", &term);
-    }
-    if let Ok(lang) = std::env::var("LANG") {
-        cmd.env("LANG", &lang);
-    }
-
-    let err = cmd.exec();
-    Err(Box::new(err))
-}
-
-#[cfg(target_os = "macos")]
-fn build_interactive_profile(work_dir: &Path) -> String {
-    let work_s = work_dir.to_string_lossy();
-    let mut p = String::new();
-
-    p.push_str("(version 1)\n");
-    p.push_str("; safebox interactive shell — Seatbelt profile\n\n");
-
-    // Default allow, then deny dangerous stuff.
-    p.push_str("(allow default)\n\n");
-
-    // Block dangerous IPC / kernel ops.
-    p.push_str("(deny mach-register)\n");
-    p.push_str("(deny mach-priv-task-port)\n");
-    p.push_str("(deny iokit-open)\n");
-    p.push_str("(deny process-exec (regex #\"^/bin/su$\"))\n");
-    p.push_str("(deny process-exec (regex #\"^/usr/bin/sudo$\"))\n\n");
-
-    // File write: deny all, allow work_dir + macOS ephemerals.
-    p.push_str("(deny file-write*)\n");
-    p.push_str(&format!(
-        "(allow file-write* (subpath \"{}\"))\n",
-        escape_sb(&work_s)
-    ));
-    p.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
-    p.push_str("(allow file-write* (subpath \"/var/folders\"))\n");
-    // Allow writing to /dev/pts/* for terminal interaction.
-    p.push_str("(allow file-write* (subpath \"/dev\"))\n\n");
-
-    // Block reads of sensitive dotfiles.
-    p.push_str("(deny file-read* (subpath \"/etc\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.ssh\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.aws\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.gnupg\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.config\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.netrc\"))\n");
-    p.push_str("(deny file-read* (regex #\"^/Users/[^/]+/Library/Keychains\"))\n\n");
-
-    // Block network.
-    p.push_str("(deny network*)\n");
-
-    p
-}
-
-#[cfg(target_os = "macos")]
-fn escape_sb(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+fn main() {
+    eprintln!("safebox shell: interactive shell is not yet supported on macOS.");
+    eprintln!("The macOS backend uses Virtualization.framework — interactive sessions");
+    eprintln!("require tokimo-sandbox-init with VSOCK support (pending).");
+    eprintln!();
+    eprintln!("For one-shot commands, use `cargo run --example vz_smoke`.");
+    std::process::exit(1);
 }
 
 // ---------------------------------------------------------------------------
