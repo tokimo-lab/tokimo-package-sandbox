@@ -53,13 +53,12 @@ pub struct State {
 
 impl State {
     fn alloc_slot(&mut self) -> usize {
-        for (i, slot) in self.child_slots.iter().enumerate() {
-            if slot.is_none() {
-                return i;
-            }
-        }
+        // Never recycle slots — child_ids must remain unique for the
+        // lifetime of the session because host-side ChildHandle may
+        // still be draining events after the child has exited.
+        let slot = self.child_slots.len();
         self.child_slots.push(None);
-        self.child_slots.len() - 1
+        slot
     }
 }
 
@@ -254,16 +253,14 @@ fn emit_exit(
         });
         let _ = send_frame(unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) }, &frame, None);
     }
-    // Cleanup: deregister fds, free slot.
+    // Cleanup: deregister fds. Slots are never recycled so child_ids
+    // stay unique for the lifetime of the session.
     if let Some(rec) = state.children.remove(&id) {
         if let Some(fd) = rec.stdout_fd.as_ref() {
             let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
         }
         if let Some(fd) = rec.stderr_fd.as_ref() {
             let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
-        }
-        if rec.slot < state.child_slots.len() {
-            state.child_slots[rec.slot] = None;
         }
     }
 }
@@ -377,15 +374,31 @@ fn handle_op(op: Op, client: &OwnedFd, state: &mut State, registry: &mio::Regist
                 ChildKind::Shell,
             );
         }
-        Op::Spawn { id, argv, env_overlay, cwd, stdio } => {
+        Op::Spawn { id, argv, env_overlay, cwd, stdio, inherit_from_child } => {
+            let inherited_env = inherit_from_child
+                .as_ref()
+                .and_then(|cid| resolve_child_env(state, cid));
+            let inherited_cwd = inherit_from_child
+                .as_ref()
+                .and_then(|cid| resolve_child_cwd(state, cid));
+
+            let effective_cwd = cwd.or(inherited_cwd);
+            let effective_env = if let Some(base_env) = inherited_env {
+                let mut merged = base_env;
+                merged.extend(env_overlay);
+                merged
+            } else {
+                env_overlay
+            };
+
             spawn_child(
                 client,
                 state,
                 registry,
                 id,
                 argv,
-                env_overlay,
-                cwd,
+                effective_env,
+                effective_cwd,
                 stdio,
                 ChildKind::Generic,
             );
@@ -614,6 +627,30 @@ fn merge_env(base: &[(String, String)], overlay: &[(String, String)]) -> Vec<(St
         out.insert(k.clone(), v.clone());
     }
     out.into_iter().collect()
+}
+
+fn resolve_child_cwd(state: &State, child_id: &str) -> Option<String> {
+    let rec = state.children.get(child_id)?;
+    let path = format!("/proc/{}/cwd", rec.pid);
+    std::fs::read_link(&path).ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, String)>> {
+    let rec = state.children.get(child_id)?;
+    let path = format!("/proc/{}/environ", rec.pid);
+    let data = std::fs::read(&path).ok()?;
+    let mut env = Vec::new();
+    for chunk in data.split(|&b| b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            if let Some(eq) = s.find('=') {
+                env.push((s[..eq].to_string(), s[eq + 1..].to_string()));
+            }
+        }
+    }
+    Some(env)
 }
 
 fn kill_all_children(state: &mut State) {

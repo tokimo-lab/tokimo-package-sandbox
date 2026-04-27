@@ -66,6 +66,12 @@ pub enum Op {
         #[serde(default)]
         cwd: Option<String>,
         stdio: StdioMode,
+        /// If set, init reads `/proc/<pid>/cwd` and `/proc/<pid>/environ`
+        /// from the referenced child and uses them as the base environment
+        /// and default cwd for the new child. Explicit `cwd` and
+        /// `env_overlay` take precedence.
+        #[serde(default)]
+        inherit_from_child: Option<String>,
     },
     /// Write `data_b64` (base64-encoded) to the named child's stdin (pipes
     /// mode). For PTY children this is a no-op — host writes to the master

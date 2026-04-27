@@ -164,6 +164,20 @@ impl InitClient {
         env_overlay: &[(String, String)],
         cwd: Option<&str>,
     ) -> Result<SpawnInfo> {
+        self.spawn_pipes_inherit(argv, env_overlay, cwd, None)
+    }
+
+    /// Spawn (Pipes mode) with optional environment/cwd inheritance from an
+    /// existing child (identified by `child_id`). When set, init reads
+    /// `/proc/<pid>/cwd` and `/proc/<pid>/environ` and uses them as the
+    /// base; explicit `cwd` and `env_overlay` take precedence.
+    pub fn spawn_pipes_inherit(
+        &self,
+        argv: &[&str],
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+        inherit_from_child: Option<&str>,
+    ) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::Spawn {
             id: id.clone(),
@@ -171,6 +185,7 @@ impl InitClient {
             env_overlay: env_overlay.to_vec(),
             cwd: cwd.map(str::to_string),
             stdio: StdioMode::Pipes,
+            inherit_from_child: inherit_from_child.map(str::to_string),
         };
         self.spawn_ack(&id, op)
     }
@@ -191,6 +206,7 @@ impl InitClient {
             env_overlay: env_overlay.to_vec(),
             cwd: cwd.map(str::to_string),
             stdio: StdioMode::Pty { rows, cols },
+            inherit_from_child: None,
         };
         let reply = self.send_op_sync(&id, op, Duration::from_secs(10))?;
         let fd = reply
@@ -458,6 +474,111 @@ impl InitClient {
 pub struct SpawnInfo {
     pub child_id: String,
     pub pid: i32,
+}
+
+/// Handle to a running child spawned via `spawn_pipes_async` or
+/// `spawn_pipes_inherit_async`. Call `wait_with_timeout` to block
+/// until the child exits and collect its output.
+pub struct ChildHandle {
+    client: Arc<InitClient>,
+    child_id: String,
+}
+
+impl ChildHandle {
+    pub(crate) fn new(client: Arc<InitClient>, child_id: String) -> Self {
+        Self { client, child_id }
+    }
+
+    /// The child's stable id as assigned by init.
+    pub fn child_id(&self) -> &str {
+        &self.child_id
+    }
+
+    /// Block until the child exits or `timeout` elapses. Returns
+    /// `(stdout_bytes, stderr_bytes, exit_code)`.
+    ///
+    /// On timeout: SIGKILLs the process group and returns whatever was
+    /// captured plus exit_code = 124 (matching coreutils `timeout`).
+    pub fn wait_with_timeout(&self, timeout: Duration) -> Result<(Vec<u8>, Vec<u8>, i32)> {
+        let deadline = Instant::now() + timeout;
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let mut exit_code: Option<i32> = None;
+        let mut timed_out = false;
+
+        loop {
+            for chunk in self.client.drain_stdout(&self.child_id) {
+                stdout_buf.extend_from_slice(&chunk);
+            }
+            for chunk in self.client.drain_stderr(&self.child_id) {
+                stderr_buf.extend_from_slice(&chunk);
+            }
+            if let Some((code, _sig)) = self.client.take_exit(&self.child_id) {
+                exit_code = Some(code);
+                break;
+            }
+            if self.client.is_dead() {
+                exit_code = Some(-1);
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                timed_out = true;
+                let _ = self.client.signal(&self.child_id, libc::SIGKILL, true);
+                let drain_deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < drain_deadline {
+                    self.client.wait_for_event(&self.child_id, drain_deadline);
+                    for chunk in self.client.drain_stdout(&self.child_id) {
+                        stdout_buf.extend_from_slice(&chunk);
+                    }
+                    for chunk in self.client.drain_stderr(&self.child_id) {
+                        stderr_buf.extend_from_slice(&chunk);
+                    }
+                    if let Some((code, _sig)) = self.client.take_exit(&self.child_id) {
+                        exit_code = Some(code);
+                        break;
+                    }
+                }
+                break;
+            }
+            self.client.wait_for_event(&self.child_id, deadline);
+        }
+
+        let _ = self.client.close_child(&self.child_id);
+        let code = if timed_out {
+            124
+        } else {
+            exit_code.unwrap_or(-1)
+        };
+        Ok((stdout_buf, stderr_buf, code))
+    }
+}
+
+impl InitClient {
+    /// Spawn a child in pipes mode and return a [`ChildHandle`] immediately.
+    /// The child runs independently; call [`ChildHandle::wait_with_timeout`]
+    /// to block until it exits.
+    pub fn spawn_pipes_async(
+        self: &Arc<Self>,
+        argv: &[&str],
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<ChildHandle> {
+        self.spawn_pipes_inherit_async(argv, env_overlay, cwd, None)
+    }
+
+    /// Spawn a child in pipes mode with environment/cwd inheritance from an
+    /// existing child. Returns a [`ChildHandle`] immediately.
+    pub fn spawn_pipes_inherit_async(
+        self: &Arc<Self>,
+        argv: &[&str],
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+        inherit_from_child: Option<&str>,
+    ) -> Result<ChildHandle> {
+        let info = self.spawn_pipes_inherit(argv, env_overlay, cwd, inherit_from_child)?;
+        Ok(ChildHandle::new(Arc::clone(self), info.child_id))
+    }
 }
 
 fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {

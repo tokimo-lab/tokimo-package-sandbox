@@ -26,6 +26,7 @@ pub enum ChildKind {
 pub struct ChildRecord {
     pub pid: i32,
     pub pgid: i32,
+    #[allow(dead_code)]
     pub slot: usize,
     #[allow(dead_code)]
     pub kind: ChildKind,

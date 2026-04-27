@@ -28,22 +28,19 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(not(target_os = "linux"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{SandboxConfig, CAPTURE_GUEST_DIR};
+use crate::config::SandboxConfig;
 use crate::{Error, Result};
 
-/// Guest-side directory for per-job capture files.
-/// On Linux this is `/run/sandbox-jobs` (the internally-managed bind mount);
-/// on other platforms it falls back to `/tmp` (no namespace isolation).
-const GUEST_CAPTURE_DIR: &str = if cfg!(target_os = "linux") {
-    CAPTURE_GUEST_DIR
-} else {
-    "/tmp"
-};
+/// Guest-side directory for per-job capture files (non-Linux fallback only;
+/// Linux uses pipe-mode capture via init control socket).
+#[cfg(not(target_os = "linux"))]
+const GUEST_CAPTURE_DIR: &str = "/tmp";
 
 /// Result of a single `Session::exec` (or `JobHandle::wait`) call.
 #[derive(Debug, Clone)]
@@ -92,6 +89,31 @@ pub type OpenPtyFn = Box<
 /// fall back to `Session::exec` if a caller needs one-shot semantics there).
 pub type RunOneshotFn = Box<
     dyn Fn(&str, Duration) -> Result<ExecOutput> + Send + Sync,
+>;
+
+/// Trait for spawn output collection. Implementations collect stdout/stderr
+/// from a background job and return them when `wait_with_timeout` is called.
+pub(crate) trait JobOutput: Send + Sync {
+    fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput>;
+}
+
+/// Factory for spawning an async background job whose output is collected
+/// via a [`JobOutput`] handle. The `u64` is the session-local job id used
+/// for `kill_job` lookup. Returns the handle immediately; call
+/// `wait_with_timeout` on it to block until the job completes.
+///
+/// `None` on platforms without an init control socket (macOS/Windows).
+pub type SpawnAsyncFn = Box<
+    dyn Fn(u64, &str) -> Result<Box<dyn JobOutput>> + Send + Sync,
+>;
+
+/// Factory for killing a previously spawned background job by its
+/// session-local job id. Returns `Ok(())` if the signal was dispatched;
+/// does not guarantee the job has exited.
+///
+/// `None` on platforms without an init control socket (macOS/Windows).
+pub type KillSpawnFn = Box<
+    dyn Fn(u64) -> Result<()> + Send + Sync,
 >;
 
 /// A PTY child running inside the sandbox. Exposes the master fd directly for
@@ -202,6 +224,11 @@ pub(crate) struct ShellHandle {
     /// Run a one-shot pipe-mode command without occupying the long-lived
     /// shell. `None` on platforms without an init control socket.
     pub run_oneshot: Option<Arc<RunOneshotFn>>,
+    /// Spawn a background job via init's pipe mode, returning a [`JobOutput`]
+    /// handle immediately. `None` on platforms without an init control socket.
+    pub spawn_async: Option<Arc<SpawnAsyncFn>>,
+    /// Kill a background job by its session-local id. `None` on non-Linux.
+    pub kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
 pub struct Session {
@@ -212,12 +239,15 @@ pub struct Session {
     counter: u64,
     readers: Vec<JoinHandle<()>>,
     timeout: Duration,
-    /// Host-side directory for per-job capture files. On Linux this is
-    /// `<work_dir>/.sandbox-jobs/` (bind-mounted at `/run/sandbox-jobs`
-    /// inside the sandbox); on other platforms it equals `work_dir`.
+    /// Host-side directory for per-job capture files (non-Linux fallback only).
+    #[cfg(not(target_os = "linux"))]
     capture_dir: PathBuf,
     open_pty: Option<Arc<OpenPtyFn>>,
     run_oneshot: Option<Arc<RunOneshotFn>>,
+    /// Spawn a background job via pipe mode. `None` on non-Linux.
+    spawn_async: Option<Arc<SpawnAsyncFn>>,
+    /// Kill a background job by its session-local id. `None` on non-Linux.
+    kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
 impl Session {
@@ -245,22 +275,16 @@ impl Session {
         let r1 = spawn_reader(stdout, sid.clone(), Stream::Stdout, state.clone());
         let r2 = spawn_reader(stderr, sid.clone(), Stream::Stderr, state.clone());
 
-        let work_dir = cfg
+        #[cfg(not(target_os = "linux"))]
+        let capture_dir = cfg
             .work_dir
             .canonicalize()
             .unwrap_or_else(|_| cfg.work_dir.clone());
 
-        // On Linux the guest-side capture directory `/run/sandbox-jobs` is
-        // bind-mounted to `<work_dir>/.sandbox-jobs/` by the bwrap builder
-        // (see `linux.rs`). On other platforms there is no namespace
-        // isolation, so capture files go directly into `work_dir`.
-        #[cfg(target_os = "linux")]
-        let capture_dir = work_dir.join(".sandbox-jobs");
-        #[cfg(not(target_os = "linux"))]
-        let capture_dir = work_dir.clone();
-
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
+        let spawn_async = handle.spawn_async.clone();
+        let kill_spawn = handle.kill_spawn.clone();
 
         Ok(Self {
             handle: Some(handle),
@@ -270,9 +294,12 @@ impl Session {
             counter: 0,
             readers: vec![r1, r2],
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
+            #[cfg(not(target_os = "linux"))]
             capture_dir,
             open_pty,
             run_oneshot,
+            spawn_async,
+            kill_spawn,
         })
     }
 
@@ -483,37 +510,36 @@ impl Session {
     /// assert_eq!(r.stdout.trim(), "SLOW");
     /// ```
     pub fn spawn(&mut self, cmd: &str) -> Result<JobHandle> {
+        self.counter += 1;
+        let id = self.counter;
+
+        if let Some(factory) = self.spawn_async.as_ref() {
+            // Linux pipe mode: spawn via init with env/cwd inheritance.
+            let output = factory(id, cmd)?;
+            return Ok(JobHandle {
+                id,
+                output,
+                timeout: self.timeout,
+            });
+        }
+
+        // Non-Linux file mode fallback.
+        self.spawn_file_mode(cmd, id)
+    }
+
+    /// File-mode spawn fallback for platforms without an init control socket.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_file_mode(&mut self, cmd: &str, id: u64) -> Result<JobHandle> {
         let stdin = self
             .stdin
             .as_mut()
             .ok_or_else(|| Error::exec("session is closed"))?;
-        self.counter += 1;
-        let id = self.counter;
-
         let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
         let out_name = format!(".tps_job_{}_{}.out", self.sid, id);
         let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, id);
-
-        // Capture files live at a fixed guest-side path managed internally by
-        // the sandbox (see `GUEST_CAPTURE_DIR`). Callers do NOT need to set up
-        // any extra_mount for this to work — it is guaranteed to be backed by
-        // the host-side `capture_dir`.
         let guest_dir = GUEST_CAPTURE_DIR;
 
-        // Wrap user cmd in `setsid` so the entire job tree lives in its own
-        // process group / session. Capture the setsid wrapper's PID into a
-        // pidfile so `kill_job` can `kill -KILL -- -<pgid>` that whole tree
-        // without touching the session bash.
-        //
-        // Layout:
-        //   { setsid bash -c '<eval USER>' >OUT 2>ERR & echo $! >PIDFILE ;
-        //     wait $! ; rc=$? ; printf SBJOB_<sid>_<id> rc ; }
-        //
-        // The outer brace group is itself backgrounded with `&` so the
-        // session bash stays free to accept new commands. `wait $!` makes
-        // the brace group's exit reflect the user command's real exit
-        // code (instead of `setsid` always exiting 0 after fork).
         let script = format!(
             "{{ __sb_d='{guest_dir}' ; setsid bash -c \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" > \"$__sb_d/{out_name}\" 2> \"$__sb_d/{err_name}\" & __sb_jpid=$! ; printf '%s' \"$__sb_jpid\" > \"$__sb_d/{pid_name}\" ; wait \"$__sb_jpid\" ; __sb_jrc=$? ; rm -f \"$__sb_d/{pid_name}\" ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
             guest_dir = guest_dir,
@@ -534,11 +560,20 @@ impl Session {
 
         Ok(JobHandle {
             id,
-            sid: self.sid.clone(),
-            state: self.state.clone(),
-            capture_dir: self.capture_dir.clone(),
+            output: Box::new(FileJobOutput {
+                sid: self.sid.clone(),
+                id,
+                state: self.state.clone(),
+                capture_dir: self.capture_dir.clone(),
+            }),
             timeout: self.timeout,
         })
+    }
+
+    /// Stub — never called on Linux (spawn_async is always Some).
+    #[cfg(target_os = "linux")]
+    fn spawn_file_mode(&self, _cmd: &str, _id: u64) -> Result<JobHandle> {
+        unreachable!("spawn_async is always Some on Linux")
     }
 
     /// Send `SIGKILL` to a previously-spawned job's entire process group.
@@ -557,6 +592,9 @@ impl Session {
     /// guarantee the job is dead — call `JobHandle::wait_with_timeout`
     /// after this to confirm. If the session itself is closed, returns
     /// `Err`.
+    /// Send `SIGKILL` to a previously-spawned job's entire process group.
+    /// On Linux (pipe mode) this is not yet supported and returns an error.
+    #[cfg(not(target_os = "linux"))]
     pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
         let stdin = self
             .stdin
@@ -564,9 +602,6 @@ impl Session {
             .ok_or_else(|| Error::exec("session is closed"))?;
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
         let guest_dir = GUEST_CAPTURE_DIR;
-        // `|| true` so a missing pidfile (race: job already exited) doesn't
-        // make bash think the kill failed; we always want to fall through
-        // to the brace-group sentinel.
         let snippet = format!(
             "{{ __sb_d='{guest_dir}' ; if [ -f \"$__sb_d/{pid_name}\" ]; then __sb_kpid=$(cat \"$__sb_d/{pid_name}\" 2>/dev/null) ; if [ -n \"$__sb_kpid\" ]; then kill -KILL -- \"-$__sb_kpid\" 2>/dev/null || true ; fi ; fi ; }}\n",
             guest_dir = guest_dir,
@@ -579,6 +614,16 @@ impl Session {
             .flush()
             .map_err(|e| Error::exec(format!("flush session stdin: {}", e)))?;
         Ok(())
+    }
+
+    /// Send SIGKILL to a pipe-mode job via the init control socket.
+    #[cfg(target_os = "linux")]
+    pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
+        let killer = self
+            .kill_spawn
+            .as_ref()
+            .ok_or_else(|| Error::exec("session is closed"))?;
+        killer(job_id)
     }
 
 
@@ -642,9 +687,7 @@ impl Drop for Session {
 /// alive until you've collected results.)
 pub struct JobHandle {
     id: u64,
-    sid: String,
-    state: Arc<(Mutex<SessionState>, Condvar)>,
-    capture_dir: PathBuf,
+    output: Box<dyn JobOutput>,
     timeout: Duration,
 }
 
@@ -654,15 +697,31 @@ impl JobHandle {
         self.id
     }
 
-    /// Block until the job finishes (or the per-exec timeout elapses).
-    /// Reads its captured stdout/stderr files from the work directory and
-    /// returns them along with the exit code. The temp files are removed.
+    /// Block until the job finishes (or the per-exec timeout elapses)
+    /// and return its captured output.
     pub fn wait(self) -> Result<ExecOutput> {
         self.wait_with_timeout(self.timeout)
     }
 
     /// Like [`wait`](Self::wait) but with an explicit timeout.
     pub fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput> {
+        self.output.wait_with_timeout(timeout)
+    }
+}
+
+/// File-mode [`JobOutput`] implementation for non-Linux platforms.
+/// Reads captured output from per-job files written by the bash script.
+#[cfg(not(target_os = "linux"))]
+struct FileJobOutput {
+    sid: String,
+    id: u64,
+    state: Arc<(Mutex<SessionState>, Condvar)>,
+    capture_dir: PathBuf,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl JobOutput for FileJobOutput {
+    fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput> {
         let deadline = Instant::now() + timeout;
         let (lock, cv) = &*self.state;
         let mut guard = lock

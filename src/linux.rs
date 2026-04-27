@@ -8,7 +8,8 @@ use crate::l4::{self, L4Config, L4Handle};
 use crate::net_observer::{self, ProxyConfig, ProxyHandle};
 use crate::seccomp::generate_bpf_file;
 use crate::{Error, ExecutionResult, Result};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -230,21 +231,6 @@ fn build_bwrap_command_inner(
             cmd.args(["--bind", &src_s, &dst]);
         }
     }
-
-    // Internal capture directory: sandbox-managed, placed AFTER extra_mounts
-    // so "later wins" — even if a caller tries to remap /run/sandbox-jobs, our
-    // internal bind wins. spawn writes per-job capture files here; wait reads
-    // them from the host-side work_dir/.sandbox-jobs/ counterpart. Callers do
-    // NOT need to configure an extra_mount for this path.
-    let sandbox_jobs_host = work_dir.join(".sandbox-jobs");
-    std::fs::create_dir_all(&sandbox_jobs_host)
-        .map_err(|e| Error::exec(format!("create sandbox-jobs dir: {e}")))?;
-    cmd.args(["--dir", "/run"]);
-    cmd.args([
-        "--bind",
-        &sandbox_jobs_host.to_string_lossy(),
-        "/run/sandbox-jobs",
-    ]);
 
     // Hide sensitive dotfiles under HOME. Although we empty-dir /home, a user
     // might mount their HOME explicitly — make sure the dotfiles are blanked.
@@ -746,6 +732,51 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
         })
     });
 
+    // Shared job_id → child_id mapping for kill_job support.
+    let job_map: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Async spawn factory: each call spawns a child that inherits the shell's
+    // cwd/env via `/proc/<pid>/cwd` + `/proc/<pid>/environ`. Returns a
+    // `JobOutput` handle immediately; output is collected on `wait_with_timeout`.
+    let spawn_client = client.clone();
+    let spawn_shell_cid = child_id.clone();
+    let spawn_job_map = job_map.clone();
+    let spawn_async: crate::session::SpawnAsyncFn = Box::new(move |job_id: u64, cmd: &str| {
+        let handle = spawn_client.spawn_pipes_inherit_async(
+            &["/bin/bash", "-c", cmd],
+            &[],
+            None,
+            Some(&spawn_shell_cid),
+        )?;
+        let child_id = handle.child_id().to_string();
+        spawn_job_map
+            .lock()
+            .map_err(|_| Error::exec("job map poisoned"))?
+            .insert(job_id, child_id);
+        Ok(Box::new(PipeJobOutput {
+            handle,
+            _client: spawn_client.clone(),
+        }))
+    });
+
+    // Kill factory: looks up a child_id by job_id and sends SIGKILL via init.
+    let kill_client = client.clone();
+    let kill_job_map = job_map.clone();
+    let kill_spawn: crate::session::KillSpawnFn = Box::new(move |job_id: u64| {
+        let child_id = {
+            let map = kill_job_map
+                .lock()
+                .map_err(|_| Error::exec("job map poisoned"))?;
+            map.get(&job_id).cloned()
+        };
+        if let Some(cid) = child_id {
+            // Best-effort: send SIGKILL, ignore result (child may already be dead).
+            let _ = kill_client.signal(&cid, libc::SIGKILL, true);
+        }
+        // Always return Ok — caller uses wait_with_timeout to confirm death.
+        Ok(())
+    });
+
     Ok(crate::session::ShellHandle {
         stdin: Box::new(stdin),
         stdout: Box::new(stdout_read),
@@ -755,7 +786,29 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
         keepalive,
         open_pty: Some(Arc::new(open_pty)),
         run_oneshot: Some(Arc::new(run_oneshot)),
+        spawn_async: Some(Arc::new(spawn_async)),
+        kill_spawn: Some(Arc::new(kill_spawn)),
     })
+}
+
+/// [`JobOutput`] implementation backed by init's pipe mode.
+/// The [`ChildHandle`] drains stdout/stderr events into memory via the
+/// shared `InitClient` reader thread.
+struct PipeJobOutput {
+    handle: crate::init_client::ChildHandle,
+    /// Keep the `InitClient` alive until wait completes.
+    _client: Arc<crate::init_client::InitClient>,
+}
+
+impl crate::session::JobOutput for PipeJobOutput {
+    fn wait_with_timeout(&self, timeout: std::time::Duration) -> crate::Result<crate::session::ExecOutput> {
+        let (stdout, stderr, code) = self.handle.wait_with_timeout(timeout)?;
+        Ok(crate::session::ExecOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code: code,
+        })
+    }
 }
 
 /// Open a PTY child via the given init client. Used by both
@@ -816,7 +869,7 @@ struct InitLifecycle {
     cv: Condvar,
 }
 
-use std::sync::{Condvar, Mutex};
+use std::sync::Condvar;
 
 struct InitClientStdin {
     client: Arc<crate::init_client::InitClient>,

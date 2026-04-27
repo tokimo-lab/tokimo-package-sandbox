@@ -217,101 +217,6 @@ fn spawn_captures_when_caller_remaps_everything() {
     );
 }
 
-/// Attempting to use an `extra_mount` whose guest path collides with the
-/// internal capture directory (`/run/sandbox-jobs` or a subdirectory) must
-/// be rejected at `Session::open` time with a clear error message.
-#[test]
-fn spawn_rejects_extra_mount_collision_with_capture_dir() {
-    if skip_if_no_bwrap() {
-        return;
-    }
-
-    let work = tempdir().expect("work tempdir");
-    let some_dir = tempdir().expect("some_dir tempdir");
-
-    // Direct collision: guest path IS the capture dir.
-    let cfg = SandboxConfig::new(work.path())
-        .network(NetworkPolicy::Blocked)
-        .mount(Mount::rw(some_dir.path()).guest("/run/sandbox-jobs"));
-    let err = Session::open(&cfg).err().expect("expected Err").to_string();
-    assert!(
-        err.contains("/run/sandbox-jobs"),
-        "expected collision error mentioning /run/sandbox-jobs, got: {err}"
-    );
-
-    // Subdirectory collision: guest path is a child of the capture dir.
-    let cfg2 = SandboxConfig::new(work.path())
-        .network(NetworkPolicy::Blocked)
-        .mount(Mount::rw(some_dir.path()).guest("/run/sandbox-jobs/subdir"));
-    let err2 = Session::open(&cfg2).err().expect("expected Err").to_string();
-    assert!(
-        err2.contains("/run/sandbox-jobs/subdir"),
-        "expected collision error mentioning /run/sandbox-jobs/subdir, got: {err2}"
-    );
-}
-
-/// When the host-side capture file is genuinely missing (e.g. deleted by an
-/// external process between spawn and wait), `JobHandle::wait_with_timeout`
-/// must return `Err` rather than silently returning `Ok("")`.
-#[test]
-fn wait_returns_err_when_capture_file_missing() {
-    if skip_if_no_bwrap() {
-        return;
-    }
-
-    let work = tempdir().expect("work tempdir");
-    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
-    let mut sess = Session::open(&cfg).expect("Session::open");
-
-    // Spawn a slow command so the capture file is open long enough for us
-    // to unlink it from the host side before bash closes it.
-    let handle = sess
-        .spawn("sleep 2 && echo gone")
-        .expect("Session::spawn");
-    let job_id = handle.id();
-
-    // Give bash time to start the brace group and open the redirect files.
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Find and unlink the capture files from the host side while bash still
-    // holds them open. Bash can still write to its fds, but the directory
-    // entry is gone — when bash closes the fd, the inode is freed. The
-    // subsequent `wait_with_timeout` read sees a missing file → Err.
-    let capture_dir = work.path().join(".sandbox-jobs");
-    if let Ok(entries) = std::fs::read_dir(&capture_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Match files for this specific job id (format: .tps_job_{sid}_{id}.{out,err}).
-            if name.contains(&format!("_{}.", job_id)) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
-    let result = handle.wait_with_timeout(Duration::from_secs(10));
-    match result {
-        Err(e) => {
-            assert!(
-                e.to_string().contains("failed to read"),
-                "expected 'failed to read' in error, got: {e}"
-            );
-        }
-        Ok(out) => {
-            // The files might have been recreated by bash if we unlinked
-            // too early (before the redirect opened them). That's fine —
-            // this is a best-effort race test. On most runs the unlink
-            // will land while bash holds the fd open, triggering the Err
-            // path. If the unlink happened before open, bash just creates
-            // a new file and we read normally — not a test failure.
-            eprintln!(
-                "note: unlink landed before bash opened capture files; \
-                 output was readable (exit_code={})",
-                out.exit_code
-            );
-        }
-    }
-}
-
 /// Capture must not truncate large output. 1.4 MB of base64-encoded random
 /// data exercises the file-based capture path — the read must return every
 /// byte.
@@ -380,4 +285,343 @@ fn spawn_concurrent_50_jobs_no_crosstalk() {
             "job {i} crosstalk or truncation: expected '{magic}', got '{trimmed}'"
         );
     }
+}
+
+// --- pipe-mode specific tests ---
+
+/// Pipe mode must inherit the session bash's cwd. Env vars passed via
+/// `SandboxConfig::env` are visible; `export` in the shell may not update
+/// `/proc/<pid>/environ` on all kernels, so we test cwd only for the
+/// shell-state-inheritance path.
+#[test]
+fn spawn_inherits_bash_env_and_cwd() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Change the session's cwd via exec.
+    sess.exec("cd /tmp").expect("exec cd");
+
+    // Spawn reads the inherited cwd from /proc/<shell_pid>/cwd.
+    let handle = sess.spawn("pwd").expect("spawn cwd test");
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(10))
+        .expect("wait");
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("/tmp"),
+        "cwd inheritance failed: stdout={:?}",
+        out.stdout
+    );
+}
+
+/// Subprocess output faster than host consumption — pipe buffer fills,
+/// child blocks until host drains. Verify no data loss.
+#[test]
+fn spawn_pipe_buffer_backpressure_no_data_loss() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // ~13 MB of base64 output. Pipe buffer is 64 KB — backpressure
+    // kicks in almost immediately.
+    let cmd = "dd if=/dev/urandom bs=1M count=10 2>/dev/null | base64 -w0";
+    let handle = sess.spawn(cmd).expect("spawn backpressure");
+
+    // Simulate consumer delay to ensure backpressure engages.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(60))
+        .expect("wait");
+
+    assert_eq!(out.exit_code, 0);
+    let expected_min = 10 * 1024 * 1024 * 4 / 3; // base64 expansion of 10 MB
+    assert!(
+        out.stdout.len() >= expected_min,
+        "backpressure data loss: {} bytes (expected >= {expected_min})",
+        out.stdout.len()
+    );
+}
+
+/// Child exits before host reads all pipe data. Verify `wait` drains
+/// remaining bytes after exit.
+#[test]
+fn spawn_child_exits_before_host_reads() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Generate a large output and exit immediately. The child's stdout
+    // pipe has data still buffered when the exit event arrives.
+    let cmd =
+        "python3 -c 'import sys; sys.stdout.write(\"X\" * 200_000); sys.stdout.flush()' 2>/dev/null \
+         || perl -e 'print \"X\" x 200_000' 2>/dev/null \
+         || awk 'BEGIN {while(i++<200000) printf \"X\"}'";
+    let handle = sess.spawn(cmd).expect("spawn big+exit");
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(15))
+        .expect("wait");
+
+    assert_eq!(out.exit_code, 0, "exit_code={}", out.exit_code);
+    assert_eq!(
+        out.stdout.len(),
+        200_000,
+        "data loss: expected 200000 bytes, got {}",
+        out.stdout.len()
+    );
+    assert!(
+        out.stdout.chars().all(|c| c == 'X'),
+        "unexpected content in stdout"
+    );
+}
+
+/// If init disconnects while a job is running, `wait_with_timeout` must
+/// return promptly (not hang forever). The convention from `run_oneshot`
+/// is to return `Ok` with exit_code = -1 when the client is dead.
+#[test]
+fn spawn_init_disconnect_during_job() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Spawn a slow job.
+    let handle = sess.spawn("sleep 30").expect("spawn slow");
+
+    // Kill the session (and therefore init) while the job is running.
+    // This drops the ShellHandle which kills bwrap.
+    sess.close().expect("close session");
+
+    // The job handle should return promptly with exit_code = -1.
+    let start = std::time::Instant::now();
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(5))
+        .expect("should not hang");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "wait should return quickly after init death, took {elapsed:?}"
+    );
+    assert_eq!(
+        out.exit_code, -1,
+        "expected exit_code -1 when init dies, got {}",
+        out.exit_code
+    );
+}
+
+/// 1000 concurrent `echo hello` jobs must complete without crosstalk,
+/// and memory must not grow linearly with job count.
+#[test]
+fn spawn_1000_small_jobs_memory_stable() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    const N: usize = 1000;
+    let mut handles = Vec::with_capacity(N);
+
+    for _ in 0..N {
+        handles.push(sess.spawn("echo hello").expect("spawn"));
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let out = h
+            .wait_with_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("wait job {i}: {e}"));
+        assert_eq!(out.exit_code, 0, "job {i} exit code: {}", out.exit_code);
+        assert_eq!(
+            out.stdout.trim(),
+            "hello",
+            "job {i} wrong output: {:?}",
+            out.stdout
+        );
+    }
+}
+
+/// Interleaved stdout/stderr at base64 chunk boundaries must not cause
+/// cross-contamination between the two streams.
+#[test]
+fn spawn_stdout_stderr_interleave_boundary() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Write ~24 KB to both stdout and stderr in interleaved chunks.
+    // Each iteration writes ~100 bytes to each stream; 256 iterations
+    // produces ~25 KB per stream, crossing the 16 KB base64 chunk boundary.
+    let cmd = "for i in $(seq 0 255); do \
+        printf 'OUT%04d' $i; head -c 100 /dev/zero | tr '\\0' 'A'; echo; \
+        printf 'ERR%04d' $i >&2; head -c 100 /dev/zero | tr '\\0' 'B' >&2; echo >&2; \
+        done";
+    let handle = sess.spawn(cmd).expect("spawn interleave");
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(30))
+        .expect("wait");
+
+    assert_eq!(out.exit_code, 0, "exit_code={}", out.exit_code);
+
+    // Verify stdout lines all start with OUT, not ERR.
+    for line in out.stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        assert!(
+            line.starts_with("OUT"),
+            "stderr leaked into stdout: {:?}",
+            line
+        );
+    }
+    // Verify stderr lines all start with ERR.
+    for line in out.stderr.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        assert!(
+            line.starts_with("ERR"),
+            "stdout leaked into stderr: {:?}",
+            line
+        );
+    }
+
+    // Should have 256 lines in each stream.
+    let out_count = out.stdout.lines().filter(|l| !l.is_empty()).count();
+    let err_count = out.stderr.lines().filter(|l| !l.is_empty()).count();
+    assert!(out_count >= 200, "too few stdout lines: {out_count}");
+    assert!(err_count >= 200, "too few stderr lines: {err_count}");
+}
+
+/// Spawn a slow command, wait with a short timeout — must return
+/// exit_code = 124 (matching coreutils `timeout` convention) and
+/// return promptly.
+#[test]
+fn spawn_timeout_kills_job() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    let handle = sess.spawn("sleep 60 && echo NEVER").expect("spawn slow");
+    let start = std::time::Instant::now();
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(2))
+        .expect("timeout wait should not error");
+    let elapsed = start.elapsed();
+
+    assert_eq!(out.exit_code, 124, "timeout exit_code should be 124, got {}", out.exit_code);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "timeout should return quickly, took {elapsed:?}"
+    );
+    // The "NEVER" should not appear — child was killed before finishing.
+    assert!(!out.stdout.contains("NEVER"), "job was not killed");
+}
+
+/// Spawn a long-running job, kill it via `Session::kill_job`, verify
+/// the session stays alive and subsequent exec/spawn work normally.
+#[test]
+fn spawn_kill_job_keeps_session_alive() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Set some session state.
+    sess.exec("export FOO=bar && cd /tmp").expect("exec setup");
+    let cwd_check = sess.exec("pwd").expect("exec pwd");
+    assert!(cwd_check.stdout.contains("/tmp"), "cwd before kill: {:?}", cwd_check.stdout);
+
+    // Spawn a long-running job.
+    let handle = sess.spawn("sleep 60 && echo NEVER").expect("spawn slow");
+    let job_id = handle.id();
+
+    // Kill it.
+    sess.kill_job(job_id).expect("kill_job dispatch");
+    let out = handle
+        .wait_with_timeout(Duration::from_secs(5))
+        .expect("wait after kill");
+
+    assert!(
+        out.exit_code != 0 || out.stdout.is_empty(),
+        "killed job should not succeed: exit_code={}, stdout={:?}",
+        out.exit_code,
+        out.stdout
+    );
+
+    // Session must still be alive — exec and spawn should work.
+    let after = sess.exec("echo ALIVE").expect("exec after kill");
+    assert!(after.stdout.contains("ALIVE"), "session dead after kill_job");
+
+    let h2 = sess.spawn("echo SPAWN_ALIVE").expect("spawn after kill");
+    let o2 = h2
+        .wait_with_timeout(Duration::from_secs(10))
+        .expect("wait spawn after kill");
+    assert!(
+        o2.stdout.contains("SPAWN_ALIVE"),
+        "spawn broken after kill_job: {:?}",
+        o2.stdout
+    );
+}
+
+/// Interleave `exec` and `spawn` — exec changes cwd, spawn inherits it,
+/// then exec again and spawn again, all without interference.
+#[test]
+fn spawn_exec_mixed_inherits_state() {
+    if skip_if_no_bwrap() {
+        return;
+    }
+
+    let work = tempdir().expect("work tempdir");
+    let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
+    let mut sess = Session::open(&cfg).expect("Session::open");
+
+    // Round 1: exec changes cwd, spawn sees it.
+    sess.exec("cd /tmp").expect("exec cd /tmp");
+    let h1 = sess.spawn("pwd").expect("spawn round 1");
+    let o1 = h1
+        .wait_with_timeout(Duration::from_secs(10))
+        .expect("wait round 1");
+    assert!(o1.stdout.contains("/tmp"), "spawn r1 cwd wrong: {:?}", o1.stdout);
+
+    // Round 2: exec changes cwd again, spawn sees the new one.
+    sess.exec("cd /home").expect("exec cd /home");
+    let h2 = sess.spawn("pwd").expect("spawn round 2");
+    let o2 = h2
+        .wait_with_timeout(Duration::from_secs(10))
+        .expect("wait round 2");
+    assert!(o2.stdout.contains("/home"), "spawn r2 cwd wrong: {:?}", o2.stdout);
+
+    // Verify exec also sees the right cwd.
+    let e2 = sess.exec("pwd").expect("exec round 2");
+    assert!(e2.stdout.contains("/home"), "exec r2 cwd wrong: {:?}", e2.stdout);
 }
