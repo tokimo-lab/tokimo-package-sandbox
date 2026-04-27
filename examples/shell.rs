@@ -74,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cmd.args(["--unshare-net"]); // blocked by default
     cmd.args(["--clearenv"]);
     cmd.args([
-        "--setenv", "PATH",
+        "--setenv",
+        "PATH",
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ]);
     cmd.args(["--setenv", "HOME", "/tmp"]);
@@ -165,10 +166,7 @@ fn build_interactive_profile(work_dir: &Path) -> String {
 
     // File write: deny all, allow work_dir + macOS ephemerals.
     p.push_str("(deny file-write*)\n");
-    p.push_str(&format!(
-        "(allow file-write* (subpath \"{}\"))\n",
-        escape_sb(&work_s)
-    ));
+    p.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", escape_sb(&work_s)));
     p.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
     p.push_str("(allow file-write* (subpath \"/var/folders\"))\n");
     // Allow writing to /dev/pts/* for terminal interaction.

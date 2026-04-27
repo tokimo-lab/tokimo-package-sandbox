@@ -81,7 +81,7 @@ pub fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionRes
     }
     #[cfg(target_os = "windows")]
     {
-        return windows::run(cmd, cfg);
+        windows::run(cmd, cfg)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {

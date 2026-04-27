@@ -9,8 +9,6 @@
 //!      sandbox within WSL.
 //!   3. If WSL itself is unavailable, we refuse execution.
 
-#![cfg(target_os = "windows")]
-
 use crate::config::{NetworkPolicy, SandboxConfig};
 use crate::{Error, ExecutionResult, Result};
 

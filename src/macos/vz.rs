@@ -24,10 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SerialPortConfiguration,
-    SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration, VirtualMachineConfiguration, VirtualMachineState,
-    is_supported,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SerialPortConfiguration, SharedDirectory,
+    SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration, VirtualMachineConfiguration,
+    VirtualMachineState, is_supported,
 };
 
 use crate::config::SandboxConfig;
@@ -101,126 +100,120 @@ pub(crate) fn spawn_session_shell(_cfg: &SandboxConfig) -> Result<crate::session
 
 /// Boot a VM, pass command via kernel cmdline, read result from shared files.
 fn exec_vm(cfg: &SandboxConfig, cmd_b64: &str) -> Result<ExecutionResult> {
-        if !is_supported() {
-            return Err(Error::validation(
-                "Virtualization.framework not available (requires macOS 11+)",
-            ));
+    if !is_supported() {
+        return Err(Error::validation(
+            "Virtualization.framework not available (requires macOS 11+)",
+        ));
+    }
+
+    let kernel_path = find_kernel()?;
+    let initrd_path = find_initrd()?;
+    let rootfs_path = find_rootfs(cfg)?;
+    let memory_mb: u64 = std::env::var("TOKIMO_VZ_MEMORY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MEMORY_MB);
+    let cpu_count: usize = std::env::var("TOKIMO_VZ_CPUS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CPUS);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| Error::exec(format!("tokio runtime: {e}")))?;
+
+    let cmd_b64 = cmd_b64.to_string();
+    let rootfs_s = rootfs_path.to_string_lossy().into_owned();
+    let kernel_s = kernel_path.to_string_lossy().into_owned();
+    let initrd_s = initrd_path.to_string_lossy().into_owned();
+    let rootfs_result = rootfs_path.clone();
+
+    let result: Result<ExecutionResult> = rt.block_on(async {
+        let mut boot_loader =
+            LinuxBootLoader::new(&kernel_s).map_err(|e| Error::exec(format!("LinuxBootLoader: {e}")))?;
+        boot_loader
+            .set_initial_ramdisk(&initrd_s)
+            .set_command_line(&format!("console=hvc0 quiet loglevel=3 run={cmd_b64}"));
+
+        let shared_dir =
+            SharedDirectory::new(&rootfs_s, false).map_err(|e| Error::exec(format!("SharedDirectory: {e}")))?;
+        let single_share =
+            SingleDirectoryShare::new(shared_dir).map_err(|e| Error::exec(format!("SingleDirectoryShare: {e}")))?;
+        let mut fs_config = VirtioFileSystemDeviceConfiguration::new("work")
+            .map_err(|e| Error::exec(format!("VirtioFileSystemDevice: {e}")))?;
+        fs_config.set_share(single_share);
+
+        let serial = SerialPortConfiguration::virtio_console().map_err(|e| Error::exec(format!("SerialPort: {e}")))?;
+        let serial_fd_raw = serial.read_fd();
+
+        let mut config = VirtualMachineConfiguration::new().map_err(|e| Error::exec(format!("VM config: {e}")))?;
+        config
+            .set_cpu_count(cpu_count)
+            .set_memory_size(memory_mb * 1024 * 1024)
+            .set_platform(GenericPlatform::new().map_err(|e| Error::exec(format!("Platform: {e}")))?)
+            .set_boot_loader(boot_loader)
+            .add_entropy_device(EntropyDeviceConfiguration::new().map_err(|e| Error::exec(format!("Entropy: {e}")))?)
+            .add_socket_device(SocketDeviceConfiguration::new().map_err(|e| Error::exec(format!("Socket: {e}")))?)
+            .add_serial_port(serial)
+            .add_directory_share(fs_config);
+
+        let vm = config.build().map_err(|e| Error::exec(format!("VM build: {e}")))?;
+
+        tracing::info!(kernel=%kernel_s, initrd=%initrd_s, rootfs=%rootfs_s, "Booting VZ VM");
+
+        vm.start().await.map_err(|e| Error::exec(format!("VM start: {e}")))?;
+
+        if vm.state() != VirtualMachineState::Running {
+            return Err(Error::exec(format!("VM state: {:?}", vm.state())));
         }
 
-        let kernel_path = find_kernel()?;
-        let initrd_path = find_initrd()?;
-        let rootfs_path = find_rootfs(cfg)?;
-        let memory_mb: u64 = std::env::var("TOKIMO_VZ_MEMORY")
+        // Drain serial for debugging (non-blocking poll).
+        if let Some(fd) = serial_fd_raw {
+            drain_serial_debug(fd);
+        }
+
+        // Wait for VM to stop (initrd calls poweroff -f after command).
+        // Use a panic hook to catch ObjC exceptions during state polling.
+        let deadline = std::time::Instant::now() + EXEC_TIMEOUT + Duration::from_secs(10);
+        let vm_arc = Arc::new(vm);
+        let vm_ref = vm_arc.clone();
+        loop {
+            let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm_ref.state()));
+            match state {
+                Ok(VirtualMachineState::Stopped) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if std::time::Instant::now() > deadline {
+                tracing::warn!("VM timeout");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        tracing::info!("VM stopped, reading results...");
+
+        // Read results from virtiofs-shared files (written by initrd).
+        let stdout = std::fs::read_to_string(rootfs_result.join(".vz_stdout")).unwrap_or_default();
+        let stderr = std::fs::read_to_string(rootfs_result.join(".vz_stderr")).unwrap_or_default();
+        let exit_code = std::fs::read_to_string(rootfs_result.join(".vz_exit_code"))
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MEMORY_MB);
-        let cpu_count: usize = std::env::var("TOKIMO_VZ_CPUS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_CPUS);
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(-1);
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|e| Error::exec(format!("tokio runtime: {e}")))?;
+        // Clean up temp files.
+        let _ = std::fs::remove_file(rootfs_result.join(".vz_stdout"));
+        let _ = std::fs::remove_file(rootfs_result.join(".vz_stderr"));
+        let _ = std::fs::remove_file(rootfs_result.join(".vz_exit_code"));
 
-        let cmd_b64 = cmd_b64.to_string();
-        let rootfs_s = rootfs_path.to_string_lossy().into_owned();
-        let kernel_s = kernel_path.to_string_lossy().into_owned();
-        let initrd_s = initrd_path.to_string_lossy().into_owned();
-        let rootfs_result = rootfs_path.clone();
-
-        let result: Result<ExecutionResult> = rt.block_on(async {
-            let mut boot_loader = LinuxBootLoader::new(&kernel_s)
-                .map_err(|e| Error::exec(format!("LinuxBootLoader: {e}")))?;
-            boot_loader
-                .set_initial_ramdisk(&initrd_s)
-                .set_command_line(&format!(
-                    "console=hvc0 quiet loglevel=3 run={cmd_b64}"
-                ));
-
-            let shared_dir = SharedDirectory::new(&rootfs_s, false)
-                .map_err(|e| Error::exec(format!("SharedDirectory: {e}")))?;
-            let single_share = SingleDirectoryShare::new(shared_dir)
-                .map_err(|e| Error::exec(format!("SingleDirectoryShare: {e}")))?;
-            let mut fs_config = VirtioFileSystemDeviceConfiguration::new("work")
-                .map_err(|e| Error::exec(format!("VirtioFileSystemDevice: {e}")))?;
-            fs_config.set_share(single_share);
-
-            let serial = SerialPortConfiguration::virtio_console()
-                .map_err(|e| Error::exec(format!("SerialPort: {e}")))?;
-            let serial_fd_raw = serial.read_fd();
-
-            let mut config = VirtualMachineConfiguration::new()
-                .map_err(|e| Error::exec(format!("VM config: {e}")))?;
-            config
-                .set_cpu_count(cpu_count)
-                .set_memory_size(memory_mb * 1024 * 1024)
-                .set_platform(GenericPlatform::new().map_err(|e| Error::exec(format!("Platform: {e}")))?)
-                .set_boot_loader(boot_loader)
-                .add_entropy_device(EntropyDeviceConfiguration::new().map_err(|e| Error::exec(format!("Entropy: {e}")))?)
-                .add_socket_device(SocketDeviceConfiguration::new().map_err(|e| Error::exec(format!("Socket: {e}")))?)
-                .add_serial_port(serial)
-                .add_directory_share(fs_config);
-
-            let vm = config.build().map_err(|e| Error::exec(format!("VM build: {e}")))?;
-
-            tracing::info!(kernel=%kernel_s, initrd=%initrd_s, rootfs=%rootfs_s, "Booting VZ VM");
-
-            vm.start().await.map_err(|e| Error::exec(format!("VM start: {e}")))?;
-
-            if vm.state() != VirtualMachineState::Running {
-                return Err(Error::exec(format!("VM state: {:?}", vm.state())));
-            }
-
-            // Drain serial for debugging (non-blocking poll).
-            if let Some(fd) = serial_fd_raw {
-                drain_serial_debug(fd);
-            }
-
-            // Wait for VM to stop (initrd calls poweroff -f after command).
-            // Use a panic hook to catch ObjC exceptions during state polling.
-            let deadline = std::time::Instant::now() + EXEC_TIMEOUT + Duration::from_secs(10);
-            let vm_arc = Arc::new(vm);
-            let vm_ref = vm_arc.clone();
-            loop {
-                let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    vm_ref.state()
-                }));
-                match state {
-                    Ok(VirtualMachineState::Stopped) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if std::time::Instant::now() > deadline {
-                    tracing::warn!("VM timeout");
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-
-            tracing::info!("VM stopped, reading results...");
-
-            // Read results from virtiofs-shared files (written by initrd).
-            let stdout = std::fs::read_to_string(rootfs_result.join(".vz_stdout")).unwrap_or_default();
-            let stderr = std::fs::read_to_string(rootfs_result.join(".vz_stderr")).unwrap_or_default();
-            let exit_code = std::fs::read_to_string(rootfs_result.join(".vz_exit_code"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok())
-                .unwrap_or(-1);
-
-            // Clean up temp files.
-            let _ = std::fs::remove_file(rootfs_result.join(".vz_stdout"));
-            let _ = std::fs::remove_file(rootfs_result.join(".vz_stderr"));
-            let _ = std::fs::remove_file(rootfs_result.join(".vz_exit_code"));
-
-            Ok(ExecutionResult {
-                stdout,
-                stderr,
-                exit_code,
-                timed_out: false,
-                oom_killed: false,
-            })
-        });
+        Ok(ExecutionResult {
+            stdout,
+            stderr,
+            exit_code,
+            timed_out: false,
+            oom_killed: false,
+        })
+    });
 
     result
 }
@@ -259,54 +252,74 @@ fn drain_serial_debug(fd: i32) {
 fn find_kernel() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_KERNEL") {
         let pb = PathBuf::from(&p);
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
         return Err(Error::exec(format!("TOKIMO_VZ_KERNEL={} not found", pb.display())));
     }
     if let Ok(home) = std::env::var("HOME") {
         let pb = PathBuf::from(&home).join(".tokimo/kernel/vmlinuz");
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in &["vmlinuz", "bzImage", "kernel"] {
                 let pb = dir.join(name);
-                if pb.exists() { return Ok(pb); }
+                if pb.exists() {
+                    return Ok(pb);
+                }
             }
         }
     }
-    Err(Error::validation("VZ kernel not found. Set TOKIMO_VZ_KERNEL=/path/to/vmlinuz"))
+    Err(Error::validation(
+        "VZ kernel not found. Set TOKIMO_VZ_KERNEL=/path/to/vmlinuz",
+    ))
 }
 
 fn find_initrd() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_INITRD") {
         let pb = PathBuf::from(&p);
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
         return Err(Error::exec(format!("TOKIMO_VZ_INITRD={} not found", pb.display())));
     }
     if let Ok(home) = std::env::var("HOME") {
         let pb = PathBuf::from(&home).join(".tokimo/initrd.img");
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in &["initrd.img", "initramfs.cpio.gz", "initrd"] {
                 let pb = dir.join(name);
-                if pb.exists() { return Ok(pb); }
+                if pb.exists() {
+                    return Ok(pb);
+                }
             }
         }
     }
-    Err(Error::validation("VZ initrd not found. Set TOKIMO_VZ_INITRD=/path/to/initrd.img"))
+    Err(Error::validation(
+        "VZ initrd not found. Set TOKIMO_VZ_INITRD=/path/to/initrd.img",
+    ))
 }
 
 fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_ROOTFS") {
         let pb = PathBuf::from(&p);
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
         return Err(Error::exec(format!("TOKIMO_VZ_ROOTFS={} not found", pb.display())));
     }
     if let Ok(home) = std::env::var("HOME") {
         let pb = PathBuf::from(&home).join(".tokimo/rootfs");
-        if pb.exists() { return Ok(pb); }
+        if pb.exists() {
+            return Ok(pb);
+        }
     }
     // Fall back to cfg.work_dir — caller may have rootfs there.
     if cfg.work_dir.join("usr").exists() {
