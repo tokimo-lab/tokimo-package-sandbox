@@ -72,17 +72,14 @@ impl HostPattern {
 /// the proxy resolves hostnames itself, so DNS visibility is via HTTP/SNI
 /// events. Kept in the API so callers can configure the future slirp4netns
 /// path without source changes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum DnsPolicy {
-    Resolver { upstream: Vec<SocketAddr> },
+    Resolver {
+        upstream: Vec<SocketAddr>,
+    },
+    #[default]
     PassThrough,
     Blocked,
-}
-
-impl Default for DnsPolicy {
-    fn default() -> Self {
-        DnsPolicy::PassThrough
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

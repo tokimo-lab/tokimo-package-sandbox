@@ -73,6 +73,7 @@ pub(crate) fn build_bwrap_command(inner_argv: &[&str], cfg: &SandboxConfig) -> R
 /// argv just before the `inner_argv` (i.e., after all standard mounts, env,
 /// seccomp, etc.). Used by `spawn_init` to add `--as-pid-1` and the init
 /// binary / control socket bind mounts.
+#[allow(dead_code)] // Currently only used via build_bwrap_command_with_extras_inner
 pub(crate) fn build_bwrap_command_with_extras(
     inner_argv: &[&str],
     cfg: &SandboxConfig,
@@ -887,7 +888,7 @@ impl std::io::Write for InitClientStdin {
         for chunk in buf.chunks(32 * 1024) {
             self.client
                 .write(&self.child_id, chunk)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         Ok(buf.len())
     }

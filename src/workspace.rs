@@ -129,6 +129,10 @@ pub struct UserHandle {
 /// [`Workspace::add_user`]; each gets an independent bash shell with
 /// isolated `$TMPDIR` and working directory.
 pub struct Workspace {
+    /// Holds the spawned init process. Never directly read but must be kept alive
+    /// for the entire lifetime of the workspace. On drop, triggers cleanup via
+    /// bwrap's PDEATHSIG.
+    #[allow(dead_code)]
     spawned: SpawnedInit,
     users: HashMap<String, UserHandle>,
     host_sock: PathBuf,

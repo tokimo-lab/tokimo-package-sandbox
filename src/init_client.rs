@@ -442,8 +442,8 @@ impl InitClient {
     ///
     /// This is a convenience wrapper around `spawn_pipes` + `wait_for_event`
     /// + `drain_stdout/stderr` + `take_exit`. It does **not** hold any
-    /// mutex — multiple concurrent callers can `run_oneshot` independently
-    /// because each call has its own `child_id`.
+    ///   mutex — multiple concurrent callers can `run_oneshot` independently
+    ///   because each call has its own `child_id`.
     pub fn run_oneshot(
         &self,
         argv: &[&str],

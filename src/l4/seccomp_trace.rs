@@ -361,7 +361,7 @@ pub(crate) fn start_parent(
                 libc::ptrace(
                     PTRACE_SEIZE as _,
                     child_pid,
-                    0 as *mut libc::c_void,
+                    std::ptr::null_mut::<libc::c_void>(),
                     options as usize as *mut libc::c_void,
                 )
             };
@@ -470,7 +470,7 @@ fn run_tracer_loop(main_pid: i32, cfg: L4Config, shutdown: Shutdown, exit_tx: Se
                 libc::ptrace(
                     PTRACE_GETEVENTMSG as _,
                     pid,
-                    0 as *mut libc::c_void,
+                    std::ptr::null_mut::<libc::c_void>(),
                     &mut new_pid as *mut libc::c_long as *mut libc::c_void,
                 )
             };
@@ -563,7 +563,7 @@ fn handle_seccomp_event(pid: i32, cfg: &L4Config) {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let (sockaddr_ptr, addrlen, proto): (u64, usize, Proto) = { return };
 
-    if sockaddr_ptr == 0 || addrlen < 2 || addrlen > 128 {
+    if sockaddr_ptr == 0 || !(2..=128).contains(&addrlen) {
         tracing::debug!("l4-trace: skip addr_ptr=0x{:x} len={}", sockaddr_ptr, addrlen);
         return;
     }

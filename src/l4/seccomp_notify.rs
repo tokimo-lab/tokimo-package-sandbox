@@ -446,7 +446,7 @@ pub(crate) fn start_parent(pending: Pending, cfg: L4Config) -> io::Result<Seccom
     let thread = thread::Builder::new()
         .name("tokimo-l4-notify".into())
         .spawn(move || run_notify_loop(listener_fd, cfg, shutdown_thread))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     Ok(SeccompNotifyHandle {
         shutdown,
@@ -479,15 +479,12 @@ fn recv_listener_fd(sp_parent: RawFd) -> io::Result<RawFd> {
     let cmsg = cbuf.as_ptr() as *const libc::cmsghdr;
     unsafe {
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "expected SCM_RIGHTS from pre_exec",
-            ));
+            return Err(io::Error::other("expected SCM_RIGHTS from pre_exec"));
         }
         let data_ptr = libc_cmsg_data(cmsg) as *const libc::c_int;
         let fd = *data_ptr as RawFd;
         if fd < 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "bad listener fd"));
+            return Err(io::Error::other("bad listener fd"));
         }
         Ok(fd)
     }

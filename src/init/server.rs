@@ -536,15 +536,10 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             })();
             ack(bf, id, res);
         }
-        Op::Wait { id, child_id } => {
+        Op::Wait { id, child_id: _ } => {
             // v1: synchronous Wait returns immediately if child already gone,
             // otherwise just acks (Exit event will follow when reaper sees it).
-            let already = !state.children.contains_key(&child_id);
-            if already {
-                ack(bf, id, Ok(()));
-            } else {
-                ack(bf, id, Ok(()));
-            }
+            ack(bf, id, Ok(()));
         }
         Op::Close { id, child_id } => {
             let res = (|| -> Result<(), ErrorReply> {
@@ -802,7 +797,7 @@ fn spawn_child_inner(
 fn merge_env(base: &[(String, String)], overlay: &[(String, String)]) -> Vec<(String, String)> {
     let mut out: HashMap<String, String> = base.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (k, v) in overlay {
-        if PROTECTED_ENV.iter().any(|p| *p == k.as_str()) {
+        if PROTECTED_ENV.contains(&k.as_str()) {
             // Silently drop; child still gets the base value. (We could
             // surface this as an error but plan §11 lists EnvProtected as
             // a per-spawn outcome, so refuse rather than silently merge for

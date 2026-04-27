@@ -7,9 +7,10 @@ use std::sync::Arc;
 use crate::net_observer::{DnsPolicy, HostPattern, NetEventSink};
 
 /// Network policy inside the sandbox.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum NetworkPolicy {
     /// No network access at all. On Linux this uses a private network namespace.
+    #[default]
     Blocked,
     /// Share the host network namespace. The sandbox can reach everything
     /// the host can reach.
@@ -56,12 +57,6 @@ impl std::fmt::Debug for NetworkPolicy {
                 .field("dns_policy", dns_policy)
                 .finish_non_exhaustive(),
         }
-    }
-}
-
-impl Default for NetworkPolicy {
-    fn default() -> Self {
-        NetworkPolicy::Blocked
     }
 }
 

@@ -73,7 +73,7 @@ pub fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionRes
 
     #[cfg(target_os = "linux")]
     {
-        return linux::run(cmd, cfg);
+        linux::run(cmd, cfg)
     }
     #[cfg(target_os = "macos")]
     {
