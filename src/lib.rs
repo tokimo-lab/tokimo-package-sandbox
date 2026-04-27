@@ -39,7 +39,7 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
+pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
 pub use error::{Error, Result};
 pub use net_observer::{
     DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict,

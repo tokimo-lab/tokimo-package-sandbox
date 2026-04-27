@@ -121,6 +121,23 @@ impl ResourceLimits {
     }
 }
 
+/// Controls the default system layout that the sandbox prepares before
+/// applying `extra_mounts`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SystemLayout {
+    /// Bind read-only `/usr /lib /lib64 /bin /sbin` and a curated set of
+    /// `/etc` files from the host, plus create empty `/home` and `/root`
+    /// directories. This is the historical behavior and works well for
+    /// quick one-shot sandboxes that want to reuse the host's tooling.
+    #[default]
+    HostShared,
+    /// Skip all default host bind mounts and directory stubs. The caller is
+    /// responsible for providing a complete rootfs via `extra_mounts`
+    /// (typically by pointing read-only mounts at a packaged rootfs and
+    /// per-instance read-write mounts at writable subtrees).
+    CallerProvided,
+}
+
 /// A single bind mount request.
 #[derive(Debug, Clone)]
 pub struct Mount {
@@ -176,6 +193,10 @@ pub struct SandboxConfig {
     pub extra_mounts: Vec<Mount>,
     pub network: NetworkPolicy,
     pub limits: ResourceLimits,
+    /// Controls whether the sandbox prepares a host-shared default layout
+    /// (`/usr`, `/lib`, `/etc/*`, …) before applying `extra_mounts`. Defaults
+    /// to [`SystemLayout::HostShared`] for backward compatibility.
+    pub system_layout: SystemLayout,
     /// Environment variables passed to the child. `PATH` gets a sensible
     /// default if not provided.
     pub env: Vec<(OsString, OsString)>,
@@ -196,6 +217,7 @@ impl SandboxConfig {
             extra_mounts: Vec::new(),
             network: NetworkPolicy::default(),
             limits: ResourceLimits::default(),
+            system_layout: SystemLayout::default(),
             env: Vec::new(),
             stdin: None,
             cwd: None,
@@ -212,6 +234,10 @@ impl SandboxConfig {
     }
     pub fn limits(mut self, l: ResourceLimits) -> Self {
         self.limits = l;
+        self
+    }
+    pub fn system_layout(mut self, layout: SystemLayout) -> Self {
+        self.system_layout = layout;
         self
     }
     pub fn mount(mut self, m: Mount) -> Self {

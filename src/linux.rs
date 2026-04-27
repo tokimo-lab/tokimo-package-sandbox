@@ -3,7 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::common::{pipe_stdio, spawn_run, which};
-use crate::config::{NetworkPolicy, SandboxConfig};
+use crate::config::{NetworkPolicy, SandboxConfig, SystemLayout};
 use crate::l4::{self, L4Config, L4Handle};
 use crate::net_observer::{self, ProxyConfig, ProxyHandle};
 use crate::seccomp::generate_bpf_file;
@@ -181,32 +181,40 @@ fn build_bwrap_command_inner(
     cmd.args(["--unshare-all", "--die-with-parent"]);
 
     // Read-only system trees (so /bin/sh, /usr/bin/rm, etc. exist).
-    for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-        if Path::new(p).exists() {
-            cmd.args(["--ro-bind", p, p]);
+    match cfg.system_layout {
+        SystemLayout::HostShared => {
+            for p in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
+                if Path::new(p).exists() {
+                    cmd.args(["--ro-bind", p, p]);
+                }
+            }
+
+            // Minimal /etc pieces for DNS + TLS to keep bash/common tools working.
+            for etc in [
+                "/etc/ld.so.cache",
+                "/etc/ld.so.conf",
+                "/etc/ld.so.conf.d",
+                "/etc/resolv.conf",
+                "/etc/nsswitch.conf",
+                "/etc/hosts",
+                "/etc/ssl/certs",
+                "/etc/ca-certificates.conf",
+                "/etc/alternatives",
+            ] {
+                if Path::new(etc).exists() {
+                    cmd.args(["--ro-bind", etc, etc]);
+                }
+            }
+
+            // Empty HOME + /root so anything written there dies with the sandbox.
+            cmd.args(["--dir", "/home"]);
+            cmd.args(["--dir", "/root"]);
+        }
+        SystemLayout::CallerProvided => {
+            // Caller is responsible for providing the full rootfs via
+            // `extra_mounts`; skip all default host bind mounts.
         }
     }
-
-    // Minimal /etc pieces for DNS + TLS to keep bash/common tools working.
-    for etc in [
-        "/etc/ld.so.cache",
-        "/etc/ld.so.conf",
-        "/etc/ld.so.conf.d",
-        "/etc/resolv.conf",
-        "/etc/nsswitch.conf",
-        "/etc/hosts",
-        "/etc/ssl/certs",
-        "/etc/ca-certificates.conf",
-        "/etc/alternatives",
-    ] {
-        if Path::new(etc).exists() {
-            cmd.args(["--ro-bind", etc, etc]);
-        }
-    }
-
-    // Empty HOME + /root so anything written there dies with the sandbox.
-    cmd.args(["--dir", "/home"]);
-    cmd.args(["--dir", "/root"]);
 
     // work_dir mounted at /tmp, read-write, but at both the host path and /tmp,
     // so commands using either will find it. We prefer /tmp as the cwd.
@@ -1090,4 +1098,24 @@ pub fn spawn_init(cfg: &SandboxConfig) -> Result<SpawnedInit> {
         host_control_dir,
         keepalive: Box::new((keepalive, guard)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_layout_default_is_host_shared() {
+        assert_eq!(SystemLayout::default(), SystemLayout::HostShared);
+    }
+
+    #[test]
+    fn sandbox_config_system_layout_builder() {
+        let tmp = std::env::temp_dir();
+        let cfg = SandboxConfig::new(&tmp);
+        assert_eq!(cfg.system_layout, SystemLayout::HostShared);
+
+        let cfg = cfg.system_layout(SystemLayout::CallerProvided);
+        assert_eq!(cfg.system_layout, SystemLayout::CallerProvided);
+    }
 }
