@@ -203,7 +203,15 @@ pub struct Session {
     counter: u64,
     readers: Vec<JoinHandle<()>>,
     timeout: Duration,
+    /// Host-side path to the bound work directory. `JobHandle::wait_with_timeout`
+    /// reads per-job capture files from here.
     work_dir: PathBuf,
+    /// Guest-side (in-sandbox) path that bind-maps to `work_dir`. Used by
+    /// `Session::spawn` so the script writes per-job capture files at a
+    /// location whose host counterpart we know — independent of `$TMPDIR`,
+    /// which downstream callers may remap to a different host directory
+    /// (e.g. `AgentSandbox` overrides `/tmp` with a per-agent tmpfs).
+    guest_work_dir: PathBuf,
     open_pty: Option<Arc<OpenPtyFn>>,
     run_oneshot: Option<Arc<RunOneshotFn>>,
 }
@@ -237,6 +245,16 @@ impl Session {
             .work_dir
             .canonicalize()
             .unwrap_or_else(|_| cfg.work_dir.clone());
+        // Guest-side path that bind-maps to `work_dir`. Defaults to /tmp on
+        // Linux (see `linux.rs` — work_dir is bind-mounted there) unless the
+        // caller pinned `cfg.cwd` to an explicit guest path that they
+        // separately bound to the same host work_dir (the AgentSandbox
+        // pattern: `cfg.cwd = /home/workspace`, with an extra_mount that
+        // binds host `work_dir` → `/home/workspace`).
+        let guest_work_dir = cfg
+            .cwd
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
 
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
@@ -250,6 +268,7 @@ impl Session {
             readers: vec![r1, r2],
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
             work_dir,
+            guest_work_dir,
             open_pty,
             run_oneshot,
         })
@@ -467,6 +486,15 @@ impl Session {
         let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, id);
 
+        // Per-job capture files live in `guest_work_dir` (which bind-maps to
+        // `work_dir` on the host). Using a fixed in-sandbox path avoids the
+        // `$TMPDIR`-vs-`work_dir` mismatch that bit conversation 9f47e6fd:
+        // when a downstream caller (e.g. `AgentSandbox`) adds an
+        // `extra_mounts` entry that overrides `/tmp` with a per-agent
+        // tmpfs, `$TMPDIR` no longer resolves to the same host directory
+        // as `work_dir`, so the host-side reader saw empty files.
+        let guest_dir = self.guest_work_dir.to_string_lossy();
+
         // Wrap user cmd in `setsid` so the entire job tree lives in its own
         // process group / session. Capture the setsid wrapper's PID into a
         // pidfile so `kill_job` can `kill -KILL -- -<pgid>` that whole tree
@@ -481,7 +509,8 @@ impl Session {
         // the brace group's exit reflect the user command's real exit
         // code (instead of `setsid` always exiting 0 after fork).
         let script = format!(
-            "{{ setsid bash -c \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" > \"$TMPDIR/{out_name}\" 2> \"$TMPDIR/{err_name}\" & __sb_jpid=$! ; printf '%s' \"$__sb_jpid\" > \"$TMPDIR/{pid_name}\" ; wait \"$__sb_jpid\" ; __sb_jrc=$? ; rm -f \"$TMPDIR/{pid_name}\" ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
+            "{{ __sb_d='{guest_dir}' ; setsid bash -c \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" > \"$__sb_d/{out_name}\" 2> \"$__sb_d/{err_name}\" & __sb_jpid=$! ; printf '%s' \"$__sb_jpid\" > \"$__sb_d/{pid_name}\" ; wait \"$__sb_jpid\" ; __sb_jrc=$? ; rm -f \"$__sb_d/{pid_name}\" ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
+            guest_dir = guest_dir,
             delim = delim,
             cmd = cmd,
             sid = self.sid,
@@ -528,11 +557,13 @@ impl Session {
             .as_mut()
             .ok_or_else(|| Error::exec("session is closed"))?;
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
+        let guest_dir = self.guest_work_dir.to_string_lossy();
         // `|| true` so a missing pidfile (race: job already exited) doesn't
         // make bash think the kill failed; we always want to fall through
         // to the brace-group sentinel.
         let snippet = format!(
-            "{{ if [ -f \"$TMPDIR/{pid_name}\" ]; then __sb_kpid=$(cat \"$TMPDIR/{pid_name}\" 2>/dev/null) ; if [ -n \"$__sb_kpid\" ]; then kill -KILL -- \"-$__sb_kpid\" 2>/dev/null || true ; fi ; fi ; }}\n",
+            "{{ __sb_d='{guest_dir}' ; if [ -f \"$__sb_d/{pid_name}\" ]; then __sb_kpid=$(cat \"$__sb_d/{pid_name}\" 2>/dev/null) ; if [ -n \"$__sb_kpid\" ]; then kill -KILL -- \"-$__sb_kpid\" 2>/dev/null || true ; fi ; fi ; }}\n",
+            guest_dir = guest_dir,
             pid_name = pid_name,
         );
         stdin
@@ -663,8 +694,34 @@ impl JobHandle {
         let err_path = self
             .work_dir
             .join(format!(".tps_job_{}_{}.err", self.sid, self.id));
-        let stdout_bytes = std::fs::read(&out_path).unwrap_or_default();
-        let stderr_bytes = std::fs::read(&err_path).unwrap_or_default();
+        let stdout_bytes = match std::fs::read(&out_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    sid = %self.sid,
+                    job_id = self.id,
+                    path = %out_path.display(),
+                    error = %e,
+                    "failed to read job stdout capture file; \
+                     guest_work_dir may not bind-map to host work_dir"
+                );
+                Vec::new()
+            }
+        };
+        let stderr_bytes = match std::fs::read(&err_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    sid = %self.sid,
+                    job_id = self.id,
+                    path = %err_path.display(),
+                    error = %e,
+                    "failed to read job stderr capture file; \
+                     guest_work_dir may not bind-map to host work_dir"
+                );
+                Vec::new()
+            }
+        };
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(&err_path);
 
