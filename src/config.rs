@@ -99,18 +99,22 @@ impl Default for ResourceLimits {
 }
 
 impl ResourceLimits {
+    #[cfg(unix)]
     pub(crate) fn max_memory_bytes(&self) -> u64 {
         self.max_memory_mb.saturating_mul(1024 * 1024)
     }
 
+    #[cfg(unix)]
     pub(crate) fn has_memory_limit(&self) -> bool {
         self.max_memory_mb > 0
     }
 
+    #[cfg(unix)]
     pub(crate) fn has_file_size_limit(&self) -> bool {
         self.max_file_size_mb > 0
     }
 
+    #[cfg(unix)]
     pub(crate) fn has_cpu_time_limit(&self) -> bool {
         self.timeout_secs > 0
     }

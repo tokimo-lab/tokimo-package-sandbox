@@ -135,6 +135,37 @@ macOS host
   └─ ~840ms cold boot-to-result
 ```
 
+### Windows
+
+Windows delegates to WSL2, which provides a full Linux kernel with namespace + seccomp isolation. The host-side `windows.rs` is a thin forwarding layer: it translates Windows paths to `/mnt/` WSL paths, assembles a `bwrap` command line, and executes it via `wsl -e bash -lc '...'`.
+
+```
+Windows host
+  │
+  ├─ run()  ──► wsl -e bash -lc 'bwrap --unshare-all ... -- <cmd>'
+  │               │
+  │               └──► WSL2 VM
+  │                      │
+  │                      ├─ bwrap namespaces (user, mount, PID, net, IPC, UTS)
+  │                      ├─ seccomp BPF (~300 syscalls)
+  │                      ├─ work_dir bind-mounted at /tmp
+  │                      └─ command runs fully isolated inside the VM
+  │
+  └─ Session::open()  ──► wsl -e bash -lc 'bwrap ... -- /bin/bash --noprofile --norc'
+                            │
+                            └──► bash REPL over stdio (sentinel protocol)
+                                  ├─ exec / spawn  ──► same semantics as Linux
+                                  └─ no init control socket; bash sentinel carries
+                                     cwd/env inheritance and I/O framing
+```
+
+- **Requires WSL2** — `wsl --install` once, then `sudo apt install bubblewrap` inside the WSL distro
+- **Same Linux sandbox** — reuses `bwrap`, seccomp BPF, and cgroups inside the VM verbatim
+- **Path translation** — `C:\Users\...` → `/mnt/c/Users/...` for bind mounts and CWD
+- **No console window** — `CREATE_NO_WINDOW` flag suppresses the WSL terminal popup
+- **Network observe unsupported** — `Observed` / `Gated` return an error on Windows; use Linux directly for those policies
+- **Fallback mode** — set `SAFEBOX_WSL_NO_BWRAP=1` to skip bwrap inside WSL (WSL-only isolation, no filesystem sandbox)
+
 ## API
 
 ### One-shot execution

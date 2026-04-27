@@ -1,18 +1,16 @@
-//! Proves the sandbox protects the host: creates a canary file in $HOME and in
-//! /tmp, then runs `rm -rf` targeting both host paths from inside the sandbox.
-//! The canaries on the host should survive.
+//! Proves the sandbox protects the host: creates a canary file in a host temp
+//! directory, then runs `rm -rf` from inside the sandbox. The canary on the
+//! host should survive.
 
 use std::fs;
-use std::path::PathBuf;
 use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let canary_home = PathBuf::from(&home).join("tps-canary-DO-NOT-DELETE.txt");
-    let canary_tmp_host = PathBuf::from("/tmp").join("tps-canary-host.txt");
+    let canary_dir = std::env::temp_dir().join("tps-rmrf-canary");
+    fs::create_dir_all(&canary_dir)?;
+    let canary = canary_dir.join("tps-canary-DO-NOT-DELETE.txt");
 
-    fs::write(&canary_home, b"host canary - should survive\n")?;
-    fs::write(&canary_tmp_host, b"host /tmp canary - should survive\n")?;
+    fs::write(&canary, b"host canary - should survive\n")?;
 
     let work = tempfile::tempdir()?;
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
@@ -33,18 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- stdout ---\n{}", out.stdout);
     println!("--- stderr ---\n{}", out.stderr);
 
-    // Verify canaries.
-    let a = canary_home.exists();
-    let b = canary_tmp_host.exists();
-    println!("\nHost canary in $HOME still present? {}", a);
-    println!("Host canary in /tmp still present?   {}", b);
-    fs::remove_file(&canary_home).ok();
-    fs::remove_file(&canary_tmp_host).ok();
+    // Verify canary survived.
+    let survived = canary.exists();
+    println!("\nHost canary still present? {}", survived);
+    fs::remove_file(&canary).ok();
+    let _ = fs::remove_dir(&canary_dir);
 
-    if a && b {
-        println!("\n✅ SANDBOX HELD: host files were not affected.");
+    if survived {
+        println!("\n✅ SANDBOX HELD: host file was not affected.");
         Ok(())
     } else {
-        Err("❌ SANDBOX FAILED: a host canary was deleted".into())
+        Err("❌ SANDBOX FAILED: the host canary was deleted".into())
     }
 }

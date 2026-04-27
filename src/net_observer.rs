@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 //! L7 network observer — an in-process HTTP(S) proxy that reports every
 //! request the sandbox makes (method + URL for HTTP; CONNECT host + port and
 //! TLS SNI for HTTPS) and optionally enforces a host allowlist.

@@ -105,6 +105,7 @@ pub type SpawnAsyncFn = Box<dyn Fn(u64, &str) -> Result<Box<dyn JobOutput>> + Se
 /// does not guarantee the job has exited.
 ///
 /// `None` on platforms without an init control socket (macOS/Windows).
+#[cfg(target_os = "linux")]
 pub type KillSpawnFn = Box<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
 /// A PTY child running inside the sandbox. Exposes the master fd directly for
@@ -223,7 +224,8 @@ pub(crate) struct ShellHandle {
     /// Spawn a background job via init's pipe mode, returning a [`JobOutput`]
     /// handle immediately. `None` on platforms without an init control socket.
     pub spawn_async: Option<Arc<SpawnAsyncFn>>,
-    /// Kill a background job by its session-local id. `None` on non-Linux.
+    /// Kill a background job by its session-local id. Linux-only.
+    #[cfg(target_os = "linux")]
     pub kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
@@ -242,7 +244,8 @@ pub struct Session {
     run_oneshot: Option<Arc<RunOneshotFn>>,
     /// Spawn a background job via pipe mode. `None` on non-Linux.
     spawn_async: Option<Arc<SpawnAsyncFn>>,
-    /// Kill a background job by its session-local id. `None` on non-Linux.
+    /// Kill a background job by its session-local id. Linux-only.
+    #[cfg(target_os = "linux")]
     kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
@@ -268,6 +271,7 @@ impl Session {
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
         let spawn_async = handle.spawn_async.clone();
+        #[cfg(target_os = "linux")]
         let kill_spawn = handle.kill_spawn.clone();
 
         Ok(Self {
@@ -283,6 +287,7 @@ impl Session {
             open_pty,
             run_oneshot,
             spawn_async,
+            #[cfg(target_os = "linux")]
             kill_spawn,
         })
     }
@@ -990,6 +995,7 @@ pub(crate) fn shell_handle_from_child(
         open_pty: None,
         run_oneshot: None,
         spawn_async: None,
+        #[cfg(target_os = "linux")]
         kill_spawn: None,
     })
 }

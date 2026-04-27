@@ -4,11 +4,15 @@
 //! Run with:
 //!     cargo run --example concurrent_oneshot
 
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig, Session};
 
+#[cfg(target_os = "linux")]
 fn main() {
     let tmp = std::env::temp_dir().join(format!("tk-oneshot-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -57,4 +61,9 @@ fn main() {
         N
     );
     println!("ok");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("concurrent_oneshot: Linux-only (requires init control socket)");
 }

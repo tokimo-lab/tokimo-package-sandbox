@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let work = tempfile::tempdir()?;
     let cfg = tokimo_package_sandbox::SandboxConfig::new(work.path())
@@ -35,4 +36,9 @@ rprint(\"[green]✓ ipython[/green]  \" + IPython.__version__)
 
     println!("\nDone.");
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("vz_smoke: macOS-only (Virtualization.framework backend)");
 }
