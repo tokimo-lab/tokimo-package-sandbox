@@ -15,7 +15,7 @@ use crate::config::{NetworkPolicy, SandboxConfig};
 use crate::{Error, ExecutionResult, Result};
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -144,7 +144,7 @@ fn shell_quote(s: &str) -> String {
 
 /// Build the bash -lc script that re-execs the user command (or, if `user_cmd`
 /// is None, an interactive bash) inside WSL under bwrap.
-fn build_inner_script(cfg: &SandboxConfig, user_cmd: Option<&[impl AsRef<str>]>) -> Result<String> {
+fn build_inner_script<S: AsRef<str>>(cfg: &SandboxConfig, user_cmd: Option<&[S]>) -> Result<String> {
     if !wsl_available() {
         return Err(Error::ToolNotFound(
             "WSL is not available. Install WSL2 (`wsl --install`). tokimo-package-sandbox on Windows requires WSL2 for real isolation.".into(),

@@ -113,6 +113,7 @@ pub type KillSpawnFn = Box<dyn Fn(u64) -> Result<()> + Send + Sync>;
 pub struct PtyHandle {
     /// Host-side PTY master fd (kernel-allocated). Non-blocking is *not* set
     /// — callers should configure it as appropriate (or read on a thread).
+    #[cfg(unix)]
     master: Option<std::os::fd::OwnedFd>,
     /// Stable id of the child as known by the init server.
     child_id: String,
@@ -138,11 +139,13 @@ impl PtyHandle {
     /// Take ownership of the PTY master fd. After this, read/write/kill on
     /// the host side are the caller's responsibility, but `resize` and the
     /// kept-alive resources still work.
+    #[cfg(unix)]
     pub fn take_master(&mut self) -> Option<std::os::fd::OwnedFd> {
         self.master.take()
     }
 
     /// Borrow the PTY master fd.
+    #[cfg(unix)]
     pub fn master_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.master.as_ref().map(|f| f.as_fd())
     }
@@ -164,6 +167,7 @@ impl PtyHandle {
 
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(unix)]
     pub(crate) fn new(
         master: std::os::fd::OwnedFd,
         child_id: String,
@@ -190,6 +194,7 @@ impl Drop for PtyHandle {
     }
 }
 
+#[cfg(unix)]
 use std::os::fd::AsFd;
 
 /// Platform-agnostic container around the in-sandbox shell process. The
@@ -984,5 +989,7 @@ pub(crate) fn shell_handle_from_child(
         keepalive: Box::new((child, keepalive)),
         open_pty: None,
         run_oneshot: None,
+        spawn_async: None,
+        kill_spawn: None,
     })
 }
