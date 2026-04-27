@@ -31,8 +31,11 @@ fn main() {
 
     // Wait should now resolve quickly with a non-zero exit (signal).
     let r = slow.wait_with_timeout(Duration::from_secs(3));
-    println!("[{:>4}ms] wait_with_timeout returned: {:?}",
-             t0.elapsed().as_millis(), r.as_ref().map(|o| o.exit_code).map_err(|e| e.to_string()));
+    println!(
+        "[{:>4}ms] wait_with_timeout returned: {:?}",
+        t0.elapsed().as_millis(),
+        r.as_ref().map(|o| o.exit_code).map_err(|e| e.to_string())
+    );
     let out = r.expect("wait should succeed (job killed)");
     assert!(out.exit_code != 0, "killed job must have non-zero exit, got 0");
     let elapsed = t0.elapsed();

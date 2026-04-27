@@ -14,13 +14,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use nix::sys::socket::{
-    AddressFamily, SockFlag, SockType, UnixAddr, connect, socket,
-};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 
-use crate::init_protocol::{
-    Event, ErrorReply, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features,
-};
+use crate::init_protocol::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::init_wire::{recv_frame, send_frame};
 use crate::{Error, Result};
 
@@ -75,17 +71,10 @@ impl InitClient {
     /// Connect to the SEQPACKET socket at `path` (host-side bind path) and
     /// spawn the background reader thread.
     pub fn connect(path: &Path) -> Result<Self> {
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        )
-        .map_err(|e| Error::exec(format!("socket(SEQPACKET): {e}")))?;
-        let addr = UnixAddr::new(path)
-            .map_err(|e| Error::exec(format!("UnixAddr {path:?}: {e}")))?;
-        connect(fd.as_raw_fd(), &addr)
-            .map_err(|e| Error::exec(format!("connect {path:?}: {e}")))?;
+        let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(|e| Error::exec(format!("socket(SEQPACKET): {e}")))?;
+        let addr = UnixAddr::new(path).map_err(|e| Error::exec(format!("UnixAddr {path:?}: {e}")))?;
+        connect(fd.as_raw_fd(), &addr).map_err(|e| Error::exec(format!("connect {path:?}: {e}")))?;
 
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
@@ -117,7 +106,13 @@ impl InitClient {
         };
         let reply = self.send_op_sync(&id, op, Duration::from_secs(5))?;
         match reply.reply {
-            Reply::Hello { ok, init_pid, error, protocol, .. } => {
+            Reply::Hello {
+                ok,
+                init_pid,
+                error,
+                protocol,
+                ..
+            } => {
                 if !ok {
                     return Err(Error::exec(format!(
                         "init handshake rejected: {:?}",
@@ -141,12 +136,7 @@ impl InitClient {
     }
 
     /// OpenShell → returns child_id of the long-lived shell.
-    pub fn open_shell(
-        &self,
-        argv: &[&str],
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn open_shell(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::OpenShell {
             id: id.clone(),
@@ -159,12 +149,7 @@ impl InitClient {
 
     /// AddUser — create a per-user isolated bash shell inside the shared
     /// init container. Returns spawn info with the shell's `child_id`.
-    pub fn add_user(
-        &self,
-        user_id: &str,
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn add_user(&self, user_id: &str, env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::AddUser {
             id: id.clone(),
@@ -210,12 +195,7 @@ impl InitClient {
     }
 
     /// Spawn (Pipes mode).
-    pub fn spawn_pipes(
-        &self,
-        argv: &[&str],
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn spawn_pipes(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         self.spawn_pipes_inherit(argv, env_overlay, cwd, None)
     }
 
@@ -265,12 +245,15 @@ impl InitClient {
             .fd
             .ok_or_else(|| Error::exec("PTY spawn reply missing master fd"))?;
         let info = match reply.reply {
-            Reply::Spawn { ok, child_id, pid, error, .. } => {
+            Reply::Spawn {
+                ok,
+                child_id,
+                pid,
+                error,
+                ..
+            } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn pty failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn pty failed: {:?}", error.map(|e| e.message))));
                 }
                 SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -285,12 +268,15 @@ impl InitClient {
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
         let reply = self.send_op_sync(id, op, Duration::from_secs(10))?;
         match reply.reply {
-            Reply::Spawn { ok, child_id, pid, error, .. } => {
+            Reply::Spawn {
+                ok,
+                child_id,
+                pid,
+                error,
+                ..
+            } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -344,7 +330,10 @@ impl InitClient {
 
     pub fn shutdown(&self) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::Shutdown { id: id.clone(), kill_all: true };
+        let op = Op::Shutdown {
+            id: id.clone(),
+            kill_all: true,
+        };
         self.ack_op(&id, op)
     }
 
@@ -355,10 +344,7 @@ impl InitClient {
                 if ok {
                     Ok(())
                 } else {
-                    Err(Error::exec(format!(
-                        "init op failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
+                    Err(Error::exec(format!("init op failed: {:?}", error.map(|e| e.message))))
                 }
             }
             other => Err(Error::exec(format!("expected Ack, got {other:?}"))),
@@ -369,7 +355,11 @@ impl InitClient {
         // Send the op while holding send_lock (kernel atomicity for SEQPACKET
         // is per-packet, but we still need to serialize JSON build + sendmsg).
         {
-            let _guard = self.inner.send_lock.lock().map_err(|_| Error::exec("send lock poisoned"))?;
+            let _guard = self
+                .inner
+                .send_lock
+                .lock()
+                .map_err(|_| Error::exec("send lock poisoned"))?;
             let bf = unsafe { BorrowedFd::borrow_raw(self.inner.sock.as_raw_fd()) };
             send_frame(bf, &Frame::Op(op), None)?;
         }
@@ -386,9 +376,7 @@ impl InitClient {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(Error::exec(format!(
-                    "init op {id} timed out after {timeout:?}"
-                )));
+                return Err(Error::exec(format!("init op {id} timed out after {timeout:?}")));
             }
             let (g2, _) = cv
                 .wait_timeout(g, deadline - now)
@@ -512,11 +500,7 @@ impl InitClient {
         }
 
         let _ = self.close_child(&child_id);
-        let code = if timed_out {
-            124
-        } else {
-            exit_code.unwrap_or(-1)
-        };
+        let code = if timed_out { 124 } else { exit_code.unwrap_or(-1) };
         Ok((stdout_buf, stderr_buf, code))
     }
 }
@@ -597,11 +581,7 @@ impl ChildHandle {
         }
 
         let _ = self.client.close_child(&self.child_id);
-        let code = if timed_out {
-            124
-        } else {
-            exit_code.unwrap_or(-1)
-        };
+        let code = if timed_out { 124 } else { exit_code.unwrap_or(-1) };
         Ok((stdout_buf, stderr_buf, code))
     }
 }

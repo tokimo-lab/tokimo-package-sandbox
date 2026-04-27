@@ -18,9 +18,7 @@ fn main() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let mut pty = sess
-        .open_pty(24, 80, &argv, &[], None)
-        .expect("open_pty");
+    let mut pty = sess.open_pty(24, 80, &argv, &[], None).expect("open_pty");
 
     // Take ownership of the master fd so we can read/write directly.
     let master = pty.take_master().expect("master fd");

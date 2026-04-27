@@ -30,8 +30,5 @@ pub(crate) struct EbpfHandle;
 impl super::L4Backend for EbpfHandle {}
 
 pub(crate) fn start_parent(_p: Pending, _cfg: L4Config) -> io::Result<EbpfHandle> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "ebpf backend scaffold only",
-    ))
+    Err(io::Error::new(io::ErrorKind::Unsupported, "ebpf backend scaffold only"))
 }

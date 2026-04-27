@@ -28,10 +28,7 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
     Ok(result)
 }
 
-pub(crate) fn build_seatbelt_command(
-    inner_argv: &[&str],
-    cfg: &SandboxConfig,
-) -> Result<(Command, SeatbeltKeepAlive)> {
+pub(crate) fn build_seatbelt_command(inner_argv: &[&str], cfg: &SandboxConfig) -> Result<(Command, SeatbeltKeepAlive)> {
     let work_dir = cfg
         .work_dir
         .canonicalize()
@@ -58,10 +55,7 @@ pub(crate) fn build_seatbelt_command(
         cmd.env(k, v);
     }
     if !saw_path {
-        cmd.env(
-            "PATH",
-            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
-        );
+        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin");
     }
     cmd.env("HOME", &work_dir);
     cmd.env("TMPDIR", &work_dir);
@@ -120,10 +114,7 @@ fn build_profile(work_dir: &Path, cfg: &SandboxConfig) -> Result<String> {
 
     // File write: deny all, allow work_dir + macOS ephemerals.
     p.push_str("(deny file-write*)\n");
-    p.push_str(&format!(
-        "(allow file-write* (subpath \"{}\"))\n",
-        escape_sb(&work_s)
-    ));
+    p.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", escape_sb(&work_s)));
     p.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
     p.push_str("(allow file-write* (subpath \"/var/folders\"))\n");
 
@@ -131,10 +122,7 @@ fn build_profile(work_dir: &Path, cfg: &SandboxConfig) -> Result<String> {
     for m in &cfg.extra_mounts {
         if !m.read_only {
             let s = m.host.to_string_lossy();
-            p.push_str(&format!(
-                "(allow file-write* (subpath \"{}\"))\n",
-                escape_sb(&s)
-            ));
+            p.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", escape_sb(&s)));
         }
     }
 

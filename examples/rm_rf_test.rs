@@ -2,9 +2,9 @@
 //! /tmp, then runs `rm -rf` targeting both host paths from inside the sandbox.
 //! The canaries on the host should survive.
 
-use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig};
 use std::fs;
 use std::path::PathBuf;
+use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -26,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let out = tokimo_package_sandbox::run(&["/bin/sh", "-c", &script], &cfg)?;
 
-    println!("exit: {} timed_out: {} oom: {}", out.exit_code, out.timed_out, out.oom_killed);
+    println!(
+        "exit: {} timed_out: {} oom: {}",
+        out.exit_code, out.timed_out, out.oom_killed
+    );
     println!("--- stdout ---\n{}", out.stdout);
     println!("--- stderr ---\n{}", out.stderr);
 

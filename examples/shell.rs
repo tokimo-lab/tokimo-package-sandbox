@@ -5,10 +5,10 @@
 //! Type commands, explore the sandboxed filesystem. Exit with `exit` or Ctrl-D.
 //! Anything you do (rm -rf /, curl, whatever) cannot affect the host.
 
-use tokimo_package_sandbox::{NetworkPolicy, ResourceLimits, SandboxConfig};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use tokimo_package_sandbox::{NetworkPolicy, ResourceLimits, SandboxConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Persist the work dir across restarts by using a fixed path.
@@ -36,10 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     exec_interactive_bwrap(&work, &cfg)
 }
 
-fn exec_interactive_bwrap(
-    work: &Path,
-    cfg: &SandboxConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn exec_interactive_bwrap(work: &Path, cfg: &SandboxConfig) -> Result<(), Box<dyn std::error::Error>> {
     let work = work.canonicalize()?;
     let mut cmd = Command::new("bwrap");
     cmd.args(["--unshare-all", "--die-with-parent"]);

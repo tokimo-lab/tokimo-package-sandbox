@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, fcntl, FcntlArg, FdFlag};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::stat::Mode;
 use nix::unistd::{ForkResult, Pid, chdir, dup2, fork, pipe2, setpgid, setsid};
 
@@ -47,11 +47,7 @@ pub struct Spawned {
 }
 
 /// Spawn `argv` with three pipes connected to stdin/stdout/stderr.
-pub fn spawn_pipes(
-    argv: &[String],
-    env: &[(String, String)],
-    cwd: Option<&str>,
-) -> Result<Spawned, ErrorReply> {
+pub fn spawn_pipes(argv: &[String], env: &[(String, String)], cwd: Option<&str>) -> Result<Spawned, ErrorReply> {
     if argv.is_empty() {
         return Err(ErrorReply::new(ErrorCode::BadRequest, "empty argv"));
     }
@@ -76,8 +72,7 @@ pub fn spawn_pipes(
 
     // SAFETY: fork() in PID-1 init; we control the entire program. After
     // fork we only call async-signal-safe libc + nix functions in child.
-    let res = unsafe { fork() }
-        .map_err(|e| ErrorReply::new(ErrorCode::ForkFailed, format!("fork: {e}")))?;
+    let res = unsafe { fork() }.map_err(|e| ErrorReply::new(ErrorCode::ForkFailed, format!("fork: {e}")))?;
     match res {
         ForkResult::Child => {
             // We never return from child.
@@ -109,14 +104,9 @@ pub fn spawn_pipes(
 
             // Read errno from the pre-exec pipe; if any bytes arrive, exec failed.
             // err_r is CLOEXEC + blocking — set non-blocking briefly.
-            let _ = fcntl(
-                err_r.as_raw_fd(),
-                FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
-            );
+            let _ = fcntl(err_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
             let mut buf = [0u8; 4];
-            let n = unsafe {
-                libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-            };
+            let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n == 4 {
                 let errno = i32::from_ne_bytes(buf);
                 let code = match errno {
@@ -127,10 +117,7 @@ pub fn spawn_pipes(
                 };
                 // Reap zombie.
                 let _ = nix::sys::wait::waitpid(child, None);
-                return Err(ErrorReply::new(
-                    code,
-                    format!("exec failed: errno {errno}"),
-                ));
+                return Err(ErrorReply::new(code, format!("exec failed: errno {errno}")));
             }
 
             Ok(Spawned {
@@ -156,18 +143,16 @@ pub fn spawn_pty(
     if argv.is_empty() {
         return Err(ErrorReply::new(ErrorCode::BadRequest, "empty argv"));
     }
-    let (master, slave_path) = ptymod::open_pty()
-        .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("openpty: {e}")))?;
-    ptymod::set_winsize(master.as_raw_fd(), rows, cols)
-        .map_err(|e| ErrorReply::new(ErrorCode::Internal, e))?;
+    let (master, slave_path) =
+        ptymod::open_pty().map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("openpty: {e}")))?;
+    ptymod::set_winsize(master.as_raw_fd(), rows, cols).map_err(|e| ErrorReply::new(ErrorCode::Internal, e))?;
 
     let cargv = build_cstr_argv(argv)?;
     let cenv = build_cstr_env(env)?;
     let (err_r, err_w) =
         pipe2(OFlag::O_CLOEXEC).map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("pipe2 err: {e}")))?;
 
-    let res = unsafe { fork() }
-        .map_err(|e| ErrorReply::new(ErrorCode::ForkFailed, format!("fork: {e}")))?;
+    let res = unsafe { fork() }.map_err(|e| ErrorReply::new(ErrorCode::ForkFailed, format!("fork: {e}")))?;
     match res {
         ForkResult::Child => {
             child_setup_pty(&slave_path, err_w.as_raw_fd(), cwd, &cargv, &cenv);
@@ -183,9 +168,7 @@ pub fn spawn_pty(
 
             let _ = fcntl(err_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
             let mut buf = [0u8; 4];
-            let n = unsafe {
-                libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-            };
+            let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n == 4 {
                 let errno = i32::from_ne_bytes(buf);
                 let code = match errno {
@@ -195,10 +178,7 @@ pub fn spawn_pty(
                     _ => ErrorCode::Internal,
                 };
                 let _ = nix::sys::wait::waitpid(child, None);
-                return Err(ErrorReply::new(
-                    code,
-                    format!("exec failed: errno {errno}"),
-                ));
+                return Err(ErrorReply::new(code, format!("exec failed: errno {errno}")));
             }
 
             // Master fd left blocking on purpose: init does NOT read from it
@@ -253,21 +233,21 @@ fn child_setup_pipes(
     unblock_signals();
     // Install seccomp if BPF bytes were passed (workspace mode).
     install_seccomp_from_env();
-    let argv_p: Vec<*const libc::c_char> =
-        argv.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    let env_p: Vec<*const libc::c_char> =
-        env.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let argv_p: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let env_p: Vec<*const libc::c_char> = env
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     let _ = unsafe { libc::execve(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
     report_errno_and_exit(err_w, Errno::last_raw());
 }
 
-fn child_setup_pty(
-    slave_path: &str,
-    err_w: i32,
-    cwd: Option<&str>,
-    argv: &[CString],
-    env: &[CString],
-) -> ! {
+fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CString], env: &[CString]) -> ! {
     let sid_rc = unsafe { libc::setsid() };
     if sid_rc < 0 {
         report_errno_and_exit(err_w, Errno::last_raw());
@@ -303,10 +283,7 @@ fn child_setup_pty(
             }
         }
     }
-    if dup2(slave_fd, 0).is_err()
-        || dup2(slave_fd, 1).is_err()
-        || dup2(slave_fd, 2).is_err()
-    {
+    if dup2(slave_fd, 0).is_err() || dup2(slave_fd, 1).is_err() || dup2(slave_fd, 2).is_err() {
         report_errno_and_exit(err_w, Errno::last_raw());
     }
     if slave_fd > 2 {
@@ -318,10 +295,16 @@ fn child_setup_pty(
     unblock_signals();
     // Install seccomp if BPF bytes were passed (workspace mode).
     install_seccomp_from_env();
-    let argv_p: Vec<*const libc::c_char> =
-        argv.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    let env_p: Vec<*const libc::c_char> =
-        env.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+    let argv_p: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let env_p: Vec<*const libc::c_char> = env
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     let _ = unsafe { libc::execve(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
     report_errno_and_exit(err_w, Errno::last_raw());
 }
@@ -384,8 +367,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 fn build_cstr_argv(argv: &[String]) -> Result<Vec<CString>, ErrorReply> {
     argv.iter()
         .map(|s| {
-            CString::new(s.as_bytes())
-                .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("argv NUL: {e}")))
+            CString::new(s.as_bytes()).map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("argv NUL: {e}")))
         })
         .collect()
 }

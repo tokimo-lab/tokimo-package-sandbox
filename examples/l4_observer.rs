@@ -27,8 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokimo_package_sandbox::{
-    HostPattern, Layer, NetEvent, NetEventSink, NetworkPolicy, ResourceLimits, SandboxConfig,
-    Verdict,
+    HostPattern, Layer, NetEvent, NetEventSink, NetworkPolicy, ResourceLimits, SandboxConfig, Verdict,
 };
 
 struct LoggingSink {
@@ -49,12 +48,7 @@ impl NetEventSink for LoggingSink {
         let remote = ev
             .remote
             .map(|r| r.to_string())
-            .or_else(|| {
-                ev.host
-                    .clone()
-                    .zip(ev.port)
-                    .map(|(h, p)| format!("{}:{}", h, p))
-            })
+            .or_else(|| ev.host.clone().zip(ev.port).map(|(h, p)| format!("{}:{}", h, p)))
             .unwrap_or_else(|| "-".into());
         let extra = match (&ev.http_method, &ev.http_url, &ev.sni) {
             (Some(m), Some(u), _) => format!(" {} {}", m, u),
@@ -62,15 +56,8 @@ impl NetEventSink for LoggingSink {
             _ => String::new(),
         };
         let pid = ev.pid.map(|p| format!(" pid={}", p)).unwrap_or_default();
-        let comm = ev
-            .comm
-            .as_deref()
-            .map(|c| format!(" comm={}", c))
-            .unwrap_or_default();
-        println!(
-            "[+{:>5}ms] {} {}{}{}{}",
-            ms, layer, remote, pid, comm, extra
-        );
+        let comm = ev.comm.as_deref().map(|c| format!(" comm={}", c)).unwrap_or_default();
+        println!("[+{:>5}ms] {} {}{}{}{}", ms, layer, remote, pid, comm, extra);
         self.events.lock().unwrap().push(ev.clone());
         Verdict::Allow
     }

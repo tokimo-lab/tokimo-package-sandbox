@@ -11,7 +11,8 @@ use std::path::Path;
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
-    #[allow(dead_code)] pub const SOCKET: u32 = 41;
+    #[allow(dead_code)]
+    pub const SOCKET: u32 = 41;
     pub const PTRACE: u32 = 101;
     pub const MOUNT: u32 = 165;
     pub const UMOUNT2: u32 = 166;
@@ -26,7 +27,8 @@ mod nr {
 
 #[cfg(target_arch = "aarch64")]
 mod nr {
-    #[allow(dead_code)] pub const SOCKET: u32 = 198;
+    #[allow(dead_code)]
+    pub const SOCKET: u32 = 198;
     pub const PTRACE: u32 = 117;
     pub const MOUNT: u32 = 40;
     pub const UMOUNT2: u32 = 39;
@@ -41,7 +43,8 @@ mod nr {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod nr {
-    #[allow(dead_code)] pub const SOCKET: u32 = 0;
+    #[allow(dead_code)]
+    pub const SOCKET: u32 = 0;
     pub const PTRACE: u32 = 0;
     pub const MOUNT: u32 = 0;
     pub const UMOUNT2: u32 = 0;

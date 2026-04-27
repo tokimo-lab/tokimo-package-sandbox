@@ -43,7 +43,9 @@ fn two_users_exec_independently() {
     f.ws.add_user(&UserConfig::new("alice")).expect("add alice");
     f.ws.add_user(&UserConfig::new("bob")).expect("add bob");
 
-    let a = f.ws.exec("alice", "echo ALICE", Duration::from_secs(10)).expect("alice");
+    let a =
+        f.ws.exec("alice", "echo ALICE", Duration::from_secs(10))
+            .expect("alice");
     let b = f.ws.exec("bob", "echo BOB", Duration::from_secs(10)).expect("bob");
 
     assert!(a.stdout.contains("ALICE"), "alice: {}", a.stdout);
@@ -57,11 +59,15 @@ fn add_user_creates_isolated_tmp() {
     f.ws.add_user(&UserConfig::new("alice")).expect("add alice");
 
     // Verify per-user tmp directory exists and is writable.
-    let out = f.ws.exec("alice", "ls -d /tmp/alice && echo ok", Duration::from_secs(10)).expect("exec");
+    let out =
+        f.ws.exec("alice", "ls -d /tmp/alice && echo ok", Duration::from_secs(10))
+            .expect("exec");
     assert!(out.stdout.contains("ok"), "/tmp/alice should exist: {}", out.stdout);
 
     // Verify per-user work directory exists.
-    let out = f.ws.exec("alice", "ls -d /work/alice && echo ok", Duration::from_secs(10)).expect("exec");
+    let out =
+        f.ws.exec("alice", "ls -d /work/alice && echo ok", Duration::from_secs(10))
+            .expect("exec");
     assert!(out.stdout.contains("ok"), "/work/alice should exist: {}", out.stdout);
 }
 
@@ -69,20 +75,29 @@ fn add_user_creates_isolated_tmp() {
 fn add_user_creates_isolated_cwd() {
     skip_if_no_bwrap();
     let mut f = Fixture::new();
-    f.ws.add_user(&UserConfig::new("bob").cwd("/work/bob")).expect("add bob");
+    f.ws.add_user(&UserConfig::new("bob").cwd("/work/bob"))
+        .expect("add bob");
 
     let out = f.ws.exec("bob", "pwd", Duration::from_secs(10)).expect("exec");
-    assert!(out.stdout.contains("/work/bob"), "expected /work/bob in pwd, got: {}", out.stdout);
+    assert!(
+        out.stdout.contains("/work/bob"),
+        "expected /work/bob in pwd, got: {}",
+        out.stdout
+    );
 }
 
 #[test]
 fn two_users_env_isolated() {
     skip_if_no_bwrap();
     let mut f = Fixture::new();
-    f.ws.add_user(&UserConfig::new("alice").env("MYVAR", "alice_value")).expect("add alice");
-    f.ws.add_user(&UserConfig::new("bob").env("MYVAR", "bob_value")).expect("add bob");
+    f.ws.add_user(&UserConfig::new("alice").env("MYVAR", "alice_value"))
+        .expect("add alice");
+    f.ws.add_user(&UserConfig::new("bob").env("MYVAR", "bob_value"))
+        .expect("add bob");
 
-    let a = f.ws.exec("alice", "echo $MYVAR", Duration::from_secs(10)).expect("alice");
+    let a =
+        f.ws.exec("alice", "echo $MYVAR", Duration::from_secs(10))
+            .expect("alice");
     let b = f.ws.exec("bob", "echo $MYVAR", Duration::from_secs(10)).expect("bob");
 
     assert!(a.stdout.contains("alice_value"), "alice: {}", a.stdout);
@@ -102,7 +117,9 @@ fn remove_user_does_not_affect_other() {
 
     f.ws.remove_user("alice").expect("remove alice");
 
-    let b = f.ws.exec("bob", "echo still_alive", Duration::from_secs(10)).expect("bob");
+    let b =
+        f.ws.exec("bob", "echo still_alive", Duration::from_secs(10))
+            .expect("bob");
     assert!(b.stdout.contains("still_alive"), "bob: {}", b.stdout);
 }
 
@@ -114,7 +131,9 @@ fn add_user_after_remove() {
     f.ws.remove_user("alice").expect("remove alice");
     f.ws.add_user(&UserConfig::new("alice2")).expect("re-add as alice2");
 
-    let out = f.ws.exec("alice2", "echo reincarnated", Duration::from_secs(10)).expect("exec");
+    let out =
+        f.ws.exec("alice2", "echo reincarnated", Duration::from_secs(10))
+            .expect("exec");
     assert!(out.stdout.contains("reincarnated"), "re-added user: {}", out.stdout);
 }
 
@@ -143,8 +162,10 @@ fn three_users_concurrent_exec() {
 fn user_timeout_only_kills_that_user() {
     skip_if_no_bwrap();
     let mut f = Fixture::new();
-    f.ws.add_user(&UserConfig::new("alice").timeout(Duration::from_secs(1))).expect("add alice");
-    f.ws.add_user(&UserConfig::new("bob").timeout(Duration::from_secs(30))).expect("add bob");
+    f.ws.add_user(&UserConfig::new("alice").timeout(Duration::from_secs(1)))
+        .expect("add alice");
+    f.ws.add_user(&UserConfig::new("bob").timeout(Duration::from_secs(30)))
+        .expect("add bob");
 
     let result = f.ws.exec("alice", "sleep 10", Duration::from_secs(1));
     assert!(result.is_err() || result.unwrap().exit_code == 124);
@@ -157,14 +178,17 @@ fn user_timeout_only_kills_that_user() {
 fn user_spawn_unaffected_by_exec_timeout() {
     skip_if_no_bwrap();
     let mut f = Fixture::new();
-    f.ws.add_user(&UserConfig::new("alice").timeout(Duration::from_secs(1))).expect("add alice");
+    f.ws.add_user(&UserConfig::new("alice").timeout(Duration::from_secs(1)))
+        .expect("add alice");
 
     f.ws.spawn("alice", "sleep 30").expect("spawn");
 
     let result = f.ws.exec("alice", "sleep 10", Duration::from_secs(1));
     assert!(result.is_err() || result.unwrap().exit_code == 124);
 
-    let out = f.ws.exec("alice", "echo still_working", Duration::from_secs(10)).expect("alice");
+    let out =
+        f.ws.exec("alice", "echo still_working", Duration::from_secs(10))
+            .expect("alice");
     assert!(out.stdout.contains("still_working"), "alice: {}", out.stdout);
 }
 
@@ -185,7 +209,13 @@ fn dynamic_add_mount_visible() {
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
 
     let host_path_str = host_dir.path().to_string_lossy().to_string();
-    let out = ws.exec("alice", &format!("cat {}/hello.txt", host_path_str), Duration::from_secs(10)).expect("exec");
+    let out = ws
+        .exec(
+            "alice",
+            &format!("cat {}/hello.txt", host_path_str),
+            Duration::from_secs(10),
+        )
+        .expect("exec");
     assert!(out.stdout.contains("mounted_content"), "got: {}", out.stdout);
 }
 
@@ -199,7 +229,13 @@ fn child_cannot_call_mount() {
     let mut f = Fixture::new();
     f.ws.add_user(&UserConfig::new("alice")).expect("add alice");
 
-    let out = f.ws.exec("alice", "mount --bind /tmp /mnt 2>&1; echo EXIT:$?", Duration::from_secs(10)).expect("exec");
+    let out =
+        f.ws.exec(
+            "alice",
+            "mount --bind /tmp /mnt 2>&1; echo EXIT:$?",
+            Duration::from_secs(10),
+        )
+        .expect("exec");
 
     let combined = format!("{}{}", out.stdout, out.stderr);
     assert!(
@@ -208,7 +244,9 @@ fn child_cannot_call_mount() {
             || combined.contains("denied")
             || combined.contains("Operation not permitted")
             || !combined.contains("EXIT:0"),
-        "mount should have failed, got: stdout={} stderr={}", out.stdout, out.stderr
+        "mount should have failed, got: stdout={} stderr={}",
+        out.stdout,
+        out.stderr
     );
 }
 

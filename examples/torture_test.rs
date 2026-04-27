@@ -43,11 +43,16 @@ fn main() {
     // 3) AI rogue `&`: backgrounds something noisy mid-command. Must NOT pollute
     //    next exec()'s framing.
     let r = sess.exec("yes garbage | head -5 & wait").unwrap();
-    check!("rogue & + wait", r.stdout.lines().filter(|l| *l == "garbage").count() == 5);
+    check!(
+        "rogue & + wait",
+        r.stdout.lines().filter(|l| *l == "garbage").count() == 5
+    );
 
     // 4) Truly rogue: `&`-ed daemon left running (no wait). The next exec must
     //    still parse cleanly.
-    let r = sess.exec("(while true; do echo SPAM; sleep 0.05; done) & disown; echo started").unwrap();
+    let r = sess
+        .exec("(while true; do echo SPAM; sleep 0.05; done) & disown; echo started")
+        .unwrap();
     check!("rogue daemon backgrounded", r.stdout.contains("started"));
 
     // 5) Immediately after the rogue daemon: plain echo must NOT see SPAM.
@@ -155,10 +160,7 @@ fn main() {
     );
 
     // 20) Total wall ≈ max(bg1, bg2) not sum.
-    check!(
-        "wall time ~1.5s (parallel)",
-        t0.elapsed() < Duration::from_millis(2500)
-    );
+    check!("wall time ~1.5s (parallel)", t0.elapsed() < Duration::from_millis(2500));
 
     // 21) Very long single-line output (no newline at end).
     let r = sess.exec("printf '%.0sX' {1..5000}").unwrap();

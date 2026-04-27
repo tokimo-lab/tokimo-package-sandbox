@@ -23,8 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokimo_package_sandbox::{
-    DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, NetworkPolicy, ResourceLimits,
-    SandboxConfig, Verdict,
+    DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, NetworkPolicy, ResourceLimits, SandboxConfig, Verdict,
 };
 
 /// Sink that prints each event and collects them for later assertions.
@@ -160,10 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 4) Assertions on what the sink observed ---
     let events = sink.events.lock().unwrap().clone();
     println!("\n==== summary: {} L7 events observed ====", events.len());
-    let hosts: std::collections::BTreeSet<String> = events
-        .iter()
-        .filter_map(|e| e.host.clone())
-        .collect();
+    let hosts: std::collections::BTreeSet<String> = events.iter().filter_map(|e| e.host.clone()).collect();
     println!("unique hosts: {:?}", hosts);
 
     let saw_example = events.iter().any(|e| e.host.as_deref() == Some("example.com"));

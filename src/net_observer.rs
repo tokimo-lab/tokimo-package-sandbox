@@ -25,8 +25,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -294,10 +294,7 @@ fn read_headers(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
             return Ok(Some(buf));
         }
         if buf.len() > 32 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request headers too large",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "request headers too large"));
         }
     }
 }
@@ -363,11 +360,7 @@ fn handle_connect(
         if !cfg.host_allowed(sni) || matches!(v, Verdict::Deny(_)) {
             // We already replied 200; the only way to signal denial now is
             // to drop. Log and tear down.
-            tracing::info!(
-                "net_observer: denying tunnel after SNI sniff sni={} host={}",
-                sni,
-                host
-            );
+            tracing::info!("net_observer: denying tunnel after SNI sniff sni={} host={}", sni, host);
             let _ = client_rest.shutdown(Shutdown::Both);
             return Ok(());
         }
@@ -446,9 +439,7 @@ fn handle_plain(
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("proxy-connection")
-            || lower.starts_with("proxy-authorization")
-        {
+        if lower.starts_with("proxy-connection") || lower.starts_with("proxy-authorization") {
             continue;
         }
         rewritten.extend_from_slice(line.as_bytes());
@@ -490,12 +481,7 @@ fn tunnel(mut c_in: TcpStream, mut u_out: TcpStream, mut c_out: TcpStream, mut u
     let _ = t2.join();
 }
 
-fn write_http_status(
-    client: &mut TcpStream,
-    code: u16,
-    reason: &str,
-    body: &str,
-) -> io::Result<()> {
+fn write_http_status(client: &mut TcpStream, code: u16, reason: &str, body: &str) -> io::Result<()> {
     let resp = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         code,
@@ -535,8 +521,7 @@ fn parse_http_target(target: &str, host_header: Option<&str>) -> Option<(String,
         } else {
             "/".to_string()
         };
-        let (host, port) = split_host_port(authority)
-            .unwrap_or_else(|| (authority.to_string(), 80));
+        let (host, port) = split_host_port(authority).unwrap_or_else(|| (authority.to_string(), 80));
         return Some((host, port, path));
     }
     // Relative URL — need Host header.
@@ -632,9 +617,7 @@ fn extract_sni(buf: &[u8]) -> Option<String> {
                 }
                 if name_type == 0 {
                     // host_name
-                    return std::str::from_utf8(&list[q..q + name_len])
-                        .ok()
-                        .map(|s| s.to_string());
+                    return std::str::from_utf8(&list[q..q + name_len]).ok().map(|s| s.to_string());
                 }
                 q += name_len;
             }

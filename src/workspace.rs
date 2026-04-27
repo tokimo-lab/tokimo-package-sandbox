@@ -178,11 +178,7 @@ impl Workspace {
         let client = Arc::new(InitClient::connect(&self.host_sock)?);
         client.hello()?;
 
-        let env_overlay: Vec<(String, String)> = cfg
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let env_overlay: Vec<(String, String)> = cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let cwd = cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
         let info = client.add_user(&cfg.user_id, &env_overlay, cwd.as_deref())?;
 
@@ -214,15 +210,13 @@ impl Workspace {
     /// inheritance from the user's shell. On timeout, only the spawned
     /// child is killed — the user's bash and other users are unaffected.
     pub fn exec(&self, user_id: &str, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
-        let user = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
-        let handle = user.client.spawn_pipes_inherit_async(
-            &["/bin/bash", "-c", cmd],
-            &[],
-            None,
-            Some(&user.shell_id),
-        )?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
+        let handle =
+            user.client
+                .spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &[], None, Some(&user.shell_id))?;
         let (stdout, stderr, code) = handle.wait_with_timeout(timeout)?;
         Ok(ExecOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -233,7 +227,9 @@ impl Workspace {
 
     /// Execute a command using the user's default timeout.
     pub fn exec_default(&self, user_id: &str, cmd: &str) -> Result<ExecOutput> {
-        let timeout = self.users.get(user_id)
+        let timeout = self
+            .users
+            .get(user_id)
             .map(|u| u.timeout)
             .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         self.exec(user_id, cmd, timeout)
@@ -242,24 +238,23 @@ impl Workspace {
     /// Spawn a background job in the user's environment. Returns the job's
     /// `child_id` for later tracking / kill.
     pub fn spawn(&self, user_id: &str, cmd: &str) -> Result<String> {
-        let user = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
-        let info = user.client.spawn_pipes_inherit(
-            &["/bin/bash", "-c", cmd],
-            &[],
-            None,
-            Some(&user.shell_id),
-        )?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
+        let info = user
+            .client
+            .spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &[], None, Some(&user.shell_id))?;
         Ok(info.child_id)
     }
 
     /// Re-create the user's bash shell after it died (e.g., due to timeout
     /// or accidental kill). The new shell inherits the same user config.
     pub fn respawn_shell(&mut self, user_id: &str) -> Result<()> {
-        let handle = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
+        let handle = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         let info = handle.client.add_user(user_id, &[], None)?;
         // We need to update the shell_id. Since UserHandle doesn't have
         // interior mutability, rebuild the handle.
@@ -276,25 +271,28 @@ impl Workspace {
     /// Dynamically bind-mount a path for a specific user. `source` must
     /// already be visible inside the container.
     pub fn add_mount(&self, user_id: &str, source: &str, target: &str, read_only: bool) -> Result<()> {
-        let user = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         user.client.bind_mount(source, target, read_only)
     }
 
     /// Unmount a previously bind-mounted path for a specific user.
     pub fn remove_mount(&self, user_id: &str, target: &str) -> Result<()> {
-        let user = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         user.client.unmount(target)
     }
 
     /// Kill a specific child process by id.
     pub fn kill(&self, user_id: &str, child_id: &str) -> Result<()> {
-        let user = self.users.get(user_id).ok_or_else(|| {
-            Error::exec(format!("user {user_id} not found"))
-        })?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         user.client.signal(child_id, libc::SIGKILL, true)
     }
 

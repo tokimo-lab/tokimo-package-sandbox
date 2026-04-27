@@ -43,9 +43,7 @@ mod windows;
 
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
 pub use error::{Error, Result};
-pub use net_observer::{
-    DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict,
-};
+pub use net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 pub use result::ExecutionResult;
 pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Session};
 
@@ -94,10 +92,7 @@ pub fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionRes
 }
 
 #[cfg(unix)]
-fn run_without_sandbox<S: AsRef<str>>(
-    cmd: &[S],
-    cfg: &SandboxConfig,
-) -> Result<ExecutionResult> {
+fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     use std::process::Command;
     if cmd.is_empty() {
         return Err(Error::validation("empty command"));
@@ -120,12 +115,7 @@ fn run_without_sandbox<S: AsRef<str>>(
 }
 
 #[cfg(windows)]
-fn run_without_sandbox<S: AsRef<str>>(
-    cmd: &[S],
-    _cfg: &SandboxConfig,
-) -> Result<ExecutionResult> {
+fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], _cfg: &SandboxConfig) -> Result<ExecutionResult> {
     let _ = cmd;
-    Err(Error::validation(
-        "SAFEBOX_DISABLE is not supported on Windows",
-    ))
+    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
 }

@@ -15,9 +15,7 @@ use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use nix::cmsg_space;
-use nix::sys::socket::{
-    ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg,
-};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
 use crate::init_protocol::{Frame, MAX_FRAME_BYTES};
 use crate::{Error, Result};
@@ -26,8 +24,7 @@ use crate::{Error, Result};
 /// SCM_RIGHTS. The kernel duplicates the fd into the receiver, so the
 /// caller retains ownership of the original.
 pub fn send_frame(sock: BorrowedFd<'_>, frame: &Frame, fd: Option<RawFd>) -> Result<()> {
-    let bytes = serde_json::to_vec(frame)
-        .map_err(|e| Error::exec(format!("serialize wire frame: {e}")))?;
+    let bytes = serde_json::to_vec(frame).map_err(|e| Error::exec(format!("serialize wire frame: {e}")))?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(Error::exec(format!(
             "wire frame too large: {} > {} bytes",
@@ -46,19 +43,18 @@ pub fn send_frame(sock: BorrowedFd<'_>, frame: &Frame, fd: Option<RawFd>) -> Res
         }
         None => &[],
     };
-    sendmsg::<()>(sock.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None)
-        .or_else(|e| {
-            if matches!(e, nix::errno::Errno::EAGAIN) {
-                // Socket was set non-blocking (e.g. by mio on the server side).
-                // Wait for it to become writable, then retry. This is the
-                // backpressure path under heavy child output bursts.
-                wait_writable_blocking(sock.as_raw_fd())?;
-                sendmsg::<()>(sock.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None)
-                    .map_err(|e2| Error::exec(format!("sendmsg (retry): {e2}")))
-            } else {
-                Err(Error::exec(format!("sendmsg: {e}")))
-            }
-        })?;
+    sendmsg::<()>(sock.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None).or_else(|e| {
+        if matches!(e, nix::errno::Errno::EAGAIN) {
+            // Socket was set non-blocking (e.g. by mio on the server side).
+            // Wait for it to become writable, then retry. This is the
+            // backpressure path under heavy child output bursts.
+            wait_writable_blocking(sock.as_raw_fd())?;
+            sendmsg::<()>(sock.as_raw_fd(), &iov, cmsgs, MsgFlags::empty(), None)
+                .map_err(|e2| Error::exec(format!("sendmsg (retry): {e2}")))
+        } else {
+            Err(Error::exec(format!("sendmsg: {e}")))
+        }
+    })?;
     Ok(())
 }
 
@@ -94,13 +90,8 @@ pub fn recv_frame(sock: BorrowedFd<'_>) -> Result<Option<(Frame, Option<OwnedFd>
     let mut buf = vec![0u8; MAX_FRAME_BYTES + 4096];
     let mut iov = [IoSliceMut::new(&mut buf)];
     let mut cmsg = cmsg_space!([RawFd; 1]);
-    let res = recvmsg::<()>(
-        sock.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg),
-        MsgFlags::empty(),
-    )
-    .map_err(|e| Error::exec(format!("recvmsg: {e}")))?;
+    let res = recvmsg::<()>(sock.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::empty())
+        .map_err(|e| Error::exec(format!("recvmsg: {e}")))?;
     let n = res.bytes;
     if n == 0 {
         return Ok(None);
@@ -126,8 +117,7 @@ pub fn recv_frame(sock: BorrowedFd<'_>) -> Result<Option<(Frame, Option<OwnedFd>
     }
     let _ = res;
     let payload = &buf[..n];
-    let frame: Frame = serde_json::from_slice(payload)
-        .map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
+    let frame: Frame = serde_json::from_slice(payload).map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
     Ok(Some((frame, owned)))
 }
 

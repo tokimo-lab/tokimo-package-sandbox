@@ -76,11 +76,7 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
     if let Some(ref mut e) = child.stderr {
         let _ = e.read_to_string(&mut stderr);
     }
-    let exit_code = child
-        .wait()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(-1);
+    let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
 
     Ok(ExecutionResult {
         stdout,
@@ -148,10 +144,7 @@ fn shell_quote(s: &str) -> String {
 
 /// Build the bash -lc script that re-execs the user command (or, if `user_cmd`
 /// is None, an interactive bash) inside WSL under bwrap.
-fn build_inner_script(
-    cfg: &SandboxConfig,
-    user_cmd: Option<&[impl AsRef<str>]>,
-) -> Result<String> {
+fn build_inner_script(cfg: &SandboxConfig, user_cmd: Option<&[impl AsRef<str>]>) -> Result<String> {
     if !wsl_available() {
         return Err(Error::ToolNotFound(
             "WSL is not available. Install WSL2 (`wsl --install`). tokimo-package-sandbox on Windows requires WSL2 for real isolation.".into(),
@@ -164,8 +157,7 @@ fn build_inner_script(
         ));
     }
 
-    let work_dir_wsl = windows_to_wsl_path(&cfg.work_dir)
-        .ok_or_else(|| Error::validation("bad work_dir path"))?;
+    let work_dir_wsl = windows_to_wsl_path(&cfg.work_dir).ok_or_else(|| Error::validation("bad work_dir path"))?;
 
     let mut inner = String::new();
     if bwrap_inside {

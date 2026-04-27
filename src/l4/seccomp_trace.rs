@@ -29,7 +29,7 @@
 //!   4. return from pre_exec; `exec(bwrap)` follows. Tracer is already
 //!      attached, so any `connect()` during the sandboxed program traps.
 
-use super::{build_event, L4Config, Shutdown};
+use super::{L4Config, Shutdown, build_event};
 use crate::net_observer::Proto;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -126,22 +126,67 @@ struct SockFprog {
 fn build_program() -> [SockFilter; 9] {
     [
         // load arch
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: OFF_ARCH },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFF_ARCH,
+        },
         // arch != AUDIT_ARCH -> allow (safer than kill when arch mismatch)
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: AUDIT_ARCH },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: AUDIT_ARCH,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
         // load nr
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: OFF_NR },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFF_NR,
+        },
         // nr == connect -> trace w/ tag=CONNECT (jump to index 7)
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: nr::CONNECT },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: nr::CONNECT,
+        },
         // nr == sendto  -> trace w/ tag=SENDTO  (jump to index 8)
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: nr::SENDTO },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: nr::SENDTO,
+        },
         // default allow
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
         // trace connect
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_TRACE | TAG_CONNECT },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE | TAG_CONNECT,
+        },
         // trace sendto
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_TRACE | TAG_SENDTO },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE | TAG_SENDTO,
+        },
     ]
 }
 
@@ -225,10 +270,7 @@ unsafe fn probe_in_child() -> bool {
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         };
-        let prog = SockFprog {
-            len: 1,
-            filter: &allow,
-        };
+        let prog = SockFprog { len: 1, filter: &allow };
         let rc = libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER as libc::c_long,
@@ -383,11 +425,21 @@ fn run_tracer_loop(main_pid: i32, cfg: L4Config, shutdown: Shutdown, exit_tx: Se
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
             let signaled = libc::WIFSIGNALED(status);
             let termsig = if signaled { libc::WTERMSIG(status) } else { 0 };
-            let exitcode = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+            let exitcode = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
             let coredump = signaled && libc::WCOREDUMP(status);
             tracing::debug!(
                 "l4-trace: pid {} exited (main={}) signaled={} termsig={} exitcode={} coredump={} raw_status=0x{:x}",
-                pid, main_pid, signaled, termsig, exitcode, coredump, status
+                pid,
+                main_pid,
+                signaled,
+                termsig,
+                exitcode,
+                coredump,
+                status
             );
             if pid == main_pid && !main_exit_sent {
                 let es = ExitStatus::from_raw(status);
@@ -472,14 +524,7 @@ fn handle_seccomp_event(pid: i32, cfg: &L4Config) {
     let (sockaddr_ptr, addrlen, proto) = {
         // On x86_64 fetch user_regs_struct via PTRACE_GETREGS.
         let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::ptrace(
-                libc::PTRACE_GETREGS,
-                pid,
-                0usize,
-                &mut regs as *mut _ as usize,
-            )
-        };
+        let rc = unsafe { libc::ptrace(libc::PTRACE_GETREGS, pid, 0usize, &mut regs as *mut _ as usize) };
         if rc < 0 {
             return;
         }

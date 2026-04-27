@@ -24,8 +24,8 @@
 use crate::net_observer::{HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 pub(crate) mod seccomp_notify;
@@ -209,12 +209,7 @@ pub(crate) fn finalize(
 
 // ---- helpers shared across backends ------------------------------------
 
-pub(crate) fn build_event(
-    remote: SocketAddr,
-    proto: Proto,
-    pid: u32,
-    comm: Option<String>,
-) -> NetEvent {
+pub(crate) fn build_event(remote: SocketAddr, proto: Proto, pid: u32, comm: Option<String>) -> NetEvent {
     NetEvent {
         ts: std::time::SystemTime::now(),
         pid: Some(pid),

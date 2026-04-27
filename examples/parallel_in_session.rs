@@ -39,9 +39,7 @@ fn main() {
     println!("[{:>5}ms] date: {}", t0.elapsed().as_millis(), r.stdout.trim());
 
     // Spawn a second background job concurrently.
-    let other = sess
-        .spawn("sleep 1 && echo OTHER DONE && echo bye >&2")
-        .expect("spawn");
+    let other = sess.spawn("sleep 1 && echo OTHER DONE && echo bye >&2").expect("spawn");
     println!("[{:>5}ms] spawned other id={}", t0.elapsed().as_millis(), other.id());
 
     // Yet another fast exec while two bg jobs run.

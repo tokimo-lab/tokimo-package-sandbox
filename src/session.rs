@@ -74,11 +74,8 @@ struct SessionState {
 /// additional PTY children any time during the session's lifetime.
 ///
 /// `None` on backends that don't support PTY (currently macOS/Windows).
-pub type OpenPtyFn = Box<
-    dyn Fn(u16, u16, &[String], &[(String, String)], Option<&str>) -> Result<PtyHandle>
-        + Send
-        + Sync,
->;
+pub type OpenPtyFn =
+    Box<dyn Fn(u16, u16, &[String], &[(String, String)], Option<&str>) -> Result<PtyHandle> + Send + Sync>;
 
 /// Factory for one-shot pipe-mode children. Spawns an independent process
 /// inside the same sandbox container (sharing PID namespace, mounts, env)
@@ -87,9 +84,7 @@ pub type OpenPtyFn = Box<
 ///
 /// `None` on backends that don't have an init control socket (macOS/Windows
 /// fall back to `Session::exec` if a caller needs one-shot semantics there).
-pub type RunOneshotFn = Box<
-    dyn Fn(&str, Duration) -> Result<ExecOutput> + Send + Sync,
->;
+pub type RunOneshotFn = Box<dyn Fn(&str, Duration) -> Result<ExecOutput> + Send + Sync>;
 
 /// Trait for spawn output collection. Implementations collect stdout/stderr
 /// from a background job and return them when `wait_with_timeout` is called.
@@ -103,18 +98,14 @@ pub(crate) trait JobOutput: Send + Sync {
 /// `wait_with_timeout` on it to block until the job completes.
 ///
 /// `None` on platforms without an init control socket (macOS/Windows).
-pub type SpawnAsyncFn = Box<
-    dyn Fn(u64, &str) -> Result<Box<dyn JobOutput>> + Send + Sync,
->;
+pub type SpawnAsyncFn = Box<dyn Fn(u64, &str) -> Result<Box<dyn JobOutput>> + Send + Sync>;
 
 /// Factory for killing a previously spawned background job by its
 /// session-local job id. Returns `Ok(())` if the signal was dispatched;
 /// does not guarantee the job has exited.
 ///
 /// `None` on platforms without an init control socket (macOS/Windows).
-pub type KillSpawnFn = Box<
-    dyn Fn(u64) -> Result<()> + Send + Sync,
->;
+pub type KillSpawnFn = Box<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
 /// A PTY child running inside the sandbox. Exposes the master fd directly for
 /// raw read/write (suitable for terminal_ws bidirectional copy). Resize/kill
@@ -255,19 +246,10 @@ impl Session {
     pub fn open(cfg: &SandboxConfig) -> Result<Self> {
         cfg.validate()?;
         let mut handle = spawn_session_shell(cfg)?;
-        let stdin = std::mem::replace(
-            &mut handle.stdin,
-            Box::new(std::io::sink()) as Box<dyn Write + Send>,
-        );
+        let stdin = std::mem::replace(&mut handle.stdin, Box::new(std::io::sink()) as Box<dyn Write + Send>);
         // Move stdout/stderr Read out so the spawned reader threads can own them.
-        let stdout = std::mem::replace(
-            &mut handle.stdout,
-            Box::new(std::io::empty()) as Box<dyn Read + Send>,
-        );
-        let stderr = std::mem::replace(
-            &mut handle.stderr,
-            Box::new(std::io::empty()) as Box<dyn Read + Send>,
-        );
+        let stdout = std::mem::replace(&mut handle.stdout, Box::new(std::io::empty()) as Box<dyn Read + Send>);
+        let stderr = std::mem::replace(&mut handle.stderr, Box::new(std::io::empty()) as Box<dyn Read + Send>);
 
         let sid = random_token();
         let state = Arc::new((Mutex::new(SessionState::default()), Condvar::new()));
@@ -276,10 +258,7 @@ impl Session {
         let r2 = spawn_reader(stderr, sid.clone(), Stream::Stderr, state.clone());
 
         #[cfg(not(target_os = "linux"))]
-        let capture_dir = cfg
-            .work_dir
-            .canonicalize()
-            .unwrap_or_else(|_| cfg.work_dir.clone());
+        let capture_dir = cfg.work_dir.canonicalize().unwrap_or_else(|_| cfg.work_dir.clone());
 
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
@@ -366,10 +345,7 @@ impl Session {
     /// Run `cmd` (a bash snippet) inside the session and return its output.
     /// State (env, cwd, background jobs, files) persists into subsequent calls.
     pub fn exec(&mut self, cmd: &str) -> Result<ExecOutput> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::exec("session is closed"))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| Error::exec("session is closed"))?;
         self.counter += 1;
         let id = self.counter;
         tracing::debug!(
@@ -426,9 +402,7 @@ impl Session {
         // Wait for both sentinels.
         let deadline = Instant::now() + self.timeout;
         let (lock, cv) = &*self.state;
-        let mut guard = lock
-            .lock()
-            .map_err(|_| Error::exec("session state poisoned"))?;
+        let mut guard = lock.lock().map_err(|_| Error::exec("session state poisoned"))?;
         loop {
             if guard.early_eof {
                 return Err(Error::exec(
@@ -464,10 +438,7 @@ impl Session {
                     "Session::exec TIMED OUT — tearing down session"
                 );
                 let _ = self.close_inner();
-                return Err(Error::exec(format!(
-                    "session exec timed out after {:?}",
-                    timeout
-                )));
+                return Err(Error::exec(format!("session exec timed out after {:?}", timeout)));
             }
             let (g, _) = cv
                 .wait_timeout(guard, deadline - now)
@@ -530,10 +501,7 @@ impl Session {
     /// File-mode spawn fallback for platforms without an init control socket.
     #[cfg(not(target_os = "linux"))]
     fn spawn_file_mode(&mut self, cmd: &str, id: u64) -> Result<JobHandle> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::exec("session is closed"))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| Error::exec("session is closed"))?;
         let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
         let out_name = format!(".tps_job_{}_{}.out", self.sid, id);
         let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
@@ -596,10 +564,7 @@ impl Session {
     /// On Linux (pipe mode) this is not yet supported and returns an error.
     #[cfg(not(target_os = "linux"))]
     pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::exec("session is closed"))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| Error::exec("session is closed"))?;
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
         let guest_dir = GUEST_CAPTURE_DIR;
         let snippet = format!(
@@ -625,7 +590,6 @@ impl Session {
             .ok_or_else(|| Error::exec("session is closed"))?;
         killer(job_id)
     }
-
 
     fn close_inner(&mut self) -> Result<()> {
         tracing::debug!(
@@ -724,9 +688,7 @@ impl JobOutput for FileJobOutput {
     fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput> {
         let deadline = Instant::now() + timeout;
         let (lock, cv) = &*self.state;
-        let mut guard = lock
-            .lock()
-            .map_err(|_| Error::exec("session state poisoned"))?;
+        let mut guard = lock.lock().map_err(|_| Error::exec("session state poisoned"))?;
         let exit_code = loop {
             if let Some(slot) = guard.completed.get(&self.id) {
                 if slot.job_done {
@@ -735,9 +697,7 @@ impl JobOutput for FileJobOutput {
                 }
             }
             if guard.early_eof {
-                return Err(Error::exec(
-                    "session shell exited before background job completed",
-                ));
+                return Err(Error::exec("session shell exited before background job completed"));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -753,12 +713,8 @@ impl JobOutput for FileJobOutput {
         };
         drop(guard);
 
-        let out_path = self
-            .capture_dir
-            .join(format!(".tps_job_{}_{}.out", self.sid, self.id));
-        let err_path = self
-            .capture_dir
-            .join(format!(".tps_job_{}_{}.err", self.sid, self.id));
+        let out_path = self.capture_dir.join(format!(".tps_job_{}_{}.out", self.sid, self.id));
+        let err_path = self.capture_dir.join(format!(".tps_job_{}_{}.err", self.sid, self.id));
         let stdout_bytes = std::fs::read(&out_path).map_err(|e| {
             Error::exec(format!(
                 "failed to read job stdout capture file {} (job {}): {e}",
@@ -863,9 +819,7 @@ fn spawn_reader<R: Read + Send + ?Sized + 'static>(
                                 None => break, // wait for more bytes
                             };
                             let line_end = line_start + 1 + nl + 1;
-                            let line = std::str::from_utf8(&buf[line_start..line_end])
-                                .unwrap_or("")
-                                .trim();
+                            let line = std::str::from_utf8(&buf[line_start..line_end]).unwrap_or("").trim();
                             let prefix = match kind {
                                 SentKind::Out => &pat_sbout[1..],
                                 SentKind::Err => &pat_sberr[1..],

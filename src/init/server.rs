@@ -14,13 +14,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
-use nix::sys::signal::{Signal, killpg, kill};
+use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::socket::{SockFlag, accept4};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::sys::socket::{accept4, SockFlag};
 use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::init_protocol::{
-    Event, ErrorCode, ErrorReply, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES,
-    StdioMode, default_features,
+    ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
 };
 use tokimo_package_sandbox::init_wire::{recv_frame, send_frame};
 
@@ -32,9 +31,16 @@ use crate::pty as ptymod;
 /// AI's network traffic through the L7 audit proxy; letting a child blow
 /// them away defeats audit.
 const PROTECTED_ENV: &[&str] = &[
-    "PATH", "LANG", "LC_ALL", "SAFEBOX",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "no_proxy",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "SAFEBOX",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
 ];
 
 const TOK_LISTENER: Token = Token(0);
@@ -79,27 +85,15 @@ pub fn snapshot_base_env() -> Vec<(String, String)> {
     env::vars().collect()
 }
 
-pub fn run_loop(
-    listener: OwnedFd,
-    sigfd: OwnedFd,
-    base_env: Vec<(String, String)>,
-) -> Result<(), String> {
+pub fn run_loop(listener: OwnedFd, sigfd: OwnedFd, base_env: Vec<(String, String)>) -> Result<(), String> {
     let mut poll = Poll::new().map_err(|e| format!("Poll::new: {e}"))?;
     let mut events = Events::with_capacity(64);
 
     poll.registry()
-        .register(
-            &mut SourceFd(&listener.as_raw_fd()),
-            TOK_LISTENER,
-            Interest::READABLE,
-        )
+        .register(&mut SourceFd(&listener.as_raw_fd()), TOK_LISTENER, Interest::READABLE)
         .map_err(|e| format!("register listener: {e}"))?;
     poll.registry()
-        .register(
-            &mut SourceFd(&sigfd.as_raw_fd()),
-            TOK_SIGFD,
-            Interest::READABLE,
-        )
+        .register(&mut SourceFd(&sigfd.as_raw_fd()), TOK_SIGFD, Interest::READABLE)
         .map_err(|e| format!("register sigfd: {e}"))?;
 
     let mut state = State {
@@ -122,9 +116,7 @@ pub fn run_loop(
         for ev in events.iter() {
             match ev.token() {
                 TOK_LISTENER => {
-                    if let Err(e) =
-                        accept_client(&listener, &mut state, poll.registry())
-                    {
+                    if let Err(e) = accept_client(&listener, &mut state, poll.registry()) {
                         eprintln!("[init] accept_client: {e}");
                     }
                 }
@@ -175,27 +167,16 @@ impl State {
     }
 }
 
-fn accept_client(
-    listener: &OwnedFd,
-    state: &mut State,
-    registry: &mio::Registry,
-) -> Result<(), String> {
-    let fd = accept4(
-        listener.as_raw_fd(),
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
-    )
-    .map_err(|e| format!("accept4: {e}"))?;
+fn accept_client(listener: &OwnedFd, state: &mut State, registry: &mio::Registry) -> Result<(), String> {
+    let fd = accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK)
+        .map_err(|e| format!("accept4: {e}"))?;
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let raw = owned.as_raw_fd();
     // Allocate a client slot (never recycled).
     let slot = state.client_slots.len();
     let token = Token(TOK_CLIENT_BASE + slot);
     registry
-        .register(
-            &mut SourceFd(&raw),
-            token,
-            Interest::READABLE,
-        )
+        .register(&mut SourceFd(&raw), token, Interest::READABLE)
         .map_err(|e| format!("register client: {e}"))?;
     state.client_slots.push(Some(raw));
     state.clients.insert(
@@ -257,19 +238,14 @@ fn drain_sigfd(sigfd: &OwnedFd) {
     // Just drain — content not used; we always waitpid(-1, WNOHANG).
     let mut buf = [0u8; 1024];
     loop {
-        let n = unsafe {
-            libc::read(sigfd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-        };
+        let n = unsafe { libc::read(sigfd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             break;
         }
     }
 }
 
-fn reap_children(
-    state: &mut State,
-    registry: &mio::Registry,
-) {
+fn reap_children(state: &mut State, registry: &mio::Registry) {
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, code)) => {
@@ -285,13 +261,7 @@ fn reap_children(
     }
 }
 
-fn emit_exit(
-    state: &mut State,
-    registry: &mio::Registry,
-    pid: Pid,
-    code: i32,
-    signal: Option<i32>,
-) {
+fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, signal: Option<i32>) {
     // Find child by pid (reverse lookup).
     let child_id = state
         .children
@@ -321,11 +291,7 @@ fn emit_exit(
                 code,
                 signal,
             });
-            let _ = send_frame(
-                unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) },
-                &frame,
-                None,
-            );
+            let _ = send_frame(unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) }, &frame, None);
         }
     }
     // Cleanup: deregister fds and remove from client's children set.
@@ -366,11 +332,7 @@ fn drain_pipe(fd: &OwnedFd, child_id: &str, client: &OwnedFd, is_stderr: bool) {
     }
 }
 
-fn pump_child_stream(
-    token: Token,
-    state: &mut State,
-    _registry: &mio::Registry,
-) {
+fn pump_child_stream(token: Token, state: &mut State, _registry: &mio::Registry) {
     let raw = token.0;
     if raw < TOK_CHILD_BASE {
         return;
@@ -382,7 +344,9 @@ fn pump_child_stream(
         Some(id) => id,
         None => return,
     };
-    let Some(rec) = state.children.get(&child_id) else { return };
+    let Some(rec) = state.children.get(&child_id) else {
+        return;
+    };
     let owner_fd = rec.owner_fd;
     let fd = if is_stderr {
         rec.stderr_fd.as_ref()
@@ -390,15 +354,13 @@ fn pump_child_stream(
         rec.stdout_fd.as_ref()
     };
     let Some(fd) = fd else { return };
-    let Some(client) = state.clients.get(&owner_fd) else { return };
+    let Some(client) = state.clients.get(&owner_fd) else {
+        return;
+    };
     drain_pipe(fd, &child_id, &client.fd, is_stderr);
 }
 
-fn handle_client_readable(
-    client_fd: RawFd,
-    state: &mut State,
-    registry: &mio::Registry,
-) -> Result<bool, String> {
+fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
     loop {
         let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
         let res = recv_frame(bf);
@@ -443,7 +405,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             };
             let _ = send_frame(bf, &Frame::Reply(reply), None);
         }
-        Op::OpenShell { id, argv, env_overlay, cwd } => {
+        Op::OpenShell {
+            id,
+            argv,
+            env_overlay,
+            cwd,
+        } => {
             spawn_child(
                 client_fd,
                 state,
@@ -456,7 +423,14 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 ChildKind::Shell,
             );
         }
-        Op::Spawn { id, argv, env_overlay, cwd, stdio, inherit_from_child } => {
+        Op::Spawn {
+            id,
+            argv,
+            env_overlay,
+            cwd,
+            stdio,
+            inherit_from_child,
+        } => {
             let inherited_env = inherit_from_child
                 .as_ref()
                 .and_then(|cid| resolve_child_env(state, cid));
@@ -490,21 +464,17 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 let bytes = B64
                     .decode(&data_b64)
                     .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("base64: {e}")))?;
-                let rec = state.children.get_mut(&child_id).ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}"))
-                })?;
-                let fd = rec.stdin_fd.as_ref().ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::BadRequest, "child has no stdin (PTY?)")
-                })?;
+                let rec = state
+                    .children
+                    .get_mut(&child_id)
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}")))?;
+                let fd = rec
+                    .stdin_fd
+                    .as_ref()
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::BadRequest, "child has no stdin (PTY?)"))?;
                 let mut off = 0;
                 while off < bytes.len() {
-                    let n = unsafe {
-                        libc::write(
-                            fd.as_raw_fd(),
-                            bytes.as_ptr().add(off).cast(),
-                            bytes.len() - off,
-                        )
-                    };
+                    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().add(off).cast(), bytes.len() - off) };
                     if n < 0 {
                         let err = std::io::Error::last_os_error();
                         if err.kind() == std::io::ErrorKind::Interrupted {
@@ -521,14 +491,21 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             })();
             ack(bf, id, res);
         }
-        Op::Resize { id, child_id, rows, cols } => {
+        Op::Resize {
+            id,
+            child_id,
+            rows,
+            cols,
+        } => {
             let res = (|| -> Result<(), ErrorReply> {
-                let rec = state.children.get(&child_id).ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}"))
-                })?;
-                let master = rec.master_fd.as_ref().ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::BadRequest, "child has no PTY")
-                })?;
+                let rec = state
+                    .children
+                    .get(&child_id)
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}")))?;
+                let master = rec
+                    .master_fd
+                    .as_ref()
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::BadRequest, "child has no PTY"))?;
                 ptymod::set_winsize(master.as_raw_fd(), rows, cols)
                     .map_err(|e| ErrorReply::new(ErrorCode::Internal, e))?;
                 let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGWINCH);
@@ -536,14 +513,19 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             })();
             ack(bf, id, res);
         }
-        Op::Signal { id, child_id, sig, to_pgrp } => {
+        Op::Signal {
+            id,
+            child_id,
+            sig,
+            to_pgrp,
+        } => {
             let res = (|| -> Result<(), ErrorReply> {
-                let sig = Signal::try_from(sig).map_err(|_| {
-                    ErrorReply::new(ErrorCode::BadRequest, format!("invalid signal {sig}"))
-                })?;
-                let rec = state.children.get(&child_id).ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}"))
-                })?;
+                let sig = Signal::try_from(sig)
+                    .map_err(|_| ErrorReply::new(ErrorCode::BadRequest, format!("invalid signal {sig}")))?;
+                let rec = state
+                    .children
+                    .get(&child_id)
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}")))?;
                 let target = if to_pgrp { rec.pgid } else { rec.pid };
                 let r = if to_pgrp {
                     killpg(Pid::from_raw(target), sig)
@@ -566,9 +548,10 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         }
         Op::Close { id, child_id } => {
             let res = (|| -> Result<(), ErrorReply> {
-                let rec = state.children.get_mut(&child_id).ok_or_else(|| {
-                    ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}"))
-                })?;
+                let rec = state
+                    .children
+                    .get_mut(&child_id)
+                    .ok_or_else(|| ErrorReply::new(ErrorCode::UnknownChild, format!("no such child {child_id}")))?;
                 rec.stdin_fd.take(); // drop = close
                 rec.master_fd.take();
                 Ok(())
@@ -604,7 +587,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             }
             ack(bf, id, Ok(()));
         }
-        Op::AddUser { id, user_id, cwd, env_overlay } => {
+        Op::AddUser {
+            id,
+            user_id,
+            cwd,
+            env_overlay,
+        } => {
             // Ensure per-user directories exist.
             let tmpdir = format!("/tmp/{}", user_id);
             let workdir = format!("/work/{}", user_id);
@@ -650,7 +638,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             }
             ack(bf, id, Ok(()));
         }
-        Op::BindMount { id, source, target, read_only } => {
+        Op::BindMount {
+            id,
+            source,
+            target,
+            read_only,
+        } => {
             let res = (|| -> Result<(), ErrorReply> {
                 let src = std::ffi::CString::new(source.as_str())
                     .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
@@ -661,7 +654,15 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 } else {
                     libc::MS_BIND
                 };
-                let rc = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), std::ptr::null::<libc::c_char>(), flags, std::ptr::null::<libc::c_void>()) };
+                let rc = unsafe {
+                    libc::mount(
+                        src.as_ptr(),
+                        tgt.as_ptr(),
+                        std::ptr::null::<libc::c_char>(),
+                        flags,
+                        std::ptr::null::<libc::c_void>(),
+                    )
+                };
                 if rc != 0 {
                     return Err(ErrorReply::new(
                         ErrorCode::Internal,
@@ -692,8 +693,16 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
 
 fn ack(bf: BorrowedFd<'_>, id: String, res: Result<(), ErrorReply>) {
     let reply = match res {
-        Ok(()) => Reply::Ack { id, ok: true, error: None },
-        Err(e) => Reply::Ack { id, ok: false, error: Some(e) },
+        Ok(()) => Reply::Ack {
+            id,
+            ok: true,
+            error: None,
+        },
+        Err(e) => Reply::Ack {
+            id,
+            ok: false,
+            error: Some(e),
+        },
     };
     let _ = send_frame(bf, &Frame::Reply(reply), None);
 }
@@ -751,19 +760,11 @@ fn spawn_child_inner(
             // Register pipe fds.
             if let Some(fd) = spawned.stdout_fd.as_ref() {
                 let tok = Token(TOK_CHILD_BASE + slot * 2);
-                let _ = registry.register(
-                    &mut SourceFd(&fd.as_raw_fd()),
-                    tok,
-                    Interest::READABLE,
-                );
+                let _ = registry.register(&mut SourceFd(&fd.as_raw_fd()), tok, Interest::READABLE);
             }
             if let Some(fd) = spawned.stderr_fd.as_ref() {
                 let tok = Token(TOK_CHILD_BASE + slot * 2 + 1);
-                let _ = registry.register(
-                    &mut SourceFd(&fd.as_raw_fd()),
-                    tok,
-                    Interest::READABLE,
-                );
+                let _ = registry.register(&mut SourceFd(&fd.as_raw_fd()), tok, Interest::READABLE);
             }
             let pid = spawned.pid;
             state.child_slots[slot] = Some(child_id.clone());
@@ -799,8 +800,7 @@ fn spawn_child_inner(
 }
 
 fn merge_env(base: &[(String, String)], overlay: &[(String, String)]) -> Vec<(String, String)> {
-    let mut out: HashMap<String, String> =
-        base.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut out: HashMap<String, String> = base.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (k, v) in overlay {
         if PROTECTED_ENV.iter().any(|p| *p == k.as_str()) {
             // Silently drop; child still gets the base value. (We could
@@ -857,8 +857,7 @@ fn _drop<T>(_t: T) {}
 
 // Silence unused import warnings on platforms without the relevant features.
 #[allow(dead_code)]
-fn _touch() {
-}
+fn _touch() {}
 
 #[allow(dead_code)]
 fn op_name(op: &Op) -> &'static str {

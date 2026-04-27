@@ -22,7 +22,7 @@
 //! is deliberately NOT trapped: our own bootstrap `sendmsg(SCM_RIGHTS)`
 //! would deadlock.
 
-use super::{build_event, close_fd, new_shutdown, L4Config, Shutdown};
+use super::{L4Config, Shutdown, build_event, close_fd, new_shutdown};
 use crate::net_observer::{Proto, Verdict};
 use std::io;
 use std::mem;
@@ -150,14 +150,54 @@ const PROG_LEN: u16 = 8;
 
 fn build_program() -> [SockFilter; 8] {
     [
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: OFF_ARCH },
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: AUDIT_ARCH },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: OFF_NR },
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: nr::CONNECT },
-        SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: nr::SENDTO },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
-        SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_USER_NOTIF },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFF_ARCH,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: AUDIT_ARCH,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: OFF_NR,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: nr::CONNECT,
+        },
+        SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: nr::SENDTO,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
     ]
 }
 
@@ -223,7 +263,7 @@ fn probe_new_listener_supported() -> io::Result<()> {
                 "seccomp NEW_LISTENER not available on this host \
                  (likely inherited seccomp filter or WSL2 / container runtime); \
                  L4 observer disabled. L7 proxy observer is unaffected.",
-            ))
+            ));
         }
         _ => {}
     }
@@ -241,10 +281,7 @@ fn probe_new_listener_supported() -> io::Result<()> {
                 jf: 0,
                 k: SECCOMP_RET_ALLOW,
             };
-            let prog = SockFprog {
-                len: 1,
-                filter: &allow,
-            };
+            let prog = SockFprog { len: 1, filter: &allow };
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
                 libc::_exit(2);
             }
@@ -372,8 +409,7 @@ fn libc_cmsg_len(data_len: usize) -> libc::size_t {
 }
 #[inline]
 fn libc_cmsg_space(data_len: usize) -> libc::size_t {
-    (libc_cmsg_align(mem::size_of::<libc::cmsghdr>()) + libc_cmsg_align(data_len))
-        as libc::size_t
+    (libc_cmsg_align(mem::size_of::<libc::cmsghdr>()) + libc_cmsg_align(data_len)) as libc::size_t
 }
 #[inline]
 unsafe fn libc_cmsg_data(cmsg: *const libc::cmsghdr) -> *const u8 {
@@ -399,10 +435,7 @@ impl Drop for SeccompNotifyHandle {
     }
 }
 
-pub(crate) fn start_parent(
-    pending: Pending,
-    cfg: L4Config,
-) -> io::Result<SeccompNotifyHandle> {
+pub(crate) fn start_parent(pending: Pending, cfg: L4Config) -> io::Result<SeccompNotifyHandle> {
     // Receive listener fd from child via SCM_RIGHTS.
     let listener_fd = recv_listener_fd(pending.sp_parent)?;
     // sp_parent no longer needed.
@@ -522,7 +555,11 @@ fn handle_one(listener_fd: RawFd, notif: &SeccompNotif, cfg: &L4Config) {
     }
 
     let sa = parse_sockaddr(&buf[..n]);
-    let proto = if syscall_nr == nr::SENDTO { Proto::Udp } else { Proto::Tcp };
+    let proto = if syscall_nr == nr::SENDTO {
+        Proto::Udp
+    } else {
+        Proto::Tcp
+    };
 
     if let Some(remote) = sa {
         let comm = read_comm(notif.pid);
@@ -586,13 +623,7 @@ fn respond_errno(listener_fd: RawFd, id: u64, errno: i32) -> io::Result<()> {
 }
 
 fn notif_id_valid(listener_fd: RawFd, id: u64) -> bool {
-    let rc = unsafe {
-        libc::ioctl(
-            listener_fd,
-            SECCOMP_IOCTL_NOTIF_ID_VALID as _,
-            &id as *const u64,
-        )
-    };
+    let rc = unsafe { libc::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID as _, &id as *const u64) };
     rc == 0
 }
 
@@ -607,16 +638,7 @@ pub(super) fn read_sockaddr(pid: u32, remote_ptr: u64, len: usize, out: &mut [u8
         iov_base: remote_ptr as *mut libc::c_void,
         iov_len: len,
     };
-    let n = unsafe {
-        libc::process_vm_readv(
-            pid as libc::pid_t,
-            &local,
-            1,
-            &remote,
-            1,
-            0,
-        )
-    };
+    let n = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
     if n <= 0 {
         // Fallback: /proc/<pid>/mem pread.
         read_via_proc_mem(pid, remote_ptr, len, out)
@@ -630,11 +652,7 @@ fn read_via_proc_mem(pid: u32, remote_ptr: u64, len: usize, out: &mut [u8]) -> O
     let path = format!("/proc/{}/mem", pid);
     let f = std::fs::OpenOptions::new().read(true).open(&path).ok()?;
     let n = f.read_at(&mut out[..len], remote_ptr).ok()?;
-    if n == 0 {
-        None
-    } else {
-        Some(n)
-    }
+    if n == 0 { None } else { Some(n) }
 }
 
 pub(super) fn read_comm(pid: u32) -> Option<String> {

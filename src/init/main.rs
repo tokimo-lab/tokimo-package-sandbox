@@ -16,9 +16,7 @@ use std::process::ExitCode;
 
 use nix::sys::signal::{SigSet, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
-use nix::sys::socket::{
-    AddressFamily, SockFlag, SockType, UnixAddr, bind, listen, socket, Backlog,
-};
+use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket};
 use nix::unistd::getpid;
 
 mod child;
@@ -40,10 +38,7 @@ fn run() -> Result<(), String> {
     // Hard requirement: bwrap MUST have launched us with `--as-pid-1`.
     let pid = getpid();
     if pid.as_raw() != 1 {
-        return Err(format!(
-            "init must be PID 1 (got {}); host forgot --as-pid-1",
-            pid
-        ));
+        return Err(format!("init must be PID 1 (got {}); host forgot --as-pid-1", pid));
     }
 
     // Block the signals we want to receive via signalfd. SIGCHLD is the

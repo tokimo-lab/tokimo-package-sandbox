@@ -62,13 +62,9 @@ pub(crate) fn run(cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<Execut
 /// Like `build_bwrap_command_with_extras` with no extras. Currently unused
 /// but retained for symmetry with the legacy code path.
 #[allow(dead_code)]
-pub(crate) fn build_bwrap_command(
-    inner_argv: &[&str],
-    cfg: &SandboxConfig,
-) -> Result<(Command, BwrapKeepAlive)> {
-    let bwrap = which("bwrap").ok_or_else(|| {
-        Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into())
-    })?;
+pub(crate) fn build_bwrap_command(inner_argv: &[&str], cfg: &SandboxConfig) -> Result<(Command, BwrapKeepAlive)> {
+    let bwrap = which("bwrap")
+        .ok_or_else(|| Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into()))?;
     let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, &[], false)?;
     Ok((cmd, keepalive))
 }
@@ -91,18 +87,13 @@ fn build_bwrap_command_with_extras_inner(
     extra_args: &[&str],
     skip_seccomp: bool,
 ) -> Result<(Command, BwrapKeepAlive)> {
-    let bwrap = which("bwrap").ok_or_else(|| {
-        Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into())
-    })?;
+    let bwrap = which("bwrap")
+        .ok_or_else(|| Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into()))?;
     let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, extra_args, skip_seccomp)?;
     Ok((cmd, keepalive))
 }
 
-fn run_with_bwrap(
-    bwrap: &Path,
-    user_cmd: &[impl AsRef<str>],
-    cfg: &SandboxConfig,
-) -> Result<ExecutionResult> {
+fn run_with_bwrap(bwrap: &Path, user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
     let (mut cmd, mut keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg, &[], false)?;
     pipe_stdio(&mut cmd);
@@ -167,7 +158,7 @@ fn build_bwrap_command_inner(
                     let fd = f.into_raw_fd();
                     // Rust opens files with O_CLOEXEC; clear it so the child inherits fd.
                     unsafe {
-                        use nix::libc::{fcntl, FD_CLOEXEC, F_GETFD, F_SETFD};
+                        use nix::libc::{F_GETFD, F_SETFD, FD_CLOEXEC, fcntl};
                         let flags = fcntl(fd, F_GETFD, 0);
                         if flags >= 0 {
                             fcntl(fd, F_SETFD, flags & !FD_CLOEXEC);
@@ -278,83 +269,82 @@ fn build_bwrap_command_inner(
     }
 
     // Network.
-    let (proxy_handle, l4_prep): (Option<ProxyHandle>, Option<(l4::ChildInstall, l4::Pending, L4Config)>) = match &cfg.network {
-        NetworkPolicy::Blocked => {
-            cmd.args(["--unshare-net"]);
-            (None, None)
-        }
-        NetworkPolicy::AllowAll => {
-            cmd.args(["--share-net"]);
-            (None, None)
-        }
-        NetworkPolicy::Observed { sink } => {
-            cmd.args(["--share-net"]);
-            let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
-            let handle = net_observer::start_proxy(ProxyConfig {
-                sink: sink.clone(),
-                allow_hosts: vec![],
-                enforce_allow: false,
-                bridge: Some(bridge.clone()),
-            })
-            .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
-            let l4_cfg = L4Config {
-                sink: sink.clone(),
-                allow_hosts: vec![],
-                enforce_allow: false,
-                bridge: Some(bridge),
-            };
-            let l4_prep = match l4::prepare(l4_cfg.clone()) {
-                Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
-                Err(e) => {
-                    tracing::warn!(
-                        "sandbox: L4 observer disabled, continuing with L7 only: {}",
-                        e
-                    );
-                    None
-                }
-            };
-            (Some(handle), l4_prep)
-        }
-        NetworkPolicy::Gated {
-            sink,
-            allow_hosts,
-            dns_policy: _,
-        } => {
-            cmd.args(["--share-net"]);
-            let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
-            let handle = net_observer::start_proxy(ProxyConfig {
-                sink: sink.clone(),
-                allow_hosts: allow_hosts.clone(),
-                enforce_allow: true,
-                bridge: Some(bridge.clone()),
-            })
-            .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
-            let l4_cfg = L4Config {
-                sink: sink.clone(),
-                allow_hosts: allow_hosts.clone(),
-                enforce_allow: true,
-                bridge: Some(bridge),
-            };
-            let l4_prep = match l4::prepare(l4_cfg.clone()) {
-                Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
-                Err(e) => {
-                    tracing::warn!(
-                        "sandbox: L4 observer disabled, continuing with L7 only: {}",
-                        e
-                    );
-                    None
-                }
-            };
-            (Some(handle), l4_prep)
-        }
-    };
+    let (proxy_handle, l4_prep): (Option<ProxyHandle>, Option<(l4::ChildInstall, l4::Pending, L4Config)>) =
+        match &cfg.network {
+            NetworkPolicy::Blocked => {
+                cmd.args(["--unshare-net"]);
+                (None, None)
+            }
+            NetworkPolicy::AllowAll => {
+                cmd.args(["--share-net"]);
+                (None, None)
+            }
+            NetworkPolicy::Observed { sink } => {
+                cmd.args(["--share-net"]);
+                let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
+                let handle = net_observer::start_proxy(ProxyConfig {
+                    sink: sink.clone(),
+                    allow_hosts: vec![],
+                    enforce_allow: false,
+                    bridge: Some(bridge.clone()),
+                })
+                .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
+                let l4_cfg = L4Config {
+                    sink: sink.clone(),
+                    allow_hosts: vec![],
+                    enforce_allow: false,
+                    bridge: Some(bridge),
+                };
+                let l4_prep = match l4::prepare(l4_cfg.clone()) {
+                    Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
+                    Err(e) => {
+                        tracing::warn!("sandbox: L4 observer disabled, continuing with L7 only: {}", e);
+                        None
+                    }
+                };
+                (Some(handle), l4_prep)
+            }
+            NetworkPolicy::Gated {
+                sink,
+                allow_hosts,
+                dns_policy: _,
+            } => {
+                cmd.args(["--share-net"]);
+                let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
+                let handle = net_observer::start_proxy(ProxyConfig {
+                    sink: sink.clone(),
+                    allow_hosts: allow_hosts.clone(),
+                    enforce_allow: true,
+                    bridge: Some(bridge.clone()),
+                })
+                .map_err(|e| Error::exec(format!("start net observer proxy: {}", e)))?;
+                let l4_cfg = L4Config {
+                    sink: sink.clone(),
+                    allow_hosts: allow_hosts.clone(),
+                    enforce_allow: true,
+                    bridge: Some(bridge),
+                };
+                let l4_prep = match l4::prepare(l4_cfg.clone()) {
+                    Ok((ci, pend)) => Some((ci, pend, l4_cfg)),
+                    Err(e) => {
+                        tracing::warn!("sandbox: L4 observer disabled, continuing with L7 only: {}", e);
+                        None
+                    }
+                };
+                (Some(handle), l4_prep)
+            }
+        };
 
     // Environment: clear default, set explicit.
     cmd.args(["--clearenv"]);
 
     // Library defaults first; the caller's `cfg.env` is applied AFTER so
     // it can override anything below (HOME, PATH, TMPDIR, ...).
-    cmd.args(["--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]);
+    cmd.args([
+        "--setenv",
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]);
     cmd.args(["--setenv", "HOME", "/tmp"]);
     cmd.args(["--setenv", "TMPDIR", "/tmp"]);
     cmd.args(["--setenv", "SAFEBOX", "1"]);
@@ -367,17 +357,20 @@ fn build_bwrap_command_inner(
     // Caller-provided env: applied last so callers can override the
     // library defaults above (e.g. set a different HOME, custom PATH).
     for (k, v) in &cfg.env {
-        cmd.args([
-            "--setenv",
-            k.to_string_lossy().as_ref(),
-            v.to_string_lossy().as_ref(),
-        ]);
+        cmd.args(["--setenv", k.to_string_lossy().as_ref(), v.to_string_lossy().as_ref()]);
     }
 
     // Point cooperating clients at the in-process L7 observer proxy.
     if let Some(h) = &proxy_handle {
         let proxy_url = format!("http://{}", h.addr());
-        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
             cmd.args(["--setenv", k, &proxy_url]);
         }
         // Local services never hit the proxy.
@@ -386,10 +379,7 @@ fn build_bwrap_command_inner(
     }
 
     // cwd inside sandbox.
-    let cwd_inside = cfg
-        .cwd
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let cwd_inside = cfg.cwd.clone().unwrap_or_else(|| PathBuf::from("/tmp"));
     cmd.args(["--chdir", &cwd_inside.to_string_lossy()]);
 
     // Seccomp BPF via fd 3. When `skip_seccomp` is set (workspace mode),
@@ -419,7 +409,7 @@ fn build_bwrap_command_inner(
     let l4_install = l4_prep.as_ref().map(|(ci, _, _)| *ci);
     unsafe {
         cmd.pre_exec(move || {
-            use nix::libc::{close, dup2, fcntl, FD_CLOEXEC, F_GETFD, F_SETFD};
+            use nix::libc::{F_GETFD, F_SETFD, FD_CLOEXEC, close, dup2, fcntl};
             crate::common::apply_rlimits(&limits);
             if let Some(src_fd) = seccomp_fd {
                 const SLOT: i32 = 3;
@@ -448,8 +438,7 @@ fn build_bwrap_command_inner(
 
     // Stash the L4 pending state on the keepalive; caller must finalize
     // AFTER `Command::spawn` returns (pre_exec has sent the listener fd).
-    let l4_pending_finalize: Option<(l4::Pending, L4Config)> =
-        l4_prep.map(|(_, p, c)| (p, c));
+    let l4_pending_finalize: Option<(l4::Pending, L4Config)> = l4_prep.map(|(_, p, c)| (p, c));
 
     Ok((
         cmd,
@@ -485,11 +474,7 @@ impl BwrapKeepAlive {
     }
 }
 
-fn run_with_firejail(
-    firejail: &Path,
-    user_cmd: &[impl AsRef<str>],
-    cfg: &SandboxConfig,
-) -> Result<ExecutionResult> {
+fn run_with_firejail(firejail: &Path, user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     let work_dir = cfg
         .work_dir
         .canonicalize()
@@ -696,13 +681,8 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
     let kill_client = client.clone();
     let kill_child_id = child_id.clone();
     let kill_lifecycle = lifecycle.clone();
-    let try_wait = Box::new(move || -> bool {
-        try_wait_lifecycle
-            .exit_code
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(true)
-    });
+    let try_wait =
+        Box::new(move || -> bool { try_wait_lifecycle.exit_code.lock().map(|g| g.is_some()).unwrap_or(true) });
     let kill = Box::new(move || {
         // Best-effort: SIGKILL the bash pgrp.
         let _ = kill_client.signal(&kill_child_id, libc::SIGKILL, true);
@@ -766,12 +746,8 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
     let spawn_shell_cid = child_id.clone();
     let spawn_job_map = job_map.clone();
     let spawn_async: crate::session::SpawnAsyncFn = Box::new(move |job_id: u64, cmd: &str| {
-        let handle = spawn_client.spawn_pipes_inherit_async(
-            &["/bin/bash", "-c", cmd],
-            &[],
-            None,
-            Some(&spawn_shell_cid),
-        )?;
+        let handle =
+            spawn_client.spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
         let child_id = handle.child_id().to_string();
         spawn_job_map
             .lock()
@@ -788,9 +764,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
     let kill_job_map = job_map.clone();
     let kill_spawn: crate::session::KillSpawnFn = Box::new(move |job_id: u64| {
         let child_id = {
-            let map = kill_job_map
-                .lock()
-                .map_err(|_| Error::exec("job map poisoned"))?;
+            let map = kill_job_map.lock().map_err(|_| Error::exec("job map poisoned"))?;
             map.get(&job_id).cloned()
         };
         if let Some(cid) = child_id {
@@ -862,23 +836,22 @@ pub(crate) fn open_pty_via_init(
 
     let wait_client = client.clone();
     let wait_id = child_id.clone();
-    let wait_fn: Box<dyn Fn(std::time::Duration) -> Option<i32> + Send + Sync> =
-        Box::new(move |timeout| {
-            let deadline = std::time::Instant::now() + timeout;
-            loop {
-                if let Some((rc, _sig)) = wait_client.take_exit(&wait_id) {
-                    return Some(rc);
-                }
-                if wait_client.is_dead() {
-                    return Some(-1);
-                }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return None;
-                }
-                wait_client.wait_for_event(&wait_id, deadline);
+    let wait_fn: Box<dyn Fn(std::time::Duration) -> Option<i32> + Send + Sync> = Box::new(move |timeout| {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some((rc, _sig)) = wait_client.take_exit(&wait_id) {
+                return Some(rc);
             }
-        });
+            if wait_client.is_dead() {
+                return Some(-1);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            wait_client.wait_for_event(&wait_id, deadline);
+        }
+    });
 
     // Keepalive: hold an Arc<InitClient> so the control socket outlives the
     // PtyHandle even if the originating Session is dropped.

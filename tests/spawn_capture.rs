@@ -58,9 +58,7 @@ fn spawn_captures_output_when_tmp_is_remapped() {
     let handle = sess
         .spawn("echo hello-stdout; echo hello-stderr 1>&2; exit 7")
         .expect("Session::spawn");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(15))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(15)).expect("wait");
 
     assert_eq!(out.exit_code, 7, "exit code propagated");
     assert!(
@@ -90,12 +88,8 @@ fn spawn_captures_stderr_on_nonzero_exit() {
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
 
-    let handle = sess
-        .spawn("echo BOOM 1>&2; exit 1")
-        .expect("Session::spawn");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(10))
-        .expect("wait");
+    let handle = sess.spawn("echo BOOM 1>&2; exit 1").expect("Session::spawn");
+    let out = handle.wait_with_timeout(Duration::from_secs(10)).expect("wait");
 
     assert_eq!(out.exit_code, 1);
     assert!(
@@ -198,9 +192,7 @@ fn spawn_captures_when_caller_remaps_everything() {
     let handle = sess
         .spawn("echo captured-stdout; echo captured-stderr 1>&2; exit 42")
         .expect("Session::spawn");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(15))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(15)).expect("wait");
 
     assert_eq!(out.exit_code, 42, "exit code propagated");
     assert!(
@@ -233,9 +225,7 @@ fn spawn_captures_megabyte_stdout_without_truncation() {
     // ~1.4 MB of base64 output.
     let cmd = "dd if=/dev/urandom bs=1024 count=1024 2>/dev/null | base64 -w0";
     let handle = sess.spawn(cmd).expect("Session::spawn");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(30))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(30)).expect("wait");
 
     assert_eq!(out.exit_code, 0, "exit code");
     let expected_min = 1024 * 1024 * 4 / 3; // base64 expansion floor
@@ -274,11 +264,7 @@ fn spawn_concurrent_50_jobs_no_crosstalk() {
         let out = handle
             .wait_with_timeout(Duration::from_secs(30))
             .unwrap_or_else(|e| panic!("wait job {i}: {e}"));
-        assert_eq!(
-            out.exit_code, 0,
-            "job {i} exit code (magic={magic}): {}",
-            out.exit_code
-        );
+        assert_eq!(out.exit_code, 0, "job {i} exit code (magic={magic}): {}", out.exit_code);
         let trimmed = out.stdout.trim();
         assert_eq!(
             trimmed, &magic,
@@ -308,9 +294,7 @@ fn spawn_inherits_bash_env_and_cwd() {
 
     // Spawn reads the inherited cwd from /proc/<shell_pid>/cwd.
     let handle = sess.spawn("pwd").expect("spawn cwd test");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(10))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(10)).expect("wait");
 
     assert_eq!(out.exit_code, 0);
     assert!(
@@ -340,9 +324,7 @@ fn spawn_pipe_buffer_backpressure_no_data_loss() {
     // Simulate consumer delay to ensure backpressure engages.
     std::thread::sleep(Duration::from_secs(1));
 
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(60))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(60)).expect("wait");
 
     assert_eq!(out.exit_code, 0);
     let expected_min = 10 * 1024 * 1024 * 4 / 3; // base64 expansion of 10 MB
@@ -367,14 +349,11 @@ fn spawn_child_exits_before_host_reads() {
 
     // Generate a large output and exit immediately. The child's stdout
     // pipe has data still buffered when the exit event arrives.
-    let cmd =
-        "python3 -c 'import sys; sys.stdout.write(\"X\" * 200_000); sys.stdout.flush()' 2>/dev/null \
+    let cmd = "python3 -c 'import sys; sys.stdout.write(\"X\" * 200_000); sys.stdout.flush()' 2>/dev/null \
          || perl -e 'print \"X\" x 200_000' 2>/dev/null \
          || awk 'BEGIN {while(i++<200000) printf \"X\"}'";
     let handle = sess.spawn(cmd).expect("spawn big+exit");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(15))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(15)).expect("wait");
 
     assert_eq!(out.exit_code, 0, "exit_code={}", out.exit_code);
     assert_eq!(
@@ -383,10 +362,7 @@ fn spawn_child_exits_before_host_reads() {
         "data loss: expected 200000 bytes, got {}",
         out.stdout.len()
     );
-    assert!(
-        out.stdout.chars().all(|c| c == 'X'),
-        "unexpected content in stdout"
-    );
+    assert!(out.stdout.chars().all(|c| c == 'X'), "unexpected content in stdout");
 }
 
 /// If init disconnects while a job is running, `wait_with_timeout` must
@@ -450,12 +426,7 @@ fn spawn_1000_small_jobs_memory_stable() {
             .wait_with_timeout(Duration::from_secs(30))
             .unwrap_or_else(|e| panic!("wait job {i}: {e}"));
         assert_eq!(out.exit_code, 0, "job {i} exit code: {}", out.exit_code);
-        assert_eq!(
-            out.stdout.trim(),
-            "hello",
-            "job {i} wrong output: {:?}",
-            out.stdout
-        );
+        assert_eq!(out.stdout.trim(), "hello", "job {i} wrong output: {:?}", out.stdout);
     }
 }
 
@@ -479,9 +450,7 @@ fn spawn_stdout_stderr_interleave_boundary() {
         printf 'ERR%04d' $i >&2; head -c 100 /dev/zero | tr '\\0' 'B' >&2; echo >&2; \
         done";
     let handle = sess.spawn(cmd).expect("spawn interleave");
-    let out = handle
-        .wait_with_timeout(Duration::from_secs(30))
-        .expect("wait");
+    let out = handle.wait_with_timeout(Duration::from_secs(30)).expect("wait");
 
     assert_eq!(out.exit_code, 0, "exit_code={}", out.exit_code);
 
@@ -490,22 +459,14 @@ fn spawn_stdout_stderr_interleave_boundary() {
         if line.is_empty() {
             continue;
         }
-        assert!(
-            line.starts_with("OUT"),
-            "stderr leaked into stdout: {:?}",
-            line
-        );
+        assert!(line.starts_with("OUT"), "stderr leaked into stdout: {:?}", line);
     }
     // Verify stderr lines all start with ERR.
     for line in out.stderr.lines() {
         if line.is_empty() {
             continue;
         }
-        assert!(
-            line.starts_with("ERR"),
-            "stdout leaked into stderr: {:?}",
-            line
-        );
+        assert!(line.starts_with("ERR"), "stdout leaked into stderr: {:?}", line);
     }
 
     // Should have 256 lines in each stream.
@@ -535,7 +496,11 @@ fn spawn_timeout_kills_job() {
         .expect("timeout wait should not error");
     let elapsed = start.elapsed();
 
-    assert_eq!(out.exit_code, 124, "timeout exit_code should be 124, got {}", out.exit_code);
+    assert_eq!(
+        out.exit_code, 124,
+        "timeout exit_code should be 124, got {}",
+        out.exit_code
+    );
     assert!(
         elapsed < Duration::from_secs(5),
         "timeout should return quickly, took {elapsed:?}"
@@ -559,7 +524,11 @@ fn spawn_kill_job_keeps_session_alive() {
     // Set some session state.
     sess.exec("export FOO=bar && cd /tmp").expect("exec setup");
     let cwd_check = sess.exec("pwd").expect("exec pwd");
-    assert!(cwd_check.stdout.contains("/tmp"), "cwd before kill: {:?}", cwd_check.stdout);
+    assert!(
+        cwd_check.stdout.contains("/tmp"),
+        "cwd before kill: {:?}",
+        cwd_check.stdout
+    );
 
     // Spawn a long-running job.
     let handle = sess.spawn("sleep 60 && echo NEVER").expect("spawn slow");
@@ -608,17 +577,13 @@ fn spawn_exec_mixed_inherits_state() {
     // Round 1: exec changes cwd, spawn sees it.
     sess.exec("cd /tmp").expect("exec cd /tmp");
     let h1 = sess.spawn("pwd").expect("spawn round 1");
-    let o1 = h1
-        .wait_with_timeout(Duration::from_secs(10))
-        .expect("wait round 1");
+    let o1 = h1.wait_with_timeout(Duration::from_secs(10)).expect("wait round 1");
     assert!(o1.stdout.contains("/tmp"), "spawn r1 cwd wrong: {:?}", o1.stdout);
 
     // Round 2: exec changes cwd again, spawn sees the new one.
     sess.exec("cd /home").expect("exec cd /home");
     let h2 = sess.spawn("pwd").expect("spawn round 2");
-    let o2 = h2
-        .wait_with_timeout(Duration::from_secs(10))
-        .expect("wait round 2");
+    let o2 = h2.wait_with_timeout(Duration::from_secs(10)).expect("wait round 2");
     assert!(o2.stdout.contains("/home"), "spawn r2 cwd wrong: {:?}", o2.stdout);
 
     // Verify exec also sees the right cwd.

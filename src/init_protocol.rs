@@ -76,9 +76,18 @@ pub enum Op {
     /// Write `data_b64` (base64-encoded) to the named child's stdin (pipes
     /// mode). For PTY children this is a no-op — host writes to the master
     /// fd directly.
-    Write { id: String, child_id: String, data_b64: String },
+    Write {
+        id: String,
+        child_id: String,
+        data_b64: String,
+    },
     /// Resize a PTY child: `ioctl(master, TIOCSWINSZ)` + `killpg(SIGWINCH)`.
-    Resize { id: String, child_id: String, rows: u16, cols: u16 },
+    Resize {
+        id: String,
+        child_id: String,
+        rows: u16,
+        cols: u16,
+    },
     /// Send a signal. `to_pgrp` defaults to true (use `killpg`).
     Signal {
         id: String,
@@ -114,10 +123,7 @@ pub enum Op {
     },
     /// Remove a user: SIGKILL all children owned by the requesting client,
     /// then (eventually) clean up /tmp/<user_id>.
-    RemoveUser {
-        id: String,
-        user_id: String,
-    },
+    RemoveUser { id: String, user_id: String },
     /// Dynamic bind mount inside the container. `source` must be a path
     /// already visible inside the container (e.g., pre-mounted host dir).
     /// `target` is the mount point created by init.
@@ -128,10 +134,7 @@ pub enum Op {
         read_only: bool,
     },
     /// Unmount a previously bind-mounted path.
-    Unmount {
-        id: String,
-        target: String,
-    },
+    Unmount { id: String, target: String },
 }
 
 fn default_true() -> bool {
@@ -197,7 +200,10 @@ pub enum ErrorCode {
 impl ErrorReply {
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 

@@ -88,17 +88,26 @@ fn case_session_killed_midflight() {
     // bash before it can emit any sentinel. Our reader sees EOF, marks
     // early_eof, and the blocked exec returns an error.
     let r = sess.exec("kill -9 $$");
-    println!("  exec(kill -9 $$) returned: {:?}", r.as_ref().err().map(|e| e.to_string()));
+    println!(
+        "  exec(kill -9 $$) returned: {:?}",
+        r.as_ref().err().map(|e| e.to_string())
+    );
     assert!(r.is_err(), "exec should fail when bash dies before sentinel");
 
     // Subsequent exec must also fail (session is dead).
     let r2 = sess.exec("echo nope");
-    println!("  follow-up exec returned: {:?}", r2.as_ref().err().map(|e| e.to_string()));
+    println!(
+        "  follow-up exec returned: {:?}",
+        r2.as_ref().err().map(|e| e.to_string())
+    );
     assert!(r2.is_err(), "follow-up exec on dead session must error");
 
     // Pending JobHandle::wait() must return error too (early_eof set).
     let r3 = bg.wait();
-    println!("  pending wait() returned: {:?}", r3.as_ref().err().map(|e| e.to_string()));
+    println!(
+        "  pending wait() returned: {:?}",
+        r3.as_ref().err().map(|e| e.to_string())
+    );
     assert!(r3.is_err(), "pending wait() must error after session dies");
 
     println!("  ✓ all post-mortem ops returned errors cleanly\n");
@@ -120,11 +129,22 @@ fn case_bg_job_timeout() {
     let t0 = Instant::now();
     let r = slow.wait_with_timeout(Duration::from_millis(500));
     let elapsed = t0.elapsed();
-    println!("  wait_with_timeout(500ms) returned in {:?}: {:?}",
-             elapsed, r.as_ref().err().map(|e| e.to_string()));
+    println!(
+        "  wait_with_timeout(500ms) returned in {:?}: {:?}",
+        elapsed,
+        r.as_ref().err().map(|e| e.to_string())
+    );
     assert!(r.is_err(), "must time out");
-    assert!(elapsed >= Duration::from_millis(450), "timeout was too eager: {:?}", elapsed);
-    assert!(elapsed < Duration::from_millis(1500), "timeout was too late: {:?}", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(450),
+        "timeout was too eager: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "timeout was too late: {:?}",
+        elapsed
+    );
 
     // Session is still healthy — more execs work fine.
     let r = sess.exec("echo still-alive").unwrap();
