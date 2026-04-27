@@ -157,6 +157,58 @@ impl InitClient {
         self.spawn_ack(&id, op)
     }
 
+    /// AddUser — create a per-user isolated bash shell inside the shared
+    /// init container. Returns spawn info with the shell's `child_id`.
+    pub fn add_user(
+        &self,
+        user_id: &str,
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<SpawnInfo> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+            cwd: cwd.map(str::to_string),
+            env_overlay: env_overlay.to_vec(),
+        };
+        self.spawn_ack(&id, op)
+    }
+
+    /// RemoveUser — kill all children owned by this client. The `user_id`
+    /// is validated against the client's own user set.
+    pub fn remove_user(&self, user_id: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Bind-mount a path inside the container. `source` must already be
+    /// visible (e.g., a pre-mounted host dir). `target` is created by init.
+    pub fn bind_mount(&self, source: &str, target: &str, read_only: bool) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::BindMount {
+            id: id.clone(),
+            source: source.into(),
+            target: target.into(),
+            read_only,
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Unmount a previously bind-mounted path.
+    pub fn unmount(&self, target: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Unmount {
+            id: id.clone(),
+            target: target.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
     /// Spawn (Pipes mode).
     pub fn spawn_pipes(
         &self,

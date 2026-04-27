@@ -75,12 +75,13 @@ const BPF_AND: u16 = 0x50;
 const SECCOMP_DATA_NR: u32 = 0;
 const SECCOMP_DATA_ARGS: u32 = 16;
 
-pub(crate) fn generate_bpf_file(path: &Path) -> Result<()> {
-    type Inst = (u16, u8, u8, u32);
-    let deny: Inst = (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ERRNO | EPERM);
-    let allow: Inst = (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+type BpfInst = (u16, u8, u8, u32);
 
-    let mut f: Vec<Inst> = Vec::with_capacity(36);
+fn build_bpf_instructions() -> Vec<BpfInst> {
+    let deny: BpfInst = (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ERRNO | EPERM);
+    let allow: BpfInst = (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+
+    let mut f: Vec<BpfInst> = Vec::with_capacity(36);
     f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_NR));
 
     for sc in [
@@ -96,17 +97,6 @@ pub(crate) fn generate_bpf_file(path: &Path) -> Result<()> {
         f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 1, sc));
         f.push(deny);
     }
-
-    // socket(AF_UNIX): allow. The PID-1 docker-shim init relies on
-    // AF_UNIX SOCK_SEQPACKET for its control socket; AF_UNIX inside the
-    // user/network namespace cannot reach host services (host-side abstract
-    // sockets aren't visible, and only host paths we explicitly bind-mount
-    // are reachable as filesystem sockets).
-    // f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 3, nr::SOCKET));
-    // f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_ARGS));
-    // f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 1, AF_UNIX));
-    // f.push(deny);
-    // f.push((BPF_LD | BPF_W | BPF_ABS, 0, 0, SECCOMP_DATA_NR));
 
     // clone(CLONE_NEWUSER)
     f.push((BPF_JMP | BPF_JEQ | BPF_K, 0, 4, nr::CLONE));
@@ -124,13 +114,30 @@ pub(crate) fn generate_bpf_file(path: &Path) -> Result<()> {
     f.push(deny);
 
     f.push(allow);
+    f
+}
 
-    let mut file = std::fs::File::create(path)?;
-    for (code, jt, jf, k) in f {
-        file.write_all(&code.to_ne_bytes())?;
-        file.write_all(&[jt])?;
-        file.write_all(&[jf])?;
-        file.write_all(&k.to_ne_bytes())?;
+/// Serialize BPF instructions to bytes (for file or in-memory use).
+pub fn serialize_bpf(instructions: &[BpfInst]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(instructions.len() * 8);
+    for &(code, jt, jf, k) in instructions {
+        out.extend_from_slice(&code.to_ne_bytes());
+        out.extend_from_slice(&[jt]);
+        out.extend_from_slice(&[jf]);
+        out.extend_from_slice(&k.to_ne_bytes());
     }
+    out
+}
+
+/// Generate BPF filter bytes (for in-process seccomp install).
+pub fn generate_bpf_bytes() -> Vec<u8> {
+    serialize_bpf(&build_bpf_instructions())
+}
+
+pub(crate) fn generate_bpf_file(path: &Path) -> Result<()> {
+    let instructions = build_bpf_instructions();
+    let bytes = serialize_bpf(&instructions);
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&bytes)?;
     Ok(())
 }

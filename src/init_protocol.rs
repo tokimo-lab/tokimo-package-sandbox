@@ -100,6 +100,38 @@ pub enum Op {
         #[serde(default = "default_true")]
         kill_all: bool,
     },
+    /// Create a per-user isolated workspace inside the shared init container.
+    /// Init creates `/tmp/<user_id>` and `/work/<user_id>`, merges env with
+    /// `TMPDIR`/`HOME` pointed at the per-user paths, then spawns a bash
+    /// shell. The reply includes the shell's `child_id`.
+    AddUser {
+        id: String,
+        user_id: String,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env_overlay: Vec<(String, String)>,
+    },
+    /// Remove a user: SIGKILL all children owned by the requesting client,
+    /// then (eventually) clean up /tmp/<user_id>.
+    RemoveUser {
+        id: String,
+        user_id: String,
+    },
+    /// Dynamic bind mount inside the container. `source` must be a path
+    /// already visible inside the container (e.g., pre-mounted host dir).
+    /// `target` is the mount point created by init.
+    BindMount {
+        id: String,
+        source: String,
+        target: String,
+        read_only: bool,
+    },
+    /// Unmount a previously bind-mounted path.
+    Unmount {
+        id: String,
+        target: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -211,5 +243,9 @@ pub fn default_features() -> Vec<String> {
         "signal".into(),
         "killpg".into(),
         "openshell".into(),
+        "adduser".into(),
+        "removeuser".into(),
+        "bindmount".into(),
+        "unmount".into(),
     ]
 }

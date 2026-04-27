@@ -32,6 +32,8 @@ mod l4;
 mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(target_os = "linux")]
+mod workspace;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -51,7 +53,13 @@ pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Ses
 pub use linux::{SpawnedInit, locate_init_binary, spawn_init};
 
 #[cfg(target_os = "linux")]
+pub use seccomp::generate_bpf_bytes;
+
+#[cfg(target_os = "linux")]
 pub use init_client::{InitClient, SpawnInfo};
+
+#[cfg(target_os = "linux")]
+pub use workspace::{UserConfig, UserHandle, Workspace, WorkspaceConfig};
 
 /// Execute `cmd` inside the sandbox configured by `cfg`.
 ///

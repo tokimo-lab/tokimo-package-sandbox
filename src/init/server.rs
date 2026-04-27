@@ -6,7 +6,7 @@
 //!   - signalfd (SIGCHLD reap → Exit events)
 //!   - per-pipe-child stdout/stderr fds (drain → Stdout/Stderr events)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
@@ -32,23 +32,36 @@ use crate::pty as ptymod;
 /// AI's network traffic through the L7 audit proxy; letting a child blow
 /// them away defeats audit.
 const PROTECTED_ENV: &[&str] = &[
-    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SAFEBOX",
+    "PATH", "LANG", "LC_ALL", "SAFEBOX",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
 ];
 
 const TOK_LISTENER: Token = Token(0);
 const TOK_SIGFD: Token = Token(1);
-const TOK_CLIENT: Token = Token(2);
+/// Client tokens start at 2; per-client token = TOK_CLIENT_BASE + slot.
+const TOK_CLIENT_BASE: usize = 2;
 /// Per-child fd tokens start at 100; even = stdout pipe, odd = stderr pipe.
 /// The numeric child slot id is encoded as `100 + slot * 2 + (is_stderr as usize)`.
 const TOK_CHILD_BASE: usize = 100;
+
+/// Per-connection state inside the init server.
+pub struct ClientState {
+    pub fd: OwnedFd,
+    /// child_ids owned by this client (for disconnect cleanup).
+    pub children: HashSet<String>,
+}
 
 pub struct State {
     pub base_env: Vec<(String, String)>,
     pub children: HashMap<String, ChildRecord>,
     /// Maps child slot index (0..) → child_id, used to decode stream tokens.
     pub child_slots: Vec<Option<String>>,
+    /// Connected clients keyed by fd.
+    pub clients: HashMap<RawFd, ClientState>,
+    /// Maps client slot index → RawFd for mio event demux.
+    /// Index = token.0 - TOK_CLIENT_BASE.
+    pub client_slots: Vec<Option<RawFd>>,
 }
 
 impl State {
@@ -93,8 +106,9 @@ pub fn run_loop(
         base_env,
         children: HashMap::new(),
         child_slots: Vec::new(),
+        clients: HashMap::new(),
+        client_slots: Vec::new(),
     };
-    let mut client: Option<OwnedFd> = None;
     let mut shutdown = false;
 
     while !shutdown {
@@ -109,29 +123,28 @@ pub fn run_loop(
             match ev.token() {
                 TOK_LISTENER => {
                     if let Err(e) =
-                        accept_client(&listener, &mut client, poll.registry())
+                        accept_client(&listener, &mut state, poll.registry())
                     {
                         eprintln!("[init] accept_client: {e}");
                     }
                 }
                 TOK_SIGFD => {
                     drain_sigfd(&sigfd);
-                    reap_children(&mut state, client.as_ref(), poll.registry());
+                    reap_children(&mut state, poll.registry());
                 }
-                TOK_CLIENT => {
-                    if let Some(c) = client.as_ref() {
-                        match handle_client_readable(c, &mut state, poll.registry()) {
-                            Ok(true) => {} // more to read maybe
+                tok if tok.0 >= TOK_CLIENT_BASE && tok.0 < TOK_CHILD_BASE => {
+                    let slot = tok.0 - TOK_CLIENT_BASE;
+                    if let Some(fd) = state.client_slots.get(slot).and_then(|o| *o) {
+                        match handle_client_readable(fd, &mut state, poll.registry()) {
                             Ok(false) => {
-                                // EOF: drop client but keep children alive
-                                let _ = poll.registry().deregister(&mut SourceFd(&c.as_raw_fd()));
-                                client = None;
+                                // EOF: clean up this client's children.
+                                disconnect_client(fd, &mut state, poll.registry());
                             }
                             Err(e) => {
                                 eprintln!("[init] client error: {e}");
-                                let _ = poll.registry().deregister(&mut SourceFd(&c.as_raw_fd()));
-                                client = None;
+                                disconnect_client(fd, &mut state, poll.registry());
                             }
+                            _ => {} // Ok(true): more to read
                         }
                         if let Some(reason) = state.shutdown_signal() {
                             shutdown = true;
@@ -142,7 +155,7 @@ pub fn run_loop(
                 }
                 tok => {
                     // Per-child stdout/stderr pipe became readable.
-                    pump_child_stream(tok, &mut state, client.as_ref(), poll.registry());
+                    pump_child_stream(tok, &mut state, poll.registry());
                 }
             }
         }
@@ -164,7 +177,7 @@ impl State {
 
 fn accept_client(
     listener: &OwnedFd,
-    slot: &mut Option<OwnedFd>,
+    state: &mut State,
     registry: &mio::Registry,
 ) -> Result<(), String> {
     let fd = accept4(
@@ -173,19 +186,71 @@ fn accept_client(
     )
     .map_err(|e| format!("accept4: {e}"))?;
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    if slot.is_some() {
-        // v1: single client only. Reject the new one by closing immediately.
-        return Ok(());
-    }
+    let raw = owned.as_raw_fd();
+    // Allocate a client slot (never recycled).
+    let slot = state.client_slots.len();
+    let token = Token(TOK_CLIENT_BASE + slot);
     registry
         .register(
-            &mut SourceFd(&owned.as_raw_fd()),
-            TOK_CLIENT,
+            &mut SourceFd(&raw),
+            token,
             Interest::READABLE,
         )
         .map_err(|e| format!("register client: {e}"))?;
-    *slot = Some(owned);
+    state.client_slots.push(Some(raw));
+    state.clients.insert(
+        raw,
+        ClientState {
+            fd: owned,
+            children: HashSet::new(),
+        },
+    );
     Ok(())
+}
+
+/// Clean up a disconnected client: kill its children, deregister all fds
+/// (including per-child pipe fds), and remove from tracking maps.
+fn disconnect_client(fd: RawFd, state: &mut State, registry: &mio::Registry) {
+    // Collect and kill all children owned by this client.
+    let child_ids: Vec<String> = state
+        .children
+        .iter()
+        .filter(|(_, c)| c.owner_fd == fd)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for cid in &child_ids {
+        if let Some(rec) = state.children.get(cid) {
+            if rec.pgid > 0 {
+                let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
+            }
+        }
+    }
+    // Remove children AND deregister their pipe fds immediately.
+    // If we don't deregister here, the pipes stay readable (EOF) but
+    // pump_child_stream can't drain them because the owner client is
+    // already gone — causing an infinite poll loop that starves new
+    // connections.
+    for cid in &child_ids {
+        if let Some(rec) = state.children.remove(cid) {
+            if let Some(fd) = rec.stdout_fd.as_ref() {
+                let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
+            }
+            if let Some(fd) = rec.stderr_fd.as_ref() {
+                let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
+            }
+        }
+    }
+    // Remove client from tracking.
+    if let Some(client) = state.clients.remove(&fd) {
+        let _ = registry.deregister(&mut SourceFd(&client.fd.as_raw_fd()));
+        // Clear the slot so the mio token won't resolve to this fd anymore.
+        for slot_entry in state.client_slots.iter_mut() {
+            if *slot_entry == Some(fd) {
+                *slot_entry = None;
+                break;
+            }
+        }
+    }
 }
 
 fn drain_sigfd(sigfd: &OwnedFd) {
@@ -203,16 +268,15 @@ fn drain_sigfd(sigfd: &OwnedFd) {
 
 fn reap_children(
     state: &mut State,
-    client: Option<&OwnedFd>,
     registry: &mio::Registry,
 ) {
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, code)) => {
-                emit_exit(state, client, registry, pid, code, None);
+                emit_exit(state, registry, pid, code, None);
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                emit_exit(state, client, registry, pid, 128 + (sig as i32), Some(sig as i32));
+                emit_exit(state, registry, pid, 128 + (sig as i32), Some(sig as i32));
             }
             Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => break,
             Ok(_) => continue,
@@ -223,7 +287,6 @@ fn reap_children(
 
 fn emit_exit(
     state: &mut State,
-    client: Option<&OwnedFd>,
     registry: &mio::Registry,
     pid: Pid,
     code: i32,
@@ -236,31 +299,46 @@ fn emit_exit(
         .find(|(_, c)| c.pid == pid.as_raw())
         .map(|(id, _)| id.clone());
     let Some(id) = child_id else { return };
+    let owner_fd = state.children.get(&id).map(|c| c.owner_fd);
     if let Some(rec) = state.children.get(&id) {
         // Drain any remaining bytes before emitting Exit.
-        if let (Some(fd), Some(c)) = (rec.stdout_fd.as_ref(), client) {
-            drain_pipe(fd, &id, c, false);
+        if let Some(fd) = rec.stdout_fd.as_ref() {
+            if let Some(c) = owner_fd.and_then(|of| state.clients.get(&of)) {
+                drain_pipe(fd, &id, &c.fd, false);
+            }
         }
-        if let (Some(fd), Some(c)) = (rec.stderr_fd.as_ref(), client) {
-            drain_pipe(fd, &id, c, true);
+        if let Some(fd) = rec.stderr_fd.as_ref() {
+            if let Some(c) = owner_fd.and_then(|of| state.clients.get(&of)) {
+                drain_pipe(fd, &id, &c.fd, true);
+            }
         }
     }
-    if let Some(client) = client {
-        let frame = Frame::Event(Event::Exit {
-            child_id: id.clone(),
-            code,
-            signal,
-        });
-        let _ = send_frame(unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) }, &frame, None);
+    // Send Exit event to the owner client.
+    if let Some(of) = owner_fd {
+        if let Some(client) = state.clients.get(&of) {
+            let frame = Frame::Event(Event::Exit {
+                child_id: id.clone(),
+                code,
+                signal,
+            });
+            let _ = send_frame(
+                unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) },
+                &frame,
+                None,
+            );
+        }
     }
-    // Cleanup: deregister fds. Slots are never recycled so child_ids
-    // stay unique for the lifetime of the session.
+    // Cleanup: deregister fds and remove from client's children set.
     if let Some(rec) = state.children.remove(&id) {
         if let Some(fd) = rec.stdout_fd.as_ref() {
             let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
         }
         if let Some(fd) = rec.stderr_fd.as_ref() {
             let _ = registry.deregister(&mut SourceFd(&fd.as_raw_fd()));
+        }
+        // Remove from client's child set.
+        if let Some(cs) = state.clients.get_mut(&rec.owner_fd) {
+            cs.children.remove(&id);
         }
     }
 }
@@ -291,7 +369,6 @@ fn drain_pipe(fd: &OwnedFd, child_id: &str, client: &OwnedFd, is_stderr: bool) {
 fn pump_child_stream(
     token: Token,
     state: &mut State,
-    client: Option<&OwnedFd>,
     _registry: &mio::Registry,
 ) {
     let raw = token.0;
@@ -306,24 +383,29 @@ fn pump_child_stream(
         None => return,
     };
     let Some(rec) = state.children.get(&child_id) else { return };
-    let fd = if is_stderr { rec.stderr_fd.as_ref() } else { rec.stdout_fd.as_ref() };
+    let owner_fd = rec.owner_fd;
+    let fd = if is_stderr {
+        rec.stderr_fd.as_ref()
+    } else {
+        rec.stdout_fd.as_ref()
+    };
     let Some(fd) = fd else { return };
-    let Some(client) = client else { return };
-    drain_pipe(fd, &child_id, client, is_stderr);
+    let Some(client) = state.clients.get(&owner_fd) else { return };
+    drain_pipe(fd, &child_id, &client.fd, is_stderr);
 }
 
 fn handle_client_readable(
-    client: &OwnedFd,
+    client_fd: RawFd,
     state: &mut State,
     registry: &mio::Registry,
 ) -> Result<bool, String> {
     loop {
-        let bf = unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) };
+        let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
         let res = recv_frame(bf);
         match res {
             Ok(None) => return Ok(false), // EOF
             Ok(Some((Frame::Op(op), _fd))) => {
-                handle_op(op, client, state, registry);
+                handle_op(op, client_fd, state, registry);
             }
             Ok(Some((other, _))) => {
                 eprintln!("[init] client sent non-Op frame: {other:?}");
@@ -339,8 +421,8 @@ fn handle_client_readable(
     }
 }
 
-fn handle_op(op: Op, client: &OwnedFd, state: &mut State, registry: &mio::Registry) {
-    let bf = unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) };
+fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Registry) {
+    let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
     match op {
         Op::Hello { id, protocol, .. } => {
             let ok = protocol == PROTOCOL_VERSION;
@@ -363,7 +445,7 @@ fn handle_op(op: Op, client: &OwnedFd, state: &mut State, registry: &mio::Regist
         }
         Op::OpenShell { id, argv, env_overlay, cwd } => {
             spawn_child(
-                client,
+                client_fd,
                 state,
                 registry,
                 id,
@@ -392,7 +474,7 @@ fn handle_op(op: Op, client: &OwnedFd, state: &mut State, registry: &mio::Regist
             };
 
             spawn_child(
-                client,
+                client_fd,
                 state,
                 registry,
                 id,
@@ -516,10 +598,94 @@ fn handle_op(op: Op, client: &OwnedFd, state: &mut State, registry: &mio::Regist
                         stderr_fd: None,
                         master_fd: None,
                         shutdown_pending: true,
+                        owner_fd: 0,
                     },
                 );
             }
             ack(bf, id, Ok(()));
+        }
+        Op::AddUser { id, user_id, cwd, env_overlay } => {
+            // Ensure per-user directories exist.
+            let tmpdir = format!("/tmp/{}", user_id);
+            let workdir = format!("/work/{}", user_id);
+            let _ = std::fs::create_dir_all(&tmpdir);
+            let _ = std::fs::create_dir_all(&workdir);
+
+            // Build per-user env with TMPDIR + HOME isolation.
+            // We must bypass `merge_env`'s PROTECTED_ENV filter here
+            // because TMPDIR and HOME *are* the isolation boundary.
+            let mut env = merge_env(&state.base_env, &env_overlay);
+            // Override TMPDIR and HOME directly (they would be dropped by merge_env).
+            env.retain(|(k, _)| k != "TMPDIR" && k != "HOME");
+            env.push(("TMPDIR".into(), tmpdir));
+            env.push(("HOME".into(), format!("/home/{}", user_id)));
+
+            let effective_cwd = cwd.unwrap_or(workdir);
+            spawn_child_inner(
+                client_fd,
+                state,
+                registry,
+                id,
+                vec!["/bin/bash".into(), "--noprofile".into(), "--norc".into()],
+                env,
+                Some(effective_cwd),
+                StdioMode::Pipes,
+                ChildKind::Shell,
+            );
+        }
+        Op::RemoveUser { id, user_id: _user_id } => {
+            // Kill all children owned by this client.
+            let child_ids: Vec<String> = state
+                .children
+                .iter()
+                .filter(|(_, c)| c.owner_fd == client_fd)
+                .map(|(cid, _)| cid.clone())
+                .collect();
+            for cid in &child_ids {
+                if let Some(rec) = state.children.get(cid) {
+                    if rec.pgid > 0 {
+                        let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
+                    }
+                }
+            }
+            ack(bf, id, Ok(()));
+        }
+        Op::BindMount { id, source, target, read_only } => {
+            let res = (|| -> Result<(), ErrorReply> {
+                let src = std::ffi::CString::new(source.as_str())
+                    .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
+                let tgt = std::ffi::CString::new(target.as_str())
+                    .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
+                let flags = if read_only {
+                    libc::MS_BIND | libc::MS_RDONLY | libc::MS_REMOUNT
+                } else {
+                    libc::MS_BIND
+                };
+                let rc = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), std::ptr::null::<libc::c_char>(), flags, std::ptr::null::<libc::c_void>()) };
+                if rc != 0 {
+                    return Err(ErrorReply::new(
+                        ErrorCode::Internal,
+                        format!("mount {source} -> {target}: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+                Ok(())
+            })();
+            ack(bf, id, res);
+        }
+        Op::Unmount { id, target } => {
+            let res = (|| -> Result<(), ErrorReply> {
+                let tgt = std::ffi::CString::new(target.as_str())
+                    .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
+                let rc = unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
+                if rc != 0 {
+                    return Err(ErrorReply::new(
+                        ErrorCode::Internal,
+                        format!("umount {target}: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+                Ok(())
+            })();
+            ack(bf, id, res);
         }
     }
 }
@@ -534,7 +700,7 @@ fn ack(bf: BorrowedFd<'_>, id: String, res: Result<(), ErrorReply>) {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_child(
-    client: &OwnedFd,
+    client_fd: RawFd,
     state: &mut State,
     registry: &mio::Registry,
     id: String,
@@ -544,8 +710,23 @@ fn spawn_child(
     stdio: StdioMode,
     kind: ChildKind,
 ) {
-    let bf = unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) };
     let env = merge_env(&state.base_env, &env_overlay);
+    spawn_child_inner(client_fd, state, registry, id, argv, env, cwd, stdio, kind);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_child_inner(
+    client_fd: RawFd,
+    state: &mut State,
+    registry: &mio::Registry,
+    id: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    stdio: StdioMode,
+    kind: ChildKind,
+) {
+    let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
     let slot = state.alloc_slot();
     let child_id = format!("c{}", slot + 1);
     let cwd_ref = cwd.as_deref();
@@ -598,8 +779,13 @@ fn spawn_child(
                 stderr_fd: spawned.stderr_fd,
                 master_fd: spawned.master_fd,
                 shutdown_pending: false,
+                owner_fd: client_fd,
             };
             state.children.insert(child_id.clone(), rec);
+            // Track child in client's set.
+            if let Some(cs) = state.clients.get_mut(&client_fd) {
+                cs.children.insert(child_id.clone());
+            }
             let reply = Reply::Spawn {
                 id,
                 ok: true,
@@ -686,5 +872,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::Wait { .. } => "Wait",
         Op::Close { .. } => "Close",
         Op::Shutdown { .. } => "Shutdown",
+        Op::AddUser { .. } => "AddUser",
+        Op::RemoveUser { .. } => "RemoveUser",
+        Op::BindMount { .. } => "BindMount",
+        Op::Unmount { .. } => "Unmount",
     }
 }

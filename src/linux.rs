@@ -69,7 +69,7 @@ pub(crate) fn build_bwrap_command(
     let bwrap = which("bwrap").ok_or_else(|| {
         Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into())
     })?;
-    let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, &[])?;
+    let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, &[], false)?;
     Ok((cmd, keepalive))
 }
 
@@ -82,10 +82,19 @@ pub(crate) fn build_bwrap_command_with_extras(
     cfg: &SandboxConfig,
     extra_args: &[&str],
 ) -> Result<(Command, BwrapKeepAlive)> {
+    build_bwrap_command_with_extras_inner(inner_argv, cfg, extra_args, false)
+}
+
+fn build_bwrap_command_with_extras_inner(
+    inner_argv: &[&str],
+    cfg: &SandboxConfig,
+    extra_args: &[&str],
+    skip_seccomp: bool,
+) -> Result<(Command, BwrapKeepAlive)> {
     let bwrap = which("bwrap").ok_or_else(|| {
         Error::ToolNotFound("`bwrap` is not installed (apt install bubblewrap)".into())
     })?;
-    let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, extra_args)?;
+    let (cmd, keepalive) = build_bwrap_command_inner(&bwrap, inner_argv, cfg, extra_args, skip_seccomp)?;
     Ok((cmd, keepalive))
 }
 
@@ -95,7 +104,7 @@ fn run_with_bwrap(
     cfg: &SandboxConfig,
 ) -> Result<ExecutionResult> {
     let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
-    let (mut cmd, mut keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg, &[])?;
+    let (mut cmd, mut keepalive) = build_bwrap_command_inner(bwrap, &argv, cfg, &[], false)?;
     pipe_stdio(&mut cmd);
     let stdin_bytes = cfg.stdin.as_deref();
     // We need to spawn, then finalize L4 (recv listener fd), then wait.
@@ -138,6 +147,7 @@ fn build_bwrap_command_inner(
     inner_argv: &[&str],
     cfg: &SandboxConfig,
     extra_args: &[&str],
+    skip_seccomp: bool,
 ) -> Result<(Command, BwrapKeepAlive)> {
     let work_dir = cfg
         .work_dir
@@ -382,8 +392,10 @@ fn build_bwrap_command_inner(
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     cmd.args(["--chdir", &cwd_inside.to_string_lossy()]);
 
-    // Seccomp BPF via fd 3.
-    if seccomp_fd.is_some() {
+    // Seccomp BPF via fd 3. When `skip_seccomp` is set (workspace mode),
+    // init installs seccomp per-child after fork so init itself can call
+    // mount() / umount2() for dynamic bind mount.
+    if !skip_seccomp && seccomp_fd.is_some() {
         cmd.args(["--seccomp", "3"]);
     }
 
@@ -1065,7 +1077,91 @@ pub fn spawn_init(cfg: &SandboxConfig) -> Result<SpawnedInit> {
         "TOKIMO_SANDBOX_CONTROL_SOCK",
         "/run/tk-sandbox/control.sock",
     ];
-    let (mut cmd, mut keepalive) = build_bwrap_command_with_extras(&inner_argv, cfg, &extra)?;
+    let (mut cmd, mut keepalive) = build_bwrap_command_with_extras_inner(&inner_argv, cfg, &extra, false)?;
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let (result_tx, result_rx) = mpsc::channel::<std::io::Result<std::process::Child>>();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let join = std::thread::Builder::new()
+        .name("sandbox-init-spawner".into())
+        .spawn(move || {
+            let mut cmd = cmd;
+            let res = cmd.spawn();
+            let ok = res.is_ok();
+            let _ = result_tx.send(res);
+            if ok {
+                let _ = stop_rx.recv();
+            }
+        })
+        .map_err(|e| Error::exec(format!("spawn sandbox-init-spawner thread: {e}")))?;
+
+    let child = result_rx
+        .recv()
+        .map_err(|e| Error::exec(format!("recv child from spawner thread: {e}")))?
+        .map_err(|e| Error::exec(format!("spawn bwrap init failed: {e}")))?;
+    let child_pid = child.id() as i32;
+    let _ = keepalive.finalize_l4(child_pid)?;
+
+    let guard = SessionSpawnerGuard {
+        _stop: stop_tx,
+        _join: Some(join),
+    };
+    Ok(SpawnedInit {
+        child,
+        host_control_dir,
+        keepalive: Box::new((keepalive, guard)),
+    })
+}
+
+/// Like [`spawn_init`] but without bwrap-level seccomp. Instead init
+/// installs seccomp per-child after fork so init itself can call mount()
+/// and umount2() for dynamic bind mounts. Used by [`super::Workspace`].
+pub fn spawn_init_workspace(cfg: &SandboxConfig) -> Result<SpawnedInit> {
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    if which("bwrap").is_none() {
+        return Err(Error::ToolNotFound(
+            "`bwrap` is required for sandbox init on Linux (apt install bubblewrap)".into(),
+        ));
+    }
+    let init_bin = locate_init_binary()?;
+    let init_bin_str = init_bin.to_string_lossy().into_owned();
+    let host_control_dir = tempfile::Builder::new()
+        .prefix("tk-sandbox-ctrl-")
+        .tempdir()
+        .map_err(|e| Error::exec(format!("create control dir: {e}")))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(host_control_dir.path(), std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::exec(format!("chmod control dir: {e}")))?;
+    let host_control_dir_str = host_control_dir.path().to_string_lossy().into_owned();
+
+    let inner_argv = ["/.tokimo-sandbox-init"];
+    // Pass BPF bytes to init for per-child seccomp install.
+    let bpf_bytes = crate::seccomp::generate_bpf_bytes();
+    let bpf_b64: String = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&bpf_bytes)
+    };
+    let extra: [&str; 13] = [
+        "--as-pid-1",
+        "--ro-bind",
+        init_bin_str.as_str(),
+        "/.tokimo-sandbox-init",
+        "--bind",
+        host_control_dir_str.as_str(),
+        "/run/tk-sandbox",
+        "--setenv",
+        "TOKIMO_SANDBOX_CONTROL_SOCK",
+        "/run/tk-sandbox/control.sock",
+        "--setenv",
+        "TOKIMO_SANDBOX_SECCOMP_B64",
+        bpf_b64.as_str(),
+    ];
+    let (mut cmd, mut keepalive) = build_bwrap_command_with_extras_inner(&inner_argv, cfg, &extra, true)?;
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());

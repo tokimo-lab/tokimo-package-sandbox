@@ -6,7 +6,7 @@
 //! when running as PID 1.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, fcntl, FcntlArg, FdFlag};
@@ -35,6 +35,7 @@ pub struct ChildRecord {
     pub stderr_fd: Option<OwnedFd>,
     pub master_fd: Option<OwnedFd>,
     pub shutdown_pending: bool,
+    pub owner_fd: RawFd,
 }
 
 pub struct Spawned {
@@ -250,6 +251,8 @@ fn child_setup_pipes(
     }
     // Unblock signals we blocked in init main (so child sees default SIGINT etc).
     unblock_signals();
+    // Install seccomp if BPF bytes were passed (workspace mode).
+    install_seccomp_from_env();
     let argv_p: Vec<*const libc::c_char> =
         argv.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
     let env_p: Vec<*const libc::c_char> =
@@ -313,6 +316,8 @@ fn child_setup_pty(
         let _ = fcntl(f, FcntlArg::F_SETFD(FdFlag::empty()));
     }
     unblock_signals();
+    // Install seccomp if BPF bytes were passed (workspace mode).
+    install_seccomp_from_env();
     let argv_p: Vec<*const libc::c_char> =
         argv.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
     let env_p: Vec<*const libc::c_char> =
@@ -335,6 +340,45 @@ fn unblock_signals() {
         libc::sigemptyset(&mut set);
         libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
     }
+}
+
+/// Install seccomp BPF filter from the `TOKIMO_SANDBOX_SECCOMP_B64` env var.
+/// Called in the child after fork, before exec. If the env var is absent (e.g.,
+/// in single-user Session mode where bwrap handles seccomp), this is a no-op.
+fn install_seccomp_from_env() {
+    let b64 = match std::env::var("TOKIMO_SANDBOX_SECCOMP_B64") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let bytes = match base64_decode(&b64) {
+        Some(b) => b,
+        None => return,
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    // Convert to sock_fprog for prctl.
+    // Each BPF instruction is 8 bytes: (u16 code, u8 jt, u8 jf, u32 k).
+    let len = bytes.len() / 8;
+    if len == 0 {
+        return;
+    }
+    let prog = libc::sock_fprog {
+        len: len as u16,
+        filter: bytes.as_ptr() as *mut libc::sock_filter,
+    };
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &prog as *const libc::sock_fprog,
+        );
+    }
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
 fn build_cstr_argv(argv: &[String]) -> Result<Vec<CString>, ErrorReply> {
