@@ -6,6 +6,11 @@ use std::sync::Arc;
 
 use crate::net_observer::{DnsPolicy, HostPattern, NetEventSink};
 
+/// Guest-side path where sandbox-internal per-job capture files live.
+/// Mounted by the Linux backend inside `build_bwrap_command_inner` — callers
+/// must NOT use this path (or any subdirectory) in `extra_mounts`.
+pub(crate) const CAPTURE_GUEST_DIR: &str = "/run/sandbox-jobs";
+
 /// Network policy inside the sandbox.
 #[derive(Clone)]
 pub enum NetworkPolicy {
@@ -272,6 +277,14 @@ impl SandboxConfig {
                 return Err(crate::Error::validation(format!(
                     "mount host path does not exist: {}",
                     m.host.display()
+                )));
+            }
+            let guest = m.guest.as_deref().unwrap_or(m.host.as_path());
+            let guest_str = guest.to_string_lossy();
+            if guest_str == CAPTURE_GUEST_DIR || guest_str.starts_with("/run/sandbox-jobs/") {
+                return Err(crate::Error::validation(format!(
+                    "extra_mount guest path '{}' conflicts with sandbox internal capture directory '{}'",
+                    guest_str, CAPTURE_GUEST_DIR
                 )));
             }
         }

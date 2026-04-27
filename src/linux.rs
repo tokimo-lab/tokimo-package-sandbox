@@ -231,6 +231,21 @@ fn build_bwrap_command_inner(
         }
     }
 
+    // Internal capture directory: sandbox-managed, placed AFTER extra_mounts
+    // so "later wins" — even if a caller tries to remap /run/sandbox-jobs, our
+    // internal bind wins. spawn writes per-job capture files here; wait reads
+    // them from the host-side work_dir/.sandbox-jobs/ counterpart. Callers do
+    // NOT need to configure an extra_mount for this path.
+    let sandbox_jobs_host = work_dir.join(".sandbox-jobs");
+    std::fs::create_dir_all(&sandbox_jobs_host)
+        .map_err(|e| Error::exec(format!("create sandbox-jobs dir: {e}")))?;
+    cmd.args(["--dir", "/run"]);
+    cmd.args([
+        "--bind",
+        &sandbox_jobs_host.to_string_lossy(),
+        "/run/sandbox-jobs",
+    ]);
+
     // Hide sensitive dotfiles under HOME. Although we empty-dir /home, a user
     // might mount their HOME explicitly — make sure the dotfiles are blanked.
     if let Ok(home) = std::env::var("HOME") {
@@ -560,12 +575,25 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    let spawned = crate::linux::spawn_init(cfg)?;
+    let mut spawned = crate::linux::spawn_init(cfg)?;
     let host_sock = spawned.host_control_dir.path().join("control.sock");
 
     // Wait for init to bind the control socket. Bwrap may take a beat.
     let deadline = Instant::now() + Duration::from_secs(5);
     while !host_sock.exists() {
+        // Check if init has already exited — if so, grab its stderr for
+        // diagnostics before we report the timeout.
+        if let Ok(Some(status)) = spawned.child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(ref mut pipe) = spawned.child.stderr {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            return Err(Error::exec(format!(
+                "init exited with {status} before binding control socket at {}; stderr: {stderr}",
+                host_sock.display()
+            )));
+        }
         if Instant::now() > deadline {
             return Err(Error::exec(format!(
                 "control socket never appeared at {} (init did not start)",

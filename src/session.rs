@@ -33,8 +33,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::SandboxConfig;
+use crate::config::{SandboxConfig, CAPTURE_GUEST_DIR};
 use crate::{Error, Result};
+
+/// Guest-side directory for per-job capture files.
+/// On Linux this is `/run/sandbox-jobs` (the internally-managed bind mount);
+/// on other platforms it falls back to `/tmp` (no namespace isolation).
+const GUEST_CAPTURE_DIR: &str = if cfg!(target_os = "linux") {
+    CAPTURE_GUEST_DIR
+} else {
+    "/tmp"
+};
 
 /// Result of a single `Session::exec` (or `JobHandle::wait`) call.
 #[derive(Debug, Clone)]
@@ -203,15 +212,10 @@ pub struct Session {
     counter: u64,
     readers: Vec<JoinHandle<()>>,
     timeout: Duration,
-    /// Host-side path to the bound work directory. `JobHandle::wait_with_timeout`
-    /// reads per-job capture files from here.
-    work_dir: PathBuf,
-    /// Guest-side (in-sandbox) path that bind-maps to `work_dir`. Used by
-    /// `Session::spawn` so the script writes per-job capture files at a
-    /// location whose host counterpart we know — independent of `$TMPDIR`,
-    /// which downstream callers may remap to a different host directory
-    /// (e.g. `AgentSandbox` overrides `/tmp` with a per-agent tmpfs).
-    guest_work_dir: PathBuf,
+    /// Host-side directory for per-job capture files. On Linux this is
+    /// `<work_dir>/.sandbox-jobs/` (bind-mounted at `/run/sandbox-jobs`
+    /// inside the sandbox); on other platforms it equals `work_dir`.
+    capture_dir: PathBuf,
     open_pty: Option<Arc<OpenPtyFn>>,
     run_oneshot: Option<Arc<RunOneshotFn>>,
 }
@@ -245,16 +249,15 @@ impl Session {
             .work_dir
             .canonicalize()
             .unwrap_or_else(|_| cfg.work_dir.clone());
-        // Guest-side path that bind-maps to `work_dir`. Defaults to /tmp on
-        // Linux (see `linux.rs` — work_dir is bind-mounted there) unless the
-        // caller pinned `cfg.cwd` to an explicit guest path that they
-        // separately bound to the same host work_dir (the AgentSandbox
-        // pattern: `cfg.cwd = /home/workspace`, with an extra_mount that
-        // binds host `work_dir` → `/home/workspace`).
-        let guest_work_dir = cfg
-            .cwd
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+        // On Linux the guest-side capture directory `/run/sandbox-jobs` is
+        // bind-mounted to `<work_dir>/.sandbox-jobs/` by the bwrap builder
+        // (see `linux.rs`). On other platforms there is no namespace
+        // isolation, so capture files go directly into `work_dir`.
+        #[cfg(target_os = "linux")]
+        let capture_dir = work_dir.join(".sandbox-jobs");
+        #[cfg(not(target_os = "linux"))]
+        let capture_dir = work_dir.clone();
 
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
@@ -267,8 +270,7 @@ impl Session {
             counter: 0,
             readers: vec![r1, r2],
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
-            work_dir,
-            guest_work_dir,
+            capture_dir,
             open_pty,
             run_oneshot,
         })
@@ -460,9 +462,16 @@ impl Session {
     ///
     /// State (env, cwd, files) is fully shared; the job runs in the same
     /// sandboxed bash as everything else. Output is captured to per-job
-    /// files in `work_dir` (so concurrent stdout/stderr from many jobs
-    /// don't interleave on the wire); call [`JobHandle::wait`] to block on
-    /// completion and read them.
+    /// files (so concurrent stdout/stderr from many jobs don't interleave
+    /// on the wire); call [`JobHandle::wait`] to block on completion and
+    /// read them.
+    ///
+    /// **Capture location is managed internally by `Session`.** Callers do
+    /// NOT need to set up any `extra_mount` or `cwd` mirror for capture to
+    /// work — the mount that backs per-job output files is injected by the
+    /// sandbox itself during `Session::open` and is guaranteed to bind-map
+    /// correctly regardless of how callers remap `/tmp`, `/home/workspace`,
+    /// or any other path.
     ///
     /// ```no_run
     /// use tokimo_package_sandbox::{SandboxConfig, Session};
@@ -486,14 +495,11 @@ impl Session {
         let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, id);
 
-        // Per-job capture files live in `guest_work_dir` (which bind-maps to
-        // `work_dir` on the host). Using a fixed in-sandbox path avoids the
-        // `$TMPDIR`-vs-`work_dir` mismatch that bit conversation 9f47e6fd:
-        // when a downstream caller (e.g. `AgentSandbox`) adds an
-        // `extra_mounts` entry that overrides `/tmp` with a per-agent
-        // tmpfs, `$TMPDIR` no longer resolves to the same host directory
-        // as `work_dir`, so the host-side reader saw empty files.
-        let guest_dir = self.guest_work_dir.to_string_lossy();
+        // Capture files live at a fixed guest-side path managed internally by
+        // the sandbox (see `GUEST_CAPTURE_DIR`). Callers do NOT need to set up
+        // any extra_mount for this to work — it is guaranteed to be backed by
+        // the host-side `capture_dir`.
+        let guest_dir = GUEST_CAPTURE_DIR;
 
         // Wrap user cmd in `setsid` so the entire job tree lives in its own
         // process group / session. Capture the setsid wrapper's PID into a
@@ -530,7 +536,7 @@ impl Session {
             id,
             sid: self.sid.clone(),
             state: self.state.clone(),
-            work_dir: self.work_dir.clone(),
+            capture_dir: self.capture_dir.clone(),
             timeout: self.timeout,
         })
     }
@@ -557,7 +563,7 @@ impl Session {
             .as_mut()
             .ok_or_else(|| Error::exec("session is closed"))?;
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
-        let guest_dir = self.guest_work_dir.to_string_lossy();
+        let guest_dir = GUEST_CAPTURE_DIR;
         // `|| true` so a missing pidfile (race: job already exited) doesn't
         // make bash think the kill failed; we always want to fall through
         // to the brace-group sentinel.
@@ -638,7 +644,7 @@ pub struct JobHandle {
     id: u64,
     sid: String,
     state: Arc<(Mutex<SessionState>, Condvar)>,
-    work_dir: PathBuf,
+    capture_dir: PathBuf,
     timeout: Duration,
 }
 
@@ -689,39 +695,25 @@ impl JobHandle {
         drop(guard);
 
         let out_path = self
-            .work_dir
+            .capture_dir
             .join(format!(".tps_job_{}_{}.out", self.sid, self.id));
         let err_path = self
-            .work_dir
+            .capture_dir
             .join(format!(".tps_job_{}_{}.err", self.sid, self.id));
-        let stdout_bytes = match std::fs::read(&out_path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    sid = %self.sid,
-                    job_id = self.id,
-                    path = %out_path.display(),
-                    error = %e,
-                    "failed to read job stdout capture file; \
-                     guest_work_dir may not bind-map to host work_dir"
-                );
-                Vec::new()
-            }
-        };
-        let stderr_bytes = match std::fs::read(&err_path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    sid = %self.sid,
-                    job_id = self.id,
-                    path = %err_path.display(),
-                    error = %e,
-                    "failed to read job stderr capture file; \
-                     guest_work_dir may not bind-map to host work_dir"
-                );
-                Vec::new()
-            }
-        };
+        let stdout_bytes = std::fs::read(&out_path).map_err(|e| {
+            Error::exec(format!(
+                "failed to read job stdout capture file {} (job {}): {e}",
+                out_path.display(),
+                self.id,
+            ))
+        })?;
+        let stderr_bytes = std::fs::read(&err_path).map_err(|e| {
+            Error::exec(format!(
+                "failed to read job stderr capture file {} (job {}): {e}",
+                err_path.display(),
+                self.id,
+            ))
+        })?;
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(&err_path);
 
