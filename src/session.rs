@@ -465,18 +465,30 @@ impl Session {
         let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
         let out_name = format!(".tps_job_{}_{}.out", self.sid, id);
         let err_name = format!(".tps_job_{}_{}.err", self.sid, id);
+        let pid_name = format!(".tps_job_{}_{}.pid", self.sid, id);
 
-        // { ( eval USER_CMD ) >OUT 2>ERR ; rc=$? ; printf '\n__SBJOB_X_id rc\n' ; } &
-        // Subshell isolates the eval; outer brace group gets backgrounded as one unit
-        // so its completion sentinel fires after the user cmd really finished.
+        // Wrap user cmd in `setsid` so the entire job tree lives in its own
+        // process group / session. Capture the setsid wrapper's PID into a
+        // pidfile so `kill_job` can `kill -KILL -- -<pgid>` that whole tree
+        // without touching the session bash.
+        //
+        // Layout:
+        //   { setsid bash -c '<eval USER>' >OUT 2>ERR & echo $! >PIDFILE ;
+        //     wait $! ; rc=$? ; printf SBJOB_<sid>_<id> rc ; }
+        //
+        // The outer brace group is itself backgrounded with `&` so the
+        // session bash stays free to accept new commands. `wait $!` makes
+        // the brace group's exit reflect the user command's real exit
+        // code (instead of `setsid` always exiting 0 after fork).
         let script = format!(
-            "{{ ( eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" ) > \"$TMPDIR/{out_name}\" 2> \"$TMPDIR/{err_name}\" ; __sb_jrc=$? ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
+            "{{ setsid bash -c \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\" > \"$TMPDIR/{out_name}\" 2> \"$TMPDIR/{err_name}\" & __sb_jpid=$! ; printf '%s' \"$__sb_jpid\" > \"$TMPDIR/{pid_name}\" ; wait \"$__sb_jpid\" ; __sb_jrc=$? ; rm -f \"$TMPDIR/{pid_name}\" ; printf '\\n__SBJOB_{sid}_{id} %d\\n' \"$__sb_jrc\" ; }} &\n",
             delim = delim,
             cmd = cmd,
             sid = self.sid,
             id = id,
             out_name = out_name,
             err_name = err_name,
+            pid_name = pid_name,
         );
         stdin
             .write_all(script.as_bytes())
@@ -493,6 +505,45 @@ impl Session {
             timeout: self.timeout,
         })
     }
+
+    /// Send `SIGKILL` to a previously-spawned job's entire process group.
+    ///
+    /// `Session::spawn` puts each job in its own pgroup via `setsid` and
+    /// records the leader PID into `$TMPDIR/.tps_job_<sid>_<id>.pid`. This
+    /// method writes a one-liner to the session's bash that reads the pid
+    /// file and `kill -KILL -- -<pgid>`s the whole tree, then `wait`s for
+    /// the brace group sentinel so subsequent `JobHandle::wait` collects
+    /// output cleanly.
+    ///
+    /// The session bash is **not** torn down — the next `exec` / `spawn`
+    /// works normally with all session state (env, cwd, files) preserved.
+    ///
+    /// Returns `Ok(())` if the kill snippet was dispatched. That doesn't
+    /// guarantee the job is dead — call `JobHandle::wait_with_timeout`
+    /// after this to confirm. If the session itself is closed, returns
+    /// `Err`.
+    pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::exec("session is closed"))?;
+        let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
+        // `|| true` so a missing pidfile (race: job already exited) doesn't
+        // make bash think the kill failed; we always want to fall through
+        // to the brace-group sentinel.
+        let snippet = format!(
+            "{{ if [ -f \"$TMPDIR/{pid_name}\" ]; then __sb_kpid=$(cat \"$TMPDIR/{pid_name}\" 2>/dev/null) ; if [ -n \"$__sb_kpid\" ]; then kill -KILL -- \"-$__sb_kpid\" 2>/dev/null || true ; fi ; fi ; }}\n",
+            pid_name = pid_name,
+        );
+        stdin
+            .write_all(snippet.as_bytes())
+            .map_err(|e| Error::exec(format!("write to session stdin: {}", e)))?;
+        stdin
+            .flush()
+            .map_err(|e| Error::exec(format!("flush session stdin: {}", e)))?;
+        Ok(())
+    }
+
 
     fn close_inner(&mut self) -> Result<()> {
         tracing::debug!(
