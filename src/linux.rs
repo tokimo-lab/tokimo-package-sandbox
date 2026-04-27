@@ -209,6 +209,21 @@ fn build_bwrap_command_inner(
             // Empty HOME + /root so anything written there dies with the sandbox.
             cmd.args(["--dir", "/home"]);
             cmd.args(["--dir", "/root"]);
+
+            // Hide sensitive dotfiles under the host HOME. Although we empty-dir
+            // /home, a user might mount their HOME explicitly via extra_mounts —
+            // make sure the dotfiles are blanked. Only meaningful for HostShared,
+            // since CallerProvided does not expose the host's /home at all and
+            // referencing $HOME there would leak the host username via bwrap's
+            // implicit mkdir of intermediate dirs.
+            if let Ok(home) = std::env::var("HOME") {
+                for name in HIDE_HOME_DIRS {
+                    let p = PathBuf::from(&home).join(name);
+                    if p.exists() {
+                        cmd.args(["--tmpfs", &p.to_string_lossy()]);
+                    }
+                }
+            }
         }
         SystemLayout::CallerProvided => {
             // Caller is responsible for providing the full rootfs via
@@ -237,17 +252,6 @@ fn build_bwrap_command_inner(
             cmd.args(["--ro-bind", &src_s, &dst]);
         } else {
             cmd.args(["--bind", &src_s, &dst]);
-        }
-    }
-
-    // Hide sensitive dotfiles under HOME. Although we empty-dir /home, a user
-    // might mount their HOME explicitly — make sure the dotfiles are blanked.
-    if let Ok(home) = std::env::var("HOME") {
-        for name in HIDE_HOME_DIRS {
-            let p = PathBuf::from(&home).join(name);
-            if p.exists() {
-                cmd.args(["--tmpfs", &p.to_string_lossy()]);
-            }
         }
     }
 
