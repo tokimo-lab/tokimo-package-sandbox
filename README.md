@@ -224,37 +224,111 @@ Under the hood: each `Session` boots a long-lived bwrap container whose **PID 1 
 ## Architecture (Linux)
 
 ```
-┌────────────────────────── host process (your program) ────────────────────────┐
-│                                                                                │
-│   Session ──────► InitClient                                                   │
-│      │                │                                                        │
-│      │                │ SOCK_SEQPACKET (length-prefixed JSON +                 │
-│      │                │   SCM_RIGHTS for stdin/out/err / PTY master fd)        │
-│      │                ▼                                                        │
-│      │        /var/run/tokimo/sandbox/<id>/control.sock                        │
-│      │                                                                        │
-│      │   spawns once per Session, kept alive across exec/open_pty calls        │
-│      ▼                                                                        │
-│   bwrap (--unshare-all --as-pid-1 --die-with-parent)                           │
-└────────┬───────────────────────────────────────────────────────────────────────┘
-         │  fork / execve PID 1 = /.tokimo-sandbox-init
+┌────────────────────────── host process (your program) ───────────────────────────┐
+│                                                                                   │
+│   Session ──────► InitClient (Arc, shared across exec / spawn / open_pty)         │
+│      │                │                                                           │
+│      │  exec() ───────│──► bash REPL (sentinel protocol over bridge pipes)        │
+│      │                │                                                           │
+│      │  spawn() ──────│──► spawn_pipes_inherit_async(shell_child_id)              │
+│      │                │       │                                                   │
+│      │                │       ▼                                                   │
+│      │                │    Op::Spawn { inherit_from_child, StdioMode::Pipes }     │
+│      │                │       │                                                   │
+│      │                │       ▼                                                   │
+│      │                │    init reads /proc/<shell_pid>/cwd + /proc/<shell_pid>/environ
+│      │                │    init forks child, streams stdout/stderr as Event frames │
+│      │                │       │                                                   │
+│      │                │       ▼                                                   │
+│      │   JobHandle ◄──│── ChildHandle::wait_with_timeout()                        │
+│      │       │        │       drain_stdout(id) / drain_stderr(id) / take_exit(id) │
+│      │       │        │       (zero disk I/O — all in-memory via shared mutex)    │
+│      │       ▼        │                                                           │
+│      │   ExecOutput   │                                                           │
+│      │                │                                                           │
+│      │  kill_job() ───│──► KillSpawnFn → signal(child_id, SIGKILL, to_pgrp=true) │
+│      │                │       (looks up job_id→child_id in shared HashMap)        │
+│      │                │                                                           │
+│      │  open_pty() ───│──► spawn_pty → master fd via SCM_RIGHTS                  │
+│      │                │                                                           │
+│      │                │ SOCK_SEQPACKET (length-prefixed JSON +                    │
+│      │                │   SCM_RIGHTS for PTY master fd)                           │
+│      │                ▼                                                           │
+│      │   /var/run/tokimo/sandbox/<id>/control.sock                                │
+│      │                                                                           │
+│      │   spawns once per Session, kept alive across all calls                     │
+│      ▼                                                                           │
+│   bwrap (--unshare-all --as-pid-1 --die-with-parent)                              │
+└────────┬──────────────────────────────────────────────────────────────────────────┘
+         │  fork / execve PID 1 = tokimo-sandbox-init
          ▼
-┌────────────────────── inside the sandbox (new namespaces) ──────────────────────┐
-│                                                                                  │
-│   PID 1: tokimo-sandbox-init                                                     │
-│     ├─ listens on /run/tk-sandbox/control.sock (SOCK_SEQPACKET)                  │
-│     ├─ signalfd → reaps every orphan via waitpid(WNOHANG)                        │
-│     ├─ Spawn(Pipes)  → fork + execve, host gets stdin/stdout/stderr fds          │
-│     ├─ Spawn(Pty)    → openpt + setsid + TIOCSCTTY, host gets master fd          │
-│     └─ OpenShell     → long-lived bash for sentinel-protocol exec()              │
-│                                                                                  │
-│   children (sharing one PID/mount/net/ipc/uts namespace, controlling tty, env):  │
-│     ├─ bash REPL (sentinel-protocol, used by Session::exec)                      │
-│     ├─ bash on PTY (tab #1)   ← visible to AI tools' `ps`                        │
-│     ├─ pip install …, curl …, vim, top, …                                        │
-│     └─ … (siblings, can signal each other, share files via cwd)                  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────── inside the sandbox (new namespaces) ────────────────────────┐
+│                                                                                    │
+│   PID 1: tokimo-sandbox-init                                                       │
+│     ├─ listens on /run/tk-sandbox/control.sock (SOCK_SEQPACKET)                    │
+│     ├─ signalfd → reaps every orphan via waitpid(WNOHANG)                          │
+│     │                                                                              │
+│     ├─ Op::OpenShell                                                               │
+│     │   └─ long-lived bash REPL for sentinel-protocol Session::exec()              │
+│     │                                                                              │
+│     ├─ Op::Spawn { StdioMode::Pipes, inherit_from_child }                          │
+│     │   ├─ reads /proc/<shell_pid>/cwd → symlink target → child cwd                │
+│     │   ├─ reads /proc/<shell_pid>/environ → null-separated KEY=VALUE → child env  │
+│     │   └─ fork + execve, pipes back stdout/stderr as Event::Stdout / Event::Stderr│
+│     │                                                                              │
+│     └─ Op::Spawn { StdioMode::Pty }                                                │
+│         └─ openpt + setsid + TIOCSCTTY, master fd → host via SCM_RIGHTS            │
+│                                                                                    │
+│   children (sharing one PID/mount/net/ipc/uts namespace):                          │
+│     ├─ bash REPL      ← child_id="c1", long-lived                                  │
+│     ├─ spawn job #1   ← child_id="c2", inherits bash cwd/env, independent process  │
+│     ├─ spawn job #2   ← child_id="c3", runs concurrently with #1                   │
+│     ├─ bash on PTY    ← interactive, master fd owned by host                       │
+│     └─ … (monotonically assigned child_ids, never recycled)                        │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Pipe-mode spawn output capture
+
+`Session::spawn` returns a `JobHandle` **immediately** and collects output via the
+init control socket — zero disk I/O, no bind-mount tricks:
+
+```
+Session::spawn("echo hello")
+  │
+  ├─ InitClient::spawn_pipes_inherit_async(shell_child_id="c1")
+  │     │
+  │     ├─ Op::Spawn { inherit_from_child: "c1", StdioMode::Pipes }
+  │     │     init reads /proc/<shell_pid>/cwd → "/tmp"    (cwd inheritance)
+  │     │     init reads /proc/<shell_pid>/environ → PATH=… (env inheritance)
+  │     │     init forks /bin/bash -c "echo hello"
+  │     │
+  │     ├─ Event::Stdout { child_id: "c2", data_b64: "aGVsbG8K" }
+  │     └─ Event::Exit   { child_id: "c2", code: 0 }
+  │
+  └─ JobHandle::wait_with_timeout()
+       │
+       ├─ drain_stdout("c2") → "hello\n"
+       ├─ drain_stderr("c2") → ""
+       ├─ take_exit("c2")    → 0
+       └─ close_child("c2")  → cleanup
+```
+
+Key properties:
+- **cwd/env inheritance** — init reads `/proc/<shell_pid>/cwd` and
+  `/proc/<shell_pid>/environ` at spawn time; the child sees exactly what
+  the REPL shell sees (including `cd` and `export` from prior `exec` calls)
+- **Concurrent spawns** — each `spawn` gets a unique, monotonically
+  assigned `child_id`; events are demuxed by id with no crosstalk
+  (tested to 1000 concurrent jobs)
+- **Timeouts** — `JobHandle::wait_with_timeout` sends `SIGKILL` via
+  `Op::Signal` when the deadline expires; exit_code = 124 (matching
+  coreutils `timeout`)
+- **Kill via session** — `Session::kill_job(job_id)` sends `SIGKILL`
+  through the init control socket using a shared `job_id → child_id`
+  mapping; session stays alive for subsequent `exec`/`spawn`
+- **Backpressure** — kernel pipe buffer (64 KB) fills when output outpaces
+  consumption; child blocks until host drains via `wait_for_event`
 
 Control protocol (v1):
 
@@ -265,18 +339,22 @@ init   → client { "ok": true,  "protocol": 1, "init_pid": 1, "features": [...]
 client → init  { "op": "OpenShell", "argv": ["/bin/bash","--noprofile","--norc"], ... }
 init   → client { "ok": true, "result": { "shell_id": "...", "pid": 12 } }
 
+client → init  { "op": "Spawn", "argv": ["/bin/bash","-c","echo hello"],
+                 "stdio": "Pipes", "inherit_from_child": "c1" }
+init   → client { "ok": true, "result": { "child_id": "c2", "pid": 14 } }
+
 client → init  { "op": "Spawn", "argv": ["/bin/bash","-l"],
                  "stdio": { "Pty": { "rows": 24, "cols": 80 } } }
-init   → client { "ok": true, "result": { "child_id": "...", "pid": 14 } }
+init   → client { "ok": true, "result": { "child_id": "c3", "pid": 15 } }
                   // SCM_RIGHTS: PTY master fd in same packet ancillary
 
 client → init  { "op": "Write",  "child_id": "...", "data_b64": "..." }
 client → init  { "op": "Resize", "child_id": "...", "rows": 30, "cols": 100 }
-client → init  { "op": "Signal", "child_id": "...", "sig": 15, "to_pgrp": true }
+client → init  { "op": "Signal", "child_id": "...", "sig": 9, "to_pgrp": true }
 client → init  { "op": "Shutdown", "kill_all": true }
 
-init   → client { "event": "Stdout"|"Stderr", "child_id": "...", "data_b64": "..." }
-init   → client { "event": "Exit",   "child_id": "...", "code": 0, "signal": null }
+init   → client { "event": "Stdout"|"Stderr", "child_id": "c2", "data_b64": "..." }
+init   → client { "event": "Exit",   "child_id": "c2", "code": 0, "signal": null }
 ```
 
 Why a long-lived PID 1 inside the sandbox?
@@ -285,27 +363,7 @@ Why a long-lived PID 1 inside the sandbox?
 - **No orphan reaping bugs.** A PID 1 that calls `waitpid(WNOHANG)` on every `SIGCHLD` keeps the process table clean even when the AI fires off `&` background jobs.
 - **PTY job control works.** `setsid()` + `TIOCSCTTY` happen inside the container, so `bash`/`vim`/`top`/Ctrl-C all behave like a real terminal — no `cannot set terminal process group` warning.
 - **Single bwrap per agent.** Container startup cost (bwrap + seccomp install) is paid once, not per command.
-
-## Persistent sessions
-
-When you need to run **multiple commands that share state** — files, env vars, cwd, background jobs — open a `Session` instead of calling `run()` each time.
-
-```rust
-use tokimo_package_sandbox::{SandboxConfig, Session};
-
-let cfg = SandboxConfig::new("/tmp/work");
-let mut sess = Session::open(&cfg)?;
-
-sess.exec("touch hello")?;                    // create file
-let out = sess.exec("ls")?;                   // file is still there
-assert!(out.stdout.contains("hello"));
-
-sess.exec("export FOO=bar")?;
-let out = sess.exec("echo $FOO")?;
-assert_eq!(out.stdout.trim(), "bar");
-
-sess.close()?;
-```
+- **Slots never recycled.** Child ids are monotonically assigned (`c1`, `c2`, …), never reused within a session. This prevents crosstalk between a late-draining `ChildHandle` and a new child that would otherwise share the same id.
 
 ### Sharing one container with an interactive PTY
 
