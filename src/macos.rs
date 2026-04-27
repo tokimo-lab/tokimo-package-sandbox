@@ -1,6 +1,8 @@
-//! macOS sandbox: generates a Seatbelt profile and invokes `sandbox-exec`.
+//! macOS sandbox: Seatbelt (default) or Virtualization.framework (opt-in via SAFEBOX_VZ=1).
 
 #![cfg(target_os = "macos")]
+
+mod vz;
 
 use crate::common::{pipe_stdio, spawn_run};
 use crate::config::{NetworkPolicy, SandboxConfig};
@@ -8,7 +10,7 @@ use crate::{Error, ExecutionResult, Result};
 
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 pub(crate) struct SeatbeltKeepAlive {
@@ -19,6 +21,13 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
     if user_cmd.is_empty() {
         return Err(Error::validation("empty command"));
     }
+
+    // VZ path: opt-in for now (requires kernel + initrd).
+    if vz::is_enabled() && vz::is_available() {
+        return vz::run(user_cmd, cfg);
+    }
+
+    // Default: Seatbelt.
     let argv: Vec<&str> = user_cmd.iter().map(|s| s.as_ref()).collect();
     let (mut cmd, keepalive) = build_seatbelt_command(&argv, cfg)?;
     pipe_stdio(&mut cmd);
@@ -84,6 +93,12 @@ pub(crate) fn build_seatbelt_command(inner_argv: &[&str], cfg: &SandboxConfig) -
 }
 
 pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
+    // VZ path: opt-in.
+    if vz::is_enabled() && vz::is_available() {
+        return vz::spawn_session_shell(cfg);
+    }
+
+    // Default: Seatbelt.
     use std::process::Stdio;
     let argv = ["/bin/bash", "--noprofile", "--norc"];
     let (mut cmd, keepalive) = build_seatbelt_command(&argv, cfg)?;

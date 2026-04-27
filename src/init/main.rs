@@ -1,31 +1,42 @@
 //! `tokimo-sandbox-init` — PID 1 inside an `AgentSandbox` bwrap container.
 //!
+//! Linux-only binary. On other platforms this binary is a no-op stub.
+//!
 //! Listens on a SEQPACKET unix socket bound at `/run/tk-sandbox/control.sock`
 //! (passed in via env var `TOKIMO_SANDBOX_CONTROL_SOCK` for tests) and serves
 //! the wire protocol defined in `tokimo_package_sandbox::init_protocol`.
-//!
-//! Hard responsibilities of being PID 1:
-//!   - reap orphaned children via `signalfd(SIGCHLD)` + `waitpid(-1, WNOHANG)`
-//!   - keep mappings of {child_id ↔ pid, pgid, master_fd, stdio pipes}
-//!   - never panic out of the event loop (each op is wrapped in catch_unwind)
 
-use std::env;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use nix::sys::signal::{SigSet, Signal};
-use nix::sys::signalfd::{SfdFlags, SignalFd};
-use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket};
-use nix::unistd::getpid;
-
+#[cfg(target_os = "linux")]
 mod child;
+#[cfg(target_os = "linux")]
 mod pty;
+#[cfg(target_os = "linux")]
 mod server;
 
+#[cfg(target_os = "linux")]
+use std::env;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::ExitCode;
+
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{SigSet, Signal};
+#[cfg(target_os = "linux")]
+use nix::sys::signalfd::{SfdFlags, SignalFd};
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket};
+#[cfg(target_os = "linux")]
+use nix::unistd::getpid;
+
+#[cfg(target_os = "linux")]
 const ENV_CONTROL_SOCK: &str = "TOKIMO_SANDBOX_CONTROL_SOCK";
+#[cfg(target_os = "linux")]
 const DEFAULT_CONTROL_SOCK: &str = "/run/tk-sandbox/control.sock";
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     if let Err(e) = run() {
         eprintln!("[tokimo-sandbox-init] fatal: {e}");
@@ -34,6 +45,13 @@ fn main() -> ExitCode {
     ExitCode::from(0)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("tokimo-sandbox-init is Linux-only");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 fn run() -> Result<(), String> {
     // Hard requirement: bwrap MUST have launched us with `--as-pid-1`.
     let pid = getpid();

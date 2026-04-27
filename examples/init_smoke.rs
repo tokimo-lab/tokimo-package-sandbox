@@ -8,13 +8,12 @@
 //!
 //! Linux only.
 
-#![cfg(target_os = "linux")]
-
-use std::time::{Duration, Instant};
-
-use tokimo_package_sandbox::{InitClient, NetworkPolicy, SandboxConfig};
-
+#[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+
+    use tokimo_package_sandbox::{InitClient, NetworkPolicy, SandboxConfig};
+
     let work = std::env::temp_dir().join("tps-init-smoke");
     std::fs::create_dir_all(&work)?;
 
@@ -70,4 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] bwrap exit: {status}");
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("init_smoke is Linux-only");
 }

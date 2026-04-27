@@ -34,6 +34,8 @@ mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.29", features = ["process", "signal"] }
 libc = "0.2"
+arcbox-vz = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -91,6 +93,10 @@ required-features = []
 name = "pty_smoke"
 path = "examples/pty_smoke.rs"
 required-features = []
+
+[[example]]
+name = "vz_smoke"
+path = "examples/vz_smoke.rs"
 
 [[bin]]
 name = "tokimo-sandbox-init"
