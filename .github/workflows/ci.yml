@@ -12,11 +12,14 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # Linux: full build + test (requires bubblewrap)
+  # Linux: full build + test (requires bubblewrap + Debian rootfs)
   # ------------------------------------------------------------------
   linux:
     name: linux (build + test)
     runs-on: ubuntu-latest
+    env:
+      ROOTFS_VERSION: v1.3.1
+      ROOTFS_ASSET: rootfs-amd64.tar.zst
     steps:
       - uses: actions/checkout@v4
 
@@ -26,14 +29,40 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install bubblewrap
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+      - name: Install bubblewrap + zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap zstd
+
+      - name: Cache test rootfs
+        id: rootfs-cache
+        uses: actions/cache@v4
+        with:
+          path: .test-rootfs
+          key: tokimo-test-rootfs-${{ env.ROOTFS_VERSION }}-${{ env.ROOTFS_ASSET }}
+
+      - name: Download + extract rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p .test-rootfs
+          curl -sSL -o rootfs.tar.zst \
+            "https://github.com/tokimo-lab/tokimo-package-rootfs/releases/download/${ROOTFS_VERSION}/${ROOTFS_ASSET}"
+          # Sanity peek at archive layout — must extract to top-level dirs
+          # like ./bin, ./usr, etc.
+          zstd -d -c rootfs.tar.zst | tar -tf - | head -3
+          zstd -d -c rootfs.tar.zst | tar -xf - -C .test-rootfs
+          rm -f rootfs.tar.zst
+          test -x .test-rootfs/usr/bin/bash || test -x .test-rootfs/bin/bash
 
       - name: Build
         run: cargo build --lib --bins --tests --examples
 
-      - name: Test
+      - name: Test (lib + bins)
         run: cargo test --lib --bins
+
+      - name: Test (integration tests with rootfs)
+        env:
+          TOKIMO_TEST_ROOTFS: ${{ github.workspace }}/.test-rootfs
+        run: cargo test --tests
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)
