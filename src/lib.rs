@@ -24,6 +24,11 @@ mod macos;
 
 #[cfg(target_os = "windows")]
 mod windows;
+/// Wire protocol shared between the host library and `tokimo-sandbox-svc.exe`.
+#[cfg(target_os = "windows")]
+pub mod svc_protocol {
+    pub use crate::windows::protocol::*;
+}
 
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
 pub use error::{Error, ExecutionResult, Result};

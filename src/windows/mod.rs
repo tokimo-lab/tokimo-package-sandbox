@@ -16,7 +16,8 @@
 //! The library auto-detects a console-mode service already running and skips
 //! the auto-install step.
 
-mod svc;
+mod client;
+pub mod protocol;
 
 use crate::{Error, ExecutionResult, Result};
 
@@ -55,7 +56,7 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CPUS);
 
-    svc::client::exec_vm(&kernel, &initrd, &rootfs, &cmd_b64, memory_mb, cpu_count)
+    client::exec_vm(&kernel, &initrd, &rootfs, &cmd_b64, memory_mb, cpu_count)
 }
 
 pub(crate) fn spawn_session_shell(_cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {

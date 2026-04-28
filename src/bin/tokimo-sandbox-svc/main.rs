@@ -17,9 +17,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    // ---------------------------------------------------------------------------
-    // Direct FFI to avoid windows-sys module path churn
-    // ---------------------------------------------------------------------------
+    use tokimo_package_sandbox::svc_protocol::{ExecVmResult, SvcError, SvcRequest, SvcResponse};
 
     // kernel32 functions (linked by default)
     extern "system" {
@@ -464,7 +462,7 @@ mod imp {
 
         let payload_len = u32::from_le_bytes(len_buf) as usize;
         if payload_len > 16 * 1024 * 1024 {
-            send_error(pipe, "bad_request", "frame too large");
+            send_error(pipe, "", "bad_request", "frame too large");
             return;
         }
 
@@ -484,27 +482,40 @@ mod imp {
             return;
         }
 
-        let request: serde_json::Value = match serde_json::from_slice(&payload) {
+        let request: SvcRequest = match serde_json::from_slice(&payload) {
             Ok(v) => v,
             Err(e) => {
-                send_error(pipe, "bad_request", &format!("JSON parse: {e}"));
+                send_error(pipe, "", "bad_request", &format!("JSON parse: {e}"));
                 return;
             }
         };
 
-        let op = request["op"].as_str().unwrap_or("unknown");
-        match op {
-            "Ping" => {
-                let id = request["id"].as_str().unwrap_or("");
-                send_json(
-                    pipe,
-                    &serde_json::json!({
-                        "kind": "Pong", "id": id, "version": VERSION,
-                    }),
-                );
-            }
-            "ExecVm" => handle_exec_vm(pipe, &request),
-            _ => send_error(pipe, "bad_request", &format!("unknown op: {op}")),
+        match request {
+            SvcRequest::Ping { id } => send_response(
+                pipe,
+                &SvcResponse::Pong {
+                    id,
+                    version: VERSION.to_string(),
+                },
+            ),
+            SvcRequest::ExecVm {
+                id,
+                kernel_path,
+                initrd_path,
+                rootfs_path,
+                cmd_b64,
+                memory_mb,
+                cpu_count,
+            } => handle_exec_vm(
+                pipe,
+                id,
+                &kernel_path,
+                &initrd_path,
+                &rootfs_path,
+                &cmd_b64,
+                memory_mb,
+                cpu_count,
+            ),
         }
 
         disconnect(pipe);
@@ -520,17 +531,19 @@ mod imp {
     // ExecVm handler
     // ---------------------------------------------------------------------------
 
-    fn handle_exec_vm(pipe: *mut c_void, request: &serde_json::Value) {
-        let id = request["id"].as_str().unwrap_or("").to_string();
-        let kernel_path = request["kernel_path"].as_str().unwrap_or("");
-        let initrd_path = request["initrd_path"].as_str().unwrap_or("");
-        let rootfs_path = request["rootfs_path"].as_str().unwrap_or("");
-        let cmd_b64 = request["cmd_b64"].as_str().unwrap_or("");
-        let memory_mb = request["memory_mb"].as_u64().unwrap_or(512);
-        let cpu_count = request["cpu_count"].as_u64().unwrap_or(2) as usize;
-
+    #[allow(clippy::too_many_arguments)]
+    fn handle_exec_vm(
+        pipe: *mut c_void,
+        id: String,
+        kernel_path: &str,
+        initrd_path: &str,
+        rootfs_path: &str,
+        cmd_b64: &str,
+        memory_mb: u64,
+        cpu_count: usize,
+    ) {
         if kernel_path.is_empty() || initrd_path.is_empty() || rootfs_path.is_empty() {
-            send_error(pipe, "not_found", &format!("missing paths for request {id}"));
+            send_error(pipe, &id, "not_found", &format!("missing paths for request {id}"));
             return;
         }
 
@@ -540,29 +553,15 @@ mod imp {
             ("rootfs", rootfs_path),
         ] {
             if !Path::new(path).exists() {
-                send_error(pipe, "not_found", &format!("{name} not found: {path}"));
+                send_error(pipe, &id, "not_found", &format!("{name} not found: {path}"));
                 return;
             }
         }
 
         match run_vm(kernel_path, initrd_path, rootfs_path, cmd_b64, memory_mb, cpu_count) {
-            Ok(result) => send_json(
-                pipe,
-                &serde_json::json!({
-                    "kind": "ExecVmResult", "id": id,
-                    "stdout": result.stdout, "stderr": result.stderr,
-                    "exit_code": result.exit_code, "timed_out": result.timed_out,
-                }),
-            ),
-            Err(e) => send_error(pipe, "hcs_error", &format!("VM execution failed: {e}")),
+            Ok(result) => send_response(pipe, &SvcResponse::ExecVmResult { id, result }),
+            Err(e) => send_error(pipe, &id, "hcs_error", &format!("VM execution failed: {e}")),
         }
-    }
-
-    struct VmResult {
-        stdout: String,
-        stderr: String,
-        exit_code: i32,
-        timed_out: bool,
     }
 
     fn run_vm(
@@ -572,7 +571,7 @@ mod imp {
         cmd_b64: &str,
         memory_mb: u64,
         cpu_count: usize,
-    ) -> Result<VmResult, String> {
+    ) -> Result<ExecVmResult, String> {
         let rootfs = Path::new(rootfs_path);
         let _ = std::fs::remove_file(rootfs.join(".vz_stdout"));
         let _ = std::fs::remove_file(rootfs.join(".vz_stderr"));
@@ -608,7 +607,7 @@ mod imp {
             if std::time::Instant::now() > deadline {
                 let _ = hcs.terminate_compute_system(handle);
                 hcs.close_compute_system(handle);
-                return Ok(VmResult {
+                return Ok(ExecVmResult {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: -1,
@@ -629,7 +628,7 @@ mod imp {
         let _ = std::fs::remove_file(rootfs.join(".vz_exit_code"));
 
         hcs.close_compute_system(handle);
-        Ok(VmResult {
+        Ok(ExecVmResult {
             stdout,
             stderr,
             exit_code,
@@ -847,9 +846,14 @@ mod imp {
     // Response helpers
     // ---------------------------------------------------------------------------
 
-    fn send_json(pipe: *mut c_void, value: &serde_json::Value) {
-        let json = value.to_string();
-        let bytes = json.as_bytes();
+    fn send_response(pipe: *mut c_void, response: &SvcResponse) {
+        let bytes = match serde_json::to_vec(response) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[svc] failed to serialize response: {e}");
+                return;
+            }
+        };
         let len = bytes.len() as u32;
         let mut written: u32 = 0;
         unsafe {
@@ -870,12 +874,16 @@ mod imp {
         }
     }
 
-    fn send_error(pipe: *mut c_void, code: &str, message: &str) {
-        send_json(
+    fn send_error(pipe: *mut c_void, id: &str, code: &str, message: &str) {
+        send_response(
             pipe,
-            &serde_json::json!({
-                "kind": "Error", "id": "", "error": { "code": code, "message": message }
-            }),
+            &SvcResponse::Error {
+                id: id.to_string(),
+                error: SvcError {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                },
+            },
         );
     }
 } // end of mod imp

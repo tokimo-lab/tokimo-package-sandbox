@@ -185,7 +185,7 @@ src/
 │   ├── bridge.rs           ──   L4 ↔ L7 verdict bridge
 │   ├── seccomp.rs          ──   BPF program codegen
 │   ├── init_client.rs      ──   host-side InitClient (SOCK_SEQPACKET)
-│   └── l4/                 ──   seccomp-notify + (scaffold) eBPF observer
+│   └── l4/                 ──   seccomp-notify + seccomp-trace + scaffold eBPF observer
 │
 ├── macos/                  ── macOS backend (Virtualization.framework)
 │   ├── mod.rs              ──   run() / spawn_session_shell()
@@ -194,8 +194,9 @@ src/
 │   └── vz_vsock.rs         ──   InitClient over VSOCK
 │
 ├── windows/                ── Windows backend (HCS via SYSTEM service)
-│   ├── mod.rs              ──   run() → svc client
-│   └── svc/                ──   named-pipe client + protocol
+│   ├── mod.rs              ──   run() → client::exec_vm()
+│   ├── client.rs           ──   named-pipe client to tokimo-sandbox-svc
+│   └── protocol.rs         ──   wire types (re-exported as `svc_protocol`)
 │
 ├── workspace/              ── multi-user Workspace (Linux + macOS)
 │   ├── mod.rs              ──   Workspace / UserHandle / UserConfig
@@ -209,7 +210,7 @@ src/
     │   └── pty.rs            ──   slave PTY setup
     │
     └── tokimo-sandbox-svc/   ── Windows SYSTEM service for HCS VM lifecycle
-        └── main.rs
+        └── main.rs           ──   reuses `svc_protocol` types from the lib
 ```
 
 Public re-exports (see `lib.rs`): `SandboxConfig`, `Mount`, `NetworkPolicy`, `ResourceLimits`,
@@ -217,7 +218,7 @@ Public re-exports (see `lib.rs`): `SandboxConfig`, `Mount`, `NetworkPolicy`, `Re
 `Workspace`, `WorkspaceConfig`, `UserConfig`, `UserHandle`, `Error`, `Result`, `ExecutionResult`,
 `NetEvent`, `NetEventSink`, `Verdict`, `Layer`, `Proto`, `DnsPolicy`, `HostPattern`,
 `SpawnedInit`, `spawn_init`, `locate_init_binary`, `InitClient`, `SpawnInfo`,
-`generate_bpf_bytes`, `protocol::{types, wire}`.
+`generate_bpf_bytes`, `protocol::{types, wire}`, `svc_protocol` (Windows only).
 
 ## Architecture
 
@@ -255,7 +256,7 @@ macOS host
   │     ├─ VirtualMachineConfiguration
   │     │     ├─ LinuxBootLoader(kernel, initrd)  ← cmd_b64 via kernel cmdline
   │     │     ├─ VirtioFileSystem("work")          ← rootfs shared via virtiofs
-  │     │     ├─ VirtioSocket                       ← VSOCK (future Session)
+  │     │     ├─ VirtioSocket                       ← VSOCK for persistent Session
   │     │     └─ VirtioConsole (serial)             ← boot diagnostics
   │     │
   │     ├─ vm.start()
@@ -328,7 +329,7 @@ pub struct ExecutionResult {
 }
 ```
 
-### Persistent sessions (Linux only)
+### Persistent sessions (Linux + macOS)
 
 ```rust
 let mut sess = Session::open(&cfg)?;
@@ -339,6 +340,9 @@ let result = job.wait_with_timeout(Duration::from_secs(10))?;
 let pty = sess.open_pty(24, 80, &["/bin/bash".into()], &[], None)?;
 sess.close()?;
 ```
+
+Windows currently exposes only one-shot `run()`. Sessions on Windows are
+tracked but not yet implemented.
 
 ### Configuration
 
@@ -367,19 +371,31 @@ On Linux, `Observed` / `Gated` layer seccomp-notify (L4) + transparent HTTP(S) p
 ## Examples
 
 ```bash
-cargo run --example basic             # One-shot: ls, id, hostname
-cargo run --example shell             # Interactive shell (Linux bwrap)
-cargo run --example rm_rf_test        # Proves rm -rf / can't touch host
-cargo run --example session           # Persistent session (Linux)
-cargo run --example vz_smoke          # macOS VZ toolchain smoke test
-cargo run --example hv_smoke          # Windows Hyper-V service smoke test
-cargo run --example gated_network     # Network observability (Linux)
-cargo run --example l4_observer       # L4+L7 event pipeline (Linux)
+# Cross-platform one-shot
+cargo run --example basic               # ls / id / hostname
+cargo run --example rm_rf_test          # proves rm -rf / can't touch host
+cargo run --example concurrent_oneshot  # parallel run() calls
+cargo run --example edge_cases          # boundary inputs
+cargo run --example torture_test        # stress test
+
+# Linux-only (bwrap + seccomp)
+cargo run --example shell               # interactive shell
+cargo run --example session             # persistent Session
+cargo run --example parallel_in_session # multiple jobs in one Session
+cargo run --example kill_job            # JobHandle::kill / wait
+cargo run --example pty_smoke           # PTY allocation + raw mode
+cargo run --example init_smoke          # tokimo-sandbox-init protocol
+cargo run --example gated_network       # network observability (Gated)
+cargo run --example l4_observer         # L4 + L7 event pipeline
+
+# Platform VM smoke tests
+cargo run --example vz_smoke            # macOS Virtualization.framework
+cargo run --example hv_smoke            # Windows Hyper-V SYSTEM service
 ```
 
 ## Init control protocol (v1, Linux)
 
-The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (future). PTY master fds via `SCM_RIGHTS`.
+The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (macOS Session). PTY master fds via `SCM_RIGHTS`.
 
 ```jsonc
 client → init  { "op": "Hello",      "protocol": 1 }
