@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package manifest for Tokimo Sandbox Service.
+
+  Mirrors Anthropic's `cowork-vm-service` packaging: the service runs as
+  LocalSystem under MSIX-managed lifecycle, registers a single named pipe
+  trigger so the SCM starts it on first connection, and ships in a signed
+  appx so installation doesn't require a UAC prompt for end users (the
+  package signature is the trust anchor instead).
+
+  Required tooling:
+    * MakeAppx.exe       (Windows 10 SDK)
+    * SignTool.exe       (Windows 10 SDK)
+    * A code-signing cert chained to a root the target machine trusts.
+
+  Build pipeline (see scripts\build-msix.ps1):
+    1. cargo build --release --bin tokimo-sandbox-svc
+    2. Stage AppxManifest.xml + tokimo-sandbox-svc.exe + assets/* into a
+       layout dir.
+    3. MakeAppx.exe pack /d <layout> /p Tokimo.SandboxSvc.msix
+    4. SignTool.exe sign /fd SHA256 /a /f <pfx> /p <pwd> Tokimo.SandboxSvc.msix
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+    IgnorableNamespaces="uap uap5 rescap desktop6">
+
+  <Identity
+      Name="Tokimo.SandboxSvc"
+      Publisher="CN=Tokimo, O=Tokimo"
+      Version="0.1.0.0"
+      ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Tokimo Sandbox Service</DisplayName>
+    <PublisherDisplayName>Tokimo</PublisherDisplayName>
+    <Logo>assets\StoreLogo.png</Logo>
+    <Description>System service that brokers Hyper-V micro-VMs for the Tokimo sandbox.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="TokimoSandboxSvc" Executable="tokimo-sandbox-svc.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          AppListEntry="none"
+          DisplayName="Tokimo Sandbox Service"
+          Description="System service for Tokimo sandbox VMs"
+          BackgroundColor="transparent"
+          Square150x150Logo="assets\Square150x150Logo.png"
+          Square44x44Logo="assets\Square44x44Logo.png" />
+
+      <Extensions>
+        <!--
+          Service registration. StartAccount=localSystem mirrors what
+          Anthropic ships and is required to call HCS APIs.
+        -->
+        <desktop6:Extension Category="windows.service" Executable="tokimo-sandbox-svc.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop6:Service
+              Name="TokimoSandboxSvc"
+              StartupType="manual"
+              StartAccount="localSystem">
+            <desktop6:StartupArguments>--service</desktop6:StartupArguments>
+          </desktop6:Service>
+        </desktop6:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="localSystemServices" />
+    <rescap:Capability Name="packagedServices" />
+  </Capabilities>
+</Package>

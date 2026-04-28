@@ -1,147 +1,107 @@
 # Windows 沙箱初始化
 
-本文档面向**空白 Windows 机器**，从零开始配置 `tokimo-package-sandbox` 运行环境。
+本文档描述 `tokimo-package-sandbox` 在 Windows 上的部署模型。架构对齐 Anthropic
+Claude Desktop 的 `cowork-vm-service`：一个 LocalSystem 服务通过命名管道接收宿主进程
+的请求，并调用 HCS API 启动 Hyper‑V 微 VM。
+
+旧版（手动 `--install` + UAC 提权）的文档已归档至 `windows.legacy.md`。
+
+## 架构
+
+```
+┌─────────────────────┐  named pipe   ┌────────────────────────┐  HCS API   ┌──────────┐
+│ host process        │ ────────────▶ │ tokimo-sandbox-svc.exe │ ─────────▶ │ HVSI VM  │
+│ (this crate's lib)  │  \\.\pipe\    │ (LocalSystem service)  │  ComputeCore│ (Linux) │
+└─────────────────────┘  tokimo-...   └────────────────────────┘            └──────────┘
+```
+
+* **服务**：`tokimo-sandbox-svc` 由 MSIX 注册为 LocalSystem 服务，通过
+  `windows-service` crate 接入 SCM。命名管道 `\\.\pipe\tokimo-sandbox-svc` 的 SDDL
+  为 `O:SYG:SYD:(A;;GA;;;SY)(A;;0x12019b;;;IU)` —— 仅 SYSTEM 完全控制，
+  Interactive Users 仅有读写权限（修复了旧版 `BU` 暴露给所有本地账户的 LPE）。
+* **宿主库**：`tokimo_package_sandbox` 在 Windows 上使用 `windows = "0.62"` crate 通过
+  `WaitNamedPipeW` + `CreateFileW` 连接服务。**不再**包含 UAC 自动安装回退；服务必须
+  通过 MSIX 预先安装。
+* **VM**：服务调用 `ComputeCore.dll` 创建 HCS Schema 2.0 计算系统。两种引导模式：
+  * **VHDX**（推荐）：`rootfs.vhdx` 以 SCSI 0:0 挂载，工作区通过 Plan9 共享，内核
+    cmdline 包含 `tokimo.boot=vhdx`。要求 `tokimo-os` 内核能识别该标志。
+  * **Plan9 root**（兼容）：工作区目录直接作为 rootfs 通过 Plan9 挂载。
 
 ## 前置条件
 
-- Windows 10 1903+ 或 Windows 11（任意版本：Home / Pro / Enterprise）
-- 硬件虚拟化已开启（Intel VT-x 或 AMD-V，BIOS 中默认开启）
+* Windows 10 21H1 / Windows 11 (10.0.19041+)
+* 启用 Hyper‑V 平台（`Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All`）
+  及 Host Compute Service（默认随 Hyper‑V 安装）
+* 一份 `tokimo-os` 构建：`vmlinuz` + `initrd` + 可选 `rootfs.vhdx`
 
-## Step 1：开启虚拟机平台
+## 安装
 
-打开 **Windows 功能**（Win+R → `optionalfeatures`）：
-
-```
-☑ Virtual Machine Platform
-```
-
-点击确定，**重启计算机**。
-
-> 这是本次初始化唯一需要重启的步骤。
-
-## Step 2：下载 TokimoOS 制品
-
-从 [tokimo-package-rootfs Releases](https://github.com/tokimo-lab/tokimo-package-rootfs/releases) 下载最新版本，两个文件：
-
-| 文件 | 内容 | 大小 |
-|---|---|---|
-| `tokimo-os-amd64.tar.zst` | Linux kernel + initrd | ~12 MB |
-| `rootfs-amd64.tar.zst` | Debian rootfs | ~500 MB |
-
-解压到你的数据目录（目录名和路径可自定义）：
+### 1. 构建 + 打包 MSIX
 
 ```powershell
-# 以 ~\.tokimo 为例，你可以改为任意路径如 D:\tokimo-os\
-$TOKIMO = "$env:USERPROFILE\.tokimo"
-mkdir -p $TOKIMO\kernel $TOKIMO\rootfs
+# 仅打包（未签名，开发用）
+pwsh ./scripts/build-msix.ps1
 
-# 解压 kernel + initrd
-zstd -d tokimo-os-amd64.tar.zst
-tar -xpf tokimo-os-amd64.tar -C $TOKIMO\
-
-# 解压 rootfs
-zstd -d rootfs-amd64.tar.zst
-tar -xpf rootfs-amd64.tar -C $TOKIMO\rootfs\
+# 带签名（发行用，需 .pfx 证书）
+pwsh ./scripts/build-msix.ps1 -PfxPath C:\certs\tokimo.pfx -PfxPassword $env:TOKIMO_PFX_PWD
 ```
 
-最终目录结构：
+产物：`target/msix/Tokimo.SandboxSvc.msix`。
 
-```
-$TOKIMO/
-  kernel/vmlinuz      ← Linux 内核
-  initrd.img          ← initramfs
-  rootfs/             ← Debian 文件系统
-    bin/  boot/  dev/  etc/  home/  lib/  ...
-    usr/bin/node      ← Node.js 24
-    usr/bin/python3   ← Python 3.13
-```
-
-## Step 3：设置环境变量（可选）
-
-如果制品不在默认位置（`~\.tokimo/`），通过环境变量指定路径：
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `TOKIMO_KERNEL` | `%USERPROFILE%\.tokimo\kernel\vmlinuz` | 内核路径 |
-| `TOKIMO_INITRD` | `%USERPROFILE%\.tokimo\initrd.img` | initrd 路径 |
-| `TOKIMO_ROOTFS` | `%USERPROFILE%\.tokimo\rootfs` | rootfs 目录 |
-| `TOKIMO_MEMORY` | `512` | VM 内存 (MB) |
-| `TOKIMO_CPUS` | `2` | vCPU 数量 |
+### 2. 安装
 
 ```powershell
-# 示例：制品放在 D 盘
-$env:TOKIMO_KERNEL = "D:\vm\kernel\vmlinuz"
-$env:TOKIMO_INITRD = "D:\vm\initrd.img"
-$env:TOKIMO_ROOTFS = "D:\vm\rootfs"
+# 已签名包：双击或
+Add-AppxPackage -Path target\msix\Tokimo.SandboxSvc.msix
+
+# 未签名（仅开发，需启用开发者模式）
+Add-AppxPackage -AllowUnsigned -Path target\msix\Tokimo.SandboxSvc.msix
 ```
 
-## Step 4：代码集成
+MSIX 安装会自动注册并启动 `TokimoSandboxSvc` 服务。卸载使用 `Remove-AppxPackage`。
 
-```toml
-[dependencies]
-tokimo-package-sandbox = "0.1"
-```
+### 3. 部署 VM 资产
 
-```rust
-use tokimo_package_sandbox::{SandboxConfig, NetworkPolicy};
+把 kernel/initrd/vhdx 放到下面任一位置（按优先级查找）：
 
-let cfg = SandboxConfig::new("/tmp/work")
-    .network(NetworkPolicy::Blocked);
+1. 环境变量：`TOKIMO_KERNEL`、`TOKIMO_INITRD`、`TOKIMO_ROOTFS_VHDX`
+2. `%USERPROFILE%\.tokimo\` 下的 `kernel\vmlinuz`、`initrd.img`、`rootfs.vhdx`
+3. 与可执行文件同目录
 
-let result = tokimo_package_sandbox::run(&["node", "-e", "console.log(1+2)"], &cfg)?;
-println!("{}", result.stdout); // "3"
-```
+若 `rootfs.vhdx` 不存在则回退到 Plan9 root 模式（需要 `rootfs/` 目录）。
 
-**首次调用时**库会自动通过 UAC 安装 `tokimo-sandbox-svc` 系统服务（弹窗一次，点确定）。之后所有调用完全透明，不再需要任何交互。
+## 运行时配置
 
-## 服务管理
+| 设置 | 类型 | 含义 |
+| --- | --- | --- |
+| `TOKIMO_VERIFY_CALLER=1` | 环境变量 | 启用调用方 Authenticode 验签（默认仅记录路径，不验签） |
+| `HKLM\SOFTWARE\Tokimo\SandboxSvc\VerifyCaller` | DWORD | 同上，注册表配置（`1` = 启用） |
+| `TOKIMO_ROOTFS_VHDX` | 环境变量 | 显式指定 VHDX 路径 |
 
-服务二进制 `tokimo-sandbox-svc.exe` 需要与应用二进制放在同一目录：
+服务对每个请求都通过 `GetNamedPipeClientProcessId` → `OpenProcess(QUERY_LIMITED)`
+→ `QueryFullProcessImageNameW` 记录调用方完整路径，并对所有客户端提交的路径执行
+TOCTOU 安全规范化（拒绝 reparse point 与硬链接）。
 
-```
-your-app/
-  your-app.exe
-  tokimo-sandbox-svc.exe   ← 从 cargo build 输出复制
-```
+## 网络策略
 
-手动管理服务的命令（通常不需要，库自动处理）：
+| `NetworkPolicy` | Windows 行为 |
+| --- | --- |
+| `Blocked` | VM 不附加任何 NIC（默认） |
+| `AllowAll` | **当前未实现**。需要 HCN endpoint 编排，未完成前服务返回 `not_implemented` |
+| `Observed` / `Gated` | Windows 后端不支持，构造请求时即拒绝 |
+
+## 开发循环
 
 ```powershell
-# 查看状态
-sc query TokimoSandboxSvc
+# 在不安装 MSIX 的情况下手动跑服务
+cargo run --bin tokimo-sandbox-svc -- --service   # 走 SCM (需要 sc create)
+cargo run --bin tokimo-sandbox-svc -- --console   # 前台调试，需要管理员
 
-# 手动安装/卸载
-.\tokimo-sandbox-svc.exe --install
-.\tokimo-sandbox-svc.exe --uninstall
+# 单测
+cargo test --bin tokimo-sandbox-svc --lib
 ```
 
-## 工作原理
+## 与 tokimo-os 协调
 
-```
-your-app.exe
-  └─ tokimo_package_sandbox::run(["node", "-e", "1+2"])
-       │
-       ├─ 读取 TOKIMO_KERNEL / TOKIMO_INITRD / TOKIMO_ROOTFS
-       ├─ 连接命名管道 \\.\pipe\tokimo-sandbox-svc
-       │   └─ 首次：管道不存在 → UAC 安装服务 → 再连 → 成功
-       └─ tokimo-sandbox-svc.exe (NT AUTHORITY\SYSTEM)
-            └─ HcsCreateComputeSystem → Hyper-V 启动 Linux VM
-                 ├─ mount rootfs (9p)
-                 ├─ bash -c "node -e '1+2'"
-                 └─ 返回 stdout/stderr/exit_code
-```
-
-## 排查
-
-| 问题 | 解决 |
-|---|---|
-| `Virtual Machine Platform not enabled` | 重新执行 Step 1，确认已重启 |
-| `tokimo-sandbox-svc.exe not found` | 将服务二进制复制到应用同级目录 |
-| `HCS create: HRESULT 0x803701XX` | 服务未安装或未运行，执行 `--install` |
-| Rootfs 文件全是 `drwxrwxrwx` | 纯 cosmetic 问题，不影响运行 |
-
-## 相关文档
-
-- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — 制品构建
-- [Linux 初始化](./linux.md)
-- [macOS 初始化](./macos.md)
+VHDX 模式需要 tokimo-os 内核 init 识别 `tokimo.boot=vhdx` 内核参数并把 `/dev/sda`
+挂载为 `/`。在 tokimo-os 落地这一支持之前，请通过缺省 Plan9 root 模式运行。

@@ -67,6 +67,39 @@ pub fn has_vz_artifacts() -> bool {
     kernel.exists() && initrd.exists() && rootfs.exists()
 }
 
+/// Check if Windows sandbox artifacts (kernel + initrd + rootfs) are present.
+pub fn has_windows_artifacts() -> bool {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let tokimo = PathBuf::from(&home).join(".tokimo");
+
+    let kernel = std::env::var("TOKIMO_KERNEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| tokimo.join("kernel").join("vmlinuz"));
+    let initrd = std::env::var("TOKIMO_INITRD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| tokimo.join("initrd.img"));
+    let rootfs = std::env::var("TOKIMO_ROOTFS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| tokimo.join("rootfs"));
+
+    kernel.exists() && initrd.exists() && rootfs.exists()
+}
+
+/// Check if the tokimo-sandbox-svc named pipe is available.
+pub fn has_windows_service() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::System::Pipes::WaitNamedPipeW;
+        let name = HSTRING::from("\\\\.\\pipe\\tokimo-sandbox-svc");
+        unsafe { WaitNamedPipeW(&name, 100).as_bool() }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Skip helpers
 // ---------------------------------------------------------------------------
@@ -76,6 +109,7 @@ pub fn has_vz_artifacts() -> bool {
 ///
 /// On Linux: skips if bwrap is not installed.
 /// On macOS: skips if VZ is unavailable or artifacts are missing.
+/// On Windows: skips if kernel/initrd/rootfs artifacts are missing.
 pub fn skip_unless_platform_ready() -> bool {
     if is_linux() {
         if !has_bwrap() {
@@ -91,8 +125,36 @@ pub fn skip_unless_platform_ready() -> bool {
             eprintln!("SKIP: VZ artifacts not found. Run download_vz_artifacts() first.");
             return true;
         }
+    } else if cfg!(target_os = "windows") {
+        if !has_windows_artifacts() {
+            eprintln!(
+                "SKIP: Windows sandbox artifacts missing. \
+                 Place kernel at ~/.tokimo/kernel/vmlinuz, initrd at ~/.tokimo/initrd.img, \
+                 and rootfs at ~/.tokimo/rootfs/. Or set TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS env vars."
+            );
+            return true;
+        }
+        if !has_windows_service() {
+            eprintln!(
+                "SKIP: tokimo-sandbox-svc pipe not available. \
+                 Run `tokimo-sandbox-svc --console` or install the service first."
+            );
+            return true;
+        }
     } else {
         eprintln!("SKIP: unsupported platform ({})", std::env::consts::OS);
+        return true;
+    }
+    false
+}
+
+/// Returns `true` if the test should be skipped because the platform
+/// doesn't support persistent sandbox sessions (`Session::open`).
+///
+/// On Windows: sessions are not yet implemented (only `run()` one-shot).
+pub fn skip_unless_session_supported() -> bool {
+    if cfg!(target_os = "windows") {
+        eprintln!("SKIP: Session not yet supported on Windows (use run() for one-shot)");
         return true;
     }
     false

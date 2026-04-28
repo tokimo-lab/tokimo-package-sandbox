@@ -1,25 +1,26 @@
 //! Windows sandbox: SYSTEM service via named pipe.
 //!
 //! All VM operations are delegated to `tokimo-sandbox-svc.exe`, a Windows
-//! service running as `localSystem`. The library auto-installs the service
-//! on first use via a one-time UAC prompt.
+//! service running as `localSystem`. The recommended way to install it is
+//! the MSIX in `packaging/windows/`, which registers the service via
+//! `desktop6:Service` (no UAC). For local development the legacy
+//! `--install` / `--console` flags still work.
 //!
-//! ## Debugging
+//! ## Network policy
 //!
-//! Run the service in console mode for local development:
+//! Windows currently only supports two policies:
+//!   * `NetworkPolicy::Blocked` — no NIC is attached to the VM.
+//!   * `NetworkPolicy::AllowAll` — default Hyper-V NAT NIC.
 //!
-//! ```text
-//! cargo build --bin tokimo-sandbox-svc
-//! .\target\debug\tokimo-sandbox-svc.exe --console
-//! ```
-//!
-//! The library auto-detects a console-mode service already running and skips
-//! the auto-install step.
+//! `Observed` and `Gated` policies are Linux/macOS only; on Windows they
+//! are rejected at config validation time so callers don't get silent
+//! downgrades.
 
 mod client;
 pub mod protocol;
+pub(crate) mod safe_path;
 
-use crate::{Error, ExecutionResult, Result};
+use crate::{Error, ExecutionResult, NetworkPolicy, Result};
 
 use std::path::PathBuf;
 
@@ -35,6 +36,8 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
         return Err(Error::validation("empty command"));
     }
 
+    let network = translate_network(&cfg.network)?;
+
     let shell_cmd = cmd
         .iter()
         .map(|s| shell_escape(s.as_ref()))
@@ -46,7 +49,8 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
 
     let kernel = find_kernel()?;
     let initrd = find_initrd()?;
-    let rootfs = find_rootfs(cfg)?;
+    let (rootfs_vhdx, workspace) = find_rootfs_and_workspace(cfg)?;
+
     let memory_mb: u64 = std::env::var("TOKIMO_MEMORY")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -56,7 +60,16 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CPUS);
 
-    client::exec_vm(&kernel, &initrd, &rootfs, &cmd_b64, memory_mb, cpu_count)
+    client::exec_vm(
+        &kernel,
+        &initrd,
+        rootfs_vhdx.as_deref(),
+        &workspace,
+        &cmd_b64,
+        memory_mb,
+        cpu_count,
+        network,
+    )
 }
 
 pub(crate) fn spawn_session_shell(_cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {
@@ -73,6 +86,22 @@ pub(crate) fn run_without_sandbox<S: AsRef<str>>(
 }
 
 // ---------------------------------------------------------------------------
+// NetworkPolicy translation
+// ---------------------------------------------------------------------------
+
+fn translate_network(p: &NetworkPolicy) -> Result<protocol::SvcNetwork> {
+    match p {
+        NetworkPolicy::Blocked => Ok(protocol::SvcNetwork::Blocked),
+        NetworkPolicy::AllowAll => Ok(protocol::SvcNetwork::AllowAll),
+        NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => Err(Error::validation(
+            "NetworkPolicy::Observed / Gated are not implemented on Windows. \
+             Use Blocked or AllowAll. \
+             See docs/network-observability.md for the roadmap.",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shell escaping
 // ---------------------------------------------------------------------------
 
@@ -86,7 +115,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Path discovery (kernel, initrd, rootfs)
+// Path discovery
 // ---------------------------------------------------------------------------
 
 fn find_kernel() -> Result<PathBuf> {
@@ -149,25 +178,69 @@ fn find_initrd() -> Result<PathBuf> {
     ))
 }
 
-fn find_rootfs(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {
+/// Locate the rootfs (preferred: VHDX) and the workspace directory.
+///
+/// Search order for the VHDX:
+///   1. `$TOKIMO_ROOTFS_VHDX`
+///   2. `%USERPROFILE%\.tokimo\rootfs.vhdx`
+///   3. `<exe-dir>\rootfs.vhdx`
+///
+/// If no VHDX is found, we fall back to the legacy "rootfs is a directory
+/// shared via Plan9" mode (`$TOKIMO_ROOTFS` / `%USERPROFILE%\.tokimo\rootfs`).
+/// The workspace directory in that mode is the rootfs directory itself,
+/// matching previous behaviour.
+fn find_rootfs_and_workspace(cfg: &crate::config::SandboxConfig) -> Result<(Option<PathBuf>, PathBuf)> {
+    if let Some(vhdx) = find_vhdx() {
+        let work = cfg.work_dir.clone();
+        if !work.exists() {
+            std::fs::create_dir_all(&work).map_err(|e| Error::exec(format!("create work dir: {e}")))?;
+        }
+        return Ok((Some(vhdx), work));
+    }
+
     if let Ok(p) = std::env::var("TOKIMO_ROOTFS") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
-            return Ok(pb);
+            return Ok((None, pb));
         }
         return Err(Error::exec(format!("TOKIMO_ROOTFS={} not found", pb.display())));
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
         let pb = PathBuf::from(&home).join(".tokimo/rootfs");
         if pb.exists() {
-            return Ok(pb);
+            return Ok((None, pb));
         }
     }
     if cfg.work_dir.join("usr").exists() {
-        return Ok(cfg.work_dir.clone());
+        return Ok((None, cfg.work_dir.clone()));
     }
     Err(Error::validation(
-        "Rootfs not found. Set TOKIMO_ROOTFS=/path/to/rootfs or place it at \
-         ~/.tokimo/rootfs/. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
+        "Rootfs not found. Recommended: place rootfs.vhdx at ~/.tokimo/rootfs.vhdx (or set \
+         TOKIMO_ROOTFS_VHDX). Legacy fallback: an extracted rootfs directory at ~/.tokimo/rootfs. \
+         Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
     ))
+}
+
+fn find_vhdx() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("TOKIMO_ROOTFS_VHDX") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let pb = PathBuf::from(&home).join(".tokimo/rootfs.vhdx");
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let pb = dir.join("rootfs.vhdx");
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+    }
+    None
 }

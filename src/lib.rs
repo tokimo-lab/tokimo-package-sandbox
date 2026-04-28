@@ -35,6 +35,11 @@ pub mod svc_protocol {
     pub use crate::windows::protocol::*;
 }
 
+/// TOCTOU-safe path canonicalisation used by the SYSTEM service. Exposed
+/// for test harnesses; library callers don't normally need it.
+#[cfg(target_os = "windows")]
+pub use windows::safe_path::canonicalize_safe;
+
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
 pub use diagnostics::is_session_fatal_message;
 pub use error::{Error, ExecutionResult, Result};

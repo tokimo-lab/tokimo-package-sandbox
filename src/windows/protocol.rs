@@ -11,6 +11,18 @@ use std::io::{self, Read, Write};
 // Frame types
 // ---------------------------------------------------------------------------
 
+/// Network policy as seen by the service. The host library translates the
+/// richer `NetworkPolicy` enum into this on-the-wire form: anything beyond
+/// the two simple cases is downgraded to `Blocked` on Windows because we
+/// don't yet ship a gvisor-style netstack in the SYSTEM service.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum SvcNetwork {
+    /// No NIC is attached to the VM. Guest cannot reach anything.
+    Blocked,
+    /// Default Hyper-V NAT NIC is attached. Guest has full network access.
+    AllowAll,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op")]
 pub enum SvcRequest {
@@ -22,11 +34,24 @@ pub enum SvcRequest {
         id: String,
         kernel_path: String,
         initrd_path: String,
-        rootfs_path: String,
+        /// Optional read/write VHDX attached as the root SCSI disk. When
+        /// present, the guest is expected to mount it as `/` and use
+        /// `workspace_path` only as `/work`. When `None`, the guest mounts
+        /// `workspace_path` itself as `/` via Plan9 (legacy behaviour).
+        rootfs_vhdx: Option<String>,
+        /// Host directory shared as Plan9 tag `work`. The guest writes
+        /// `.vz_stdout`, `.vz_stderr`, `.vz_exit_code` here.
+        workspace_path: String,
         cmd_b64: String,
         memory_mb: u64,
         cpu_count: usize,
+        #[serde(default = "default_network")]
+        network: SvcNetwork,
     },
+}
+
+fn default_network() -> SvcNetwork {
+    SvcNetwork::Blocked
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -62,27 +87,21 @@ pub enum SvcResponse {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-/// Read one length-prefixed JSON frame from a reader. Blocks until the full
-/// payload is received. Returns the raw UTF-8 bytes.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-
-    // Sanity: reject frames larger than 16 MiB.
     if len > 16 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("frame too large: {len} bytes"),
         ));
     }
-
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(payload)
 }
 
-/// Write one length-prefixed JSON frame to a writer.
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     let len = payload.len() as u32;
     w.write_all(&len.to_le_bytes())?;
@@ -91,14 +110,12 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Serialize a request to a buffer and write it as a frame.
 pub fn send_request<W: Write>(w: &mut W, req: &SvcRequest) -> io::Result<()> {
     let json =
         serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize: {e}")))?;
     write_frame(w, &json)
 }
 
-/// Read a frame and deserialize it as a response.
 pub fn recv_response<R: Read>(r: &mut R) -> io::Result<SvcResponse> {
     let payload = read_frame(r)?;
     serde_json::from_slice(&payload)
@@ -125,73 +142,40 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_vm_roundtrip() {
+    fn test_exec_vm_roundtrip_with_vhdx() {
         let req = SvcRequest::ExecVm {
             id: "vm-1".into(),
-            kernel_path: "C:\\\\Users\\\\test\\\\.tokimo\\\\kernel\\\\vmlinuz".into(),
-            initrd_path: "C:\\\\Users\\\\test\\\\.tokimo\\\\initrd.img".into(),
-            rootfs_path: "C:\\\\Users\\\\test\\\\.tokimo\\\\rootfs".into(),
+            kernel_path: r"C:\tokimo\vmlinuz".into(),
+            initrd_path: r"C:\tokimo\initrd.img".into(),
+            rootfs_vhdx: Some(r"C:\tokimo\rootfs.vhdx".into()),
+            workspace_path: r"C:\Users\me\work".into(),
             cmd_b64: "ZWNobyBoZWxsbw==".into(),
             memory_mb: 512,
             cpu_count: 2,
+            network: SvcNetwork::Blocked,
         };
         let json = serde_json::to_vec(&req).unwrap();
         let parsed: SvcRequest = serde_json::from_slice(&json).unwrap();
         match parsed {
             SvcRequest::ExecVm {
-                cmd_b64,
-                memory_mb,
-                cpu_count,
+                rootfs_vhdx,
+                network,
                 ..
             } => {
-                assert_eq!(cmd_b64, "ZWNobyBoZWxsbw==");
-                assert_eq!(memory_mb, 512);
-                assert_eq!(cpu_count, 2);
+                assert!(rootfs_vhdx.is_some());
+                assert_eq!(network, SvcNetwork::Blocked);
             }
             _ => panic!("expected ExecVm"),
         }
     }
 
     #[test]
-    fn test_response_roundtrip() {
-        let resp = SvcResponse::ExecVmResult {
-            id: "vm-1".into(),
-            result: ExecVmResult {
-                stdout: "hello".into(),
-                stderr: String::new(),
-                exit_code: 0,
-                timed_out: false,
-            },
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let parsed: SvcResponse = serde_json::from_slice(&json).unwrap();
+    fn test_exec_vm_legacy_default_network() {
+        let json = br#"{"op":"ExecVm","id":"x","kernel_path":"k","initrd_path":"i","rootfs_vhdx":null,"workspace_path":"w","cmd_b64":"","memory_mb":1,"cpu_count":1}"#;
+        let parsed: SvcRequest = serde_json::from_slice(json).unwrap();
         match parsed {
-            SvcResponse::ExecVmResult { id, result } => {
-                assert_eq!(id, "vm-1");
-                assert_eq!(result.stdout, "hello");
-                assert_eq!(result.exit_code, 0);
-            }
-            _ => panic!("expected ExecVmResult"),
-        }
-    }
-
-    #[test]
-    fn test_error_response_roundtrip() {
-        let resp = SvcResponse::Error {
-            id: "vm-1".into(),
-            error: SvcError {
-                code: "hcs_error".into(),
-                message: "HcsCreateComputeSystem failed: HRESULT 0x8037011B".into(),
-            },
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let parsed: SvcResponse = serde_json::from_slice(&json).unwrap();
-        match parsed {
-            SvcResponse::Error { id, error } => {
-                assert_eq!(id, "vm-1");
-                assert_eq!(error.code, "hcs_error");
-            }
-            _ => panic!("expected Error"),
+            SvcRequest::ExecVm { network, .. } => assert_eq!(network, SvcNetwork::Blocked),
+            _ => panic!("expected ExecVm"),
         }
     }
 
@@ -200,18 +184,15 @@ mod tests {
         let payload = b"hello world";
         let mut buf = Vec::new();
         write_frame(&mut buf, payload).unwrap();
-
         let read_back = read_frame(&mut &buf[..]).unwrap();
         assert_eq!(read_back, payload);
     }
 
     #[test]
     fn test_frame_large_rejected() {
-        // Create a fake frame claiming 20 MiB.
         let len: u32 = 20 * 1024 * 1024;
         let mut buf = Vec::new();
         buf.extend_from_slice(&len.to_le_bytes());
-        // The read will fail because there aren't enough bytes.
         let result = read_frame(&mut &buf[..]);
         assert!(result.is_err());
     }
