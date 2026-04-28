@@ -393,6 +393,44 @@ cargo run --example vz_smoke            # macOS Virtualization.framework
 cargo run --example hv_smoke            # Windows Hyper-V SYSTEM service
 ```
 
+## Tests
+
+```bash
+cargo test --lib --bins                  # unit tests, all platforms
+cargo test --tests                       # + integration tests (Linux only)
+```
+
+Linux integration tests need a real rootfs to bind-mount inside bwrap.
+Point `TOKIMO_TEST_ROOTFS` at a populated directory (any standard Linux
+filesystem tree with `/bin /sbin /lib /lib64 /usr /etc /var`) — without
+it, gated tests no-op and report skipped:
+
+```bash
+# One-time: extract any minimal Linux rootfs (Alpine / Debian / etc.)
+mkdir -p .test-rootfs && (cd .test-rootfs && \
+  curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.0-x86_64.tar.gz | tar -xz)
+
+TOKIMO_TEST_ROOTFS=$PWD/.test-rootfs cargo test --tests
+```
+
+`tests/agent_sandbox_replica.rs` mirrors the real consumer
+(`rust-server::AgentSandbox`) end-to-end: peer mount stacks, skill
+layer isolation, concurrent oneshots over a long-running main session,
+spawn timeout + kill semantics, high-throughput stdout capture, PTY IO
++ resize, NetworkPolicy::Observed L7 event sink, profile-style env
+combined with mounts.
+
+The `network_observed_sink_records_events` test is skipped on hosted
+GitHub runners (set `TOKIMO_SKIP_NETWORK_OBSERVED=1` to opt out) — see
+[issue #1](https://github.com/tokimo-lab/tokimo-package-sandbox/issues/1)
+for the seccomp-notify + loopback-proxy interaction we hit there. It
+runs fine locally and on self-hosted runners.
+
+macOS-only integration tests (`vz_session`, `vz_workspace`) are
+`#[cfg(target_os = "macos")]` and only build on a Mac. There is no
+Windows integration test crate yet — Windows coverage is exercised
+through `cargo run --example hv_smoke` from an elevated shell.
+
 ## Init control protocol (v1, Linux)
 
 The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (macOS Session). PTY master fds via `SCM_RIGHTS`.
