@@ -48,7 +48,7 @@ jobs:
             "https://github.com/tokimo-lab/tokimo-package-rootfs/releases/download/${ROOTFS_VERSION}/${ROOTFS_ASSET}"
           # Sanity peek at archive layout — must extract to top-level dirs
           # like ./bin, ./usr, etc.
-          zstd -d -c rootfs.tar.zst | tar -tf - | head -3
+          zstd -d -c rootfs.tar.zst | tar -tf - 2>/dev/null | head -3 || true
           zstd -d -c rootfs.tar.zst | tar -xf - -C .test-rootfs
           rm -f rootfs.tar.zst
           test -x .test-rootfs/usr/bin/bash || test -x .test-rootfs/bin/bash
