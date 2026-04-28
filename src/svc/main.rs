@@ -175,14 +175,32 @@ fn main() {
         match args[1].as_str() {
             "--install" => return install_service(),
             "--uninstall" => return uninstall_service(),
+            "--console" => return run_console(),
+            "-h" | "--help" => {
+                println!("tokimo-sandbox-svc v{VERSION}");
+                println!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console]");
+                println!("  --install   Install and start as Windows service (needs admin)");
+                println!("  --uninstall Stop and remove the Windows service (needs admin)");
+                println!("  --console   Run pipe server in foreground (for debugging)");
+                println!("  (no args)   Run as Windows service (called by SCM)");
+                return;
+            }
             other => {
                 eprintln!("Unknown option: {other}");
-                eprintln!("Usage: tokimo-sandbox-svc [--install|--uninstall]");
+                eprintln!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console]");
                 std::process::exit(1);
             }
         }
     }
     run_service();
+}
+
+/// Run the pipe server in the foreground for local debugging.
+fn run_console() {
+    println!("Tokimo Sandbox Service v{VERSION} (console mode)");
+    println!("Pipe: {PIPE_NAME}");
+    println!("Waiting for connections... (Ctrl+C to stop)");
+    pipe_server_loop();
 }
 
 // ---------------------------------------------------------------------------
