@@ -4,7 +4,9 @@
 //! use under the hood. It's part of the "Virtual Machine Platform" optional
 //! feature (available on Windows 10 1903+ Home/Pro/Enterprise).
 //!
-//! We use synchronous operation mode (no callbacks) for simplicity.
+//! All HCS calls go through dynamically-loaded function pointers, since
+//! ComputeCore.dll may not have a standard import library. LoadLibrary +
+//! GetProcAddress gives us reliable linking on all Windows editions.
 
 #![cfg(target_os = "windows")]
 
@@ -12,52 +14,115 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
 use std::slice;
+use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::core::HRESULT;
 
-// kernel32: HLOCAL LocalFree(HLOCAL hMem);
-extern "system" {
-    fn LocalFree(hMem: *mut c_void) -> *mut c_void;
-}
-
 // ---------------------------------------------------------------------------
-// Raw FFI: ComputeCore.dll
+// Raw types
 // ---------------------------------------------------------------------------
 
 #[allow(non_camel_case_types)]
 type HCS_SYSTEM = *mut c_void;
 #[allow(non_camel_case_types)]
 type HCS_OPERATION = *mut c_void;
-#[allow(non_camel_case_types)]
-type HCS_OPERATION_COMPLETION = Option<unsafe extern "system" fn(operation: HCS_OPERATION, context: *mut c_void)>;
 
-#[link(name = "ComputeCore")]
+type PfnCreateOperation = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HCS_OPERATION;
+type PfnCloseOperation = unsafe extern "system" fn(HCS_OPERATION) -> HRESULT;
+type PfnCreateComputeSystem =
+    unsafe extern "system" fn(*const u16, *const u16, HCS_OPERATION, *mut c_void, *mut HCS_SYSTEM) -> HRESULT;
+type PfnStartComputeSystem = unsafe extern "system" fn(HCS_SYSTEM, HCS_OPERATION, *const u16) -> HRESULT;
+type PfnTerminateComputeSystem = unsafe extern "system" fn(HCS_SYSTEM, HCS_OPERATION, *const u16) -> HRESULT;
+type PfnCloseComputeSystem = unsafe extern "system" fn(HCS_SYSTEM) -> HRESULT;
+type PfnWaitForOperationResult = unsafe extern "system" fn(HCS_OPERATION, u32, *mut HRESULT) -> HRESULT;
+type PfnGetProperties = unsafe extern "system" fn(HCS_SYSTEM, *const u16, *mut *mut u16) -> HRESULT;
+
+// kernel32 helpers
 extern "system" {
-    fn HcsCreateOperation(context: *mut c_void, callback: HCS_OPERATION_COMPLETION) -> HCS_OPERATION;
+    fn LoadLibraryW(lpFileName: *const u16) -> *mut c_void;
+    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    fn FreeLibrary(hModule: *mut c_void) -> i32;
+    fn LocalFree(hMem: *mut c_void) -> *mut c_void;
+}
 
-    fn HcsCloseOperation(operation: HCS_OPERATION) -> HRESULT;
+// ---------------------------------------------------------------------------
+// Dynamic function table
+// ---------------------------------------------------------------------------
 
-    fn HcsCreateComputeSystem(
-        id: *const u16,
-        configuration: *const u16,
-        operation: HCS_OPERATION,
-        security_descriptor: *mut c_void,
-        compute_system: *mut HCS_SYSTEM,
-    ) -> HRESULT;
+struct HcsFns {
+    _module: *mut c_void,
+    create_operation: PfnCreateOperation,
+    close_operation: PfnCloseOperation,
+    create_compute_system: PfnCreateComputeSystem,
+    start_compute_system: PfnStartComputeSystem,
+    terminate_compute_system: PfnTerminateComputeSystem,
+    close_compute_system: PfnCloseComputeSystem,
+    wait_for_operation_result: PfnWaitForOperationResult,
+    get_properties: PfnGetProperties,
+}
 
-    fn HcsStartComputeSystem(compute_system: HCS_SYSTEM, operation: HCS_OPERATION, options: *const u16) -> HRESULT;
+unsafe impl Send for HcsFns {}
+unsafe impl Sync for HcsFns {}
 
-    fn HcsTerminateComputeSystem(compute_system: HCS_SYSTEM, operation: HCS_OPERATION, options: *const u16) -> HRESULT;
+impl Drop for HcsFns {
+    fn drop(&mut self) {
+        if !self._module.is_null() {
+            unsafe { FreeLibrary(self._module) };
+        }
+    }
+}
 
-    fn HcsCloseComputeSystem(compute_system: HCS_SYSTEM) -> HRESULT;
+static HCS: OnceLock<Option<HcsFns>> = OnceLock::new();
 
-    fn HcsWaitForOperationResult(operation: HCS_OPERATION, timeout_ms: u32, result: *mut HRESULT) -> HRESULT;
+fn load_hcs_fns() -> Option<&'static HcsFns> {
+    HCS.get_or_init(|| {
+        let dll: Vec<u16> = "ComputeCore.dll\0".encode_utf16().collect();
+        let hmod = unsafe { LoadLibraryW(dll.as_ptr()) };
+        if hmod.is_null() {
+            return None;
+        }
 
-    fn HcsGetComputeSystemProperties(
-        compute_system: HCS_SYSTEM,
-        property_query: *const u16,
-        result: *mut *mut u16,
-    ) -> HRESULT;
+        macro_rules! load_fn {
+            ($name:expr, $type:ty) => {{
+                let addr = unsafe { GetProcAddress(hmod, concat!($name, "\0").as_ptr()) };
+                if addr.is_null() {
+                    unsafe { FreeLibrary(hmod) };
+                    return None;
+                }
+                unsafe { std::mem::transmute::<*mut c_void, $type>(addr) }
+            }};
+        }
+
+        let fns = HcsFns {
+            _module: hmod,
+            create_operation: load_fn!("HcsCreateOperation", PfnCreateOperation),
+            close_operation: load_fn!("HcsCloseOperation", PfnCloseOperation),
+            create_compute_system: load_fn!("HcsCreateComputeSystem", PfnCreateComputeSystem),
+            start_compute_system: load_fn!("HcsStartComputeSystem", PfnStartComputeSystem),
+            terminate_compute_system: load_fn!("HcsTerminateComputeSystem", PfnTerminateComputeSystem),
+            close_compute_system: load_fn!("HcsCloseComputeSystem", PfnCloseComputeSystem),
+            wait_for_operation_result: load_fn!("HcsWaitForOperationResult", PfnWaitForOperationResult),
+            get_properties: load_fn!("HcsGetComputeSystemProperties", PfnGetProperties),
+        };
+
+        Some(fns)
+    })
+    .as_ref()
+}
+
+/// Check if the HCS API is available on this system.
+pub fn is_available() -> bool {
+    let fns = match load_hcs_fns() {
+        Some(f) => f,
+        None => return false,
+    };
+    // Quick smoke test: create + close an operation.
+    let handle = unsafe { (fns.create_operation)(ptr::null_mut(), ptr::null_mut()) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe { (fns.close_operation)(handle) };
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +135,8 @@ pub struct HcsOperation {
 
 impl HcsOperation {
     pub fn new() -> Result<Self, HcsError> {
-        let handle = unsafe { HcsCreateOperation(ptr::null_mut(), None) };
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
+        let handle = unsafe { (fns.create_operation)(ptr::null_mut(), ptr::null_mut()) };
         if handle.is_null() {
             return Err(HcsError::last_os_error("HcsCreateOperation"));
         }
@@ -81,10 +147,10 @@ impl HcsOperation {
         self.handle
     }
 
-    /// Wait for the operation to complete, returning the operation's result HRESULT.
     pub fn wait(&self, timeout_ms: u32) -> Result<(), HcsError> {
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
         let mut op_result: HRESULT = 0;
-        let hr = unsafe { HcsWaitForOperationResult(self.handle, timeout_ms, &mut op_result) };
+        let hr = unsafe { (fns.wait_for_operation_result)(self.handle, timeout_ms, &mut op_result) };
         if hr < 0 {
             return Err(HcsError::from_hresult("HcsWaitForOperationResult", hr));
         }
@@ -98,8 +164,8 @@ impl HcsOperation {
 impl Drop for HcsOperation {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe {
-                HcsCloseOperation(self.handle);
+            if let Some(fns) = load_hcs_fns() {
+                unsafe { (fns.close_operation)(self.handle) };
             }
         }
     }
@@ -110,8 +176,8 @@ pub struct HcsSystem {
 }
 
 impl HcsSystem {
-    /// Create a compute system (VM) from a JSON configuration string.
     pub fn create(id: &str, config_json: &str) -> Result<Self, HcsError> {
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
         let id_wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
         let config_wide: Vec<u16> = config_json.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -119,7 +185,7 @@ impl HcsSystem {
         let mut handle: HCS_SYSTEM = ptr::null_mut();
 
         let hr = unsafe {
-            HcsCreateComputeSystem(
+            (fns.create_compute_system)(
                 id_wide.as_ptr(),
                 config_wide.as_ptr(),
                 op.as_raw(),
@@ -135,10 +201,10 @@ impl HcsSystem {
         Ok(Self { handle })
     }
 
-    /// Start the VM.
     pub fn start(&self) -> Result<(), HcsError> {
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
         let op = HcsOperation::new()?;
-        let hr = unsafe { HcsStartComputeSystem(self.handle, op.as_raw(), ptr::null()) };
+        let hr = unsafe { (fns.start_compute_system)(self.handle, op.as_raw(), ptr::null()) };
         if hr < 0 {
             return Err(HcsError::from_hresult("HcsStartComputeSystem", hr));
         }
@@ -146,10 +212,10 @@ impl HcsSystem {
         Ok(())
     }
 
-    /// Terminate the VM (force stop).
     pub fn terminate(&self) -> Result<(), HcsError> {
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
         let op = HcsOperation::new()?;
-        let hr = unsafe { HcsTerminateComputeSystem(self.handle, op.as_raw(), ptr::null()) };
+        let hr = unsafe { (fns.terminate_compute_system)(self.handle, op.as_raw(), ptr::null()) };
         if hr < 0 {
             return Err(HcsError::from_hresult("HcsTerminateComputeSystem", hr));
         }
@@ -157,12 +223,12 @@ impl HcsSystem {
         Ok(())
     }
 
-    /// Query VM properties. `query` is a JSON string like `"{\"Property\":\"State\"}"`.
     pub fn get_properties(&self, query: &str) -> Result<String, HcsError> {
+        let fns = load_hcs_fns().ok_or_else(|| HcsError::Other("HCS not available".into()))?;
         let query_wide: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
         let mut result_ptr: *mut u16 = ptr::null_mut();
 
-        let hr = unsafe { HcsGetComputeSystemProperties(self.handle, query_wide.as_ptr(), &mut result_ptr) };
+        let hr = unsafe { (fns.get_properties)(self.handle, query_wide.as_ptr(), &mut result_ptr) };
         if hr < 0 {
             return Err(HcsError::from_hresult("HcsGetComputeSystemProperties", hr));
         }
@@ -179,8 +245,8 @@ impl HcsSystem {
 impl Drop for HcsSystem {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe {
-                HcsCloseComputeSystem(self.handle);
+            if let Some(fns) = load_hcs_fns() {
+                unsafe { (fns.close_compute_system)(self.handle) };
             }
         }
     }
@@ -221,7 +287,6 @@ impl std::error::Error for HcsError {}
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Read a NUL-terminated wide string from a pointer.
 unsafe fn read_wide_string(ptr: *const u16) -> String {
     if ptr.is_null() {
         return String::new();
@@ -234,30 +299,10 @@ unsafe fn read_wide_string(ptr: *const u16) -> String {
     String::from_utf16_lossy(slice)
 }
 
-/// Check if the HCS API is available on this system.
-/// Requires Windows 10 1903+ with Virtual Machine Platform enabled.
-pub fn is_available() -> bool {
-    // Try to load ComputeCore.dll and create a test operation.
-    // If this succeeds, HCS is functional.
-    matches!(
-        std::panic::catch_unwind(|| {
-            let op = HcsOperation::new()?;
-            drop(op);
-            Ok::<_, HcsError>(())
-        }),
-        Ok(Ok(()))
-    )
-}
-
 // ---------------------------------------------------------------------------
 // VM configuration schema generation (HCS v2)
 // ---------------------------------------------------------------------------
 
-/// Build the JSON configuration for a Linux VM booted via HCS.
-///
-/// The schema mirrors what WSL2/hcsshim generates for LCOW (Linux Containers
-/// on Windows) UVMs. The guest mounts the rootfs via Plan 9 (virtio-9p) and
-/// receives the command via the kernel cmdline.
 pub fn build_vm_config(
     id: &str,
     kernel_path: &Path,
@@ -350,7 +395,9 @@ mod tests {
 
     #[test]
     fn test_is_available_smoke() {
-        // Should not panic; result depends on host config.
-        let _ = is_available();
+        let available = is_available();
+        // On a machine with VMP enabled, this should be true.
+        // Print for CI/debug visibility.
+        println!("HCS is_available() = {available}");
     }
 }

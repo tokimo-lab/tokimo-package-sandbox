@@ -47,8 +47,15 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<Execu
         match hv::run(cmd, cfg) {
             Ok(result) => return Ok(result),
             Err(e) => {
-                tracing::warn!(error = %e, "HCS backend failed, trying WSL2 fallback");
-                // Fall through to WSL2.
+                let msg = e.to_string();
+                if msg.contains("0x8037011B") {
+                    tracing::warn!(
+                        "HCS_E_ACCESSDENIED: add user to 'Hyper-V Administrators' group \
+                         (admin cmd: net localgroup \"Hyper-V Administrators\" %USERNAME% /add), \
+                         then log out and back in."
+                    );
+                }
+                tracing::warn!(error = %e, "HCS backend failed, falling back to WSL2");
             }
         }
     }
