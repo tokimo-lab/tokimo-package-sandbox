@@ -69,24 +69,29 @@ fn run() -> Result<(), String> {
         return Err(format!("init must be PID 1 (got {}); host forgot --as-pid-1", pid));
     }
 
-    // Mount essential filesystems (skip if already mounted by initrd script).
-    for (src, tgt, fstype) in &[
-        ("proc", "/proc", "proc"),
-        ("sysfs", "/sys", "sysfs"),
-        ("devtmpfs", "/dev", "devtmpfs"),
-    ] {
-        match mount_fs(src, tgt, fstype, 0, "") {
-            Ok(()) => {}
-            Err(e) if e.contains("Resource busy") || e.contains("16") => {
-                eprintln!("[tokimo-sandbox-init] {tgt} already mounted, skipping");
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    // When running under VSOCK or serial mode, mount virtiofs and set up.
+    // VM mode (macOS VZ / Windows HCS) starts init on a bare Linux kernel
+    // with nothing mounted, so init must mount /proc /sys /dev itself.
+    // bwrap mode (Linux) already mounted those before exec'ing init via
+    // `--proc /proc --dev /dev`, and on modern kernels (Ubuntu 24.04+) a
+    // second `mount(2)` of procfs from inside an unprivileged userns is
+    // refused with EPERM (not EBUSY), so we cannot attempt it blindly.
     let is_vm_mode = env::var(ENV_VSOCK_PORT).is_ok() || env::var(ENV_SERIAL_MODE).is_ok();
     if is_vm_mode {
+        for (src, tgt, fstype) in &[
+            ("proc", "/proc", "proc"),
+            ("sysfs", "/sys", "sysfs"),
+            ("devtmpfs", "/dev", "devtmpfs"),
+        ] {
+            match mount_fs(src, tgt, fstype, 0, "") {
+                Ok(()) => {}
+                Err(e) if e.contains("Resource busy") || e.contains("16") => {
+                    eprintln!("[tokimo-sandbox-init] {tgt} already mounted, skipping");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Mount virtiofs (VM mode only).
         let _ = std::fs::create_dir_all("/mnt/work");
         match mount_fs("work", "/mnt/work", "virtiofs", 0, "") {
             Ok(()) => eprintln!("[tokimo-sandbox-init] mounted virtiofs at /mnt/work"),
