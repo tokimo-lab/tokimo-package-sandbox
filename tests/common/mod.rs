@@ -48,7 +48,14 @@ pub fn has_vz() -> bool {
     if !is_macos() {
         return false;
     }
-    arcbox_vz::is_supported()
+    #[cfg(target_os = "macos")]
+    {
+        arcbox_vz::is_supported()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Check if VZ artifacts (kernel + initrd + rootfs) are present.
@@ -135,8 +142,7 @@ pub fn download_vz_artifacts() -> Result<(), String> {
     extract_zst(&rootfs_tar, &tmp)?;
 
     // Find the rootfs.tar inside.
-    let nested_tar = find_file(&tmp, "rootfs.tar")
-        .ok_or_else(|| "rootfs.tar not found in archive".to_string())?;
+    let nested_tar = find_file(&tmp, "rootfs.tar").ok_or_else(|| "rootfs.tar not found in archive".to_string())?;
     let rootfs_dir = dir.join("rootfs");
     let _ = std::fs::remove_dir_all(&rootfs_dir);
     std::fs::create_dir_all(&rootfs_dir).map_err(|e| format!("mkdir: {e}"))?;

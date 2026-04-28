@@ -7,33 +7,15 @@
 //! assert!(!out.success() || out.exit_code != 0);
 //! ```
 
-mod any_init;
 mod config;
 mod error;
-mod net_observer;
-mod pty;
-mod result;
+mod host;
 mod session;
 
-pub mod init_protocol;
+pub mod protocol;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod init_wire;
-
-#[cfg(target_os = "linux")]
-pub mod init_client;
-
-#[cfg(unix)]
-mod common;
-
-#[cfg(target_os = "linux")]
-mod bridge;
-#[cfg(target_os = "linux")]
-mod l4;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-mod seccomp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod workspace;
 
@@ -44,19 +26,16 @@ mod macos;
 mod windows;
 
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
-pub use error::{Error, Result};
-pub use net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
-pub use result::ExecutionResult;
+pub use error::{Error, ExecutionResult, Result};
+pub use host::net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Session};
 
 #[cfg(target_os = "linux")]
+pub use linux::init_client::{InitClient, SpawnInfo};
+#[cfg(target_os = "linux")]
+pub use linux::seccomp::generate_bpf_bytes;
+#[cfg(target_os = "linux")]
 pub use linux::{SpawnedInit, locate_init_binary, spawn_init};
-
-#[cfg(target_os = "linux")]
-pub use seccomp::generate_bpf_bytes;
-
-#[cfg(target_os = "linux")]
-pub use init_client::{InitClient, SpawnInfo};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use workspace::{UserConfig, UserHandle, Workspace, WorkspaceConfig};
@@ -112,8 +91,8 @@ fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<
     } else {
         c.current_dir(&cfg.work_dir);
     }
-    common::pipe_stdio(&mut c);
-    common::spawn_run(&mut c, cfg.stdin.as_deref(), &cfg.limits, cfg.stream_stderr)
+    host::common::pipe_stdio(&mut c);
+    host::common::spawn_run(&mut c, cfg.stdin.as_deref(), &cfg.limits, cfg.stream_stderr)
 }
 
 #[cfg(windows)]

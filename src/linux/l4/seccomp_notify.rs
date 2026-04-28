@@ -23,7 +23,7 @@
 //! would deadlock.
 
 use super::{L4Config, Shutdown, build_event, close_fd, new_shutdown};
-use crate::net_observer::{Proto, Verdict};
+use crate::host::net_observer::{Proto, Verdict};
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -370,7 +370,7 @@ pub(crate) unsafe fn child_install(sp_child: RawFd) -> io::Result<()> {
     // cmsg buffer: enough for one int fd. Over-size safely.
     let mut cbuf: [u8; 64] = [0; 64];
     let cmsg = cbuf.as_mut_ptr() as *mut libc::cmsghdr;
-    (*cmsg).cmsg_len = libc_cmsg_len(mem::size_of::<libc::c_int>()) as libc::socklen_t;
+    (*cmsg).cmsg_len = libc_cmsg_len(mem::size_of::<libc::c_int>()) as _;
     (*cmsg).cmsg_level = libc::SOL_SOCKET;
     (*cmsg).cmsg_type = libc::SCM_RIGHTS;
     let data_ptr = libc_cmsg_data(cmsg) as *mut libc::c_int;
@@ -381,7 +381,7 @@ pub(crate) unsafe fn child_install(sp_child: RawFd) -> io::Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = libc_cmsg_space(mem::size_of::<libc::c_int>()) as libc::socklen_t;
+    msg.msg_controllen = libc_cmsg_space(mem::size_of::<libc::c_int>()) as _;
     let sent = libc::sendmsg(sp_child, &msg, 0);
     if sent < 0 {
         let e = io::Error::last_os_error();
@@ -466,7 +466,7 @@ fn recv_listener_fd(sp_parent: RawFd) -> io::Result<RawFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cbuf.len() as libc::socklen_t;
+    msg.msg_controllen = cbuf.len() as _;
     let n = unsafe { libc::recvmsg(sp_parent, &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());

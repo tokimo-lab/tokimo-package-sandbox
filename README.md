@@ -162,6 +162,63 @@ In console mode, no UAC or service installation is needed — the library auto-d
 
 To uninstall: `.\tokimo-sandbox-svc.exe --uninstall` (needs admin).
 
+## Crate structure
+
+```
+src/
+├── lib.rs                  ── public surface + cross-platform `run()`
+├── config.rs               ── SandboxConfig / Mount / NetworkPolicy / ResourceLimits
+├── error.rs                ── Error / Result / ExecutionResult
+├── session.rs              ── Session / JobHandle / PtyHandle (platform dispatch)
+│
+├── protocol/               ── init control protocol (host ↔ tokimo-sandbox-init)
+│   ├── types.rs            ──   Op / Result / Event / wire frames
+│   └── wire.rs             ──   length-prefixed JSON + SCM_RIGHTS framing
+│
+├── host/                   ── host-side cross-platform helpers
+│   ├── common.rs           ──   pipe_stdio / spawn_run / rlimits  (Unix)
+│   ├── pty.rs              ──   master PTY allocation + raw-mode  (macOS)
+│   └── net_observer.rs     ──   L7 HTTP(S) proxy + DnsPolicy + NetEvent sinks
+│
+├── linux/                  ── Linux backend (bwrap + seccomp + cgroups)
+│   ├── mod.rs              ──   run() / spawn_init() / SpawnedInit
+│   ├── bridge.rs           ──   L4 ↔ L7 verdict bridge
+│   ├── seccomp.rs          ──   BPF program codegen
+│   ├── init_client.rs      ──   host-side InitClient (SOCK_SEQPACKET)
+│   └── l4/                 ──   seccomp-notify + (scaffold) eBPF observer
+│
+├── macos/                  ── macOS backend (Virtualization.framework)
+│   ├── mod.rs              ──   run() / spawn_session_shell()
+│   ├── vz.rs               ──   one-shot VM (kernel + initrd + virtiofs)
+│   ├── vz_session.rs       ──   persistent VM runner
+│   └── vz_vsock.rs         ──   InitClient over VSOCK
+│
+├── windows/                ── Windows backend (HCS via SYSTEM service)
+│   ├── mod.rs              ──   run() → svc client
+│   └── svc/                ──   named-pipe client + protocol
+│
+├── workspace/              ── multi-user Workspace (Linux + macOS)
+│   ├── mod.rs              ──   Workspace / UserHandle / UserConfig
+│   └── any_init.rs         ──   AnyInitClient enum (Linux | macOS)
+│
+└── bin/
+    ├── tokimo-sandbox-init/  ── PID 1 inside the Linux/VM container
+    │   ├── main.rs           ──   transport dispatch (SOCK_SEQPACKET / VSOCK)
+    │   ├── server.rs         ──   protocol loop
+    │   ├── child.rs          ──   spawn / waitpid / pidfd
+    │   └── pty.rs            ──   slave PTY setup
+    │
+    └── tokimo-sandbox-svc/   ── Windows SYSTEM service for HCS VM lifecycle
+        └── main.rs
+```
+
+Public re-exports (see `lib.rs`): `SandboxConfig`, `Mount`, `NetworkPolicy`, `ResourceLimits`,
+`SystemLayout`, `Session`, `JobHandle`, `PtyHandle`, `RunOneshotFn`, `OpenPtyFn`, `ExecOutput`,
+`Workspace`, `WorkspaceConfig`, `UserConfig`, `UserHandle`, `Error`, `Result`, `ExecutionResult`,
+`NetEvent`, `NetEventSink`, `Verdict`, `Layer`, `Proto`, `DnsPolicy`, `HostPattern`,
+`SpawnedInit`, `spawn_init`, `locate_init_binary`, `InitClient`, `SpawnInfo`,
+`generate_bpf_bytes`, `protocol::{types, wire}`.
+
 ## Architecture
 
 ### Linux

@@ -25,7 +25,10 @@ pub(crate) fn open_pty_master() -> Result<OwnedFd> {
     {
         let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         if fd < 0 {
-            return Err(Error::exec(format!("posix_openpt: {}", std::io::Error::last_os_error())));
+            return Err(Error::exec(format!(
+                "posix_openpt: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         if unsafe { libc::grantpt(fd) } != 0 {
             let e = std::io::Error::last_os_error();
@@ -67,10 +70,7 @@ pub(crate) fn open_pty_master() -> Result<OwnedFd> {
 pub(crate) fn set_raw_mode(fd: RawFd) -> Result<()> {
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-        return Err(Error::exec(format!(
-            "tcgetattr: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::exec(format!("tcgetattr: {}", std::io::Error::last_os_error())));
     }
     // cfmakeraw equivalent.
     termios.c_iflag &= !(libc::IGNBRK
@@ -88,10 +88,7 @@ pub(crate) fn set_raw_mode(fd: RawFd) -> Result<()> {
     termios.c_cc[libc::VMIN] = 1;
     termios.c_cc[libc::VTIME] = 0;
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
-        return Err(Error::exec(format!(
-            "tcsetattr: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::exec(format!("tcsetattr: {}", std::io::Error::last_os_error())));
     }
     Ok(())
 }

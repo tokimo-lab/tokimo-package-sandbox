@@ -13,7 +13,7 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::stat::Mode;
 use nix::unistd::{ForkResult, Pid, chdir, dup2, fork, pipe2, setpgid, setsid};
 
-use tokimo_package_sandbox::init_protocol::{ErrorCode, ErrorReply};
+use tokimo_package_sandbox::protocol::types::{ErrorCode, ErrorReply};
 
 use crate::pty as ptymod;
 

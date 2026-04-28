@@ -29,18 +29,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration,
-    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration, VirtualMachineConfiguration, VirtualMachineState,
-    is_supported,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration, SerialPortConfiguration,
+    SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    VirtualMachineConfiguration, VirtualMachineState, is_supported,
 };
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
-use super::vz::{find_initrd, find_kernel, find_rootfs, DEFAULT_CPUS, DEFAULT_MEMORY_MB};
+use super::vz::{DEFAULT_CPUS, DEFAULT_MEMORY_MB, find_initrd, find_kernel, find_rootfs};
 use crate::config::{NetworkPolicy, SandboxConfig};
-use crate::net_observer::{self, ProxyConfig, ProxyHandle};
+use crate::host::net_observer::{self, ProxyConfig, ProxyHandle};
 use crate::session::ShellHandle;
 use crate::{Error, Result};
 
@@ -115,110 +114,111 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
     );
 
     let (vm, client) = rt.block_on(async {
-            let mut boot_loader =
-                LinuxBootLoader::new(&kernel_s).map_err(|e| Error::exec(format!("LinuxBootLoader: {e}")))?;
-            boot_loader.set_initial_ramdisk(&initrd_s).set_command_line(
-                "console=hvc0 quiet loglevel=3 TOKIMO_SANDBOX_VSOCK_PORT=1",
-            );
+        let mut boot_loader =
+            LinuxBootLoader::new(&kernel_s).map_err(|e| Error::exec(format!("LinuxBootLoader: {e}")))?;
+        boot_loader
+            .set_initial_ramdisk(&initrd_s)
+            .set_command_line("console=hvc0 quiet loglevel=3 TOKIMO_SANDBOX_VSOCK_PORT=1");
 
-            let shared_dir = SharedDirectory::new(&rootfs_s, false)
-                .map_err(|e| Error::exec(format!("SharedDirectory: {e}")))?;
-            let single_share = SingleDirectoryShare::new(shared_dir)
-                .map_err(|e| Error::exec(format!("SingleDirectoryShare: {e}")))?;
-            let mut fs_config = VirtioFileSystemDeviceConfiguration::new("work")
-                .map_err(|e| Error::exec(format!("VirtioFileSystemDevice: {e}")))?;
-            fs_config.set_share(single_share);
+        let shared_dir =
+            SharedDirectory::new(&rootfs_s, false).map_err(|e| Error::exec(format!("SharedDirectory: {e}")))?;
+        let single_share =
+            SingleDirectoryShare::new(shared_dir).map_err(|e| Error::exec(format!("SingleDirectoryShare: {e}")))?;
+        let mut fs_config = VirtioFileSystemDeviceConfiguration::new("work")
+            .map_err(|e| Error::exec(format!("VirtioFileSystemDevice: {e}")))?;
+        fs_config.set_share(single_share);
 
-            let serial = SerialPortConfiguration::virtio_console()
-                .map_err(|e| Error::exec(format!("SerialPort: {e}")))?;
-            let serial_read_fd = serial.read_fd(); // capture before move
+        let serial = SerialPortConfiguration::virtio_console().map_err(|e| Error::exec(format!("SerialPort: {e}")))?;
+        let serial_read_fd = serial.read_fd(); // capture before move
 
-            let mut config = VirtualMachineConfiguration::new()
-                .map_err(|e| Error::exec(format!("VM config: {e}")))?;
-            config
-                .set_cpu_count(cpu_count)
-                .set_memory_size(memory_mb * 1024 * 1024)
-                .set_platform(GenericPlatform::new().map_err(|e| Error::exec(format!("Platform: {e}")))?)
-                .set_boot_loader(boot_loader)
-                .add_entropy_device(
-                    EntropyDeviceConfiguration::new().map_err(|e| Error::exec(format!("Entropy: {e}")))?,
-                )
-                .add_socket_device(
-                    SocketDeviceConfiguration::new().map_err(|e| Error::exec(format!("Socket: {e}")))?,
-                )
-                .add_serial_port(serial)
-                .add_directory_share(fs_config);
+        let mut config = VirtualMachineConfiguration::new().map_err(|e| Error::exec(format!("VM config: {e}")))?;
+        config
+            .set_cpu_count(cpu_count)
+            .set_memory_size(memory_mb * 1024 * 1024)
+            .set_platform(GenericPlatform::new().map_err(|e| Error::exec(format!("Platform: {e}")))?)
+            .set_boot_loader(boot_loader)
+            .add_entropy_device(EntropyDeviceConfiguration::new().map_err(|e| Error::exec(format!("Entropy: {e}")))?)
+            .add_socket_device(SocketDeviceConfiguration::new().map_err(|e| Error::exec(format!("Socket: {e}")))?)
+            .add_serial_port(serial)
+            .add_directory_share(fs_config);
 
-            // Network: only add virtio-net when not fully blocked.
-            match cfg.network {
-                NetworkPolicy::Blocked => {}
-                _ => {
-                    let net_dev = NetworkDeviceConfiguration::nat()
-                        .map_err(|e| Error::exec(format!("NetworkDevice NAT: {e}")))?;
-                    config.add_network_device(net_dev);
+        // Network: only add virtio-net when not fully blocked.
+        match cfg.network {
+            NetworkPolicy::Blocked => {}
+            _ => {
+                let net_dev =
+                    NetworkDeviceConfiguration::nat().map_err(|e| Error::exec(format!("NetworkDevice NAT: {e}")))?;
+                config.add_network_device(net_dev);
+            }
+        }
+
+        let vm = config.build().map_err(|e| Error::exec(format!("VM build: {e}")))?;
+
+        tracing::info!(kernel = %kernel_s, initrd = %initrd_s, rootfs = %rootfs_s, "Booting VZ session VM");
+        vm.start().await.map_err(|e| Error::exec(format!("VM start: {e}")))?;
+
+        if vm.state() != VirtualMachineState::Running {
+            return Err(Error::exec(format!("VM not running: {:?}", vm.state())));
+        }
+
+        // Connect VSOCK control channel. Read serial console while waiting
+        // to capture init error messages.
+        tracing::info!("VSOCK connecting to guest port {VSOCK_CONTROL_PORT}...");
+        let socket_devices = vm.socket_devices();
+        let socket_dev = socket_devices
+            .first()
+            .ok_or_else(|| Error::exec("no virtio-socket device"))?;
+
+        let deadline = Instant::now() + VSOCK_CONNECT_TIMEOUT;
+        let mut vsock_conn = None;
+        let mut console_output = String::new();
+        while Instant::now() < deadline {
+            match socket_dev.connect(VSOCK_CONTROL_PORT).await {
+                Ok(conn) => {
+                    vsock_conn = Some(conn);
+                    break;
                 }
-            }
-
-            let vm = config.build().map_err(|e| Error::exec(format!("VM build: {e}")))?;
-
-            tracing::info!(kernel = %kernel_s, initrd = %initrd_s, rootfs = %rootfs_s, "Booting VZ session VM");
-            vm.start().await.map_err(|e| Error::exec(format!("VM start: {e}")))?;
-
-            if vm.state() != VirtualMachineState::Running {
-                return Err(Error::exec(format!("VM not running: {:?}", vm.state())));
-            }
-
-            // Connect VSOCK control channel. Read serial console while waiting
-            // to capture init error messages.
-            tracing::info!("VSOCK connecting to guest port {VSOCK_CONTROL_PORT}...");
-            let socket_devices = vm.socket_devices();
-            let socket_dev = socket_devices
-                .first()
-                .ok_or_else(|| Error::exec("no virtio-socket device"))?;
-
-            let deadline = Instant::now() + VSOCK_CONNECT_TIMEOUT;
-            let mut vsock_conn = None;
-            let mut console_output = String::new();
-            while Instant::now() < deadline {
-                match socket_dev.connect(VSOCK_CONTROL_PORT).await {
-                    Ok(conn) => { vsock_conn = Some(conn); break; }
-                    Err(_) => {
-                        // Drain serial for diagnostics.
-                        if let Some(fd) = serial_read_fd {
-                            let mut buf = [0u8; 4096];
-                            unsafe {
-                                let flags = libc::fcntl(fd, libc::F_GETFL);
-                                if flags >= 0 { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK); }
-                                loop {
-                                    let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-                                    if n <= 0 { break; }
-                                    console_output.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                Err(_) => {
+                    // Drain serial for diagnostics.
+                    if let Some(fd) = serial_read_fd {
+                        let mut buf = [0u8; 4096];
+                        unsafe {
+                            let flags = libc::fcntl(fd, libc::F_GETFL);
+                            if flags >= 0 {
+                                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                            }
+                            loop {
+                                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                                if n <= 0 {
+                                    break;
                                 }
+                                console_output.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
-            let conn = vsock_conn.ok_or_else(|| Error::exec(format!(
+        }
+        let conn = vsock_conn.ok_or_else(|| {
+            Error::exec(format!(
                 "VSOCK connect timed out after {VSOCK_CONNECT_TIMEOUT:?}. Console:\n{console_output}"
-            )))?;
-
-            let transport = VsockTransport::from_raw_fd(conn.into_raw_fd())?;
-            let client = Arc::new(VsockInitClient::new(transport)?);
-            let init_pid = client.hello()?;
-            tracing::info!(init_pid, "VSOCK handshake complete");
-
-            Ok::<_, Error>((vm, client))
+            ))
         })?;
+
+        let transport = VsockTransport::from_raw_fd(conn.into_raw_fd())?;
+        let client = Arc::new(VsockInitClient::new(transport)?);
+        let init_pid = client.hello()?;
+        tracing::info!(init_pid, "VSOCK handshake complete");
+
+        Ok::<_, Error>((vm, client))
+    })?;
 
     Ok(VzSessionRunner {
         vm,
         client,
         rt,
-        keepalive: VzSessionKeepalive {
-            _rootfs: rootfs_keep,
-        },
+        keepalive: VzSessionKeepalive { _rootfs: rootfs_keep },
     })
 }
 
@@ -276,8 +276,8 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
                 allow_hosts: Vec::new(),
                 enforce_allow: matches!(cfg.network, NetworkPolicy::Gated { .. }),
             };
-            let proxy = net_observer::start_proxy(proxy_cfg)
-                .map_err(|e| Error::exec(format!("start L7 proxy: {e}")))?;
+            let proxy =
+                net_observer::start_proxy(proxy_cfg).map_err(|e| Error::exec(format!("start L7 proxy: {e}")))?;
             let addr = proxy.addr();
             let env = vec![
                 ("HTTP_PROXY".to_string(), format!("http://{addr}")),
@@ -369,13 +369,8 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
 
     // try_wait: returns true when bash has exited.
     let try_wait_lifecycle = lifecycle.clone();
-    let try_wait = Box::new(move || -> bool {
-        try_wait_lifecycle
-            .exit_code
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(true)
-    });
+    let try_wait =
+        Box::new(move || -> bool { try_wait_lifecycle.exit_code.lock().map(|g| g.is_some()).unwrap_or(true) });
 
     // kill: best-effort SIGKILL the bash pgrp.
     let kill_client = client.clone();
@@ -440,12 +435,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     let job_map: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let spawn_job_map = job_map.clone();
     let spawn_async: crate::session::SpawnAsyncFn = Box::new(move |job_id: u64, cmd: &str| {
-        let info = spawn_client.spawn_pipes_inherit(
-            &["/bin/bash", "-c", cmd],
-            &[],
-            None,
-            Some(&spawn_shell_cid),
-        )?;
+        let info = spawn_client.spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
         let cid = info.child_id.clone();
         spawn_job_map
             .lock()
@@ -464,9 +454,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     let kill_job_map = job_map;
     let kill_spawn: crate::session::KillSpawnFn = Box::new(move |job_id: u64| {
         let child_id = {
-            let map = kill_job_map
-                .lock()
-                .map_err(|_| Error::exec("job map poisoned"))?;
+            let map = kill_job_map.lock().map_err(|_| Error::exec("job map poisoned"))?;
             map.get(&job_id).cloned()
         };
         match child_id {
@@ -521,9 +509,8 @@ fn open_pty_via_init(
 ) -> Result<crate::session::PtyHandle> {
     // Open host-side PTY master. The slave side is unused — the real PTY
     // is inside the guest. We use the host master as a poll-able I/O endpoint.
-    let host_master = crate::pty::open_pty_master()
-        .map_err(|e| Error::exec(format!("open host PTY: {e}")))?;
-    crate::pty::set_winsize(host_master.as_fd().as_raw_fd(), rows, cols)
+    let host_master = crate::host::pty::open_pty_master().map_err(|e| Error::exec(format!("open host PTY: {e}")))?;
+    crate::host::pty::set_winsize(host_master.as_fd().as_raw_fd(), rows, cols)
         .map_err(|e| Error::exec(format!("set winsize: {e}")))?;
 
     // Spawn child in Pty mode inside the guest. The init server allocates a
@@ -542,8 +529,7 @@ fn open_pty_via_init(
 
     // Set raw mode: bytes (including ^C, ^\, ^Z) pass through transparently.
     // Signal generation happens on the guest PTY where the child has a real terminal.
-    crate::pty::set_raw_mode(host_master_raw)
-        .map_err(|e| Error::exec(format!("set raw mode: {e}")))?;
+    crate::host::pty::set_raw_mode(host_master_raw).map_err(|e| Error::exec(format!("set raw mode: {e}")))?;
 
     let pump = thread::Builder::new()
         .name("tps-vz-pty".into())
@@ -572,9 +558,7 @@ fn open_pty_via_init(
                 // Host → Guest: forward user input via Op::Write.
                 for _ev in events.iter() {
                     loop {
-                        let n = unsafe {
-                            libc::read(bridge_master_raw, buf.as_mut_ptr().cast(), buf.len())
-                        };
+                        let n = unsafe { libc::read(bridge_master_raw, buf.as_mut_ptr().cast(), buf.len()) };
                         if n > 0 {
                             let _ = bridge_client.write(&bridge_cid, &buf[..n as usize]);
                         } else {
@@ -585,11 +569,7 @@ fn open_pty_via_init(
                 // Guest → Host: drain Stdout events, write to PTY master.
                 for chunk in bridge_client.drain_stdout(&bridge_cid) {
                     unsafe {
-                        let _ = libc::write(
-                            bridge_master_raw,
-                            chunk.as_ptr().cast(),
-                            chunk.len(),
-                        );
+                        let _ = libc::write(bridge_master_raw, chunk.as_ptr().cast(), chunk.len());
                     }
                 }
                 if bridge_client.take_exit(&bridge_cid).is_some() || bridge_client.is_dead() {
@@ -601,14 +581,12 @@ fn open_pty_via_init(
 
     let resize_client = client.clone();
     let resize_cid = child_id.clone();
-    let resize_fn: Box<dyn Fn(u16, u16) -> Result<()> + Send + Sync> = Box::new(
-        move |r: u16, c: u16| {
-            // Resize host PTY master.
-            let _ = crate::pty::set_winsize(host_master_raw, r, c);
-            // Resize guest PTY master.
-            resize_client.resize(&resize_cid, r, c)
-        },
-    );
+    let resize_fn: Box<dyn Fn(u16, u16) -> Result<()> + Send + Sync> = Box::new(move |r: u16, c: u16| {
+        // Resize host PTY master.
+        let _ = crate::host::pty::set_winsize(host_master_raw, r, c);
+        // Resize guest PTY master.
+        resize_client.resize(&resize_cid, r, c)
+    });
 
     let kill_client = client.clone();
     let kill_cid = child_id.clone();
@@ -620,21 +598,19 @@ fn open_pty_via_init(
 
     let wait_client = client.clone();
     let wait_cid = child_id.clone();
-    let wait_fn: Box<dyn Fn(Duration) -> Option<i32> + Send + Sync> = Box::new(
-        move |timeout: Duration| {
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                if let Some((code, _sig)) = wait_client.take_exit(&wait_cid) {
-                    return Some(code);
-                }
-                if wait_client.is_dead() {
-                    return Some(-1);
-                }
-                wait_client.wait_for_event(&wait_cid, deadline);
+    let wait_fn: Box<dyn Fn(Duration) -> Option<i32> + Send + Sync> = Box::new(move |timeout: Duration| {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some((code, _sig)) = wait_client.take_exit(&wait_cid) {
+                return Some(code);
             }
-            None
-        },
-    );
+            if wait_client.is_dead() {
+                return Some(-1);
+            }
+            wait_client.wait_for_event(&wait_cid, deadline);
+        }
+        None
+    });
 
     let keepalive: Box<dyn std::any::Any + Send + Sync> = Box::new((client.clone(), pump, stop));
 
@@ -653,10 +629,7 @@ fn open_pty_via_init(
 fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(Error::exec(format!(
-            "pipe: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::exec(format!("pipe: {}", std::io::Error::last_os_error())));
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }

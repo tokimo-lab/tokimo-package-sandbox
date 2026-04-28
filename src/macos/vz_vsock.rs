@@ -23,11 +23,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 
-use crate::init_protocol::{default_features, Event, Frame, Op, Reply, StdioMode, PROTOCOL_VERSION};
-use crate::init_wire::{recv_frame_stream, send_frame_stream};
+use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
+use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
 use crate::{Error, Result};
 
 /// Opaque transport wrapping a VSOCK file descriptor.
@@ -192,9 +192,7 @@ impl VsockInitClient {
                     )));
                 }
                 if init_pid != 1 {
-                    return Err(Error::exec(format!(
-                        "init not PID 1 (got {init_pid})"
-                    )));
+                    return Err(Error::exec(format!("init not PID 1 (got {init_pid})")));
                 }
                 Ok(init_pid)
             }
@@ -205,12 +203,7 @@ impl VsockInitClient {
     // -- Shell / spawn ------------------------------------------------------
 
     /// Open a long-lived bash shell. Returns the `child_id`.
-    pub fn open_shell(
-        &self,
-        argv: &[&str],
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn open_shell(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::OpenShell {
             id: id.clone(),
@@ -222,12 +215,7 @@ impl VsockInitClient {
     }
 
     /// Spawn a pipes-mode child. Returns spawn info.
-    pub fn spawn_pipes(
-        &self,
-        argv: &[&str],
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn spawn_pipes(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         self.spawn_pipes_inherit(argv, env_overlay, cwd, None)
     }
 
@@ -282,10 +270,7 @@ impl VsockInitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn pty failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn pty failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok((
                     SpawnInfo {
@@ -310,10 +295,7 @@ impl VsockInitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -326,12 +308,7 @@ impl VsockInitClient {
 
     // -- Add / Remove user (Workspace) --------------------------------------
 
-    pub fn add_user(
-        &self,
-        user_id: &str,
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-    ) -> Result<SpawnInfo> {
+    pub fn add_user(&self, user_id: &str, env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::AddUser {
             id: id.clone(),
@@ -538,10 +515,7 @@ impl VsockInitClient {
                 if ok {
                     Ok(())
                 } else {
-                    Err(Error::exec(format!(
-                        "init op failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
+                    Err(Error::exec(format!("init op failed: {:?}", error.map(|e| e.message))))
                 }
             }
             other => Err(Error::exec(format!("expected Ack, got {other:?}"))),
@@ -572,9 +546,7 @@ impl VsockInitClient {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(Error::exec(format!(
-                    "init op {id} timed out after {timeout:?}"
-                )));
+                return Err(Error::exec(format!("init op {id} timed out after {timeout:?}")));
             }
             let (g2, _) = cv
                 .wait_timeout(g, deadline - now)

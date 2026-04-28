@@ -14,7 +14,7 @@
 
 use std::io::{Read, Write};
 
-use crate::init_protocol::{Frame, MAX_FRAME_BYTES};
+use crate::protocol::types::{Frame, MAX_FRAME_BYTES};
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -54,8 +54,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
     if buf.len() < total {
         return Ok(None);
     }
-    let frame: Frame = serde_json::from_slice(&buf[4..total])
-        .map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
+    let frame: Frame =
+        serde_json::from_slice(&buf[4..total]).map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
     Ok(Some((frame, total)))
 }
 
@@ -90,8 +90,7 @@ pub fn recv_frame_stream(r: &mut impl Read) -> Result<Option<Frame>> {
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)
         .map_err(|e| Error::exec(format!("read frame payload {len}B: {e}")))?;
-    let frame: Frame = serde_json::from_slice(&payload)
-        .map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
+    let frame: Frame = serde_json::from_slice(&payload).map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
     Ok(Some(frame))
 }
 
@@ -107,7 +106,7 @@ mod seqpacket {
     use nix::cmsg_space;
     use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 
-    use crate::init_protocol::{Frame, MAX_FRAME_BYTES};
+    use crate::protocol::types::{Frame, MAX_FRAME_BYTES};
     use crate::{Error, Result};
 
     /// Send `frame` as one SEQPACKET packet, optionally attaching `fd` via
@@ -199,7 +198,8 @@ mod seqpacket {
         }
         let _ = res;
         let payload = &buf[..n];
-        let frame: Frame = serde_json::from_slice(payload).map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
+        let frame: Frame =
+            serde_json::from_slice(payload).map_err(|e| Error::exec(format!("parse wire frame: {e}")))?;
         Ok(Some((frame, owned)))
     }
 

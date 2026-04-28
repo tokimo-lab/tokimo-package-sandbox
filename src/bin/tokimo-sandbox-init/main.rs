@@ -151,8 +151,7 @@ fn run() -> Result<(), String> {
     std::mem::forget(sigfd);
 
     eprintln!("[tokimo-sandbox-init] READY");
-    server::run_loop(listener, write_fd, sigfd_owned, base_env, transport)
-        .map_err(|e| format!("event loop: {e}"))
+    server::run_loop(listener, write_fd, sigfd_owned, base_env, transport).map_err(|e| format!("event loop: {e}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -193,10 +192,7 @@ fn bind_serial() -> Result<(OwnedFd, Option<OwnedFd>), String> {
         )
     };
     if r < 0 {
-        return Err(format!(
-            "open host→guest mailbox: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("open host→guest mailbox: {}", std::io::Error::last_os_error()));
     }
     let w = unsafe {
         libc::open(
@@ -206,10 +202,7 @@ fn bind_serial() -> Result<(OwnedFd, Option<OwnedFd>), String> {
     };
     if w < 0 {
         unsafe { libc::close(r) };
-        return Err(format!(
-            "open guest→host mailbox: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("open guest→host mailbox: {}", std::io::Error::last_os_error()));
     }
     Ok((
         unsafe { OwnedFd::from_raw_fd(r) },
@@ -226,7 +219,10 @@ fn load_vsock_modules() -> Result<(), String> {
     // Try initrd first (/lib/modules), then rootfs (/mnt/work/lib/modules).
     let mod_base = if std::fs::metadata("/lib/modules").map(|m| m.is_dir()).unwrap_or(false) {
         "/lib/modules"
-    } else if std::fs::metadata("/mnt/work/lib/modules").map(|m| m.is_dir()).unwrap_or(false) {
+    } else if std::fs::metadata("/mnt/work/lib/modules")
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         "/mnt/work/lib/modules"
     } else {
         eprintln!("[tokimo-sandbox-init] no /lib/modules found, skipping vsock modprobe");
@@ -267,9 +263,15 @@ fn load_vsock_modules() -> Result<(), String> {
     for (compressed, uncompressed) in vsock_mods.iter().zip(vsock_mods_alt.iter()) {
         let path = kdir.join(compressed);
         let alt = kdir.join(uncompressed);
-        let mod_path = if path.exists() { &path } else if alt.exists() { &alt } else { continue };
-        let path_c = std::ffi::CString::new(mod_path.to_string_lossy().as_bytes())
-            .map_err(|e| format!("CString: {e}"))?;
+        let mod_path = if path.exists() {
+            &path
+        } else if alt.exists() {
+            &alt
+        } else {
+            continue;
+        };
+        let path_c =
+            std::ffi::CString::new(mod_path.to_string_lossy().as_bytes()).map_err(|e| format!("CString: {e}"))?;
         let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             eprintln!("[tokimo-sandbox-init] open({}) failed", mod_path.display());
@@ -280,7 +282,10 @@ fn load_vsock_modules() -> Result<(), String> {
         unsafe { libc::close(fd) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("[tokimo-sandbox-init] finit_module({}) failed: {err}", mod_path.display());
+            eprintln!(
+                "[tokimo-sandbox-init] finit_module({}) failed: {err}",
+                mod_path.display()
+            );
             // Continue — maybe already loaded or not needed.
         } else {
             eprintln!("[tokimo-sandbox-init] loaded {}", mod_path.display());

@@ -19,12 +19,14 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+mod any_init;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::any_init::AnyInitClient;
+use self::any_init::AnyInitClient;
 use crate::config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
 use crate::session::ExecOutput;
 use crate::{Error, Result};
@@ -36,6 +38,7 @@ use crate::{Error, Result};
 enum AnyContainer {
     #[cfg(target_os = "linux")]
     Linux {
+        #[allow(dead_code)]
         spawned: crate::linux::SpawnedInit,
         host_sock: PathBuf,
     },
@@ -339,7 +342,7 @@ fn open_container(cfg: &SandboxConfig) -> Result<AnyContainer> {
 fn workspace_connect(container: &AnyContainer) -> Result<AnyInitClient> {
     match container {
         AnyContainer::Linux { host_sock, .. } => {
-            let client = Arc::new(crate::init_client::InitClient::connect(host_sock)?);
+            let client = Arc::new(crate::linux::init_client::InitClient::connect(host_sock)?);
             Ok(AnyInitClient::Linux(client))
         }
         #[cfg(target_os = "macos")]

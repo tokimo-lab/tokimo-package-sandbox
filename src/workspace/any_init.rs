@@ -1,6 +1,6 @@
 //! Cross-platform init-client abstraction for [`super::Workspace`].
 //!
-//! Wraps the Linux [`InitClient`][crate::init_client::InitClient] and the macOS
+//! Wraps the Linux [`InitClient`][crate::linux::init_client::InitClient] and the macOS
 //! [`VsockInitClient`][crate::macos::vz_vsock::VsockInitClient] behind a common
 //! enum so `Workspace` doesn't need to be generic.
 
@@ -20,7 +20,7 @@ use crate::Result;
 #[allow(missing_docs)]
 pub(crate) enum AnyInitClient {
     #[cfg(target_os = "linux")]
-    Linux(Arc<crate::init_client::InitClient>),
+    Linux(Arc<crate::linux::init_client::InitClient>),
     #[cfg(target_os = "macos")]
     MacOs(Arc<crate::macos::vz_vsock::VsockInitClient>),
 }
@@ -29,7 +29,7 @@ pub(crate) enum AnyInitClient {
 /// [`AnyInitClient::spawn_pipes_inherit_async`].
 pub(crate) enum AnyChildHandle {
     #[cfg(target_os = "linux")]
-    Linux(crate::init_client::ChildHandle),
+    Linux(crate::linux::init_client::ChildHandle),
     #[cfg(target_os = "macos")]
     MacOs(crate::macos::vz_vsock::ChildHandle),
 }
@@ -61,12 +61,16 @@ impl AnyInitClient {
             #[cfg(target_os = "linux")]
             Self::Linux(c) => {
                 let info = c.add_user(user_id, env_overlay, cwd)?;
-                Ok(AnySpawnInfo { child_id: info.child_id })
+                Ok(AnySpawnInfo {
+                    child_id: info.child_id,
+                })
             }
             #[cfg(target_os = "macos")]
             Self::MacOs(c) => {
                 let info = c.add_user(user_id, env_overlay, cwd)?;
-                Ok(AnySpawnInfo { child_id: info.child_id })
+                Ok(AnySpawnInfo {
+                    child_id: info.child_id,
+                })
             }
         }
     }
@@ -93,12 +97,16 @@ impl AnyInitClient {
             #[cfg(target_os = "linux")]
             Self::Linux(c) => {
                 let info = c.spawn_pipes_inherit(argv, env_overlay, cwd, inherit_from_child)?;
-                Ok(AnySpawnInfo { child_id: info.child_id })
+                Ok(AnySpawnInfo {
+                    child_id: info.child_id,
+                })
             }
             #[cfg(target_os = "macos")]
             Self::MacOs(c) => {
                 let info = c.spawn_pipes_inherit(argv, env_overlay, cwd, inherit_from_child)?;
-                Ok(AnySpawnInfo { child_id: info.child_id })
+                Ok(AnySpawnInfo {
+                    child_id: info.child_id,
+                })
             }
         }
     }

@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::net_observer::{DnsPolicy, HostPattern, NetEventSink};
+use crate::host::net_observer::{DnsPolicy, HostPattern, NetEventSink};
 
 /// Network policy inside the sandbox.
 #[derive(Clone, Default)]

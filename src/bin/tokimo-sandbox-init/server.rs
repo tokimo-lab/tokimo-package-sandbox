@@ -18,11 +18,11 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::sys::socket::{SockFlag, accept4};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getpid};
-use tokimo_package_sandbox::init_protocol::{
+use tokimo_package_sandbox::protocol::types::{
     ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
 };
-use tokimo_package_sandbox::init_wire::{recv_frame_seqpacket, send_frame_seqpacket};
-use tokimo_package_sandbox::init_wire::{encode_frame, decode_frame};
+use tokimo_package_sandbox::protocol::wire::{decode_frame, encode_frame};
+use tokimo_package_sandbox::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
 
 use crate::child::{ChildKind, ChildRecord};
 use crate::pty as ptymod;
@@ -130,7 +130,13 @@ pub fn snapshot_base_env() -> Vec<(String, String)> {
     env::vars().collect()
 }
 
-pub fn run_loop(mut listener: OwnedFd, write_fd: Option<OwnedFd>, sigfd: OwnedFd, base_env: Vec<(String, String)>, transport: Transport) -> Result<(), String> {
+pub fn run_loop(
+    mut listener: OwnedFd,
+    write_fd: Option<OwnedFd>,
+    sigfd: OwnedFd,
+    base_env: Vec<(String, String)>,
+    transport: Transport,
+) -> Result<(), String> {
     let mut poll = Poll::new().map_err(|e| format!("Poll::new: {e}"))?;
     let mut events = Events::with_capacity(64);
 
@@ -437,7 +443,11 @@ fn pump_child_stream(token: Token, state: &mut State, _registry: &mio::Registry)
 }
 
 fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
-    let transport = state.clients.get(&client_fd).map(|c| c.transport).unwrap_or(Transport::SeqPacket);
+    let transport = state
+        .clients
+        .get(&client_fd)
+        .map(|c| c.transport)
+        .unwrap_or(Transport::SeqPacket);
     if transport != Transport::SeqPacket {
         return handle_client_readable_vsock(client_fd, state, registry);
     }
@@ -594,7 +604,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
         Op::Resize {
             id,
@@ -616,7 +626,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGWINCH);
                 Ok(())
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
         Op::Signal {
             id,
@@ -639,12 +649,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 };
                 r.map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("kill: {e}")))
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
         Op::Wait { id, child_id: _ } => {
             // v1: synchronous Wait returns immediately if child already gone,
             // otherwise just acks (Exit event will follow when reaper sees it).
-            ack(state, client_fd,id, Ok(()));
+            ack(state, client_fd, id, Ok(()));
         }
         Op::Close { id, child_id } => {
             let res = (|| -> Result<(), ErrorReply> {
@@ -656,7 +666,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 rec.master_fd.take();
                 Ok(())
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
         Op::Shutdown { id, kill_all } => {
             if kill_all {
@@ -685,7 +695,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     },
                 );
             }
-            ack(state, client_fd,id, Ok(()));
+            ack(state, client_fd, id, Ok(()));
         }
         Op::AddUser {
             id,
@@ -736,7 +746,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     }
                 }
             }
-            ack(state, client_fd,id, Ok(()));
+            ack(state, client_fd, id, Ok(()));
         }
         Op::BindMount {
             id,
@@ -771,7 +781,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
         Op::Unmount { id, target } => {
             let res = (|| -> Result<(), ErrorReply> {
@@ -786,7 +796,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(state, client_fd,id, res);
+            ack(state, client_fd, id, res);
         }
     }
 }
@@ -867,46 +877,40 @@ fn spawn_child_inner(
             // fd can't be sent via SCM_RIGHTS. Instead, we bridge I/O through
             // the protocol: register the master fd for reading (output pumping)
             // and set stdin_fd to the master so Write ops go to the PTY.
-            let (effective_stdout, effective_stdin, effective_master, send_fd) = if client_is_stream
-                && spawned.master_fd.is_some()
-            {
-                let mfd = spawned.master_fd.as_ref().unwrap();
-                // Dup the master for reading — register with mio as stdout.
-                let dup_fd = unsafe { libc::dup(mfd.as_raw_fd()) };
-                if dup_fd < 0 {
-                    state.child_slots[slot] = None;
-                    let reply = Reply::Spawn {
-                        id,
-                        ok: false,
-                        child_id: None,
-                        pid: None,
-                        error: Some(ErrorReply::new(
-                            ErrorCode::Internal,
-                            format!("dup master fd: {}", std::io::Error::last_os_error()),
-                        )),
+            let (effective_stdout, effective_stdin, effective_master, send_fd) =
+                if client_is_stream && spawned.master_fd.is_some() {
+                    let mfd = spawned.master_fd.as_ref().unwrap();
+                    // Dup the master for reading — register with mio as stdout.
+                    let dup_fd = unsafe { libc::dup(mfd.as_raw_fd()) };
+                    if dup_fd < 0 {
+                        state.child_slots[slot] = None;
+                        let reply = Reply::Spawn {
+                            id,
+                            ok: false,
+                            child_id: None,
+                            pid: None,
+                            error: Some(ErrorReply::new(
+                                ErrorCode::Internal,
+                                format!("dup master fd: {}", std::io::Error::last_os_error()),
+                            )),
+                        };
+                        state.send_to_client(client_fd, &Frame::Reply(reply), None);
+                        return;
+                    }
+                    let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                    // Use master as stdin so Write ops go to PTY input.
+                    let mfd_dup2 = unsafe { libc::dup(mfd.as_raw_fd()) };
+                    let stdin_owned = if mfd_dup2 >= 0 {
+                        Some(unsafe { OwnedFd::from_raw_fd(mfd_dup2) })
+                    } else {
+                        None
                     };
-                    state.send_to_client(client_fd, &Frame::Reply(reply), None);
-                    return;
-                }
-                let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-                // Use master as stdin so Write ops go to PTY input.
-                let mfd_dup2 = unsafe { libc::dup(mfd.as_raw_fd()) };
-                let stdin_owned = if mfd_dup2 >= 0 {
-                    Some(unsafe { OwnedFd::from_raw_fd(mfd_dup2) })
+                    (Some(dup_owned), stdin_owned, spawned.master_fd, None)
                 } else {
-                    None
+                    // SeqPacket or Pipes: send master fd via SCM_RIGHTS as usual.
+                    let send_fd = spawned.master_fd.as_ref().map(|f| f.as_raw_fd());
+                    (spawned.stdout_fd, spawned.stdin_fd, spawned.master_fd, send_fd)
                 };
-                (Some(dup_owned), stdin_owned, spawned.master_fd, None)
-            } else {
-                // SeqPacket or Pipes: send master fd via SCM_RIGHTS as usual.
-                let send_fd = spawned.master_fd.as_ref().map(|f| f.as_raw_fd());
-                (
-                    spawned.stdout_fd,
-                    spawned.stdin_fd,
-                    spawned.master_fd,
-                    send_fd,
-                )
-            };
 
             // Register pumpable fds with mio.
             if let Some(fd) = effective_stdout.as_ref() {

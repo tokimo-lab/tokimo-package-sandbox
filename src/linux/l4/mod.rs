@@ -21,7 +21,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::net_observer::{HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
+use crate::host::net_observer::{HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ pub(crate) struct L4Config {
     pub allow_hosts: Vec<HostPattern>,
     /// true for `Gated`; false for `Observed`.
     pub enforce_allow: bool,
-    pub bridge: Option<Arc<crate::bridge::L4L7Bridge>>,
+    pub bridge: Option<Arc<crate::linux::bridge::L4L7Bridge>>,
 }
 
 impl L4Config {
