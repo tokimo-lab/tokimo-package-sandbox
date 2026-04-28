@@ -173,7 +173,7 @@ pub(crate) struct ProxyConfig {
     /// true for `Gated`; false for `Observed` (report but never block on host rules).
     pub enforce_allow: bool,
     #[cfg(target_os = "linux")]
-    pub bridge: Option<Arc<crate::bridge::L4L7Bridge>>,
+    pub bridge: Option<Arc<crate::linux::bridge::L4L7Bridge>>,
 }
 
 impl ProxyConfig {

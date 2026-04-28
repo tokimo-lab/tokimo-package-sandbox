@@ -16,8 +16,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 
-use crate::init_protocol::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
-use crate::init_wire::{recv_frame, send_frame};
+use crate::protocol::types::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
+use crate::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
 use crate::{Error, Result};
 
 /// Outbound op id sequence.
@@ -361,7 +361,7 @@ impl InitClient {
                 .lock()
                 .map_err(|_| Error::exec("send lock poisoned"))?;
             let bf = unsafe { BorrowedFd::borrow_raw(self.inner.sock.as_raw_fd()) };
-            send_frame(bf, &Frame::Op(op), None)?;
+            send_frame_seqpacket(bf, &Frame::Op(op), None)?;
         }
         // Wait for matching reply.
         let deadline = Instant::now() + timeout;
@@ -616,7 +616,7 @@ impl InitClient {
 fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
     let bf = unsafe { BorrowedFd::borrow_raw(sock_fd) };
     loop {
-        match recv_frame(bf) {
+        match recv_frame_seqpacket(bf) {
             Ok(None) => break,
             Ok(Some((frame, fd))) => {
                 let (lock, cv) = &*state;
@@ -667,5 +667,5 @@ fn reply_id(r: &Reply) -> String {
 #[allow(dead_code)]
 fn _silence() {
     let _: Result<()> = Err(Error::exec(""));
-    let _: ErrorReply = ErrorReply::new(crate::init_protocol::ErrorCode::Internal, "");
+    let _: ErrorReply = ErrorReply::new(crate::protocol::types::ErrorCode::Internal, "");
 }

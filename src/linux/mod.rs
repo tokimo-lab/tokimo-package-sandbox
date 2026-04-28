@@ -2,11 +2,16 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::common::{pipe_stdio, spawn_run, which};
+pub(crate) mod bridge;
+pub(crate) mod init_client;
+pub(crate) mod l4;
+pub(crate) mod seccomp;
+
 use crate::config::{NetworkPolicy, SandboxConfig, SystemLayout};
-use crate::l4::{self, L4Config, L4Handle};
-use crate::net_observer::{self, ProxyConfig, ProxyHandle};
-use crate::seccomp::generate_bpf_file;
+use crate::host::common::{pipe_stdio, spawn_run, which};
+use crate::host::net_observer::{self, ProxyConfig, ProxyHandle};
+use crate::linux::l4::{L4Config, L4Handle};
+use crate::linux::seccomp::generate_bpf_file;
 use crate::{Error, ExecutionResult, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -118,7 +123,7 @@ fn run_with_bwrap(bwrap: &Path, user_cmd: &[impl AsRef<str>], cfg: &SandboxConfi
             .map_err(|e| Error::exec(format!("spawn bwrap failed: {}", e)))?;
         let child_pid = child.id() as i32;
         let exit_rx = keepalive.finalize_l4(child_pid)?;
-        let result = crate::common::wait_with_io_ext(
+        let result = crate::host::common::wait_with_io_ext(
             &mut child,
             cfg.stdin.as_deref(),
             &cfg.limits,
@@ -282,7 +287,7 @@ fn build_bwrap_command_inner(
             }
             NetworkPolicy::Observed { sink } => {
                 cmd.args(["--share-net"]);
-                let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
+                let bridge = Arc::new(crate::linux::bridge::L4L7Bridge::new());
                 let handle = net_observer::start_proxy(ProxyConfig {
                     sink: sink.clone(),
                     allow_hosts: vec![],
@@ -311,7 +316,7 @@ fn build_bwrap_command_inner(
                 dns_policy: _,
             } => {
                 cmd.args(["--share-net"]);
-                let bridge = Arc::new(crate::bridge::L4L7Bridge::new());
+                let bridge = Arc::new(crate::linux::bridge::L4L7Bridge::new());
                 let handle = net_observer::start_proxy(ProxyConfig {
                     sink: sink.clone(),
                     allow_hosts: allow_hosts.clone(),
@@ -411,7 +416,7 @@ fn build_bwrap_command_inner(
     unsafe {
         cmd.pre_exec(move || {
             use nix::libc::{F_GETFD, F_SETFD, FD_CLOEXEC, close, dup2, fcntl};
-            crate::common::apply_rlimits(&limits);
+            crate::host::common::apply_rlimits(&limits);
             if let Some(src_fd) = seccomp_fd {
                 const SLOT: i32 = 3;
                 if src_fd == SLOT {
@@ -533,7 +538,7 @@ fn run_with_firejail(firejail: &Path, user_cmd: &[impl AsRef<str>], cfg: &Sandbo
     let limits = cfg.limits;
     unsafe {
         cmd.pre_exec(move || {
-            crate::common::apply_rlimits(&limits);
+            crate::host::common::apply_rlimits(&limits);
             Ok(())
         });
     }
@@ -565,7 +570,7 @@ fn run_with_firejail(firejail: &Path, user_cmd: &[impl AsRef<str>], cfg: &Sandbo
 /// identical to a normal `Child`'s stdout/stderr to the sentinel parser —
 /// keeping the framing logic in `session.rs` unchanged.
 pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
-    use crate::init_client::InitClient;
+    use crate::linux::init_client::InitClient;
     use std::io::Write as _;
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -794,9 +799,9 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
 /// The [`ChildHandle`] drains stdout/stderr events into memory via the
 /// shared `InitClient` reader thread.
 struct PipeJobOutput {
-    handle: crate::init_client::ChildHandle,
+    handle: crate::linux::init_client::ChildHandle,
     /// Keep the `InitClient` alive until wait completes.
-    _client: Arc<crate::init_client::InitClient>,
+    _client: Arc<crate::linux::init_client::InitClient>,
 }
 
 impl crate::session::JobOutput for PipeJobOutput {
@@ -813,7 +818,7 @@ impl crate::session::JobOutput for PipeJobOutput {
 /// Open a PTY child via the given init client. Used by both
 /// `Session::open_pty` and the PTY factory closure stored on `ShellHandle`.
 pub(crate) fn open_pty_via_init(
-    client: &Arc<crate::init_client::InitClient>,
+    client: &Arc<crate::linux::init_client::InitClient>,
     rows: u16,
     cols: u16,
     argv: &[String],
@@ -870,7 +875,7 @@ struct InitLifecycle {
 use std::sync::Condvar;
 
 struct InitClientStdin {
-    client: Arc<crate::init_client::InitClient>,
+    client: Arc<crate::linux::init_client::InitClient>,
     child_id: String,
     closed: bool,
 }
@@ -912,7 +917,7 @@ impl Drop for InitClientStdin {
 /// causes bwrap to receive `SIGKILL` via `PDEATHSIG`.
 struct InitKeepalive {
     spawned: Option<crate::linux::SpawnedInit>,
-    client: Option<Arc<crate::init_client::InitClient>>,
+    client: Option<Arc<crate::linux::init_client::InitClient>>,
     pump: Option<std::thread::JoinHandle<()>>,
     pump_stop: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1115,7 +1120,7 @@ pub fn spawn_init_workspace(cfg: &SandboxConfig) -> Result<SpawnedInit> {
 
     let inner_argv = ["/.tokimo-sandbox-init"];
     // Pass BPF bytes to init for per-child seccomp install.
-    let bpf_bytes = crate::seccomp::generate_bpf_bytes();
+    let bpf_bytes = crate::linux::seccomp::generate_bpf_bytes();
     let bpf_b64: String = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(&bpf_bytes)

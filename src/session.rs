@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -39,7 +39,7 @@ use crate::{Error, Result};
 
 /// Guest-side directory for per-job capture files (non-Linux fallback only;
 /// Linux uses pipe-mode capture via init control socket).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const GUEST_CAPTURE_DIR: &str = "/tmp";
 
 /// Result of a single `Session::exec` (or `JobHandle::wait`) call.
@@ -103,10 +103,8 @@ pub type SpawnAsyncFn = Box<dyn Fn(u64, &str) -> Result<Box<dyn JobOutput>> + Se
 /// Factory for killing a previously spawned background job by its
 /// session-local job id. Returns `Ok(())` if the signal was dispatched;
 /// does not guarantee the job has exited.
-///
-/// `None` on platforms without an init control socket (macOS/Windows).
-#[cfg(target_os = "linux")]
-pub type KillSpawnFn = Box<dyn Fn(u64) -> Result<()> + Send + Sync>;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) type KillSpawnFn = Box<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
 /// A PTY child running inside the sandbox. Exposes the master fd directly for
 /// raw read/write (suitable for terminal_ws bidirectional copy). Resize/kill
@@ -224,8 +222,8 @@ pub(crate) struct ShellHandle {
     /// Spawn a background job via init's pipe mode, returning a [`JobOutput`]
     /// handle immediately. `None` on platforms without an init control socket.
     pub spawn_async: Option<Arc<SpawnAsyncFn>>,
-    /// Kill a background job by its session-local id. Linux-only.
-    #[cfg(target_os = "linux")]
+    /// Kill a background job by its session-local id.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
@@ -238,14 +236,14 @@ pub struct Session {
     readers: Vec<JoinHandle<()>>,
     timeout: Duration,
     /// Host-side directory for per-job capture files (non-Linux fallback only).
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     capture_dir: PathBuf,
     open_pty: Option<Arc<OpenPtyFn>>,
     run_oneshot: Option<Arc<RunOneshotFn>>,
     /// Spawn a background job via pipe mode. `None` on non-Linux.
     spawn_async: Option<Arc<SpawnAsyncFn>>,
-    /// Kill a background job by its session-local id. Linux-only.
-    #[cfg(target_os = "linux")]
+    /// Kill a background job by its session-local id.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     kill_spawn: Option<Arc<KillSpawnFn>>,
 }
 
@@ -265,13 +263,13 @@ impl Session {
         let r1 = spawn_reader(stdout, sid.clone(), Stream::Stdout, state.clone());
         let r2 = spawn_reader(stderr, sid.clone(), Stream::Stderr, state.clone());
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let capture_dir = cfg.work_dir.canonicalize().unwrap_or_else(|_| cfg.work_dir.clone());
 
         let open_pty = handle.open_pty.clone();
         let run_oneshot = handle.run_oneshot.clone();
         let spawn_async = handle.spawn_async.clone();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let kill_spawn = handle.kill_spawn.clone();
 
         Ok(Self {
@@ -282,12 +280,12 @@ impl Session {
             counter: 0,
             readers: vec![r1, r2],
             timeout: Duration::from_secs(cfg.limits.timeout_secs.max(1)),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             capture_dir,
             open_pty,
             run_oneshot,
             spawn_async,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             kill_spawn,
         })
     }
@@ -509,7 +507,7 @@ impl Session {
     }
 
     /// File-mode spawn fallback for platforms without an init control socket.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn spawn_file_mode(&mut self, cmd: &str, id: u64) -> Result<JobHandle> {
         let stdin = self.stdin.as_mut().ok_or_else(|| Error::exec("session is closed"))?;
         let delim = format!("__SB_EOF_{}_{}__", self.sid, id);
@@ -549,9 +547,9 @@ impl Session {
     }
 
     /// Stub — never called on Linux (spawn_async is always Some).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn spawn_file_mode(&self, _cmd: &str, _id: u64) -> Result<JobHandle> {
-        unreachable!("spawn_async is always Some on Linux")
+        unreachable!("spawn_async is always Some on Linux/macOS")
     }
 
     /// Send `SIGKILL` to a previously-spawned job's entire process group.
@@ -572,7 +570,7 @@ impl Session {
     /// `Err`.
     /// Send `SIGKILL` to a previously-spawned job's entire process group.
     /// On Linux (pipe mode) this is not yet supported and returns an error.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| Error::exec("session is closed"))?;
         let pid_name = format!(".tps_job_{}_{}.pid", self.sid, job_id);
@@ -592,7 +590,7 @@ impl Session {
     }
 
     /// Send SIGKILL to a pipe-mode job via the init control socket.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn kill_job(&mut self, job_id: u64) -> Result<()> {
         let killer = self
             .kill_spawn
@@ -685,7 +683,7 @@ impl JobHandle {
 
 /// File-mode [`JobOutput`] implementation for non-Linux platforms.
 /// Reads captured output from per-job files written by the bash script.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct FileJobOutput {
     sid: String,
     id: u64,
@@ -693,7 +691,7 @@ struct FileJobOutput {
     capture_dir: PathBuf,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl JobOutput for FileJobOutput {
     fn wait_with_timeout(&self, timeout: Duration) -> Result<ExecOutput> {
         let deadline = Instant::now() + timeout;
@@ -947,8 +945,8 @@ fn spawn_session_shell(_cfg: &SandboxConfig) -> Result<ShellHandle> {
 }
 
 /// Build a `ShellHandle` from a normal `std::process::Child` whose stdio is
-/// piped. Used by the macOS and Windows backends.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// piped. Used by the Windows backend.
+#[cfg(target_os = "windows")]
 pub(crate) fn shell_handle_from_child(
     mut child: std::process::Child,
     keepalive: Box<dyn std::any::Any + Send>,
@@ -995,7 +993,7 @@ pub(crate) fn shell_handle_from_child(
         open_pty: None,
         run_oneshot: None,
         spawn_async: None,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         kill_spawn: None,
     })
 }

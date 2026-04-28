@@ -2,3 +2,5 @@
 Cargo.lock
 *.swp
 .DS_Store
+# Local test rootfs (downloaded by CI / dev via TOKIMO_TEST_ROOTFS env)
+/.test-rootfs/

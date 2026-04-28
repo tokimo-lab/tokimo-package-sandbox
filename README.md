@@ -162,6 +162,64 @@ In console mode, no UAC or service installation is needed — the library auto-d
 
 To uninstall: `.\tokimo-sandbox-svc.exe --uninstall` (needs admin).
 
+## Crate structure
+
+```
+src/
+├── lib.rs                  ── public surface + cross-platform `run()`
+├── config.rs               ── SandboxConfig / Mount / NetworkPolicy / ResourceLimits
+├── error.rs                ── Error / Result / ExecutionResult
+├── session.rs              ── Session / JobHandle / PtyHandle (platform dispatch)
+│
+├── protocol/               ── init control protocol (host ↔ tokimo-sandbox-init)
+│   ├── types.rs            ──   Op / Result / Event / wire frames
+│   └── wire.rs             ──   length-prefixed JSON + SCM_RIGHTS framing
+│
+├── host/                   ── host-side cross-platform helpers
+│   ├── common.rs           ──   pipe_stdio / spawn_run / rlimits  (Unix)
+│   ├── pty.rs              ──   master PTY allocation + raw-mode  (macOS)
+│   └── net_observer.rs     ──   L7 HTTP(S) proxy + DnsPolicy + NetEvent sinks
+│
+├── linux/                  ── Linux backend (bwrap + seccomp + cgroups)
+│   ├── mod.rs              ──   run() / spawn_init() / SpawnedInit
+│   ├── bridge.rs           ──   L4 ↔ L7 verdict bridge
+│   ├── seccomp.rs          ──   BPF program codegen
+│   ├── init_client.rs      ──   host-side InitClient (SOCK_SEQPACKET)
+│   └── l4/                 ──   seccomp-notify + seccomp-trace + scaffold eBPF observer
+│
+├── macos/                  ── macOS backend (Virtualization.framework)
+│   ├── mod.rs              ──   run() / spawn_session_shell()
+│   ├── vz.rs               ──   one-shot VM (kernel + initrd + virtiofs)
+│   ├── vz_session.rs       ──   persistent VM runner
+│   └── vz_vsock.rs         ──   InitClient over VSOCK
+│
+├── windows/                ── Windows backend (HCS via SYSTEM service)
+│   ├── mod.rs              ──   run() → client::exec_vm()
+│   ├── client.rs           ──   named-pipe client to tokimo-sandbox-svc
+│   └── protocol.rs         ──   wire types (re-exported as `svc_protocol`)
+│
+├── workspace/              ── multi-user Workspace (Linux + macOS)
+│   ├── mod.rs              ──   Workspace / UserHandle / UserConfig
+│   └── any_init.rs         ──   AnyInitClient enum (Linux | macOS)
+│
+└── bin/
+    ├── tokimo-sandbox-init/  ── PID 1 inside the Linux/VM container
+    │   ├── main.rs           ──   transport dispatch (SOCK_SEQPACKET / VSOCK)
+    │   ├── server.rs         ──   protocol loop
+    │   ├── child.rs          ──   spawn / waitpid / pidfd
+    │   └── pty.rs            ──   slave PTY setup
+    │
+    └── tokimo-sandbox-svc/   ── Windows SYSTEM service for HCS VM lifecycle
+        └── main.rs           ──   reuses `svc_protocol` types from the lib
+```
+
+Public re-exports (see `lib.rs`): `SandboxConfig`, `Mount`, `NetworkPolicy`, `ResourceLimits`,
+`SystemLayout`, `Session`, `JobHandle`, `PtyHandle`, `RunOneshotFn`, `OpenPtyFn`, `ExecOutput`,
+`Workspace`, `WorkspaceConfig`, `UserConfig`, `UserHandle`, `Error`, `Result`, `ExecutionResult`,
+`NetEvent`, `NetEventSink`, `Verdict`, `Layer`, `Proto`, `DnsPolicy`, `HostPattern`,
+`SpawnedInit`, `spawn_init`, `locate_init_binary`, `InitClient`, `SpawnInfo`,
+`generate_bpf_bytes`, `protocol::{types, wire}`, `svc_protocol` (Windows only).
+
 ## Architecture
 
 ### Linux
@@ -198,7 +256,7 @@ macOS host
   │     ├─ VirtualMachineConfiguration
   │     │     ├─ LinuxBootLoader(kernel, initrd)  ← cmd_b64 via kernel cmdline
   │     │     ├─ VirtioFileSystem("work")          ← rootfs shared via virtiofs
-  │     │     ├─ VirtioSocket                       ← VSOCK (future Session)
+  │     │     ├─ VirtioSocket                       ← VSOCK for persistent Session
   │     │     └─ VirtioConsole (serial)             ← boot diagnostics
   │     │
   │     ├─ vm.start()
@@ -271,7 +329,7 @@ pub struct ExecutionResult {
 }
 ```
 
-### Persistent sessions (Linux only)
+### Persistent sessions (Linux + macOS)
 
 ```rust
 let mut sess = Session::open(&cfg)?;
@@ -282,6 +340,9 @@ let result = job.wait_with_timeout(Duration::from_secs(10))?;
 let pty = sess.open_pty(24, 80, &["/bin/bash".into()], &[], None)?;
 sess.close()?;
 ```
+
+Windows currently exposes only one-shot `run()`. Sessions on Windows are
+tracked but not yet implemented.
 
 ### Configuration
 
@@ -310,19 +371,31 @@ On Linux, `Observed` / `Gated` layer seccomp-notify (L4) + transparent HTTP(S) p
 ## Examples
 
 ```bash
-cargo run --example basic             # One-shot: ls, id, hostname
-cargo run --example shell             # Interactive shell (Linux bwrap)
-cargo run --example rm_rf_test        # Proves rm -rf / can't touch host
-cargo run --example session           # Persistent session (Linux)
-cargo run --example vz_smoke          # macOS VZ toolchain smoke test
-cargo run --example hv_smoke          # Windows Hyper-V service smoke test
-cargo run --example gated_network     # Network observability (Linux)
-cargo run --example l4_observer       # L4+L7 event pipeline (Linux)
+# Cross-platform one-shot
+cargo run --example basic               # ls / id / hostname
+cargo run --example rm_rf_test          # proves rm -rf / can't touch host
+cargo run --example concurrent_oneshot  # parallel run() calls
+cargo run --example edge_cases          # boundary inputs
+cargo run --example torture_test        # stress test
+
+# Linux-only (bwrap + seccomp)
+cargo run --example shell               # interactive shell
+cargo run --example session             # persistent Session
+cargo run --example parallel_in_session # multiple jobs in one Session
+cargo run --example kill_job            # JobHandle::kill / wait
+cargo run --example pty_smoke           # PTY allocation + raw mode
+cargo run --example init_smoke          # tokimo-sandbox-init protocol
+cargo run --example gated_network       # network observability (Gated)
+cargo run --example l4_observer         # L4 + L7 event pipeline
+
+# Platform VM smoke tests
+cargo run --example vz_smoke            # macOS Virtualization.framework
+cargo run --example hv_smoke            # Windows Hyper-V SYSTEM service
 ```
 
 ## Init control protocol (v1, Linux)
 
-The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (future). PTY master fds via `SCM_RIGHTS`.
+The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (macOS Session). PTY master fds via `SCM_RIGHTS`.
 
 ```jsonc
 client → init  { "op": "Hello",      "protocol": 1 }

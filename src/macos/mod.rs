@@ -6,6 +6,8 @@
 #![cfg(target_os = "macos")]
 
 mod vz;
+pub(crate) mod vz_session;
+pub(crate) mod vz_vsock;
 
 use crate::config::SandboxConfig;
 use crate::{Error, ExecutionResult, Result};
@@ -19,9 +21,11 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<Execu
     vz::run(cmd, cfg)
 }
 
-pub(crate) fn spawn_session_shell(_cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
-    Err(Error::validation(
-        "Session shell is not yet supported on macOS VZ backend. \
-         Use run() for one-shot command execution.",
-    ))
+pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
+    if !vz::is_available() {
+        return Err(Error::validation(
+            "Virtualization.framework not available (requires macOS 11+)",
+        ));
+    }
+    vz_session::spawn_session_shell(cfg)
 }

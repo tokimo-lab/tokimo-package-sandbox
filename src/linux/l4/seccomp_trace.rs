@@ -30,7 +30,7 @@
 //!      attached, so any `connect()` during the sandboxed program traps.
 
 use super::{L4Config, Shutdown, build_event};
-use crate::net_observer::Proto;
+use crate::host::net_observer::Proto;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::os::unix::process::ExitStatusExt;

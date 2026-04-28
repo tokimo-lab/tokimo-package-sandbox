@@ -9,30 +9,19 @@
 
 mod config;
 mod error;
-mod net_observer;
-mod result;
+mod host;
 mod session;
 
-pub mod init_protocol;
+pub mod diagnostics;
+pub mod protocol;
+pub mod util;
 
-#[cfg(target_os = "linux")]
-pub mod init_wire;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod profile;
 
-#[cfg(target_os = "linux")]
-pub mod init_client;
-
-#[cfg(unix)]
-mod common;
-
-#[cfg(target_os = "linux")]
-mod bridge;
-#[cfg(target_os = "linux")]
-mod l4;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-mod seccomp;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod workspace;
 
 #[cfg(target_os = "macos")]
@@ -40,23 +29,27 @@ mod macos;
 
 #[cfg(target_os = "windows")]
 mod windows;
+/// Wire protocol shared between the host library and `tokimo-sandbox-svc.exe`.
+#[cfg(target_os = "windows")]
+pub mod svc_protocol {
+    pub use crate::windows::protocol::*;
+}
 
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
-pub use error::{Error, Result};
-pub use net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
-pub use result::ExecutionResult;
+pub use diagnostics::is_session_fatal_message;
+pub use error::{Error, ExecutionResult, Result};
+pub use host::net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Session};
+pub use util::safe_session_name;
 
+#[cfg(target_os = "linux")]
+pub use linux::init_client::{InitClient, SpawnInfo};
+#[cfg(target_os = "linux")]
+pub use linux::seccomp::generate_bpf_bytes;
 #[cfg(target_os = "linux")]
 pub use linux::{SpawnedInit, locate_init_binary, spawn_init};
 
-#[cfg(target_os = "linux")]
-pub use seccomp::generate_bpf_bytes;
-
-#[cfg(target_os = "linux")]
-pub use init_client::{InitClient, SpawnInfo};
-
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use workspace::{UserConfig, UserHandle, Workspace, WorkspaceConfig};
 
 /// Execute `cmd` inside the sandbox configured by `cfg`.
@@ -110,8 +103,8 @@ fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<
     } else {
         c.current_dir(&cfg.work_dir);
     }
-    common::pipe_stdio(&mut c);
-    common::spawn_run(&mut c, cfg.stdin.as_deref(), &cfg.limits, cfg.stream_stderr)
+    host::common::pipe_stdio(&mut c);
+    host::common::spawn_run(&mut c, cfg.stdin.as_deref(), &cfg.limits, cfg.stream_stderr)
 }
 
 #[cfg(windows)]
