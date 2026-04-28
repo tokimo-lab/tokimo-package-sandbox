@@ -449,6 +449,14 @@ fn network_observed_sink_records_events() -> TestResult {
     let Some(rootfs) = gate("network_observed_sink_records_events") else {
         return Ok(());
     };
+    // Skip on CI hosts where seccomp_notify + host HTTP proxy loopback
+    // is unreliable (observed deadlock on hosted GitHub runners). Run
+    // locally where networking + kernel features are predictable.
+    // See https://github.com/tokimo-lab/tokimo-package-sandbox/issues/1
+    if std::env::var_os("TOKIMO_SKIP_NETWORK_OBSERVED").is_some() {
+        eprintln!("network_observed_sink_records_events: SKIP (TOKIMO_SKIP_NETWORK_OBSERVED set)");
+        return Ok(());
+    }
     let host = RootHost::new();
     let workspace = host.make_dir("ws");
     let mut mounts = rootfs_system_mounts(&rootfs);
