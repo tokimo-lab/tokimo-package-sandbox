@@ -4,6 +4,7 @@
 //!   tokimo-sandbox-svc --install     Install & start the service (needs admin)
 //!   tokimo-sandbox-svc --uninstall   Stop & remove the service (needs admin)
 //!   tokimo-sandbox-svc               Run as a Windows service (called by SCM)
+//!   tokimo-sandbox-svc --console     Run pipe server in foreground (debugging)
 
 #![cfg(target_os = "windows")]
 
