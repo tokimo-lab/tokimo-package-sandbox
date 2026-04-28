@@ -1,7 +1,7 @@
-//! Multi-user [`Workspace`] — a shared bwrap container with per-user isolation.
+//! Multi-user [`Workspace`] — a shared sandbox container with per-user isolation.
 //!
 //! A single `Workspace` holds one `tokimo-sandbox-init` container. Each user
-//! gets an independent [`InitClient`] connection + bash shell with isolated
+//! gets an independent init-client connection + bash shell with isolated
 //! `$TMPDIR`, cwd, and process lifecycle.
 //!
 //! # Example
@@ -17,18 +17,35 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::any_init::AnyInitClient;
 use crate::config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig};
-use crate::init_client::InitClient;
-use crate::linux::{SpawnedInit, spawn_init_workspace};
 use crate::session::ExecOutput;
 use crate::{Error, Result};
+
+/// Platform-specific container state.
+///
+/// On Linux this is the bwrap child process + host control directory.
+/// On macOS this is the persistent VM runner.
+enum AnyContainer {
+    #[cfg(target_os = "linux")]
+    Linux {
+        spawned: crate::linux::SpawnedInit,
+        host_sock: PathBuf,
+    },
+    #[cfg(target_os = "macos")]
+    MacOs {
+        #[allow(dead_code)]
+        runner: crate::macos::vz_session::VzSessionRunner,
+        client: Arc<crate::macos::vz_vsock::VsockInitClient>,
+    },
+}
 
 /// Configuration for a multi-user [`Workspace`].
 #[derive(Debug, Clone)]
@@ -118,24 +135,15 @@ impl UserConfig {
 /// Handle to a single user inside a [`Workspace`].
 pub struct UserHandle {
     pub user_id: String,
-    client: Arc<InitClient>,
+    client: AnyInitClient,
     shell_id: String,
     timeout: Duration,
 }
 
 /// A shared sandbox container hosting multiple isolated users.
-///
-/// Created via [`Workspace::open`]. Users are added dynamically via
-/// [`Workspace::add_user`]; each gets an independent bash shell with
-/// isolated `$TMPDIR` and working directory.
 pub struct Workspace {
-    /// Holds the spawned init process. Never directly read but must be kept alive
-    /// for the entire lifetime of the workspace. On drop, triggers cleanup via
-    /// bwrap's PDEATHSIG.
-    #[allow(dead_code)]
-    spawned: SpawnedInit,
+    container: AnyContainer,
     users: HashMap<String, UserHandle>,
-    host_sock: PathBuf,
 }
 
 impl Workspace {
@@ -143,43 +151,17 @@ impl Workspace {
     /// call [`Workspace::add_user`] for each.
     pub fn open(cfg: &WorkspaceConfig) -> Result<Self> {
         let sandbox_cfg = cfg.to_sandbox_config();
-        let mut spawned = spawn_init_workspace(&sandbox_cfg)?;
-        let host_sock = spawned.host_control_dir.path().join("control.sock");
-
-        // Wait for init to bind the control socket.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !host_sock.exists() {
-            if let Ok(Some(status)) = spawned.child.try_wait() {
-                let mut stderr = String::new();
-                if let Some(ref mut pipe) = spawned.child.stderr {
-                    use std::io::Read;
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                return Err(Error::exec(format!(
-                    "init exited with {status} before binding control socket at {}; stderr: {stderr}",
-                    host_sock.display()
-                )));
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(Error::exec(format!(
-                    "control socket never appeared at {}",
-                    host_sock.display()
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
+        let container = open_container(&sandbox_cfg)?;
         Ok(Self {
-            spawned,
+            container,
             users: HashMap::new(),
-            host_sock,
         })
     }
 
-    /// Add a user. Connects a new [`InitClient`] to the running init,
-    /// sends `AddUser`, and records the resulting shell `child_id`.
+    /// Add a user. Connects a new init client, sends `AddUser`, and records
+    /// the resulting shell `child_id`.
     pub fn add_user(&mut self, cfg: &UserConfig) -> Result<()> {
-        let client = Arc::new(InitClient::connect(&self.host_sock)?);
+        let client = workspace_connect(&self.container)?;
         client.hello()?;
 
         let env_overlay: Vec<(String, String)> = cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -200,10 +182,6 @@ impl Workspace {
     pub fn remove_user(&mut self, user_id: &str) -> Result<()> {
         if let Some(handle) = self.users.remove(user_id) {
             handle.client.remove_user(user_id)?;
-            // Drop the handle explicitly to close the socket, then give the
-            // init event loop a tick to process the EOF + disconnect before
-            // the next user connects. Without this, a rapid add_user after
-            // remove may race with the init's poll batch ordering.
             drop(handle);
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -252,19 +230,16 @@ impl Workspace {
         Ok(info.child_id)
     }
 
-    /// Re-create the user's bash shell after it died (e.g., due to timeout
-    /// or accidental kill). The new shell inherits the same user config.
+    /// Re-create the user's bash shell after it died.
     pub fn respawn_shell(&mut self, user_id: &str) -> Result<()> {
         let handle = self
             .users
             .get(user_id)
             .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
         let info = handle.client.add_user(user_id, &[], None)?;
-        // We need to update the shell_id. Since UserHandle doesn't have
-        // interior mutability, rebuild the handle.
         let new_handle = UserHandle {
             user_id: handle.user_id.clone(),
-            client: handle.client.clone(),
+            client: handle.client.clone_arc(),
             shell_id: info.child_id,
             timeout: handle.timeout,
         };
@@ -272,8 +247,7 @@ impl Workspace {
         Ok(())
     }
 
-    /// Dynamically bind-mount a path for a specific user. `source` must
-    /// already be visible inside the container.
+    /// Dynamically bind-mount a path for a specific user.
     pub fn add_mount(&self, user_id: &str, source: &str, target: &str, read_only: bool) -> Result<()> {
         let user = self
             .users
@@ -307,23 +281,77 @@ impl Workspace {
 
     /// Shut down the entire container and all users.
     pub fn close(mut self) -> Result<()> {
-        // Remove all users.
         let user_ids: Vec<String> = self.users.keys().cloned().collect();
         for uid in &user_ids {
             let _ = self.remove_user(uid);
         }
-        // SpawnedInit is dropped when `self` goes out of scope,
-        // triggering bwrap PDEATHSIG cleanup.
         Ok(())
-    }
-
-    /// Access the underlying [`InitClient`] for a user (for advanced use).
-    pub fn client(&self, user_id: &str) -> Option<&Arc<InitClient>> {
-        self.users.get(user_id).map(|h| &h.client)
     }
 
     /// Get the shell `child_id` for a user.
     pub fn shell_id(&self, user_id: &str) -> Option<&str> {
         self.users.get(user_id).map(|h| h.shell_id.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific container lifecycle
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn open_container(cfg: &SandboxConfig) -> Result<AnyContainer> {
+    let mut spawned = crate::linux::spawn_init_workspace(cfg)?;
+    let host_sock = spawned.host_control_dir.path().join("control.sock");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !host_sock.exists() {
+        if let Ok(Some(status)) = spawned.child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(ref mut pipe) = spawned.child.stderr {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            return Err(Error::exec(format!(
+                "init exited with {status} before binding control socket at {}; stderr: {stderr}",
+                host_sock.display()
+            )));
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(Error::exec(format!(
+                "control socket never appeared at {}",
+                host_sock.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Ok(AnyContainer::Linux { spawned, host_sock })
+}
+
+#[cfg(target_os = "macos")]
+fn open_container(cfg: &SandboxConfig) -> Result<AnyContainer> {
+    let runner = crate::macos::vz_session::boot_session_vm(cfg)?;
+    let client = runner.client().clone();
+    Ok(AnyContainer::MacOs { runner, client })
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_connect(container: &AnyContainer) -> Result<AnyInitClient> {
+    match container {
+        AnyContainer::Linux { host_sock, .. } => {
+            let client = Arc::new(crate::init_client::InitClient::connect(host_sock)?);
+            Ok(AnyInitClient::Linux(client))
+        }
+        #[cfg(target_os = "macos")]
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn workspace_connect(container: &AnyContainer) -> Result<AnyInitClient> {
+    match container {
+        AnyContainer::MacOs { client, .. } => Ok(AnyInitClient::MacOs(Arc::clone(client))),
+        #[cfg(target_os = "linux")]
+        _ => unreachable!(),
     }
 }

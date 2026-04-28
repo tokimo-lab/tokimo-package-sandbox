@@ -1,93 +1,160 @@
-//! Host-side client for the in-sandbox `tokimo-sandbox-init`. Synchronous
-//! API that mirrors the wire protocol from `init_protocol`. A background
-//! reader thread demuxes init's reply / event packets into per-call channels.
+//! VSOCK transport for host ↔ init communication on macOS.
+//!
+//! The Virtualization.framework VM exposes one or more virtio-vsock ports.
+//! This module wraps the host-side VSOCK connection (a raw fd obtained from
+//! [`VirtioSocketConnection::into_raw_fd`][arcbox_vz::VirtioSocketConnection])
+//! and speaks the length-prefixed init wire protocol over it.
+//!
+//! ```text
+//! macOS host                          Linux guest (VM)
+//! ──────────                          ────────────────
+//! VsockInitClient                     tokimo-sandbox-init
+//!   ├─ reader thread                    ├─ VSOCK listener (port 1)
+//!   ├─ send_frame_stream ──────────▶   ├─ handle_client_readable_vsock
+//!   └─ recv_frame_stream ◀──────────   └─ send_to_client (stream)
+//! ```
 
-#![cfg(target_os = "linux")]
+#![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+use base64::Engine;
 
-use crate::init_protocol::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
-use crate::init_wire::{recv_frame_seqpacket, send_frame_seqpacket};
+use crate::init_protocol::{default_features, Event, Frame, Op, Reply, StdioMode, PROTOCOL_VERSION};
+use crate::init_wire::{recv_frame_stream, send_frame_stream};
 use crate::{Error, Result};
 
-/// Outbound op id sequence.
-fn next_id(counter: &AtomicU64) -> String {
-    format!("h{}", counter.fetch_add(1, Ordering::Relaxed))
+/// Opaque transport wrapping a VSOCK file descriptor.
+///
+/// Created from the raw fd returned by
+/// [`VirtioSocketConnection::into_raw_fd`][arcbox_vz::VirtioSocketConnection].
+/// The fd is wrapped in a `std::fs::File` for safe blocking Read + Write.
+pub struct VsockTransport {
+    /// Write half (cloned fd at construction).
+    write: Option<std::fs::File>,
+    /// Original fd for the reader side.
+    read_fd: Option<RawFd>,
 }
 
-/// Per-child fan-out channel for stdout / stderr / exit events. Held inside
-/// the shared state so the reader thread can deliver into it.
-#[derive(Default)]
-pub struct ChildEvents {
-    pub stdout: Vec<Vec<u8>>,
-    pub stderr: Vec<Vec<u8>>,
-    pub exit: Option<(i32, Option<i32>)>,
+impl VsockTransport {
+    /// Create a transport from a raw VSOCK fd. The fd must be a valid,
+    /// connected virtio-vsock file descriptor.
+    ///
+    /// The fd is duplicated so we can have independent read and write
+    /// positions (one for the reader thread, one for the send path).
+    pub fn from_raw_fd(fd: RawFd) -> Result<Self> {
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            return Err(Error::exec(format!(
+                "dup VSOCK fd: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let write = unsafe { std::fs::File::from_raw_fd(dup) };
+        Ok(Self {
+            write: Some(write),
+            read_fd: Some(fd),
+        })
+    }
+
+    /// Create a transport from separate read and write fds (serial console).
+    pub fn from_raw_fd_pair(read_fd: RawFd, write_fd: RawFd) -> Result<Self> {
+        Ok(Self {
+            read_fd: Some(read_fd),
+            write: Some(unsafe { std::fs::File::from_raw_fd(write_fd) }),
+        })
+    }
+
+    pub fn from_owned_fd(fd: OwnedFd) -> Result<Self> {
+        Self::from_raw_fd(fd.into_raw_fd())
+    }
+
+    /// Take the read half as a `std::fs::File` for use in a reader thread.
+    /// After calling this, `write` (the dup'd fd) remains for sending.
+    pub fn take_read(&mut self) -> std::fs::File {
+        let fd = self.read_fd.take().expect("take_read called twice");
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    }
 }
+
+impl Drop for VsockTransport {
+    fn drop(&mut self) {
+        if let Some(fd) = self.read_fd.take() {
+            unsafe { libc::close(fd) };
+        }
+        // write's Drop closes its fd.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared state and event channels (mirrors InitClient architecture)
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Shared {
     /// child_id → buffered events (reader appends, consumer drains).
     children: HashMap<String, ChildEvents>,
-    /// Reply id → (Reply, optional fd). Reader inserts on arrival.
-    replies: HashMap<String, ReplyMsg>,
+    /// Reply id → Reply. Reader inserts on arrival.
+    replies: HashMap<String, Reply>,
     /// True when the reader thread observed EOF or a fatal error.
     eof: bool,
 }
 
-struct ReplyMsg {
-    reply: Reply,
-    fd: Option<OwnedFd>,
+#[derive(Default)]
+struct ChildEvents {
+    pub stdout: Vec<Vec<u8>>,
+    pub stderr: Vec<Vec<u8>>,
+    pub exit: Option<(i32, Option<i32>)>,
 }
 
-/// Synchronous client. Cheap to clone (the inner `Arc` carries the socket
-/// + shared state).
-pub struct InitClient {
+// ---------------------------------------------------------------------------
+// VsockInitClient
+// ---------------------------------------------------------------------------
+
+/// Synchronous client for the in-VM `tokimo-sandbox-init` over VSOCK.
+/// Cheap to clone (the inner `Arc` carries the transport + shared state).
+pub struct VsockInitClient {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    sock: OwnedFd,
-    /// Mutex around send so concurrent op submissions don't interleave on
-    /// the SEQPACKET (kernel handles atomicity per packet, but our build
-    /// of the JSON payload would otherwise be racy).
-    send_lock: Mutex<()>,
+    /// Writer half (cloned at construction time).
+    write: Mutex<std::fs::File>,
     state: Arc<(Mutex<Shared>, Condvar)>,
     counter: AtomicU64,
-    /// JoinHandle for the reader thread; held to keep it alive.
+    /// JoinHandle for the reader thread.
     _reader: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl InitClient {
-    /// Connect to the SEQPACKET socket at `path` (host-side bind path) and
-    /// spawn the background reader thread.
-    pub fn connect(path: &Path) -> Result<Self> {
-        let fd = socket(AddressFamily::Unix, SockType::SeqPacket, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(|e| Error::exec(format!("socket(SEQPACKET): {e}")))?;
-        let addr = UnixAddr::new(path).map_err(|e| Error::exec(format!("UnixAddr {path:?}: {e}")))?;
-        connect(fd.as_raw_fd(), &addr).map_err(|e| Error::exec(format!("connect {path:?}: {e}")))?;
+fn next_id(counter: &AtomicU64) -> String {
+    format!("h{}", counter.fetch_add(1, Ordering::Relaxed))
+}
 
+impl VsockInitClient {
+    /// Build a client from a VSOCK transport. Spawns the background reader
+    /// thread immediately.
+    pub fn new(mut transport: VsockTransport) -> Result<Self> {
+        let reader_file = transport.take_read();
+        let writer = transport.write.take().expect("write fd");
+        // Consume transport — Drop is a no-op since we took both fds.
+        std::mem::forget(transport);
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
-        let reader_fd_raw = fd.as_raw_fd();
+
         let reader = thread::Builder::new()
-            .name("tokimo-init-client-reader".into())
-            .spawn(move || reader_loop(reader_fd_raw, reader_state))
-            .map_err(|e| Error::exec(format!("spawn reader thread: {e}")))?;
+            .name("tokimo-vsock-reader".into())
+            .spawn(move || reader_loop(reader_file, reader_state))
+            .map_err(|e| Error::exec(format!("spawn vsock reader thread: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                sock: fd,
-                send_lock: Mutex::new(()),
+                write: Mutex::new(writer),
                 state,
                 counter: AtomicU64::new(0),
                 _reader: Mutex::new(Some(reader)),
@@ -95,8 +162,8 @@ impl InitClient {
         })
     }
 
-    /// Send Hello and verify init replies with `init_pid == 1` + matching
-    /// protocol version.
+    // -- Handshake ----------------------------------------------------------
+
     pub fn hello(&self) -> Result<i32> {
         let id = next_id(&self.inner.counter);
         let op = Op::Hello {
@@ -105,7 +172,7 @@ impl InitClient {
             features: default_features(),
         };
         let reply = self.send_op_sync(&id, op, Duration::from_secs(5))?;
-        match reply.reply {
+        match reply {
             Reply::Hello {
                 ok,
                 init_pid,
@@ -126,7 +193,7 @@ impl InitClient {
                 }
                 if init_pid != 1 {
                     return Err(Error::exec(format!(
-                        "init not PID 1 (got {init_pid}); host forgot --as-pid-1"
+                        "init not PID 1 (got {init_pid})"
                     )));
                 }
                 Ok(init_pid)
@@ -135,8 +202,15 @@ impl InitClient {
         }
     }
 
-    /// OpenShell → returns child_id of the long-lived shell.
-    pub fn open_shell(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
+    // -- Shell / spawn ------------------------------------------------------
+
+    /// Open a long-lived bash shell. Returns the `child_id`.
+    pub fn open_shell(
+        &self,
+        argv: &[&str],
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<SpawnInfo> {
         let id = next_id(&self.inner.counter);
         let op = Op::OpenShell {
             id: id.clone(),
@@ -147,62 +221,18 @@ impl InitClient {
         self.spawn_ack(&id, op)
     }
 
-    /// AddUser — create a per-user isolated bash shell inside the shared
-    /// init container. Returns spawn info with the shell's `child_id`.
-    pub fn add_user(&self, user_id: &str, env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::AddUser {
-            id: id.clone(),
-            user_id: user_id.into(),
-            cwd: cwd.map(str::to_string),
-            env_overlay: env_overlay.to_vec(),
-        };
-        self.spawn_ack(&id, op)
-    }
-
-    /// RemoveUser — kill all children owned by this client. The `user_id`
-    /// is validated against the client's own user set.
-    pub fn remove_user(&self, user_id: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::RemoveUser {
-            id: id.clone(),
-            user_id: user_id.into(),
-        };
-        self.ack_op(&id, op)
-    }
-
-    /// Bind-mount a path inside the container. `source` must already be
-    /// visible (e.g., a pre-mounted host dir). `target` is created by init.
-    pub fn bind_mount(&self, source: &str, target: &str, read_only: bool) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::BindMount {
-            id: id.clone(),
-            source: source.into(),
-            target: target.into(),
-            read_only,
-        };
-        self.ack_op(&id, op)
-    }
-
-    /// Unmount a previously bind-mounted path.
-    pub fn unmount(&self, target: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::Unmount {
-            id: id.clone(),
-            target: target.into(),
-        };
-        self.ack_op(&id, op)
-    }
-
-    /// Spawn (Pipes mode).
-    pub fn spawn_pipes(&self, argv: &[&str], env_overlay: &[(String, String)], cwd: Option<&str>) -> Result<SpawnInfo> {
+    /// Spawn a pipes-mode child. Returns spawn info.
+    pub fn spawn_pipes(
+        &self,
+        argv: &[&str],
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<SpawnInfo> {
         self.spawn_pipes_inherit(argv, env_overlay, cwd, None)
     }
 
-    /// Spawn (Pipes mode) with optional environment/cwd inheritance from an
-    /// existing child (identified by `child_id`). When set, init reads
-    /// `/proc/<pid>/cwd` and `/proc/<pid>/environ` and uses them as the
-    /// base; explicit `cwd` and `env_overlay` take precedence.
+    /// Spawn a pipes-mode child with optional env/cwd inheritance from an
+    /// existing child.
     pub fn spawn_pipes_inherit(
         &self,
         argv: &[&str],
@@ -222,7 +252,9 @@ impl InitClient {
         self.spawn_ack(&id, op)
     }
 
-    /// Spawn (PTY mode). Returns spawn info plus the master fd received via SCM_RIGHTS.
+    /// Spawn a child in Pty mode. Returns spawn info. On stream transports
+    /// (VSOCK), the master fd is NOT returned via SCM_RIGHTS — I/O is bridged
+    /// through the protocol.
     pub fn spawn_pty(
         &self,
         argv: &[&str],
@@ -230,7 +262,7 @@ impl InitClient {
         cwd: Option<&str>,
         rows: u16,
         cols: u16,
-    ) -> Result<(SpawnInfo, OwnedFd)> {
+    ) -> Result<(SpawnInfo, Option<OwnedFd>)> {
         let id = next_id(&self.inner.counter);
         let op = Op::Spawn {
             id: id.clone(),
@@ -241,10 +273,7 @@ impl InitClient {
             inherit_from_child: None,
         };
         let reply = self.send_op_sync(&id, op, Duration::from_secs(10))?;
-        let fd = reply
-            .fd
-            .ok_or_else(|| Error::exec("PTY spawn reply missing master fd"))?;
-        let info = match reply.reply {
+        match reply {
             Reply::Spawn {
                 ok,
                 child_id,
@@ -253,21 +282,26 @@ impl InitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!("spawn pty failed: {:?}", error.map(|e| e.message))));
+                    return Err(Error::exec(format!(
+                        "spawn pty failed: {:?}",
+                        error.map(|e| e.message)
+                    )));
                 }
-                SpawnInfo {
-                    child_id: child_id.unwrap_or_default(),
-                    pid: pid.unwrap_or(0),
-                }
+                Ok((
+                    SpawnInfo {
+                        child_id: child_id.unwrap_or_default(),
+                        pid: pid.unwrap_or(0),
+                    },
+                    None, // No fd on stream transport
+                ))
             }
-            other => return Err(Error::exec(format!("unexpected reply: {other:?}"))),
-        };
-        Ok((info, fd))
+            other => Err(Error::exec(format!("unexpected reply: {other:?}"))),
+        }
     }
 
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
         let reply = self.send_op_sync(id, op, Duration::from_secs(10))?;
-        match reply.reply {
+        match reply {
             Reply::Spawn {
                 ok,
                 child_id,
@@ -276,7 +310,10 @@ impl InitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!("spawn failed: {:?}", error.map(|e| e.message))));
+                    return Err(Error::exec(format!(
+                        "spawn failed: {:?}",
+                        error.map(|e| e.message)
+                    )));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -286,6 +323,57 @@ impl InitClient {
             other => Err(Error::exec(format!("unexpected reply: {other:?}"))),
         }
     }
+
+    // -- Add / Remove user (Workspace) --------------------------------------
+
+    pub fn add_user(
+        &self,
+        user_id: &str,
+        env_overlay: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<SpawnInfo> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+            cwd: cwd.map(str::to_string),
+            env_overlay: env_overlay.to_vec(),
+        };
+        self.spawn_ack(&id, op)
+    }
+
+    pub fn remove_user(&self, user_id: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    // -- Dynamic mounts (Workspace) -----------------------------------------
+
+    pub fn bind_mount(&self, source: &str, target: &str, read_only: bool) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::BindMount {
+            id: id.clone(),
+            source: source.into(),
+            target: target.into(),
+            read_only,
+        };
+        self.ack_op(&id, op)
+    }
+
+    pub fn unmount(&self, target: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Unmount {
+            id: id.clone(),
+            target: target.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    // -- I/O ops ------------------------------------------------------------
 
     pub fn write(&self, child_id: &str, data: &[u8]) -> Result<()> {
         let id = next_id(&self.inner.counter);
@@ -337,71 +425,25 @@ impl InitClient {
         self.ack_op(&id, op)
     }
 
-    fn ack_op(&self, id: &str, op: Op) -> Result<()> {
-        let reply = self.send_op_sync(id, op, Duration::from_secs(5))?;
-        match reply.reply {
-            Reply::Ack { ok, error, .. } => {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(Error::exec(format!("init op failed: {:?}", error.map(|e| e.message))))
-                }
-            }
-            other => Err(Error::exec(format!("expected Ack, got {other:?}"))),
-        }
-    }
+    // -- Event draining -----------------------------------------------------
 
-    fn send_op_sync(&self, id: &str, op: Op, timeout: Duration) -> Result<ReplyMsg> {
-        // Send the op while holding send_lock (kernel atomicity for SEQPACKET
-        // is per-packet, but we still need to serialize JSON build + sendmsg).
-        {
-            let _guard = self
-                .inner
-                .send_lock
-                .lock()
-                .map_err(|_| Error::exec("send lock poisoned"))?;
-            let bf = unsafe { BorrowedFd::borrow_raw(self.inner.sock.as_raw_fd()) };
-            send_frame_seqpacket(bf, &Frame::Op(op), None)?;
-        }
-        // Wait for matching reply.
-        let deadline = Instant::now() + timeout;
-        let (lock, cv) = &*self.inner.state;
-        let mut g = lock.lock().map_err(|_| Error::exec("client state poisoned"))?;
-        loop {
-            if let Some(r) = g.replies.remove(id) {
-                return Ok(r);
-            }
-            if g.eof {
-                return Err(Error::exec("init connection closed before reply"));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(Error::exec(format!("init op {id} timed out after {timeout:?}")));
-            }
-            let (g2, _) = cv
-                .wait_timeout(g, deadline - now)
-                .map_err(|_| Error::exec("client state poisoned"))?;
-            g = g2;
-        }
-    }
-
-    /// Drain pending stdout for `child_id` (returns empty Vec if none).
     pub fn drain_stdout(&self, child_id: &str) -> Vec<Vec<u8>> {
         let mut g = self.inner.state.0.lock().expect("client state");
         let entry = g.children.entry(child_id.into()).or_default();
         std::mem::take(&mut entry.stdout)
     }
 
-    /// Drain pending stderr.
     pub fn drain_stderr(&self, child_id: &str) -> Vec<Vec<u8>> {
         let mut g = self.inner.state.0.lock().expect("client state");
         let entry = g.children.entry(child_id.into()).or_default();
         std::mem::take(&mut entry.stderr)
     }
 
-    /// Block until the reader has data (stdout/stderr/exit) for `child_id`
-    /// or `deadline` is reached. Returns `true` if there is something to
-    /// read, `false` on timeout.
+    pub fn take_exit(&self, child_id: &str) -> Option<(i32, Option<i32>)> {
+        let mut g = self.inner.state.0.lock().expect("client state");
+        g.children.get_mut(child_id).and_then(|c| c.exit.take())
+    }
+
     pub fn wait_for_event(&self, child_id: &str, deadline: Instant) -> bool {
         let (lock, cv) = &*self.inner.state;
         let mut g = lock.lock().expect("client state");
@@ -423,27 +465,12 @@ impl InitClient {
         }
     }
 
-    /// Take the exit status if known.
-    pub fn take_exit(&self, child_id: &str) -> Option<(i32, Option<i32>)> {
-        let mut g = self.inner.state.0.lock().expect("client state");
-        g.children.get_mut(child_id).and_then(|c| c.exit.take())
-    }
-
-    /// Has the reader thread observed EOF / fatal error?
     pub fn is_dead(&self) -> bool {
         self.inner.state.0.lock().map(|g| g.eof).unwrap_or(true)
     }
 
-    /// Run a one-shot command in pipes mode and block until completion or
-    /// `timeout`. Returns (stdout_bytes, stderr_bytes, exit_code).
-    ///
-    /// On timeout: SIGKILLs the process group and returns whatever was
-    /// captured plus exit_code = 124 (matching coreutils `timeout`).
-    ///
-    /// This is a convenience wrapper around `spawn_pipes` + `wait_for_event`
-    /// + `drain_stdout/stderr` + `take_exit`. It does **not** hold any
-    ///   mutex — multiple concurrent callers can `run_oneshot` independently
-    ///   because each call has its own `child_id`.
+    // -- One-shot execution -------------------------------------------------
+
     pub fn run_oneshot(
         &self,
         argv: &[&str],
@@ -460,7 +487,6 @@ impl InitClient {
         let mut timed_out = false;
 
         loop {
-            // Drain any pending bytes first.
             for chunk in self.drain_stdout(&child_id) {
                 stdout_buf.extend_from_slice(&chunk);
             }
@@ -479,7 +505,6 @@ impl InitClient {
             if now >= deadline {
                 timed_out = true;
                 let _ = self.signal(&child_id, libc::SIGKILL, true);
-                // Give init a brief window to reap and forward the exit.
                 let drain_deadline = Instant::now() + Duration::from_millis(500);
                 while Instant::now() < drain_deadline {
                     self.wait_for_event(&child_id, drain_deadline);
@@ -503,6 +528,60 @@ impl InitClient {
         let code = if timed_out { 124 } else { exit_code.unwrap_or(-1) };
         Ok((stdout_buf, stderr_buf, code))
     }
+
+    // -- Internal -----------------------------------------------------------
+
+    fn ack_op(&self, id: &str, op: Op) -> Result<()> {
+        let reply = self.send_op_sync(id, op, Duration::from_secs(5))?;
+        match reply {
+            Reply::Ack { ok, error, .. } => {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(Error::exec(format!(
+                        "init op failed: {:?}",
+                        error.map(|e| e.message)
+                    )))
+                }
+            }
+            other => Err(Error::exec(format!("expected Ack, got {other:?}"))),
+        }
+    }
+
+    fn send_op_sync(&self, id: &str, op: Op, timeout: Duration) -> Result<Reply> {
+        // Serialise send under a lock so concurrent ops don't interleave
+        // bytes on the stream.
+        {
+            let mut w = self
+                .inner
+                .write
+                .lock()
+                .map_err(|_| Error::exec("write lock poisoned"))?;
+            send_frame_stream(&mut *w, &Frame::Op(op))?;
+        }
+        // Wait for matching reply.
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.inner.state;
+        let mut g = lock.lock().map_err(|_| Error::exec("client state poisoned"))?;
+        loop {
+            if let Some(r) = g.replies.remove(id) {
+                return Ok(r);
+            }
+            if g.eof {
+                return Err(Error::exec("init connection closed before reply"));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::exec(format!(
+                    "init op {id} timed out after {timeout:?}"
+                )));
+            }
+            let (g2, _) = cv
+                .wait_timeout(g, deadline - now)
+                .map_err(|_| Error::exec("client state poisoned"))?;
+            g = g2;
+        }
+    }
 }
 
 /// Result of a successful Spawn / OpenShell.
@@ -512,29 +591,21 @@ pub struct SpawnInfo {
     pub pid: i32,
 }
 
-/// Handle to a running child spawned via `spawn_pipes_async` or
-/// `spawn_pipes_inherit_async`. Call `wait_with_timeout` to block
-/// until the child exits and collect its output.
+/// Handle to a running child spawned via `spawn_pipes_async`.
 pub struct ChildHandle {
-    client: Arc<InitClient>,
+    client: Arc<VsockInitClient>,
     child_id: String,
 }
 
 impl ChildHandle {
-    pub(crate) fn new(client: Arc<InitClient>, child_id: String) -> Self {
+    pub(crate) fn new(client: Arc<VsockInitClient>, child_id: String) -> Self {
         Self { client, child_id }
     }
 
-    /// The child's stable id as assigned by init.
     pub fn child_id(&self) -> &str {
         &self.child_id
     }
 
-    /// Block until the child exits or `timeout` elapses. Returns
-    /// `(stdout_bytes, stderr_bytes, exit_code)`.
-    ///
-    /// On timeout: SIGKILLs the process group and returns whatever was
-    /// captured plus exit_code = 124 (matching coreutils `timeout`).
     pub fn wait_with_timeout(&self, timeout: Duration) -> Result<(Vec<u8>, Vec<u8>, i32)> {
         let deadline = Instant::now() + timeout;
         let mut stdout_buf: Vec<u8> = Vec::new();
@@ -586,10 +657,7 @@ impl ChildHandle {
     }
 }
 
-impl InitClient {
-    /// Spawn a child in pipes mode and return a [`ChildHandle`] immediately.
-    /// The child runs independently; call [`ChildHandle::wait_with_timeout`]
-    /// to block until it exits.
+impl VsockInitClient {
     pub fn spawn_pipes_async(
         self: &Arc<Self>,
         argv: &[&str],
@@ -599,8 +667,6 @@ impl InitClient {
         self.spawn_pipes_inherit_async(argv, env_overlay, cwd, None)
     }
 
-    /// Spawn a child in pipes mode with environment/cwd inheritance from an
-    /// existing child. Returns a [`ChildHandle`] immediately.
     pub fn spawn_pipes_inherit_async(
         self: &Arc<Self>,
         argv: &[&str],
@@ -613,12 +679,21 @@ impl InitClient {
     }
 }
 
-fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
-    let bf = unsafe { BorrowedFd::borrow_raw(sock_fd) };
+// ---------------------------------------------------------------------------
+// Reader thread
+// ---------------------------------------------------------------------------
+
+fn reply_id(r: &Reply) -> String {
+    match r {
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
+    }
+}
+
+fn reader_loop(mut read: std::fs::File, state: Arc<(Mutex<Shared>, Condvar)>) {
     loop {
-        match recv_frame_seqpacket(bf) {
-            Ok(None) => break,
-            Ok(Some((frame, fd))) => {
+        match recv_frame_stream(&mut read) {
+            Ok(None) => break, // EOF
+            Ok(Some(frame)) => {
                 let (lock, cv) = &*state;
                 let mut g = match lock.lock() {
                     Ok(g) => g,
@@ -627,7 +702,7 @@ fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
                 match frame {
                     Frame::Reply(r) => {
                         let id = reply_id(&r);
-                        g.replies.insert(id, ReplyMsg { reply: r, fd });
+                        g.replies.insert(id, r);
                     }
                     Frame::Event(e) => match e {
                         Event::Stdout { child_id, data_b64 } => {
@@ -656,16 +731,4 @@ fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
         g.eof = true;
         cv.notify_all();
     }
-}
-
-fn reply_id(r: &Reply) -> String {
-    match r {
-        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
-    }
-}
-
-#[allow(dead_code)]
-fn _silence() {
-    let _: Result<()> = Err(Error::exec(""));
-    let _: ErrorReply = ErrorReply::new(crate::init_protocol::ErrorCode::Internal, "");
 }

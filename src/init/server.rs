@@ -21,7 +21,8 @@ use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::init_protocol::{
     ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
 };
-use tokimo_package_sandbox::init_wire::{recv_frame, send_frame};
+use tokimo_package_sandbox::init_wire::{recv_frame_seqpacket, send_frame_seqpacket};
+use tokimo_package_sandbox::init_wire::{encode_frame, decode_frame};
 
 use crate::child::{ChildKind, ChildRecord};
 use crate::pty as ptymod;
@@ -51,11 +52,28 @@ const TOK_CLIENT_BASE: usize = 2;
 /// The numeric child slot id is encoded as `100 + slot * 2 + (is_stderr as usize)`.
 const TOK_CHILD_BASE: usize = 100;
 
+/// Transport types for the control channel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    /// Unix SEQPACKET socket (Linux bwrap).
+    SeqPacket,
+    /// virtio-vsock stream socket (macOS VZ with VSOCK-capable kernel).
+    Vsock,
+    /// Serial console (virtio console, fd 0/1). Single pre-connected client,
+    /// stream framing.
+    Serial,
+}
+
 /// Per-connection state inside the init server.
 pub struct ClientState {
     pub fd: OwnedFd,
+    /// For Serial transport: separate write fd (stdout, fd 1). For SeqPacket
+    /// and Vsock, this is None and the primary `fd` is used for both.
+    pub write_fd: Option<OwnedFd>,
     /// child_ids owned by this client (for disconnect cleanup).
     pub children: HashSet<String>,
+    /// Transport type for this client.
+    pub transport: Transport,
 }
 
 pub struct State {
@@ -68,16 +86,43 @@ pub struct State {
     /// Maps client slot index → RawFd for mio event demux.
     /// Index = token.0 - TOK_CLIENT_BASE.
     pub client_slots: Vec<Option<RawFd>>,
+    /// If true the listener is VSOCK (stream framing); else Unix SEQPACKET.
+    pub transport: Transport,
 }
 
 impl State {
     fn alloc_slot(&mut self) -> usize {
-        // Never recycle slots — child_ids must remain unique for the
-        // lifetime of the session because host-side ChildHandle may
-        // still be draining events after the child has exited.
         let slot = self.child_slots.len();
         self.child_slots.push(None);
         slot
+    }
+
+    /// Send a `Frame` to the client identified by `client_fd`, dispatching
+    /// to the correct framing based on transport type.
+    fn send_to_client(&self, client_fd: RawFd, frame: &Frame, fd: Option<RawFd>) {
+        let client = match self.clients.get(&client_fd) {
+            Some(c) => c,
+            None => return,
+        };
+        if client.transport != Transport::SeqPacket {
+            if fd.is_some() {
+                eprintln!("[init] WARNING: SCM_RIGHTS fd lost (no ancillary support)");
+            }
+            let data = match encode_frame(frame) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[init] encode_frame: {e}");
+                    return;
+                }
+            };
+            let write_fd = client.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(client_fd);
+            unsafe {
+                let _ = libc::write(write_fd, data.as_ptr().cast(), data.len());
+            }
+        } else {
+            let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
+            let _ = send_frame_seqpacket(bf, frame, fd);
+        }
     }
 }
 
@@ -85,16 +130,9 @@ pub fn snapshot_base_env() -> Vec<(String, String)> {
     env::vars().collect()
 }
 
-pub fn run_loop(listener: OwnedFd, sigfd: OwnedFd, base_env: Vec<(String, String)>) -> Result<(), String> {
+pub fn run_loop(mut listener: OwnedFd, write_fd: Option<OwnedFd>, sigfd: OwnedFd, base_env: Vec<(String, String)>, transport: Transport) -> Result<(), String> {
     let mut poll = Poll::new().map_err(|e| format!("Poll::new: {e}"))?;
     let mut events = Events::with_capacity(64);
-
-    poll.registry()
-        .register(&mut SourceFd(&listener.as_raw_fd()), TOK_LISTENER, Interest::READABLE)
-        .map_err(|e| format!("register listener: {e}"))?;
-    poll.registry()
-        .register(&mut SourceFd(&sigfd.as_raw_fd()), TOK_SIGFD, Interest::READABLE)
-        .map_err(|e| format!("register sigfd: {e}"))?;
 
     let mut state = State {
         base_env,
@@ -102,8 +140,42 @@ pub fn run_loop(listener: OwnedFd, sigfd: OwnedFd, base_env: Vec<(String, String
         child_slots: Vec::new(),
         clients: HashMap::new(),
         client_slots: Vec::new(),
+        transport,
     };
     let mut shutdown = false;
+
+    // Serial mode: register the "listener" as a pre-connected client.
+    // Non-serial: use it as an accept socket.
+    let mut listener_opt = Some(listener);
+    if transport == Transport::Serial {
+        let l = listener_opt.take().unwrap();
+        let raw = l.as_raw_fd();
+        let slot = state.client_slots.len();
+        let token = Token(TOK_CLIENT_BASE + slot);
+        poll.registry()
+            .register(&mut SourceFd(&raw), token, Interest::READABLE)
+            .map_err(|e| format!("register serial client: {e}"))?;
+        state.client_slots.push(Some(raw));
+        state.clients.insert(
+            raw,
+            ClientState {
+                fd: l,
+                write_fd,
+                children: HashSet::new(),
+                transport,
+            },
+        );
+    }
+    if let Some(ref l) = listener_opt {
+        let raw = l.as_raw_fd();
+        poll.registry()
+            .register(&mut SourceFd(&raw), TOK_LISTENER, Interest::READABLE)
+            .map_err(|e| format!("register listener: {e}"))?;
+    }
+
+    poll.registry()
+        .register(&mut SourceFd(&sigfd.as_raw_fd()), TOK_SIGFD, Interest::READABLE)
+        .map_err(|e| format!("register sigfd: {e}"))?;
 
     while !shutdown {
         if let Err(e) = poll.poll(&mut events, None) {
@@ -116,8 +188,10 @@ pub fn run_loop(listener: OwnedFd, sigfd: OwnedFd, base_env: Vec<(String, String
         for ev in events.iter() {
             match ev.token() {
                 TOK_LISTENER => {
-                    if let Err(e) = accept_client(&listener, &mut state, poll.registry()) {
-                        eprintln!("[init] accept_client: {e}");
+                    if let Some(ref l) = listener_opt {
+                        if let Err(e) = accept_client(l, &mut state, poll.registry()) {
+                            eprintln!("[init] accept_client: {e}");
+                        }
                     }
                 }
                 TOK_SIGFD => {
@@ -183,7 +257,9 @@ fn accept_client(listener: &OwnedFd, state: &mut State, registry: &mio::Registry
         raw,
         ClientState {
             fd: owned,
+            write_fd: None,
             children: HashSet::new(),
+            transport: state.transport,
         },
     );
     Ok(())
@@ -273,13 +349,13 @@ fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, s
     if let Some(rec) = state.children.get(&id) {
         // Drain any remaining bytes before emitting Exit.
         if let Some(fd) = rec.stdout_fd.as_ref() {
-            if let Some(c) = owner_fd.and_then(|of| state.clients.get(&of)) {
-                drain_pipe(fd, &id, &c.fd, false);
+            if let Some(of) = owner_fd {
+                drain_pipe(fd, &id, of, false, state);
             }
         }
         if let Some(fd) = rec.stderr_fd.as_ref() {
-            if let Some(c) = owner_fd.and_then(|of| state.clients.get(&of)) {
-                drain_pipe(fd, &id, &c.fd, true);
+            if let Some(of) = owner_fd {
+                drain_pipe(fd, &id, of, true, state);
             }
         }
     }
@@ -291,7 +367,7 @@ fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, s
                 code,
                 signal,
             });
-            let _ = send_frame(unsafe { BorrowedFd::borrow_raw(client.fd.as_raw_fd()) }, &frame, None);
+            state.send_to_client(client.fd.as_raw_fd(), &frame, None);
         }
     }
     // Cleanup: deregister fds and remove from client's children set.
@@ -309,7 +385,7 @@ fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, s
     }
 }
 
-fn drain_pipe(fd: &OwnedFd, child_id: &str, client: &OwnedFd, is_stderr: bool) {
+fn drain_pipe(fd: &OwnedFd, child_id: &str, owner_fd: RawFd, is_stderr: bool, state: &State) {
     let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
     loop {
         let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
@@ -328,7 +404,7 @@ fn drain_pipe(fd: &OwnedFd, child_id: &str, client: &OwnedFd, is_stderr: bool) {
                 data_b64: B64.encode(chunk),
             }
         });
-        let _ = send_frame(unsafe { BorrowedFd::borrow_raw(client.as_raw_fd()) }, &frame, None);
+        state.send_to_client(owner_fd, &frame, None);
     }
 }
 
@@ -357,15 +433,19 @@ fn pump_child_stream(token: Token, state: &mut State, _registry: &mio::Registry)
     let Some(client) = state.clients.get(&owner_fd) else {
         return;
     };
-    drain_pipe(fd, &child_id, &client.fd, is_stderr);
+    drain_pipe(fd, &child_id, owner_fd, is_stderr, state);
 }
 
 fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
+    let transport = state.clients.get(&client_fd).map(|c| c.transport).unwrap_or(Transport::SeqPacket);
+    if transport != Transport::SeqPacket {
+        return handle_client_readable_vsock(client_fd, state, registry);
+    }
     loop {
         let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
-        let res = recv_frame(bf);
+        let res = recv_frame_seqpacket(bf);
         match res {
-            Ok(None) => return Ok(false), // EOF
+            Ok(None) => return Ok(false),
             Ok(Some((Frame::Op(op), _fd))) => {
                 handle_op(op, client_fd, state, registry);
             }
@@ -383,8 +463,33 @@ fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::R
     }
 }
 
+/// Read length-prefixed frames from a VSOCK (stream) client.
+fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = unsafe { libc::read(client_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n == 0 {
+            return Ok(false);
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(true);
+            }
+            return Err(err.to_string());
+        }
+        let data = &buf[..n as usize];
+        match decode_frame(data).map_err(|e| format!("decode_frame: {e}"))? {
+            Some((Frame::Op(op), _)) => handle_op(op, client_fd, state, registry),
+            Some((other, _)) => eprintln!("[init] client sent non-Op frame: {other:?}"),
+            None => {} // partial frame; wait for more
+        }
+        break; // One read per mio wake-up for VSOCK
+    }
+    Ok(true)
+}
+
 fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Registry) {
-    let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
     match op {
         Op::Hello { id, protocol, .. } => {
             let ok = protocol == PROTOCOL_VERSION;
@@ -403,7 +508,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     ))
                 },
             };
-            let _ = send_frame(bf, &Frame::Reply(reply), None);
+            state.send_to_client(client_fd, &Frame::Reply(reply), None);
         }
         Op::OpenShell {
             id,
@@ -489,7 +594,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
         Op::Resize {
             id,
@@ -511,7 +616,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGWINCH);
                 Ok(())
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
         Op::Signal {
             id,
@@ -534,12 +639,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 };
                 r.map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("kill: {e}")))
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
         Op::Wait { id, child_id: _ } => {
             // v1: synchronous Wait returns immediately if child already gone,
             // otherwise just acks (Exit event will follow when reaper sees it).
-            ack(bf, id, Ok(()));
+            ack(state, client_fd,id, Ok(()));
         }
         Op::Close { id, child_id } => {
             let res = (|| -> Result<(), ErrorReply> {
@@ -551,7 +656,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 rec.master_fd.take();
                 Ok(())
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
         Op::Shutdown { id, kill_all } => {
             if kill_all {
@@ -580,7 +685,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     },
                 );
             }
-            ack(bf, id, Ok(()));
+            ack(state, client_fd,id, Ok(()));
         }
         Op::AddUser {
             id,
@@ -631,7 +736,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     }
                 }
             }
-            ack(bf, id, Ok(()));
+            ack(state, client_fd,id, Ok(()));
         }
         Op::BindMount {
             id,
@@ -666,7 +771,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
         Op::Unmount { id, target } => {
             let res = (|| -> Result<(), ErrorReply> {
@@ -681,12 +786,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 }
                 Ok(())
             })();
-            ack(bf, id, res);
+            ack(state, client_fd,id, res);
         }
     }
 }
 
-fn ack(bf: BorrowedFd<'_>, id: String, res: Result<(), ErrorReply>) {
+fn ack(state: &State, client_fd: RawFd, id: String, res: Result<(), ErrorReply>) {
     let reply = match res {
         Ok(()) => Reply::Ack {
             id,
@@ -699,7 +804,7 @@ fn ack(bf: BorrowedFd<'_>, id: String, res: Result<(), ErrorReply>) {
             error: Some(e),
         },
     };
-    let _ = send_frame(bf, &Frame::Reply(reply), None);
+    state.send_to_client(client_fd, &Frame::Reply(reply), None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -730,10 +835,16 @@ fn spawn_child_inner(
     stdio: StdioMode,
     kind: ChildKind,
 ) {
-    let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
     let slot = state.alloc_slot();
     let child_id = format!("c{}", slot + 1);
     let cwd_ref = cwd.as_deref();
+
+    // Check if we can use SCM_RIGHTS for the master fd.
+    let client_is_stream = state
+        .clients
+        .get(&client_fd)
+        .map(|c| c.transport != Transport::SeqPacket)
+        .unwrap_or(false);
 
     let res = match &stdio {
         StdioMode::Pipes => crate::child::spawn_pipes(&argv, &env, cwd_ref),
@@ -749,11 +860,56 @@ fn spawn_child_inner(
                 pid: None,
                 error: Some(err),
             };
-            let _ = send_frame(bf, &Frame::Reply(reply), None);
+            state.send_to_client(client_fd, &Frame::Reply(reply), None);
         }
         Ok(spawned) => {
-            // Register pipe fds.
-            if let Some(fd) = spawned.stdout_fd.as_ref() {
+            // For Pty mode over stream transport (VSOCK, Serial): the master
+            // fd can't be sent via SCM_RIGHTS. Instead, we bridge I/O through
+            // the protocol: register the master fd for reading (output pumping)
+            // and set stdin_fd to the master so Write ops go to the PTY.
+            let (effective_stdout, effective_stdin, effective_master, send_fd) = if client_is_stream
+                && spawned.master_fd.is_some()
+            {
+                let mfd = spawned.master_fd.as_ref().unwrap();
+                // Dup the master for reading — register with mio as stdout.
+                let dup_fd = unsafe { libc::dup(mfd.as_raw_fd()) };
+                if dup_fd < 0 {
+                    state.child_slots[slot] = None;
+                    let reply = Reply::Spawn {
+                        id,
+                        ok: false,
+                        child_id: None,
+                        pid: None,
+                        error: Some(ErrorReply::new(
+                            ErrorCode::Internal,
+                            format!("dup master fd: {}", std::io::Error::last_os_error()),
+                        )),
+                    };
+                    state.send_to_client(client_fd, &Frame::Reply(reply), None);
+                    return;
+                }
+                let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                // Use master as stdin so Write ops go to PTY input.
+                let mfd_dup2 = unsafe { libc::dup(mfd.as_raw_fd()) };
+                let stdin_owned = if mfd_dup2 >= 0 {
+                    Some(unsafe { OwnedFd::from_raw_fd(mfd_dup2) })
+                } else {
+                    None
+                };
+                (Some(dup_owned), stdin_owned, spawned.master_fd, None)
+            } else {
+                // SeqPacket or Pipes: send master fd via SCM_RIGHTS as usual.
+                let send_fd = spawned.master_fd.as_ref().map(|f| f.as_raw_fd());
+                (
+                    spawned.stdout_fd,
+                    spawned.stdin_fd,
+                    spawned.master_fd,
+                    send_fd,
+                )
+            };
+
+            // Register pumpable fds with mio.
+            if let Some(fd) = effective_stdout.as_ref() {
                 let tok = Token(TOK_CHILD_BASE + slot * 2);
                 let _ = registry.register(&mut SourceFd(&fd.as_raw_fd()), tok, Interest::READABLE);
             }
@@ -763,22 +919,19 @@ fn spawn_child_inner(
             }
             let pid = spawned.pid;
             state.child_slots[slot] = Some(child_id.clone());
-            // Master fd to send back via SCM_RIGHTS.
-            let master_for_send: Option<RawFd> = spawned.master_fd.as_ref().map(|f| f.as_raw_fd());
             let rec = ChildRecord {
                 pid,
                 pgid: pid,
                 slot,
                 kind,
-                stdin_fd: spawned.stdin_fd,
-                stdout_fd: spawned.stdout_fd,
+                stdin_fd: effective_stdin,
+                stdout_fd: effective_stdout,
                 stderr_fd: spawned.stderr_fd,
-                master_fd: spawned.master_fd,
+                master_fd: effective_master,
                 shutdown_pending: false,
                 owner_fd: client_fd,
             };
             state.children.insert(child_id.clone(), rec);
-            // Track child in client's set.
             if let Some(cs) = state.clients.get_mut(&client_fd) {
                 cs.children.insert(child_id.clone());
             }
@@ -789,7 +942,7 @@ fn spawn_child_inner(
                 pid: Some(pid),
                 error: None,
             };
-            let _ = send_frame(bf, &Frame::Reply(reply), master_for_send);
+            state.send_to_client(client_fd, &Frame::Reply(reply), send_fd);
         }
     }
 }
@@ -817,6 +970,8 @@ fn resolve_child_cwd(state: &State, child_id: &str) -> Option<String> {
 }
 
 fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, String)>> {
+    let rec = state.children.get(child_id)?;
+    let path = format!("/proc/{}/environ", rec.pid);
     let rec = state.children.get(child_id)?;
     let path = format!("/proc/{}/environ", rec.pid);
     let data = std::fs::read(&path).ok()?;

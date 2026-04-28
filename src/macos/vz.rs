@@ -32,8 +32,8 @@ use arcbox_vz::{
 use crate::config::SandboxConfig;
 use crate::{Error, ExecutionResult, Result};
 
-const DEFAULT_MEMORY_MB: u64 = 512;
-const DEFAULT_CPUS: usize = 2;
+pub(crate) const DEFAULT_MEMORY_MB: u64 = 512;
+pub(crate) const DEFAULT_CPUS: usize = 2;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -84,14 +84,6 @@ fn shell_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
-}
-
-/// Session shell — not yet implemented for VZ path.
-pub(crate) fn spawn_session_shell(_cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
-    Err(Error::validation(
-        "VZ Session: requires tokimo-sandbox-init in initrd. \
-         Use SAFEBOX_VZ=0 for Seatbelt backend with Session support.",
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -174,24 +166,39 @@ fn exec_vm(cfg: &SandboxConfig, cmd_b64: &str) -> Result<ExecutionResult> {
         }
 
         // Wait for VM to stop (initrd calls poweroff -f after command).
-        // Use a panic hook to catch ObjC exceptions during state polling.
         let deadline = std::time::Instant::now() + EXEC_TIMEOUT + Duration::from_secs(10);
         let vm_arc = Arc::new(vm);
         let vm_ref = vm_arc.clone();
+        let mut timed_out = false;
+        // Collect serial output for OOM detection.
+        let mut serial_buf = Vec::new();
         loop {
+            // Drain any available serial output.
+            if let Some(fd) = serial_fd_raw {
+                let mut buf = [0u8; 4096];
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    serial_buf.extend_from_slice(&buf[..n as usize]);
+                }
+            }
             let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm_ref.state()));
             match state {
                 Ok(VirtualMachineState::Stopped) | Err(_) => break,
                 Ok(_) => {}
             }
             if std::time::Instant::now() > deadline {
+                timed_out = true;
                 tracing::warn!("VM timeout");
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        tracing::info!("VM stopped, reading results...");
+        // Check serial output for OOM killer messages.
+        let serial_str = String::from_utf8_lossy(&serial_buf);
+        let oom_killed = serial_str.contains("Out of memory") || serial_str.contains("Killed process");
+
+        tracing::info!(timed_out, oom_killed, "VM stopped, reading results...");
 
         // Read results from virtiofs-shared files (written by initrd).
         let stdout = std::fs::read_to_string(rootfs_result.join(".vz_stdout")).unwrap_or_default();
@@ -210,8 +217,8 @@ fn exec_vm(cfg: &SandboxConfig, cmd_b64: &str) -> Result<ExecutionResult> {
             stdout,
             stderr,
             exit_code,
-            timed_out: false,
-            oom_killed: false,
+            timed_out,
+            oom_killed,
         })
     });
 
@@ -249,7 +256,7 @@ fn drain_serial_debug(fd: i32) {
 // Path discovery
 // ---------------------------------------------------------------------------
 
-fn find_kernel() -> Result<PathBuf> {
+pub(crate) fn find_kernel() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_KERNEL") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
@@ -278,7 +285,7 @@ fn find_kernel() -> Result<PathBuf> {
     ))
 }
 
-fn find_initrd() -> Result<PathBuf> {
+pub(crate) fn find_initrd() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_INITRD") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
@@ -307,7 +314,7 @@ fn find_initrd() -> Result<PathBuf> {
     ))
 }
 
-fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
+pub(crate) fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_VZ_ROOTFS") {
         let pb = PathBuf::from(&p);
         if pb.exists() {

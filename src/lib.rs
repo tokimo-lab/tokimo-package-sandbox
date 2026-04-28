@@ -7,15 +7,17 @@
 //! assert!(!out.success() || out.exit_code != 0);
 //! ```
 
+mod any_init;
 mod config;
 mod error;
 mod net_observer;
+mod pty;
 mod result;
 mod session;
 
 pub mod init_protocol;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod init_wire;
 
 #[cfg(target_os = "linux")]
@@ -32,7 +34,7 @@ mod l4;
 mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod workspace;
 
 #[cfg(target_os = "macos")]
@@ -56,7 +58,7 @@ pub use seccomp::generate_bpf_bytes;
 #[cfg(target_os = "linux")]
 pub use init_client::{InitClient, SpawnInfo};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use workspace::{UserConfig, UserHandle, Workspace, WorkspaceConfig};
 
 /// Execute `cmd` inside the sandbox configured by `cfg`.

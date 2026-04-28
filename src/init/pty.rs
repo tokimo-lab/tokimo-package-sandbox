@@ -25,12 +25,12 @@ pub fn open_pty() -> Result<(OwnedFd, String), String> {
         // Linux ptsname_r is preferred; fall back to ptsname (not async-safe
         // but we're in init parent, no signal hazard).
         let mut buf = [0i8; 256];
-        let r = libc::ptsname_r(master, buf.as_mut_ptr(), buf.len());
+        let r = libc::ptsname_r(master, buf.as_mut_ptr().cast(), buf.len());
         if r != 0 {
             libc::close(master);
             return Err(format!("ptsname_r: errno {r}"));
         }
-        let cstr = CStr::from_ptr(buf.as_ptr());
+        let cstr = CStr::from_ptr(buf.as_ptr().cast());
         let path = cstr.to_string_lossy().into_owned();
         let master_fd = OwnedFd::from_raw_fd(master);
         // Suppress unused warning for CString import.
