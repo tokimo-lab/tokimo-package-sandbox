@@ -1,13 +1,17 @@
-//! Windows sandbox: re-executes the command inside WSL2 under bubblewrap.
+//! Windows sandbox: Hyper-V (HCS) primary, WSL2 fallback.
 //!
-//! Strategy:
-//!   1. If `wsl` is available and `bwrap` is installed inside WSL, run the
-//!      command inside WSL under a bwrap sandbox that mirrors the Linux driver.
-//!   2. Otherwise fail by default. The caller may opt in to "WSL only, no
-//!      bwrap" via `SandboxConfig::network(AllowAll)` + `SAFEBOX_WSL_NO_BWRAP=1`
-//!      env var — this still isolates from the Windows host but offers no FS
-//!      sandbox within WSL.
-//!   3. If WSL itself is unavailable, we refuse execution.
+//! ## Backend dispatch
+//!
+//! 1. **HCS** (default) — boots a lightweight Linux VM via the Host Compute
+//!    Service API. Requires "Virtual Machine Platform" (Win10 1903+, all
+//!    editions including Home). No WSL2 or distro needed.
+//! 2. **WSL2** (fallback) — re-executes inside WSL2 under bubblewrap.
+//!    Requires `wsl --install` + `sudo apt install bubblewrap`.
+//!
+//! Set `SAFEBOX_WSL=1` to force WSL2 backend even when HCS is available.
+
+mod hcs;
+mod hv;
 
 use crate::config::{NetworkPolicy, SandboxConfig};
 use crate::{Error, ExecutionResult, Result};
@@ -24,11 +28,64 @@ fn hide(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
-pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<ExecutionResult> {
-    if user_cmd.is_empty() {
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    if cmd.is_empty() {
         return Err(Error::validation("empty command"));
     }
-    let inner = build_inner_script(cfg, Some(user_cmd))?;
+
+    // Force WSL2 backend via env var.
+    if std::env::var("SAFEBOX_WSL").ok().as_deref() == Some("1") {
+        return run_wsl(cmd, cfg);
+    }
+
+    // Prefer HCS over WSL2.
+    if hv::is_available() {
+        match hv::run(cmd, cfg) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                tracing::warn!(error = %e, "HCS backend failed, trying WSL2 fallback");
+                // Fall through to WSL2.
+            }
+        }
+    }
+
+    // Fallback to WSL2.
+    run_wsl(cmd, cfg)
+}
+
+pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
+    if std::env::var("SAFEBOX_WSL").ok().as_deref() == Some("1") || !hv::is_available() {
+        return spawn_session_shell_wsl(cfg);
+    }
+
+    // Try HCS session first.
+    match hv::spawn_session_shell(cfg) {
+        Ok(handle) => Ok(handle),
+        Err(_e) => {
+            tracing::warn!("HCS session not available, trying WSL2");
+            spawn_session_shell_wsl(cfg)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HCS: SAFEBOX_DISABLE escape hatch (unsupported)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn run_without_sandbox<S: AsRef<str>>(_cmd: &[S], _cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
+}
+
+// ---------------------------------------------------------------------------
+// WSL2 backend (fallback)
+// ---------------------------------------------------------------------------
+
+fn run_wsl<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    let inner = build_inner_script(cfg, Some(cmd))?;
     let mut wsl = Command::new("wsl");
     hide(&mut wsl);
     wsl.args(["-e", "bash", "-lc", &inner])
@@ -36,9 +93,7 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = wsl
-        .spawn()
-        .map_err(|e| Error::exec(format!("spawn wsl failed: {}", e)))?;
+    let mut child = wsl.spawn().map_err(|e| Error::exec(format!("spawn wsl failed: {e}")))?;
 
     if let Some(bytes) = cfg.stdin.as_deref() {
         if let Some(mut stdin) = child.stdin.take() {
@@ -46,7 +101,6 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
         }
     }
 
-    // Simple timeout on Windows (no pre_exec available).
     let timeout = Duration::from_secs(cfg.limits.timeout_secs);
     let start = Instant::now();
     let mut timed_out = false;
@@ -62,7 +116,7 @@ pub(crate) fn run(user_cmd: &[impl AsRef<str>], cfg: &SandboxConfig) -> Result<E
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return Err(Error::exec(format!("wait failed: {}", e))),
+            Err(e) => return Err(Error::exec(format!("wait failed: {e}"))),
         }
     }
 
@@ -126,7 +180,6 @@ fn windows_to_wsl_path(p: &Path) -> Option<String> {
 }
 
 fn shell_quote(s: &str) -> String {
-    // POSIX single-quote. To embed a literal ' we close quote, escape, reopen.
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -140,12 +193,10 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Build the bash -lc script that re-execs the user command (or, if `user_cmd`
-/// is None, an interactive bash) inside WSL under bwrap.
 fn build_inner_script<S: AsRef<str>>(cfg: &SandboxConfig, user_cmd: Option<&[S]>) -> Result<String> {
     if !wsl_available() {
         return Err(Error::ToolNotFound(
-            "WSL is not available. Install WSL2 (`wsl --install`). tokimo-package-sandbox on Windows requires WSL2 for real isolation.".into(),
+            "WSL is not available. Install WSL2 (`wsl --install`). tokimo-package-sandbox on Windows requires either Virtual Machine Platform (for HCS) or WSL2 for real isolation.".into(),
         ));
     }
     let bwrap_inside = wsl_has_bwrap();
@@ -192,7 +243,7 @@ fn build_inner_script<S: AsRef<str>>(cfg: &SandboxConfig, user_cmd: Option<&[S]>
             NetworkPolicy::AllowAll => inner.push_str(" --share-net"),
             NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => {
                 return Err(Error::validation(
-                    "NetworkPolicy::Observed / Gated are not supported on Windows (Linux-only; see docs/network-observability.md)",
+                    "NetworkPolicy::Observed / Gated are not supported on Windows (Linux-only)",
                 ));
             }
         }
@@ -232,7 +283,7 @@ fn build_inner_script<S: AsRef<str>>(cfg: &SandboxConfig, user_cmd: Option<&[S]>
     Ok(inner)
 }
 
-pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
+fn spawn_session_shell_wsl(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
     let inner = build_inner_script::<&str>(cfg, None)?;
     let mut wsl = Command::new("wsl");
     hide(&mut wsl);
@@ -242,6 +293,6 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
         .stderr(Stdio::piped());
     let child = wsl
         .spawn()
-        .map_err(|e| Error::exec(format!("spawn wsl session shell failed: {}", e)))?;
+        .map_err(|e| Error::exec(format!("spawn wsl session shell failed: {e}")))?;
     crate::session::shell_handle_from_child(child, Box::new(()) as Box<dyn std::any::Any + Send>)
 }

@@ -11,7 +11,7 @@ Cross-platform native sandbox for executing untrusted commands safely.
 |---|---|---|
 | **Linux** | bubblewrap + seccomp BPF + cgroups | strong — user/PID/mount/net/UTS namespaces |
 | **macOS** | Virtualization.framework → Linux VM | strong — full Linux namespaces + seccomp inside VM |
-| **Windows** | WSL2 + bubblewrap | strong — VM + Linux sandbox |
+| **Windows** | Hyper-V (HCS) → Linux VM | strong — full Linux namespaces + seccomp inside VM |
 
 ## Quick start
 
@@ -44,7 +44,7 @@ let out = tokimo_package_sandbox::run(&["rm", "-rf", "/"], &cfg)?;
 |---|---|
 | **Linux** | `sudo apt install bubblewrap` (firejail fallback) |
 | **macOS** | Linux kernel + initrd from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) |
-| **Windows** | `wsl --install`, then `sudo apt install bubblewrap` |
+| **Windows** | Enable "Virtual Machine Platform" in Windows Features (Win 10 1903+, all editions). WSL2 fallback available. |
 
 ## macOS setup
 
@@ -76,6 +76,52 @@ Entitlement file (`vz.entitlements`):
     <key>com.apple.security.virtualization</key><true/>
 </dict></plist>
 ```
+
+## Windows setup
+
+The Windows backend boots a lightweight Linux VM via the Host Compute Service (HCS) API — the same technology that powers WSL2. No WSL2 distro or `wsl.exe` needed.
+
+### 1. Enable Virtual Machine Platform
+
+Open **Windows Features** (optionalfeatures.exe) and check:
+- **Virtual Machine Platform**
+- **Windows Hypervisor Platform** (optional, for diagnostics)
+
+Restart when prompted.
+
+### 2. Install TokimoOS artifacts
+
+Download the latest release from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases) and extract to `~\.tokimo\`:
+
+```powershell
+# Download
+curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/tokimo-os-amd64.tar.zst
+zstd -d tokimo-os-amd64.tar.zst
+tar -xpf tokimo-os-amd64.tar -C $env:USERPROFILE\.tokimo\
+
+# Expected layout:
+# ~\.tokimo\kernel\vmlinuz   — Linux kernel
+# ~\.tokimo\initrd.img       — initramfs
+# ~\.tokimo\rootfs\          — Debian 13 rootfs
+```
+
+Or set custom paths via environment variables:
+```powershell
+$env:TOKIMO_HV_KERNEL = "D:\vm\vmlinuz"
+$env:TOKIMO_HV_INITRD = "D:\vm\initrd.img"
+$env:TOKIMO_HV_ROOTFS = "D:\vm\rootfs"
+```
+
+### 3. Run
+
+```rust
+// Same API as Linux/macOS — platform dispatch is automatic.
+let out = tokimo_package_sandbox::run(&["node", "-e", "console.log('hi')"], &cfg)?;
+```
+
+### Fallback: WSL2 mode
+
+Set `SAFEBOX_WSL=1` to use the WSL2 backend instead of HCS. This requires WSL2 with bubblewrap installed.
 
 ## Architecture
 
@@ -137,34 +183,46 @@ macOS host
 
 ### Windows
 
-Windows delegates to WSL2, which provides a full Linux kernel with namespace + seccomp isolation. The host-side `windows.rs` is a thin forwarding layer: it translates Windows paths to `/mnt/` WSL paths, assembles a `bwrap` command line, and executes it via `wsl -e bash -lc '...'`.
+Windows boots a lightweight Linux VM via the Host Compute Service (HCS) API — the same hypervisor-level API that powers WSL2. No WSL2 distro or `wsl.exe` is needed. The architecture mirrors the macOS VZ backend, sharing the same kernel + initrd + rootfs artifacts.
 
 ```
 Windows host
   │
-  ├─ run()  ──► wsl -e bash -lc 'bwrap --unshare-all ... -- <cmd>'
-  │               │
-  │               └──► WSL2 VM
-  │                      │
-  │                      ├─ bwrap namespaces (user, mount, PID, net, IPC, UTS)
-  │                      ├─ seccomp BPF (~300 syscalls)
-  │                      ├─ work_dir bind-mounted at /tmp
-  │                      └─ command runs fully isolated inside the VM
+  ├─ run() → hv::exec_vm(cfg)
+  │     │
+  │     ├─ HcsCreateComputeSystem(schema_json)
+  │     │     ├─ Chipset.LinuxKernel(kernel, initrd)  ← cmd_b64 via kernel cmdline
+  │     │     ├─ Devices.Plan9("work")                 ← rootfs shared via 9p
+  │     │     └─ ComPorts.0 (named pipe)               ← boot diagnostics
+  │     │
+  │     ├─ HcsStartComputeSystem
+  │     │
+  │     │  ┌─────── Linux VM ─────────────────┐
+  │     │  │  initrd init                     │
+  │     │  │    ├─ mount 9p → /mnt/work       │
+  │     │  │    ├─ chroot /mnt/work           │
+  │     │  │    └─ bash -c "<decoded_cmd>"    │
+  │     │  │                                  │
+  │     │  │  Result written to:              │
+  │     │  │    /mnt/work/.vz_stdout          │
+  │     │  │    /mnt/work/.vz_stderr          │
+  │     │  │    /mnt/work/.vz_exit_code       │
+  │     │  └──────────────────────────────────┘
+  │     │
+  │     └─ Read result files → ExecutionResult
   │
-  └─ Session::open()  ──► wsl -e bash -lc 'bwrap ... -- /bin/bash --noprofile --norc'
-                            │
-                            └──► bash REPL over stdio (sentinel protocol)
-                                  ├─ exec / spawn  ──► same semantics as Linux
-                                  └─ no init control socket; bash sentinel carries
-                                     cwd/env inheritance and I/O framing
+  └─ Fallback: SAFEBOX_WSL=1 → WSL2 + bwrap (legacy path)
 ```
 
-- **Requires WSL2** — `wsl --install` once, then `sudo apt install bubblewrap` inside the WSL distro
-- **Same Linux sandbox** — reuses `bwrap`, seccomp BPF, and cgroups inside the VM verbatim
-- **Path translation** — `C:\Users\...` → `/mnt/c/Users/...` for bind mounts and CWD
-- **No console window** — `CREATE_NO_WINDOW` flag suppresses the WSL terminal popup
+- **Virtual Machine Platform required** — one-time enable in Windows Features (all editions, including Home)
+- **Same artifacts as macOS** — kernel + initrd + rootfs from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) releases
+- **Shared initrd init** — the same `init.sh` works on both macOS VZ (virtiofs) and Windows HCS (9p)
+- **WSL2 fallback** — set `SAFEBOX_WSL=1` to use the legacy WSL2 + bwrap path
 - **Network observe unsupported** — `Observed` / `Gated` return an error on Windows; use Linux directly for those policies
-- **Fallback mode** — set `SAFEBOX_WSL_NO_BWRAP=1` to skip bwrap inside WSL (WSL-only isolation, no filesystem sandbox)
+
+### macOS / Windows shared initrd
+
+The initrd init script ([`init.sh`](https://github.com/tokimo-lab/tokimo-package-rootfs/blob/main/init.sh)) is shared between macOS and Windows. It auto-detects the filesystem mount type (virtiofs on macOS, 9p on Windows HCS) and runs the same command execution + result collection logic on both platforms.
 
 ## API
 
@@ -265,7 +323,7 @@ init   → client { "event": "Exit",   "child_id": "c2", "code": 0 }
 
 ## Related
 
-- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — Debian rootfs images (amd64 + arm64)
+- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — TokimoOS bundle (kernel + initrd + Debian rootfs) for macOS VZ and Windows HCS
 
 ## License
 

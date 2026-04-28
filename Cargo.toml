@@ -98,6 +98,10 @@ required-features = []
 name = "vz_smoke"
 path = "examples/vz_smoke.rs"
 
+[[example]]
+name = "hv_smoke"
+path = "examples/hv_smoke.rs"
+
 [[bin]]
 name = "tokimo-sandbox-init"
 path = "src/init/main.rs"
