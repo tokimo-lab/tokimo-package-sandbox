@@ -11,7 +11,7 @@ Cross-platform native sandbox for executing untrusted commands safely.
 |---|---|---|
 | **Linux** | bubblewrap + seccomp BPF + cgroups | strong — user/PID/mount/net/UTS namespaces |
 | **macOS** | Virtualization.framework → Linux VM | strong — full Linux namespaces + seccomp inside VM |
-| **Windows** | Hyper-V (HCS) → Linux VM | strong — full Linux namespaces + seccomp inside VM |
+| **Windows** | Hyper-V (HCS) → Linux VM via SYSTEM service | strong — full Linux namespaces + seccomp inside VM |
 
 ## Quick start
 
@@ -43,31 +43,48 @@ let out = tokimo_package_sandbox::run(&["rm", "-rf", "/"], &cfg)?;
 | Platform | Requirement |
 |---|---|
 | **Linux** | `sudo apt install bubblewrap` (firejail fallback) |
-| **macOS** | Linux kernel + initrd from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) |
-| **Windows** | Enable "Virtual Machine Platform" in Windows Features (Win 10 1903+, all editions). WSL2 fallback available. |
+| **macOS** | Linux kernel + initrd + rootfs from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) |
+| **Windows** | Enable "Virtual Machine Platform" in Windows Features (Win 10 1903+, all editions). One-time UAC to install the SYSTEM service. |
+
+## What's inside the sandbox
+
+All platforms run the same **Debian 13 (Trixie) Linux rootfs** with pre-installed tooling:
+
+| Category | Contents |
+|---|---|
+| **Runtimes** | Node.js 24, Python 3.13, Lua 5.4 |
+| **Editors** | vim, nano |
+| **Office / docs** | pandoc, libreoffice (headless), poppler, qpdf, tesseract-ocr |
+| **Python pkgs** | pypdf, pdfplumber, reportlab, pandas, openpyxl, markitdown, ipython, requests, rich, Pillow |
+| **Node.js global** | pnpm, docx, pptxgenjs |
+| **Media** | ffmpeg |
+| **Network** | curl, wget, dig, ping, rsync, git |
+| **Other** | jq, zstd, bash-completion |
+
+Artifacts are built by [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — a single CI pipeline produces kernel + initrd + rootfs for both macOS and Windows.
 
 ## macOS setup
 
-The macOS backend boots a lightweight Linux VM via Virtualization.framework (macOS 11+). You need a kernel and initrd:
+The macOS backend boots a lightweight Linux VM via Virtualization.framework (macOS 11+).
 
 ```bash
-# 1. Download rootfs + kernel from tokimo-package-rootfs releases
-#    (or build from source: git clone tokimo-package-rootfs && bash build.sh arm64)
+# 1. Download artifacts
+curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/tokimo-os-arm64.tar.zst
+curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/rootfs-arm64.tar.zst
 
-# 2. Install artifacts to default locations
-mkdir -p ~/.tokimo ~/.tokimo/kernel
-# kernel → ~/.tokimo/kernel/vmlinuz
-# initrd → ~/.tokimo/initrd.img
-# rootfs → ~/.tokimo/rootfs/    (or set TOKIMO_VZ_ROOTFS)
+# 2. Extract to ~/.tokimo/
+zstd -d tokimo-os-arm64.tar.zst && tar -xpf tokimo-os-arm64.tar -C ~/.tokimo/
+mkdir -p ~/.tokimo/rootfs
+zstd -d rootfs-arm64.tar.zst && tar -xpf rootfs-arm64.tar -C ~/.tokimo/rootfs/
 
 # 3. Sign the binary with virtualization entitlement
 codesign --entitlements vz.entitlements --force -s - target/debug/your-app
 
 # 4. Run
-TOKIMO_VZ_ROOTFS=/path/to/rootfs ./your-app
+./your-app
 ```
 
-Entitlement file (`vz.entitlements`):
+Entitlement (`vz.entitlements`):
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -77,51 +94,73 @@ Entitlement file (`vz.entitlements`):
 </dict></plist>
 ```
 
+Env vars: `TOKIMO_VZ_KERNEL`, `TOKIMO_VZ_INITRD`, `TOKIMO_VZ_ROOTFS`, `TOKIMO_VZ_MEMORY`, `TOKIMO_VZ_CPUS`.
+
 ## Windows setup
 
-The Windows backend boots a lightweight Linux VM via the Host Compute Service (HCS) API — the same technology that powers WSL2. No WSL2 distro or `wsl.exe` needed.
+The Windows backend uses a **SYSTEM-level service** (`tokimo-sandbox-svc.exe`) that creates Hyper-V VMs on behalf of non-admin users. Same architecture as Docker Desktop and Claude Desktop.
 
 ### 1. Enable Virtual Machine Platform
 
-Open **Windows Features** (optionalfeatures.exe) and check:
-- **Virtual Machine Platform**
-- **Windows Hypervisor Platform** (optional, for diagnostics)
+Open **Windows Features** → check **Virtual Machine Platform** → restart.
 
-Restart when prompted.
-
-### 2. Install TokimoOS artifacts
-
-Download the latest release from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases) and extract to `~\.tokimo\`:
+### 2. Install artifacts
 
 ```powershell
 # Download
 curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/tokimo-os-amd64.tar.zst
-zstd -d tokimo-os-amd64.tar.zst
-tar -xpf tokimo-os-amd64.tar -C $env:USERPROFILE\.tokimo\
+curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/rootfs-amd64.tar.zst
 
-# Expected layout:
-# ~\.tokimo\kernel\vmlinuz   — Linux kernel
-# ~\.tokimo\initrd.img       — initramfs
-# ~\.tokimo\rootfs\          — Debian 13 rootfs
+# Extract
+zstd -d tokimo-os-amd64.tar.zst; tar -xpf tokimo-os-amd64.tar -C $env:USERPROFILE\.tokimo\
+mkdir -p $env:USERPROFILE\.tokimo\rootfs
+zstd -d rootfs-amd64.tar.zst; tar -xpf rootfs-amd64.tar -C $env:USERPROFILE\.tokimo\rootfs\
 ```
 
-Or set custom paths via environment variables:
-```powershell
-$env:TOKIMO_HV_KERNEL = "D:\vm\vmlinuz"
-$env:TOKIMO_HV_INITRD = "D:\vm\initrd.img"
-$env:TOKIMO_HV_ROOTFS = "D:\vm\rootfs"
+Expected layout:
+```
+~\.tokimo\
+  kernel\vmlinuz      ← Linux kernel
+  initrd.img          ← initramfs
+  rootfs\             ← Debian 13 filesystem
 ```
 
-### 3. Run
+### 3. First run
 
 ```rust
-// Same API as Linux/macOS — platform dispatch is automatic.
-let out = tokimo_package_sandbox::run(&["node", "-e", "console.log('hi')"], &cfg)?;
+// On first call, the library auto-installs the service via UAC.
+// User clicks "Yes" once. After that, everything is transparent.
+let out = tokimo_package_sandbox::run(&["python3", "--version"], &cfg)?;
 ```
 
-### Fallback: WSL2 mode
+Custom paths via env vars: `TOKIMO_KERNEL`, `TOKIMO_INITRD`, `TOKIMO_ROOTFS`, `TOKIMO_MEMORY`, `TOKIMO_CPUS`.
 
-Set `SAFEBOX_WSL=1` to use the WSL2 backend instead of HCS. This requires WSL2 with bubblewrap installed.
+### Distribution
+
+When shipping an application that uses this library, bundle `tokimo-sandbox-svc.exe` alongside your binary:
+
+```
+your-app\
+  your-app.exe
+  tokimo-sandbox-svc.exe   ← copy from cargo build output
+```
+
+The library finds the service binary next to the process executable and auto-installs it on first use.
+
+### Debugging
+
+```powershell
+# Terminal 1: run service in foreground (see all logs)
+cargo build --bin tokimo-sandbox-svc
+.\target\debug\tokimo-sandbox-svc.exe --console
+
+# Terminal 2: run examples
+cargo run --example hv_smoke
+```
+
+In console mode, no UAC or service installation is needed — the library auto-detects the pipe and connects directly.
+
+To uninstall: `.\tokimo-sandbox-svc.exe --uninstall` (needs admin).
 
 ## Architecture
 
@@ -168,12 +207,9 @@ macOS host
   │     │  │  initrd init                    │
   │     │  │    ├─ mount virtiofs → /mnt/work│
   │     │  │    ├─ chroot /mnt/work          │
-  │     │  │    └─ bash -c "<decoded_cmd>"   │
+  │     │  │    └─ bash -c "<cmd>"           │
   │     │  │                                 │
-  │     │  │  Result written to:             │
-  │     │  │    /mnt/work/.vz_stdout         │
-  │     │  │    /mnt/work/.vz_stderr         │
-  │     │  │    /mnt/work/.vz_exit_code      │
+  │     │  │  Result → .vz_stdout/.vz_stderr │
   │     │  └─────────────────────────────────┘
   │     │
   │     └─ Read result files → ExecutionResult
@@ -183,46 +219,41 @@ macOS host
 
 ### Windows
 
-Windows boots a lightweight Linux VM via the Host Compute Service (HCS) API — the same hypervisor-level API that powers WSL2. No WSL2 distro or `wsl.exe` is needed. The architecture mirrors the macOS VZ backend, sharing the same kernel + initrd + rootfs artifacts.
-
 ```
 Windows host
   │
-  ├─ run() → hv::exec_vm(cfg)
+  ├─ run() → resolve paths → svc::client::exec_vm()
   │     │
-  │     ├─ HcsCreateComputeSystem(schema_json)
-  │     │     ├─ Chipset.LinuxKernel(kernel, initrd)  ← cmd_b64 via kernel cmdline
-  │     │     ├─ Devices.Plan9("work")                 ← rootfs shared via 9p
-  │     │     └─ ComPorts.0 (named pipe)               ← boot diagnostics
+  │     │  named pipe \\.\pipe\tokimo-sandbox-svc
   │     │
-  │     ├─ HcsStartComputeSystem
+  │     ├─ tokimo-sandbox-svc.exe (NT AUTHORITY\SYSTEM)
+  │     │     │
+  │     │     ├─ HcsCreateComputeSystem(schema)
+  │     │     │     └─ LinuxKernel(kernel, initrd)
+  │     │     │     └─ Plan9("work") → rootfs shared via 9p
+  │     │     │
+  │     │     ├─ HcsStartComputeSystem
+  │     │     │
+  │     │     │  ┌─────── Linux VM (amd64) ──────┐
+  │     │     │  │  initrd init                  │
+  │     │     │  │    ├─ mount 9p → /mnt/work    │
+  │     │     │  │    ├─ chroot /mnt/work        │
+  │     │     │  │    └─ bash -c "<cmd>"         │
+  │     │     │  │                               │
+  │     │     │  │  Result → .vz_stdout/.vz_stderr│
+  │     │     │  └───────────────────────────────┘
+  │     │     │
+  │     │     └─ Send response over pipe
   │     │
-  │     │  ┌─────── Linux VM ─────────────────┐
-  │     │  │  initrd init                     │
-  │     │  │    ├─ mount 9p → /mnt/work       │
-  │     │  │    ├─ chroot /mnt/work           │
-  │     │  │    └─ bash -c "<decoded_cmd>"    │
-  │     │  │                                  │
-  │     │  │  Result written to:              │
-  │     │  │    /mnt/work/.vz_stdout          │
-  │     │  │    /mnt/work/.vz_stderr          │
-  │     │  │    /mnt/work/.vz_exit_code       │
-  │     │  └──────────────────────────────────┘
-  │     │
-  │     └─ Read result files → ExecutionResult
+  │     └─ Parse response → ExecutionResult
   │
-  └─ Fallback: SAFEBOX_WSL=1 → WSL2 + bwrap (legacy path)
+  └─ Service auto-installs via UAC on first use
 ```
 
-- **Virtual Machine Platform required** — one-time enable in Windows Features (all editions, including Home)
-- **Same artifacts as macOS** — kernel + initrd + rootfs from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) releases
-- **Shared initrd init** — the same `init.sh` works on both macOS VZ (virtiofs) and Windows HCS (9p)
-- **WSL2 fallback** — set `SAFEBOX_WSL=1` to use the legacy WSL2 + bwrap path
-- **Network observe unsupported** — `Observed` / `Gated` return an error on Windows; use Linux directly for those policies
-
-### macOS / Windows shared initrd
-
-The initrd init script ([`init.sh`](https://github.com/tokimo-lab/tokimo-package-rootfs/blob/main/init.sh)) is shared between macOS and Windows. It auto-detects the filesystem mount type (virtiofs on macOS, 9p on Windows HCS) and runs the same command execution + result collection logic on both platforms.
+**Shared across macOS and Windows:**
+- Same kernel (`vmlinuz`), initrd (`init.sh` + busybox), rootfs (Debian 13)
+- Same init script auto-detects virtiofs (macOS) vs 9p (Windows)
+- Same result file convention: `.vz_stdout`, `.vz_stderr`, `.vz_exit_code`
 
 ## API
 
@@ -248,7 +279,7 @@ sess.exec("export FOO=bar")?;
 sess.exec("cd /tmp && touch hello")?;
 let job = sess.spawn("sleep 5 && echo done")?;
 let result = job.wait_with_timeout(Duration::from_secs(10))?;
-let pty = sess.open_pty(24, 80, &["/bin/bash".into()], &[], None)?;  // Linux
+let pty = sess.open_pty(24, 80, &["/bin/bash".into()], &[], None)?;
 sess.close()?;
 ```
 
@@ -284,13 +315,14 @@ cargo run --example shell             # Interactive shell (Linux bwrap)
 cargo run --example rm_rf_test        # Proves rm -rf / can't touch host
 cargo run --example session           # Persistent session (Linux)
 cargo run --example vz_smoke          # macOS VZ toolchain smoke test
+cargo run --example hv_smoke          # Windows Hyper-V service smoke test
 cargo run --example gated_network     # Network observability (Linux)
 cargo run --example l4_observer       # L4+L7 event pipeline (Linux)
 ```
 
 ## Init control protocol (v1, Linux)
 
-The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (future macOS Session). PTY master fds via `SCM_RIGHTS`.
+The host communicates with `tokimo-sandbox-init` via length-prefixed JSON frames over `SOCK_SEQPACKET` (Linux) or VSOCK (future). PTY master fds via `SCM_RIGHTS`.
 
 ```jsonc
 client → init  { "op": "Hello",      "protocol": 1 }
@@ -315,15 +347,15 @@ init   → client { "event": "Exit",   "child_id": "c2", "code": 0 }
 
 | | tokimo-package-sandbox | Docker |
 |---|---|---|
-| **Daemon** | none (library call) | dockerd required |
-| **Startup** | ~50ms (Linux) / ~840ms (macOS VZ) | ~1–3s |
-| **Images** | none (reuses host /usr, /bin, /lib) | required |
+| **Daemon** | library call (or SYSTEM service on Windows) | dockerd required |
+| **Startup** | ~50ms (Linux) / ~840ms (macOS VZ) / ~600ms (Windows HCS) | ~1–3s |
+| **Images** | none (reuses Debian rootfs) | required |
 | **API** | Rust native | subprocess `docker run` |
 | **Use case** | "run this one untrusted command" | "deploy this service stack" |
 
 ## Related
 
-- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — TokimoOS bundle (kernel + initrd + Debian rootfs) for macOS VZ and Windows HCS
+- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — TokimoOS bundle (kernel + initrd + Debian rootfs)
 
 ## License
 
