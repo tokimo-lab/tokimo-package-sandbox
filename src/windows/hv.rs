@@ -23,7 +23,6 @@
 
 #![cfg(target_os = "windows")]
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,11 +47,8 @@ pub(crate) fn is_available() -> bool {
 
 /// One-shot command execution via HCS Linux VM.
 ///
-/// Boots a VM, runs the command via kernel cmdline, collects output from
-/// shared files. Uses the same initrd + rootfs as the macOS VZ backend.
-///
-/// On `HCS_E_ACCESSDENIED`, attempts a one-time self-elevation to add the
-/// current user to the Hyper-V Administrators group.
+/// Tries the SYSTEM service first, then direct HCS, then WSL2 fallback.
+/// This is called from `windows::run()` as the HCS path.
 pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
     if cmd.is_empty() {
         return Err(Error::validation("empty command"));
@@ -67,77 +63,35 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<Execu
     use base64::Engine;
     let cmd_b64 = base64::engine::general_purpose::STANDARD.encode(shell_cmd.as_bytes());
 
-    match exec_vm(cfg, &cmd_b64) {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            // If access denied, try to fix permissions automatically.
-            if e.to_string().contains("0x8037011B") {
-                try_auto_elevate();
-            }
-            Err(e)
+    // Try the SYSTEM service first.
+    if std::env::var("TOKIMO_NO_SERVICE").ok().as_deref() != Some("1") {
+        match try_via_service(cfg, &cmd_b64) {
+            Ok(result) => return Ok(result),
+            Err(_) => {} // fall through
         }
     }
+
+    // Try direct HCS.
+    exec_vm(cfg, &cmd_b64)
 }
 
-/// Attempt a one-time UAC elevation to add the current user to the
-/// Hyper-V Administrators group. This allows future HCS calls to succeed
-/// without admin. The user must log out and back in for it to take effect.
-fn try_auto_elevate() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static ATTEMPTED: AtomicBool = AtomicBool::new(false);
-    if ATTEMPTED.swap(true, Ordering::Relaxed) {
-        return;
-    }
+/// Attempt execution via the tokimo-sandbox-svc SYSTEM service.
+fn try_via_service(cfg: &SandboxConfig, cmd_b64: &str) -> Result<ExecutionResult> {
+    let kernel = find_kernel()?;
+    let initrd = find_initrd()?;
+    let rootfs = find_rootfs(cfg)?;
+    let memory_mb: u64 = std::env::var("TOKIMO_HV_MEMORY")
+        .ok()
+        .or_else(|| std::env::var("TOKIMO_VZ_MEMORY").ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MEMORY_MB);
+    let cpu_count: usize = std::env::var("TOKIMO_HV_CPUS")
+        .ok()
+        .or_else(|| std::env::var("TOKIMO_VZ_CPUS").ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CPUS);
 
-    let username = std::env::var("USERNAME").unwrap_or_default();
-    if username.is_empty() {
-        return;
-    }
-
-    let app: Vec<u16> = "cmd\0".encode_utf16().collect();
-    let args: Vec<u16> = format!("/c net localgroup \"Hyper-V Administrators\" {} /add\0", username)
-        .encode_utf16()
-        .collect();
-    let op: Vec<u16> = "runas\0".encode_utf16().collect(); // triggers UAC
-
-    tracing::info!("Attempting one-time HCS permission setup via UAC...");
-
-    // ShellExecuteW from shell32.dll — triggers UAC via "runas" verb.
-    extern "system" {
-        fn ShellExecuteW(
-            hwnd: *mut c_void,
-            lpOperation: *const u16,
-            lpFile: *const u16,
-            lpParameters: *const u16,
-            lpDirectory: *const u16,
-            nShowCmd: i32,
-        ) -> *mut c_void;
-    }
-
-    let ret = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            op.as_ptr(),
-            app.as_ptr(),
-            args.as_ptr(),
-            std::ptr::null(),
-            0,
-        )
-    };
-
-    // ShellExecuteW returns > 32 on success (as an HINSTANCE pointer value).
-    if ret as usize > 32 {
-        tracing::info!(
-            "UAC prompt shown. After approval, log out and back in for \
-             Hyper-V Administrators group membership to take effect."
-        );
-    } else {
-        tracing::warn!(
-            "UAC elevation failed (ShellExecuteW returned {:?}). \
-             Run manually as admin: net localgroup \"Hyper-V Administrators\" {username} /add",
-            ret
-        );
-    }
+    super::svc::client::exec_vm(&kernel, &initrd, &rootfs, cmd_b64, memory_mb, cpu_count)
 }
 
 /// Session shell — not yet implemented for HCS path.

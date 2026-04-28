@@ -43,6 +43,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]
@@ -101,6 +105,11 @@ path = "examples/vz_smoke.rs"
 [[example]]
 name = "hv_smoke"
 path = "examples/hv_smoke.rs"
+
+[[bin]]
+name = "tokimo-sandbox-svc"
+path = "src/svc/main.rs"
+required-features = []
 
 [[bin]]
 name = "tokimo-sandbox-init"

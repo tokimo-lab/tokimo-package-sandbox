@@ -12,6 +12,7 @@
 
 mod hcs;
 mod hv;
+mod svc;
 
 use crate::config::{NetworkPolicy, SandboxConfig};
 use crate::{Error, ExecutionResult, Result};
@@ -42,19 +43,11 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<Execu
         return run_wsl(cmd, cfg);
     }
 
-    // Prefer HCS over WSL2.
+    // Prefer HCS (with SYSTEM service) over WSL2.
     if hv::is_available() {
         match hv::run(cmd, cfg) {
             Ok(result) => return Ok(result),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("0x8037011B") {
-                    tracing::warn!(
-                        "HCS_E_ACCESSDENIED: add user to 'Hyper-V Administrators' group \
-                         (admin cmd: net localgroup \"Hyper-V Administrators\" %USERNAME% /add), \
-                         then log out and back in."
-                    );
-                }
                 tracing::warn!(error = %e, "HCS backend failed, falling back to WSL2");
             }
         }
