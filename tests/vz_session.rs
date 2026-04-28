@@ -11,13 +11,11 @@ use std::time::Duration;
 use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig, Session};
 
 fn skip_if_no_vz() -> bool {
-    let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL")
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.tokimo/kernel/vmlinuz"))
-        });
+    let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL").ok().or_else(|| {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| format!("{h}/.tokimo/kernel/vmlinuz"))
+    });
     let Some(kernel) = vmlinuz else {
         eprintln!("SKIP: TOKIMO_VZ_KERNEL not set and ~/.tokimo/kernel/vmlinuz not found");
         return true;
@@ -71,7 +69,11 @@ fn session_exec_preserves_cwd() {
     sess.exec("cd /tmp && mkdir -p tps_cwd_test && cd tps_cwd_test")
         .expect("cd");
     let out = sess.exec("pwd").expect("pwd");
-    assert!(out.stdout.contains("tps_cwd_test"), "cwd should be tps_cwd_test, got: {}", out.stdout);
+    assert!(
+        out.stdout.contains("tps_cwd_test"),
+        "cwd should be tps_cwd_test, got: {}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -157,12 +159,18 @@ fn session_spawn_inherits_env_and_cwd() {
     sess.exec("export MYSPAWNVAR=inherited42").expect("export");
     sess.exec("mkdir -p /tmp/spawn_cwd_test && cd /tmp/spawn_cwd_test")
         .expect("cd");
-    let job = sess
-        .spawn("echo MV=$MYSPAWNVAR && pwd")
-        .expect("spawn");
+    let job = sess.spawn("echo MV=$MYSPAWNVAR && pwd").expect("spawn");
     let out = job.wait_with_timeout(Duration::from_secs(10)).expect("wait");
-    assert!(out.stdout.contains("MV=inherited42"), "env should be inherited: {}", out.stdout);
-    assert!(out.stdout.contains("spawn_cwd_test"), "cwd should be inherited: {}", out.stdout);
+    assert!(
+        out.stdout.contains("MV=inherited42"),
+        "env should be inherited: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("spawn_cwd_test"),
+        "cwd should be inherited: {}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -175,7 +183,11 @@ fn session_spawn_timeout_kills_job() {
     let mut sess = Session::open(&cfg).expect("Session::open");
     let job = sess.spawn("sleep 60").expect("spawn sleep");
     let out = job.wait_with_timeout(Duration::from_secs(2)).expect("wait");
-    assert_eq!(out.exit_code, 124, "timeout should give exit_code 124, got {}", out.exit_code);
+    assert_eq!(
+        out.exit_code, 124,
+        "timeout should give exit_code 124, got {}",
+        out.exit_code
+    );
 }
 
 #[test]
@@ -204,12 +216,8 @@ fn session_spawn_concurrent_no_crosstalk() {
     let work = tempfile::tempdir().expect("work tempdir");
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
-    let j1 = sess
-        .spawn("echo JOB1_MARKER_ABC123")
-        .expect("spawn j1");
-    let j2 = sess
-        .spawn("echo JOB2_MARKER_XYZ789")
-        .expect("spawn j2");
+    let j1 = sess.spawn("echo JOB1_MARKER_ABC123").expect("spawn j1");
+    let j2 = sess.spawn("echo JOB2_MARKER_XYZ789").expect("spawn j2");
     let o1 = j1.wait_with_timeout(Duration::from_secs(5)).expect("wait j1");
     let o2 = j2.wait_with_timeout(Duration::from_secs(5)).expect("wait j2");
     assert!(o1.stdout.contains("JOB1_MARKER_ABC123"), "j1 output: {}", o1.stdout);

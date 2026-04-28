@@ -36,10 +36,7 @@ impl Fixture {
         let work = tempfile::tempdir().expect("work tempdir");
         let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
         let sess = Session::open(&cfg).expect("Session::open");
-        Self {
-            _work: work,
-            sess,
-        }
+        Self { _work: work, sess }
     }
 }
 
@@ -79,11 +76,7 @@ fn session_exec_cwd_persistence() {
         .exec("mkdir -p /tmp/tps_cwd_test && cd /tmp/tps_cwd_test")
         .expect("cd");
     let out = f.sess.exec("pwd").expect("pwd");
-    assert!(
-        out.stdout.contains("tps_cwd_test"),
-        "cwd: {}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("tps_cwd_test"), "cwd: {}", out.stdout);
 }
 
 #[test]
@@ -141,10 +134,7 @@ fn session_spawn_captures_output() {
         return;
     }
     let mut f = Fixture::new();
-    let job = f
-        .sess
-        .spawn("echo spawn-hello && echo spawn-err 1>&2")
-        .expect("spawn");
+    let job = f.sess.spawn("echo spawn-hello && echo spawn-err 1>&2").expect("spawn");
     let out = job.wait_with_timeout(Duration::from_secs(10)).expect("wait");
     assert_eq!(out.stdout.trim(), "spawn-hello");
     assert_eq!(out.stderr.trim(), "spawn-err");
@@ -162,11 +152,7 @@ fn session_spawn_inherits_cwd() {
         .expect("cd");
     let job = f.sess.spawn("pwd").expect("spawn cwd");
     let out = job.wait_with_timeout(Duration::from_secs(10)).expect("wait");
-    assert!(
-        out.stdout.contains("spawn_cwd_inherit"),
-        "cwd: {}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("spawn_cwd_inherit"), "cwd: {}", out.stdout);
 }
 
 #[test]
@@ -210,16 +196,8 @@ fn session_spawn_concurrent_no_crosstalk() {
     let j2 = f.sess.spawn("echo JOB2_MARKER_XYZ").expect("spawn j2");
     let o1 = j1.wait_with_timeout(Duration::from_secs(5)).expect("wait j1");
     let o2 = j2.wait_with_timeout(Duration::from_secs(5)).expect("wait j2");
-    assert!(
-        o1.stdout.contains("JOB1_MARKER_ABC"),
-        "j1: {}",
-        o1.stdout
-    );
-    assert!(
-        o2.stdout.contains("JOB2_MARKER_XYZ"),
-        "j2: {}",
-        o2.stdout
-    );
+    assert!(o1.stdout.contains("JOB1_MARKER_ABC"), "j1: {}", o1.stdout);
+    assert!(o2.stdout.contains("JOB2_MARKER_XYZ"), "j2: {}", o2.stdout);
     assert!(!o1.stdout.contains("JOB2_MARKER"), "crosstalk in j1");
     assert!(!o2.stdout.contains("JOB1_MARKER"), "crosstalk in j2");
 }

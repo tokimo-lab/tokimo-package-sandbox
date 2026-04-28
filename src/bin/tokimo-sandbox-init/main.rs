@@ -21,7 +21,7 @@ mod server;
 #[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
@@ -278,7 +278,7 @@ fn load_vsock_modules() -> Result<(), String> {
             continue;
         }
         // finit_module syscall (not in libc crate for all targets).
-        let rc = unsafe { libc::syscall(libc::SYS_finit_module, fd, b"\0".as_ptr(), 0usize) };
+        let rc = unsafe { libc::syscall(libc::SYS_finit_module, fd, c"".as_ptr(), 0usize) };
         unsafe { libc::close(fd) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
@@ -344,7 +344,7 @@ fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
     .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
 
     // Bind to VMADDR_CID_ANY on the guest side.
-    let addr = VsockAddr::new(libc::VMADDR_CID_ANY as u32, port);
+    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
     bind(fd.as_raw_fd(), &addr).map_err(|e| format!("bind VSOCK port {port}: {e}"))?;
     listen(&fd, Backlog::new(8).unwrap()).map_err(|e| format!("listen VSOCK: {e}"))?;
 

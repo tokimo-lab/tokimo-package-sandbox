@@ -131,7 +131,7 @@ pub fn snapshot_base_env() -> Vec<(String, String)> {
 }
 
 pub fn run_loop(
-    mut listener: OwnedFd,
+    listener: OwnedFd,
     write_fd: Option<OwnedFd>,
     sigfd: OwnedFd,
     base_env: Vec<(String, String)>,
@@ -436,7 +436,7 @@ fn pump_child_stream(token: Token, state: &mut State, _registry: &mio::Registry)
         rec.stdout_fd.as_ref()
     };
     let Some(fd) = fd else { return };
-    let Some(client) = state.clients.get(&owner_fd) else {
+    let Some(_client) = state.clients.get(&owner_fd) else {
         return;
     };
     drain_pipe(fd, &child_id, owner_fd, is_stderr, state);
@@ -476,25 +476,22 @@ fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::R
 /// Read length-prefixed frames from a VSOCK (stream) client.
 fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = unsafe { libc::read(client_fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n == 0 {
-            return Ok(false);
+    let n = unsafe { libc::read(client_fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n == 0 {
+        return Ok(false);
+    }
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(true);
         }
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(true);
-            }
-            return Err(err.to_string());
-        }
-        let data = &buf[..n as usize];
-        match decode_frame(data).map_err(|e| format!("decode_frame: {e}"))? {
-            Some((Frame::Op(op), _)) => handle_op(op, client_fd, state, registry),
-            Some((other, _)) => eprintln!("[init] client sent non-Op frame: {other:?}"),
-            None => {} // partial frame; wait for more
-        }
-        break; // One read per mio wake-up for VSOCK
+        return Err(err.to_string());
+    }
+    let data = &buf[..n as usize];
+    match decode_frame(data).map_err(|e| format!("decode_frame: {e}"))? {
+        Some((Frame::Op(op), _)) => handle_op(op, client_fd, state, registry),
+        Some((other, _)) => eprintln!("[init] client sent non-Op frame: {other:?}"),
+        None => {} // partial frame; wait for more
     }
     Ok(true)
 }
@@ -878,8 +875,7 @@ fn spawn_child_inner(
             // the protocol: register the master fd for reading (output pumping)
             // and set stdin_fd to the master so Write ops go to the PTY.
             let (effective_stdout, effective_stdin, effective_master, send_fd) =
-                if client_is_stream && spawned.master_fd.is_some() {
-                    let mfd = spawned.master_fd.as_ref().unwrap();
+                if let Some(mfd) = spawned.master_fd.as_ref().filter(|_| client_is_stream) {
                     // Dup the master for reading — register with mio as stdout.
                     let dup_fd = unsafe { libc::dup(mfd.as_raw_fd()) };
                     if dup_fd < 0 {
@@ -975,7 +971,7 @@ fn resolve_child_cwd(state: &State, child_id: &str) -> Option<String> {
 
 fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, String)>> {
     let rec = state.children.get(child_id)?;
-    let path = format!("/proc/{}/environ", rec.pid);
+    let _path = format!("/proc/{}/environ", rec.pid);
     let rec = state.children.get(child_id)?;
     let path = format!("/proc/{}/environ", rec.pid);
     let data = std::fs::read(&path).ok()?;

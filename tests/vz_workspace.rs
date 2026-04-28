@@ -10,13 +10,11 @@ use std::time::Duration;
 use tokimo_package_sandbox::{UserConfig, Workspace, WorkspaceConfig};
 
 fn skip_if_no_vz() -> bool {
-    let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL")
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{h}/.tokimo/kernel/vmlinuz"))
-        });
+    let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL").ok().or_else(|| {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| format!("{h}/.tokimo/kernel/vmlinuz"))
+    });
     let Some(kernel) = vmlinuz else {
         eprintln!("SKIP: TOKIMO_VZ_KERNEL not set");
         return true;
@@ -46,14 +44,24 @@ fn two_users_exec_independently() {
     ws.exec_default("alice", "export ALICE_ONLY=42").expect("exec alice");
     ws.exec_default("bob", "export BOB_ONLY=99").expect("exec bob");
 
-    let a_out = ws.exec_default("alice", "echo A=$ALICE_ONLY B=$BOB_ONLY")
+    let a_out = ws
+        .exec_default("alice", "echo A=$ALICE_ONLY B=$BOB_ONLY")
         .expect("exec alice check");
-    let b_out = ws.exec_default("bob", "echo A=$ALICE_ONLY B=$BOB_ONLY")
+    let b_out = ws
+        .exec_default("bob", "echo A=$ALICE_ONLY B=$BOB_ONLY")
         .expect("exec bob check");
 
     assert!(a_out.stdout.contains("A=42"), "alice should see A=42: {}", a_out.stdout);
-    assert!(!a_out.stdout.contains("B=99"), "alice should not see B=99: {}", a_out.stdout);
-    assert!(!b_out.stdout.contains("A=42"), "bob should not see A=42: {}", b_out.stdout);
+    assert!(
+        !a_out.stdout.contains("B=99"),
+        "alice should not see B=99: {}",
+        a_out.stdout
+    );
+    assert!(
+        !b_out.stdout.contains("A=42"),
+        "bob should not see A=42: {}",
+        b_out.stdout
+    );
     assert!(b_out.stdout.contains("B=99"), "bob should see B=99: {}", b_out.stdout);
 
     ws.close().expect("close");
@@ -70,7 +78,11 @@ fn add_user_creates_isolated_tmp() {
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
 
     let out = ws.exec_default("alice", "echo $TMPDIR").expect("exec");
-    assert!(out.stdout.contains("alice"), "TMPDIR should contain user id: {}", out.stdout);
+    assert!(
+        out.stdout.contains("alice"),
+        "TMPDIR should contain user id: {}",
+        out.stdout
+    );
 
     ws.close().expect("close");
 }
@@ -136,7 +148,12 @@ fn three_users_concurrent_exec() {
 
     for uid in &["u1", "u2", "u3"] {
         let out = ws.exec_default(uid, "echo $MYVAR").expect("exec read");
-        assert!(out.stdout.contains(&format!("{uid}_val")), "{} should see its own var: {}", uid, out.stdout);
+        assert!(
+            out.stdout.contains(&format!("{uid}_val")),
+            "{} should see its own var: {}",
+            uid,
+            out.stdout
+        );
     }
 
     ws.close().expect("close");
