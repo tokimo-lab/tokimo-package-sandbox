@@ -74,7 +74,11 @@ jobs:
       - name: Test (integration tests with rootfs)
         env:
           TOKIMO_TEST_ROOTFS: ${{ github.workspace }}/.test-rootfs
-        run: cargo test --tests
+          # Force serial test execution with live output so we can see
+          # which test (if any) hangs on the hosted runner. Wrap in
+          # `timeout` to bound total wall time at 10 min — anything over
+          # that is almost certainly a deadlock, not slow CI.
+        run: timeout --signal=ABRT 600 cargo test --tests -- --test-threads=1 --nocapture
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)
