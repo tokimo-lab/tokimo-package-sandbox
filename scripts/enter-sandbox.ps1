@@ -88,50 +88,28 @@ if (-not $hasBwrap) {
     exit 1
 }
 
+# Full namespace isolation: --unshare-all gives user+mount+PID+IPC+UTS+cgroup+net,
+# then --share-net opts back in so the sandbox has internet access for debugging.
+$bwrapFlags = "--bind '$wslRootfs' / --bind /tmp /tmp --proc /proc --dev /dev --unshare-all --share-net --uid 1000 --gid 1000 --hostname TokimoOS"
+
 if ($Command -ne "") {
-    # One-shot command inside the rootfs via bwrap
-    Write-Host "Running inside sandbox:" -ForegroundColor Cyan
+    Write-Host "Running inside sandbox (full namespace isolation):" -ForegroundColor Cyan
     Write-Host "  > $Command" -ForegroundColor White
     Write-Host ""
-    wsl -e bwrap `
-        --bind "$wslRootfs" / `
-        --bind /tmp /tmp `
-        --proc /proc --dev /dev `
-        --unshare-user --uid 1000 --gid 1000 `
-        --unshare-uts --hostname TokimoOS `
-        --clearenv `
-        --setenv HOME /home/tokimo `
-        --setenv USER tokimo --setenv LOGNAME tokimo `
-        --setenv PATH /home/tokimo/bin:/usr/local/bin:/usr/bin:/bin `
-        --setenv NPM_CONFIG_PREFIX /home/tokimo `
-        --setenv NODE_PATH /home/tokimo/lib/node_modules `
-        --setenv PYTHONPATH /home/tokimo/python_packages `
-        --setenv PIP_TARGET /home/tokimo/python_packages `
-        --setenv TERM xterm-256color `
-        -- /bin/bash -lc "$Command"
+    $cmd = "exec bwrap $bwrapFlags --clearenv --setenv HOME /home/tokimo --setenv USER tokimo --setenv LOGNAME tokimo --setenv PATH /home/tokimo/bin:/usr/local/bin:/usr/bin:/bin --setenv NPM_CONFIG_PREFIX /home/tokimo --setenv NODE_PATH /home/tokimo/lib/node_modules --setenv PYTHONPATH /home/tokimo/python_packages --setenv PIP_TARGET /home/tokimo/python_packages --setenv TERM xterm-256color -- /bin/bash -lc '$Command'"
+    wsl -e sh -c $cmd
 } else {
-    # Interactive shell inside the rootfs via bwrap (no sudo, no password)
-    Write-Host "Entering sandbox..." -ForegroundColor Cyan
+    Write-Host "Entering sandbox (full namespace isolation)..." -ForegroundColor Cyan
     Write-Host "  Rootfs : $RootfsPath"
-    Write-Host "  Inside : /  (bwrap --bind rootfs → /)"
-    Write-Host "  User   : tokimo (uid 1000)"
-    Write-Host "  Host   : TokimoOS"
+    Write-Host "  Inside : /  (bwrap --unshare-all --share-net)"
+    Write-Host "  User   : tokimo (uid 1000), Host: TokimoOS"
+    Write-Host "  PID ns : isolated (ps shows only sandbox processes)"
     Write-Host ""
-    Write-Host "  NOT your WSL2 system. This is the Debian 13 rootfs." -ForegroundColor Green
     Write-Host "  Type 'exit' or Ctrl+D to leave." -ForegroundColor DarkGray
     Write-Host ""
 
-    wsl -e bwrap `
-        --bind "$wslRootfs" / `
-        --bind /tmp /tmp `
-        --proc /proc --dev /dev `
-        --unshare-user --uid 1000 --gid 1000 `
-        --unshare-uts --hostname TokimoOS `
-        --unsetenv LD_LIBRARY_PATH `
-        --setenv HOME /home/tokimo `
-        --setenv USER tokimo --setenv LOGNAME tokimo `
-        --setenv TERM xterm-256color `
-        -- /bin/bash --login
+    $cmd = "exec bwrap $bwrapFlags --unsetenv LD_LIBRARY_PATH --setenv HOME /home/tokimo --setenv USER tokimo --setenv LOGNAME tokimo --setenv TERM xterm-256color -- /bin/bash --login"
+    wsl -e sh -c $cmd
 }
 
 Write-Host ""
