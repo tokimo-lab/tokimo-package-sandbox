@@ -1,7 +1,7 @@
 [package]
 name = "tokimo-package-sandbox"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["William Chan <root@williamchan.me>"]
 license = "MIT"
 description = "Cross-platform native sandbox for running arbitrary commands safely. Linux (bwrap + seccomp), macOS (Seatbelt), Windows (WSL2)."
