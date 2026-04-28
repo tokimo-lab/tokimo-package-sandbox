@@ -605,3 +605,123 @@ fn profile_env_and_mounts_combined() -> TestResult {
     sess.close().map_err(|e| format!("close: {e}"))?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: skill mount layers stay independent of each other and of peer mounts
+// ---------------------------------------------------------------------------
+//
+// Mirrors `agent_sandbox.rs`: builtin skills are RO at
+// `/home/tokimo/.tokimo/skills`, user skills are RW at `/skills`, and one
+// peer's workspace lives under `/mnt/shared/<peer>/home/workspace`. The three
+// trees must NOT alias — writing to one must not leak into the others, and
+// builtin contents must not appear under user skills or under the peer.
+
+#[test]
+fn skill_layers_isolated_from_peers_and_each_other() -> TestResult {
+    let Some(rootfs) = gate("skill_layers_isolated_from_peers_and_each_other") else {
+        return Ok(());
+    };
+    let host = RootHost::new();
+
+    // Self leaves.
+    let self_workspace = host.make_dir("self/workspace");
+    let self_tmp = host.make_dir("self/tmp");
+
+    // Skills.
+    let user_skills = host.make_dir("user_skills");
+    let builtin_skills = host.make_dir("builtin_skills");
+    std::fs::write(builtin_skills.join("BUILTIN.md"), b"builtin-payload-xyz")?;
+
+    // One peer.
+    let shared_root_marker = host.make_dir("shared_root");
+    let shared_ro_marker = host.make_dir("shared_ro");
+    for sub in ["home/workspace", "tmp", "upload", "output"] {
+        std::fs::create_dir_all(shared_ro_marker.join(sub))?;
+    }
+    let peer_name = "peer1";
+    std::fs::create_dir_all(shared_root_marker.join(peer_name))?;
+    let peer_workspace = host.make_dir("peer1/workspace");
+    std::fs::write(peer_workspace.join("peer_marker.txt"), b"peer-payload-abc")?;
+
+    let mut mounts = rootfs_system_mounts(&rootfs);
+    mounts.push(Mount::rw(self_workspace.clone()).guest("/home/workspace"));
+    mounts.push(Mount::rw(self_tmp).guest("/tmp"));
+
+    // 3 layers under test: builtin RO, user RW, peer chain.
+    mounts.push(Mount::ro(builtin_skills.clone()).guest("/home/tokimo/.tokimo/skills"));
+    mounts.push(Mount::rw(user_skills.clone()).guest("/skills"));
+    mounts.push(Mount::ro(shared_root_marker).guest("/mnt/shared"));
+    mounts.push(Mount::ro(shared_ro_marker).guest(format!("/mnt/shared/{peer_name}")));
+    mounts.push(Mount::rw(peer_workspace.clone()).guest(format!("/mnt/shared/{peer_name}/home/workspace")));
+
+    let cfg = SandboxConfig::new(&self_workspace)
+        .system_layout(SystemLayout::CallerProvided)
+        .network(NetworkPolicy::Blocked)
+        .cwd(PathBuf::from("/home/workspace"))
+        .mounts(mounts);
+    let mut sess = Session::open(&cfg).map_err(|e| format!("Session::open: {e}"))?;
+
+    // Builtin contents readable.
+    let out = sess.exec("cat /home/tokimo/.tokimo/skills/BUILTIN.md")?;
+    assert!(out.stdout.contains("builtin-payload-xyz"), "builtin read: {out:?}");
+
+    // Builtin write rejected (RO mount).
+    let out = sess.exec("touch /home/tokimo/.tokimo/skills/sneaky 2>&1; echo EXIT:$?")?;
+    assert!(
+        !out.stdout.contains("EXIT:0"),
+        "builtin write should fail, got: {}",
+        out.stdout
+    );
+
+    // User skills RW write succeeds.
+    let out = sess.exec("echo user-payload-123 > /skills/user.txt && echo OK")?;
+    assert!(out.stdout.contains("OK"), "user write: stderr={}", out.stderr);
+
+    // Isolation ① — user write does NOT appear under builtin tree.
+    let out = sess.exec("test -e /home/tokimo/.tokimo/skills/user.txt && echo LEAK || echo CLEAN")?;
+    assert!(
+        out.stdout.contains("CLEAN"),
+        "user→builtin leak (separate mounts!): {}",
+        out.stdout
+    );
+
+    // Isolation ② — user write does NOT appear under peer workspace.
+    let out = sess.exec(&format!(
+        "test -e /mnt/shared/{peer_name}/home/workspace/user.txt && echo LEAK || echo CLEAN"
+    ))?;
+    assert!(
+        out.stdout.contains("CLEAN"),
+        "user→peer leak: {}",
+        out.stdout
+    );
+
+    // Isolation ③ — builtin payload NOT under /skills.
+    let out = sess.exec("test -e /skills/BUILTIN.md && echo LEAK || echo CLEAN")?;
+    assert!(
+        out.stdout.contains("CLEAN"),
+        "builtin→user leak: {}",
+        out.stdout
+    );
+
+    // Isolation ④ — peer workspace visible (sanity), peer payload NOT under
+    // /skills nor under builtin.
+    let out = sess.exec(&format!(
+        "cat /mnt/shared/{peer_name}/home/workspace/peer_marker.txt"
+    ))?;
+    assert!(out.stdout.contains("peer-payload-abc"), "peer read: {out:?}");
+    let out = sess.exec("test -e /skills/peer_marker.txt && echo LEAK || echo CLEAN")?;
+    assert!(out.stdout.contains("CLEAN"), "peer→user leak: {}", out.stdout);
+    let out = sess.exec("test -e /home/tokimo/.tokimo/skills/peer_marker.txt && echo LEAK || echo CLEAN")?;
+    assert!(out.stdout.contains("CLEAN"), "peer→builtin leak: {}", out.stdout);
+
+    // Sanity host-side: user.txt shows up in user_skills/ on host.
+    assert!(
+        user_skills.join("user.txt").exists(),
+        "user write didn't propagate to host {}",
+        user_skills.display()
+    );
+
+    sess.close().map_err(|e| format!("close: {e}"))?;
+    Ok(())
+}
+
