@@ -689,25 +689,15 @@ fn skill_layers_isolated_from_peers_and_each_other() -> TestResult {
     let out = sess.exec(&format!(
         "test -e /mnt/shared/{peer_name}/home/workspace/user.txt && echo LEAK || echo CLEAN"
     ))?;
-    assert!(
-        out.stdout.contains("CLEAN"),
-        "user→peer leak: {}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("CLEAN"), "user→peer leak: {}", out.stdout);
 
     // Isolation ③ — builtin payload NOT under /skills.
     let out = sess.exec("test -e /skills/BUILTIN.md && echo LEAK || echo CLEAN")?;
-    assert!(
-        out.stdout.contains("CLEAN"),
-        "builtin→user leak: {}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("CLEAN"), "builtin→user leak: {}", out.stdout);
 
     // Isolation ④ — peer workspace visible (sanity), peer payload NOT under
     // /skills nor under builtin.
-    let out = sess.exec(&format!(
-        "cat /mnt/shared/{peer_name}/home/workspace/peer_marker.txt"
-    ))?;
+    let out = sess.exec(&format!("cat /mnt/shared/{peer_name}/home/workspace/peer_marker.txt"))?;
     assert!(out.stdout.contains("peer-payload-abc"), "peer read: {out:?}");
     let out = sess.exec("test -e /skills/peer_marker.txt && echo LEAK || echo CLEAN")?;
     assert!(out.stdout.contains("CLEAN"), "peer→user leak: {}", out.stdout);
@@ -740,9 +730,7 @@ fn pty_write_all(fd: i32, data: &[u8]) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut pos = 0;
     while pos < data.len() {
-        let n = unsafe {
-            libc::write(fd, data[pos..].as_ptr() as *const libc::c_void, data.len() - pos)
-        };
+        let n = unsafe { libc::write(fd, data[pos..].as_ptr() as *const libc::c_void, data.len() - pos) };
         if n > 0 {
             pos += n as usize;
         } else if n == -1 {
@@ -897,8 +885,7 @@ fn pty_basic_io_and_resize() -> TestResult {
     let mut buf = [0u8; 4096];
     let drain_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let n =
-            unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n > 0 {
             accumulated.extend_from_slice(&buf[..n as usize]);
         } else if n == -1 {
