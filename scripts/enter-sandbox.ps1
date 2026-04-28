@@ -65,40 +65,73 @@ Write-Host ""
 Write-Host "===================================" -ForegroundColor Green
 Write-Host ""
 
-# --- Try WSL2 interactive mode ---
+# --- Enter the sandbox ---
 $wslAvailable = $null -ne (Get-Command wsl -ErrorAction SilentlyContinue)
 
 if (-not $wslAvailable) {
-    Write-Host "WSL2 not installed. Install it to get an interactive shell:" -ForegroundColor Yellow
-    Write-Host "  wsl --install" -ForegroundColor White
-    Write-Host ""
-    Write-Host "You can still browse the rootfs in File Explorer:" -ForegroundColor White
-    Write-Host "  start $RootfsPath" -ForegroundColor White
+    Write-Host "WSL2 not installed." -ForegroundColor Yellow
+    Write-Host "  You can still browse the rootfs: start $RootfsPath" -ForegroundColor White
+    Write-Host "  Or use the service: cargo run --example hv_smoke" -ForegroundColor White
     exit 0
 }
 
-# Translate Windows path to WSL path
+# Translate Windows path to WSL path (C:\Users\... -> /mnt/c/Users/...)
 $wslRootfs = ($RootfsPath -replace '\\', '/' -replace '^([A-Z]):', '/mnt/$1').ToLower()
-$wslHome = "/home/tokimo"
+
+# Check if bubblewrap is available (no sudo needed)
+$hasBwrap = (wsl -e which bwrap 2>$null) -ne ""
+
+if (-not $hasBwrap) {
+    Write-Host "bubblewrap not installed in WSL2." -ForegroundColor Yellow
+    Write-Host "  Run: wsl -e sudo apt install -y bubblewrap" -ForegroundColor White
+    Write-Host "  Then re-run this script." -ForegroundColor White
+    exit 1
+}
 
 if ($Command -ne "") {
-    # One-shot command mode
+    # One-shot command inside the rootfs via bwrap
     Write-Host "Running inside sandbox:" -ForegroundColor Cyan
     Write-Host "  > $Command" -ForegroundColor White
     Write-Host ""
-    wsl -e sudo /usr/sbin/chroot "$wslRootfs" /bin/bash -lc "$Command"
+    wsl -e bwrap `
+        --bind "$wslRootfs" / `
+        --bind /tmp /tmp `
+        --proc /proc --dev /dev `
+        --unshare-user --uid 1000 --gid 1000 `
+        --unshare-uts --hostname TokimoOS `
+        --clearenv `
+        --setenv HOME /home/tokimo `
+        --setenv USER tokimo --setenv LOGNAME tokimo `
+        --setenv PATH /home/tokimo/bin:/usr/local/bin:/usr/bin:/bin `
+        --setenv NPM_CONFIG_PREFIX /home/tokimo `
+        --setenv NODE_PATH /home/tokimo/lib/node_modules `
+        --setenv PYTHONPATH /home/tokimo/python_packages `
+        --setenv PIP_TARGET /home/tokimo/python_packages `
+        --setenv TERM xterm-256color `
+        -- /bin/bash -lc "$Command"
 } else {
-    # Interactive shell mode
-    Write-Host "Entering interactive sandbox shell..." -ForegroundColor Cyan
-    Write-Host "  Rootfs: $RootfsPath (inside VM: /)"
-    Write-Host "  User:   tokimo (uid 1000)"
-    Write-Host "  Home:   /home/tokimo"
+    # Interactive shell inside the rootfs via bwrap (no sudo, no password)
+    Write-Host "Entering sandbox..." -ForegroundColor Cyan
+    Write-Host "  Rootfs : $RootfsPath"
+    Write-Host "  Inside : /  (bwrap --bind rootfs → /)"
+    Write-Host "  User   : tokimo (uid 1000)"
+    Write-Host "  Host   : TokimoOS"
     Write-Host ""
-    Write-Host "  Type 'exit' or press Ctrl+D to leave." -ForegroundColor DarkGray
+    Write-Host "  NOT your WSL2 system. This is the Debian 13 rootfs." -ForegroundColor Green
+    Write-Host "  Type 'exit' or Ctrl+D to leave." -ForegroundColor DarkGray
     Write-Host ""
 
-    # The rootfs already has .bashrc/.bash_profile that set up env and PS1.
-    wsl -e sudo /usr/sbin/chroot "$wslRootfs" /bin/bash --login
+    wsl -e bwrap `
+        --bind "$wslRootfs" / `
+        --bind /tmp /tmp `
+        --proc /proc --dev /dev `
+        --unshare-user --uid 1000 --gid 1000 `
+        --unshare-uts --hostname TokimoOS `
+        --unsetenv LD_LIBRARY_PATH `
+        --setenv HOME /home/tokimo `
+        --setenv USER tokimo --setenv LOGNAME tokimo `
+        --setenv TERM xterm-256color `
+        -- /bin/bash --login
 }
 
 Write-Host ""
