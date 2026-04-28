@@ -725,3 +725,243 @@ fn skill_layers_isolated_from_peers_and_each_other() -> TestResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Test 8: PTY basic I/O and resize
+// ---------------------------------------------------------------------------
+
+fn set_nonblock(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+fn pty_write_all(fd: i32, data: &[u8]) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pos = 0;
+    while pos < data.len() {
+        let n = unsafe {
+            libc::write(fd, data[pos..].as_ptr() as *const libc::c_void, data.len() - pos)
+        };
+        if n > 0 {
+            pos += n as usize;
+        } else if n == -1 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                thread::sleep(Duration::from_millis(5));
+            } else {
+                return Err(format!("pty write error: errno={err}").into());
+            }
+        }
+        if Instant::now() > deadline {
+            return Err("pty write timed out".into());
+        }
+    }
+    Ok(())
+}
+
+/// Strip CSI/ESC escape sequences so PTY output can be parsed as plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some('[') = chars.next() {
+                // CSI sequence — consume until the final byte (0x40–0x7E).
+                for c2 in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            // Other ESC forms: only the ESC char is skipped.
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Read PTY until `needle` appears in `accumulated[search_from..]` or deadline.
+fn pty_read_until(
+    fd: i32,
+    needle: &str,
+    accumulated: &mut Vec<u8>,
+    search_from: usize,
+    deadline: Instant,
+) -> Result<(), Box<dyn Error>> {
+    let mut buf = [0u8; 4096];
+    loop {
+        // Check before reading so data added in the previous iteration is seen.
+        let slice = &accumulated[search_from..];
+        if String::from_utf8_lossy(slice).contains(needle) {
+            return Ok(());
+        }
+        // Check deadline before blocking on read, not after.
+        if Instant::now() > deadline {
+            let tail_start = accumulated.len().saturating_sub(256);
+            eprintln!(
+                "pty_read_until timeout: needle={needle:?}\nlast ~256 bytes: {:?}",
+                String::from_utf8_lossy(&accumulated[tail_start..])
+            );
+            return Err(format!("timeout waiting for {needle:?}").into());
+        }
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            accumulated.extend_from_slice(&buf[..n as usize]);
+        } else if n == -1 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                return Err(format!("pty read error: errno={err}").into());
+            }
+        } else if n == 0 {
+            return Err("pty EOF before needle found".into());
+        }
+    }
+}
+
+/// Read PTY until a line matching `\d+ \d+` equal to `expected` appears in
+/// `accumulated[search_from..]`, to avoid being fooled by prompt echoes.
+fn pty_read_stty_size(
+    fd: i32,
+    expected: &str,
+    accumulated: &mut Vec<u8>,
+    search_from: usize,
+    deadline: Instant,
+) -> Result<(), Box<dyn Error>> {
+    let mut buf = [0u8; 4096];
+    loop {
+        // Check before reading so data added in the previous iteration is seen.
+        let slice = &accumulated[search_from..];
+        let cleaned = strip_ansi(&String::from_utf8_lossy(slice));
+        for line in cleaned.lines() {
+            let trimmed = line.trim();
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() == 2
+                && parts[0].chars().all(|c| c.is_ascii_digit())
+                && parts[1].chars().all(|c| c.is_ascii_digit())
+                && trimmed == expected
+            {
+                return Ok(());
+            }
+        }
+        // Check deadline before blocking on read, not after.
+        if Instant::now() > deadline {
+            let tail_start = accumulated.len().saturating_sub(256);
+            eprintln!(
+                "pty_read_stty_size timeout: expected={expected:?}\nlast ~256 bytes: {:?}",
+                String::from_utf8_lossy(&accumulated[tail_start..])
+            );
+            return Err(format!("timeout waiting for stty size {expected:?}").into());
+        }
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            accumulated.extend_from_slice(&buf[..n as usize]);
+        } else if n == -1 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                return Err(format!("pty read error: errno={err}").into());
+            }
+        } else if n == 0 {
+            return Err("pty EOF before stty size found".into());
+        }
+    }
+}
+
+#[test]
+fn pty_basic_io_and_resize() -> TestResult {
+    use std::os::unix::io::AsRawFd;
+
+    let Some(rootfs) = gate("pty_basic_io_and_resize") else {
+        return Ok(());
+    };
+    let host = RootHost::new();
+    let sess = build_minimal_session(&rootfs, &host);
+
+    let argv = vec!["/bin/bash".to_string()];
+    let env = vec![("TERM".to_string(), "xterm-256color".to_string())];
+    let handle = sess
+        .open_pty(24, 80, &argv, &env, None)
+        .map_err(|e| format!("open_pty: {e}"))?;
+
+    let raw_fd = handle.master_fd().ok_or("master_fd() returned None")?.as_raw_fd();
+    set_nonblock(raw_fd);
+
+    // Give bash a moment to start, then drain any initial output.
+    thread::sleep(Duration::from_millis(300));
+    let mut accumulated: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n =
+            unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            accumulated.extend_from_slice(&buf[..n as usize]);
+        } else if n == -1 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                break; // Input buffer empty; done draining.
+            }
+        } else if n == 0 {
+            return Err("pty EOF during initial drain".into());
+        }
+        if Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    eprintln!(
+        "pty_basic_io_and_resize: drained {} bytes of bash startup output",
+        accumulated.len()
+    );
+
+    // Step 1: verify we have a TTY.
+    let mark1 = accumulated.len();
+    pty_write_all(raw_fd, b"tty -s && echo TTY_OK_$$\n")?;
+    pty_read_until(
+        raw_fd,
+        "TTY_OK_",
+        &mut accumulated,
+        mark1,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|e| format!("TTY check: {e}"))?;
+
+    // Step 2: verify initial terminal size is 24x80.
+    let mark2 = accumulated.len();
+    pty_write_all(raw_fd, b"stty size\n")?;
+    pty_read_stty_size(
+        raw_fd,
+        "24 80",
+        &mut accumulated,
+        mark2,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|e| format!("stty size (24 80): {e}"))?;
+
+    // Step 3: resize to 40x132 and verify.
+    handle.resize(40, 132).map_err(|e| format!("resize: {e}"))?;
+    thread::sleep(Duration::from_millis(150)); // let SIGWINCH propagate
+    let mark3 = accumulated.len();
+    pty_write_all(raw_fd, b"stty size\n")?;
+    pty_read_stty_size(
+        raw_fd,
+        "40 132",
+        &mut accumulated,
+        mark3,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|e| format!("stty size (40 132): {e}"))?;
+
+    // Step 4: clean exit.
+    pty_write_all(raw_fd, b"exit 0\n")?;
+    let exit_code = handle.wait(Duration::from_secs(5));
+    assert_eq!(exit_code, Some(0), "expected bash to exit 0, got: {exit_code:?}");
+
+    drop(handle);
+    sess.close().map_err(|e| format!("close: {e}"))?;
+    Ok(())
+}
