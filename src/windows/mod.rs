@@ -38,18 +38,43 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
 
     let network = translate_network(&cfg.network)?;
 
-    let shell_cmd = cmd
-        .iter()
-        .map(|s| shell_escape(s.as_ref()))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    use base64::Engine;
-    let cmd_b64 = base64::engine::general_purpose::STANDARD.encode(shell_cmd.as_bytes());
-
     let kernel = find_kernel()?;
     let initrd = find_initrd()?;
     let (rootfs_vhdx, workspace) = find_rootfs_and_workspace(cfg)?;
+
+    // Write stdin buffer to the workspace so the guest can read it.
+    if let Some(ref stdin_data) = cfg.stdin {
+        let stdin_path = workspace.join(".__tps_stdin");
+        std::fs::write(&stdin_path, stdin_data)
+            .map_err(|e| Error::exec(format!("write stdin file: {e}")))?;
+    }
+
+    // Build a self-contained shell one-liner that handles cwd, env, stdin
+    // redirect, and the actual command in that order.
+    let mut shell_cmd = String::new();
+
+    if cfg.stdin.is_some() {
+        shell_cmd.push_str("exec < /.__tps_stdin; ");
+    }
+    if let Some(ref cwd) = cfg.cwd {
+        shell_cmd.push_str(&format!("cd {} && ", shell_escape(&cwd.to_string_lossy())));
+    }
+    for (k, v) in &cfg.env {
+        shell_cmd.push_str(&format!(
+            "export {}={} && ",
+            k.to_string_lossy(),
+            shell_escape(&v.to_string_lossy())
+        ));
+    }
+    shell_cmd.push_str(
+        &cmd.iter()
+            .map(|s| shell_escape(s.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+
+    use base64::Engine;
+    let cmd_b64 = base64::engine::general_purpose::STANDARD.encode(shell_cmd.as_bytes());
 
     let memory_mb: u64 = std::env::var("TOKIMO_MEMORY")
         .ok()
@@ -79,10 +104,63 @@ pub(crate) fn spawn_session_shell(_cfg: &crate::config::SandboxConfig) -> Result
 }
 
 pub(crate) fn run_without_sandbox<S: AsRef<str>>(
-    _cmd: &[S],
-    _cfg: &crate::config::SandboxConfig,
+    cmd: &[S],
+    cfg: &crate::config::SandboxConfig,
 ) -> Result<ExecutionResult> {
-    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
+    use std::process::{Command, Stdio};
+
+    if cmd.is_empty() {
+        return Err(Error::validation("empty command"));
+    }
+
+    let mut c = Command::new(cmd[0].as_ref());
+    for a in &cmd[1..] {
+        c.arg(a.as_ref());
+    }
+
+    c.stdin(Stdio::piped());
+    c.stdout(Stdio::piped());
+    c.stderr(if cfg.stream_stderr {
+        Stdio::inherit()
+    } else {
+        Stdio::piped()
+    });
+
+    for (k, v) in &cfg.env {
+        c.env(k, v);
+    }
+
+    if let Some(cwd) = &cfg.cwd {
+        c.current_dir(cwd);
+    } else {
+        c.current_dir(&cfg.work_dir);
+    }
+
+    let mut child = c.spawn().map_err(|e| Error::exec(format!("spawn failed: {e}")))?;
+
+    // Write stdin on a separate thread so we can read stdout/stderr concurrently.
+    if let Some(ref stdin_data) = cfg.stdin {
+        let mut stdin = child.stdin.take().unwrap();
+        let data = stdin_data.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+        });
+    } else {
+        drop(child.stdin.take());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::exec(format!("wait failed: {e}")))?;
+
+    Ok(ExecutionResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+        timed_out: false,
+        oom_killed: false,
+    })
 }
 
 // ---------------------------------------------------------------------------

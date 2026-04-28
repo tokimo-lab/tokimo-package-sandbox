@@ -113,7 +113,6 @@ fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<
 }
 
 #[cfg(windows)]
-fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], _cfg: &SandboxConfig) -> Result<ExecutionResult> {
-    let _ = cmd;
-    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
+fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    windows::run_without_sandbox(cmd, cfg)
 }
