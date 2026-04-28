@@ -349,11 +349,15 @@ fn timeout_kill_job_preserves_session() -> TestResult {
     // Spawn a long-runner.
     let handle = sess.spawn("sleep 30").map_err(|e| format!("spawn: {e}"))?;
 
-    // First wait should time out (returns Err on timeout).
-    let first = handle.wait_with_timeout(Duration::from_millis(500));
-    assert!(
-        first.is_err(),
-        "wait_with_timeout(500ms) should have timed out for sleep 30, got: {first:?}"
+    // First wait should hit the timeout. `wait_with_timeout` reports a
+    // timeout via `Ok(ExecOutput { exit_code: 124, .. })` (matching the
+    // shell `timeout(1)` convention) — it does NOT return `Err`.
+    let first = handle
+        .wait_with_timeout(Duration::from_millis(500))
+        .map_err(|e| format!("wait first: {e}"))?;
+    assert_eq!(
+        first.exit_code, 124,
+        "wait_with_timeout(500ms) should have timed out (rc=124) for sleep 30, got: {first:?}"
     );
 
     // Now kill_job and drain.
@@ -532,9 +536,11 @@ fn profile_env_and_mounts_combined() -> TestResult {
     mounts.push(Mount::rw(workspace.clone()).guest("/home/workspace"));
     mounts.push(Mount::rw(host.make_dir("tmp")).guest("/tmp"));
     // The 3 caller mounts: 1 RW workspace + 2 RO config dirs (workspace
-    // already counted above, plus two RO).
-    mounts.push(Mount::ro(conf_a).guest("/etc/conf_a"));
-    mounts.push(Mount::ro(conf_b).guest("/etc/conf_b"));
+    // already counted above, plus two RO). Stage them under /opt/<name>
+    // rather than /etc/<name> — the rootfs `/etc` is bind-mounted RO at
+    // line 57, so bwrap cannot mkdir new subdirs underneath it.
+    mounts.push(Mount::ro(conf_a).guest("/opt/conf_a"));
+    mounts.push(Mount::ro(conf_b).guest("/opt/conf_b"));
 
     // 5 profile-style env vars.
     let envs: [(&str, &str); 5] = [
@@ -581,7 +587,7 @@ fn profile_env_and_mounts_combined() -> TestResult {
     );
 
     // Mounts are visible too.
-    let out = sess.exec("cat /etc/conf_a/a.conf && cat /etc/conf_b/b.conf")?;
+    let out = sess.exec("cat /opt/conf_a/a.conf && cat /opt/conf_b/b.conf")?;
     assert!(
         out.stdout.contains("a=1") && out.stdout.contains("b=2"),
         "conf: {}",
