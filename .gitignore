@@ -3,3 +3,9 @@ Cargo.lock
 *.swp
 .DS_Store
 .cargo/
+# Local test rootfs (downloaded by CI / dev via TOKIMO_TEST_ROOTFS env)
+/.test-rootfs/
+# Windows VM artifacts (downloaded by scripts/fetch-vm.ps1)
+/vm/
+# IDE / agent config (per-developer)
+/.claude/

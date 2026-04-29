@@ -74,6 +74,8 @@ pub struct ClientState {
     pub children: HashSet<String>,
     /// Transport type for this client.
     pub transport: Transport,
+    /// Streaming receive buffer (used by Serial and Vsock transports).
+    pub read_buf: Vec<u8>,
 }
 
 pub struct State {
@@ -137,7 +139,9 @@ pub fn run_loop(
     base_env: Vec<(String, String)>,
     transport: Transport,
 ) -> Result<(), String> {
+    eprintln!("[init] run_loop ENTER transport={transport:?}");
     let mut poll = Poll::new().map_err(|e| format!("Poll::new: {e}"))?;
+    eprintln!("[init] run_loop after Poll::new");
     let mut events = Events::with_capacity(64);
 
     let mut state = State {
@@ -150,10 +154,12 @@ pub fn run_loop(
     };
     let mut shutdown = false;
 
-    // Serial mode: register the "listener" as a pre-connected client.
-    // Non-serial: use it as an accept socket.
+    // Serial / Vsock-client mode: register the "listener" as a pre-connected
+    // client. Cowork architecture has the host listen on AF_HYPERV and the
+    // guest dial in, so by the time we reach run_loop the vsock socket is
+    // already a single connected stream — same shape as Serial.
     let mut listener_opt = Some(listener);
-    if transport == Transport::Serial {
+    if transport == Transport::Serial || transport == Transport::Vsock {
         let l = listener_opt.take().unwrap();
         let raw = l.as_raw_fd();
         let slot = state.client_slots.len();
@@ -169,6 +175,7 @@ pub fn run_loop(
                 write_fd,
                 children: HashSet::new(),
                 transport,
+                read_buf: Vec::new(),
             },
         );
     }
@@ -183,12 +190,29 @@ pub fn run_loop(
         .register(&mut SourceFd(&sigfd.as_raw_fd()), TOK_SIGFD, Interest::READABLE)
         .map_err(|e| format!("register sigfd: {e}"))?;
 
+    eprintln!("[init] entering poll loop, transport={transport:?}");
+
     while !shutdown {
-        if let Err(e) = poll.poll(&mut events, None) {
+        if let Err(e) = poll.poll(&mut events, Some(std::time::Duration::from_millis(2000))) {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(format!("poll: {e}"));
+        }
+        let n_evs = events.iter().count();
+        eprintln!("[init] poll returned {n_evs} events");
+        if n_evs == 0 {
+            // Heartbeat: try writing a marker byte to the write fd, and log
+            // poll state to kmsg so we can verify whether (a) we're being
+            // woken at all and (b) writes actually leave the guest.
+            if transport == Transport::Serial {
+                if let Some(c) = state.clients.values().next() {
+                    let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
+                    let marker = b"HBHBHBHBHB";
+                    let n = unsafe { libc::write(wfd, marker.as_ptr().cast(), marker.len()) };
+                    eprintln!("[init] heartbeat: wrote {n} bytes to fd {wfd}");
+                }
+            }
         }
 
         for ev in events.iter() {
@@ -266,6 +290,7 @@ fn accept_client(listener: &OwnedFd, state: &mut State, registry: &mio::Registry
             write_fd: None,
             children: HashSet::new(),
             transport: state.transport,
+            read_buf: Vec::new(),
         },
     );
     Ok(())
@@ -473,25 +498,61 @@ fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::R
     }
 }
 
-/// Read length-prefixed frames from a VSOCK (stream) client.
+/// Read length-prefixed frames from a VSOCK / Serial (stream) client.
+/// Maintains a per-client buffer and processes all complete frames.
 fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = unsafe { libc::read(client_fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n == 0 {
-        return Ok(false);
-    }
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(true);
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(client_fd, tmp.as_mut_ptr().cast(), tmp.len()) };
+        if n == 0 {
+            return Ok(false);
         }
-        return Err(err.to_string());
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                break;
+            }
+            return Err(err.to_string());
+        }
+        eprintln!("[init] read {n}B from fd {client_fd}");
+        if let Some(c) = state.clients.get_mut(&client_fd) {
+            c.read_buf.extend_from_slice(&tmp[..n as usize]);
+        } else {
+            return Ok(false);
+        }
     }
-    let data = &buf[..n as usize];
-    match decode_frame(data).map_err(|e| format!("decode_frame: {e}"))? {
-        Some((Frame::Op(op), _)) => handle_op(op, client_fd, state, registry),
-        Some((other, _)) => eprintln!("[init] client sent non-Op frame: {other:?}"),
-        None => {} // partial frame; wait for more
+
+    // Drain all complete frames from the buffer.
+    loop {
+        let frame_opt = {
+            let c = match state.clients.get_mut(&client_fd) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
+            if c.read_buf.len() < 4 {
+                None
+            } else {
+                let mut len_bytes = [0u8; 4];
+                len_bytes.copy_from_slice(&c.read_buf[..4]);
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                if c.read_buf.len() < 4 + len {
+                    None
+                } else {
+                    let payload: Vec<u8> = c.read_buf.drain(..4 + len).skip(4).collect();
+                    Some(payload)
+                }
+            }
+        };
+        let payload = match frame_opt {
+            Some(p) => p,
+            None => break,
+        };
+        let frame: Frame = serde_json::from_slice(&payload)
+            .map_err(|e| format!("parse wire frame: {e}"))?;
+        match frame {
+            Frame::Op(op) => handle_op(op, client_fd, state, registry),
+            other => eprintln!("[init] client sent non-Op frame: {other:?}"),
+        }
     }
     Ok(true)
 }

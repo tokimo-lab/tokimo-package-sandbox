@@ -1,0 +1,98 @@
+===== 0. Checking build deps =====
+===== 1. Downloading artifacts =====
+-rw-r--r-- 1 william william 29832285 Apr 29 21:44 /tmp/tokimo-build/dl/ubuntu-base.tar.gz
+Downloading linux-modules-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb...
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0 25.2M    0 11564    0     0  16297      0  0:27:02 --:--:--  0:27:02 16287  0 25.2M    0  163k    0     0   133k      0  0:03:13  0:00:01  0:03:12  133k 42 25.2M   42 10.7M    0     0  4927k      0  0:00:05  0:00:02  0:00:03 4926k100 25.2M  100 25.2M    0     0  8596k      0  0:00:03  0:00:03 --:--:-- 8598k
+-rw-r--r-- 1 william william 26441704 Apr 29 21:45 /tmp/tokimo-build/dl/linux-modules-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb
+Downloading linux-modules-extra-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb...
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0 75.9M    0  3262    0     0   4655      0  4:45:01 --:--:--  4:45:01  4653  0 75.9M    0  125k    0     0   107k      0  0:12:00  0:00:01  0:11:59  107k 13 75.9M   13  9.8M    0     0  4677k      0  0:00:16  0:00:02  0:00:14 4676k 38 75.9M   38 29.3M    0     0  9510k      0  0:00:08  0:00:03  0:00:05 9508k 63 75.9M   63 48.2M    0     0  11.5M      0  0:00:06  0:00:04  0:00:02 11.5M 88 75.9M   88 67.5M    0     0  13.0M      0  0:00:05  0:00:05 --:--:-- 15.1M100 75.9M  100 75.9M    0     0  13.5M      0  0:00:05  0:00:05 --:--:-- 17.1M
+-rw-r--r-- 1 william william 79605206 Apr 29 21:45 /tmp/tokimo-build/dl/linux-modules-extra-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb
+===== 2. Cross-compiling tokimo-sandbox-init (musl) =====
+   --> src/linux/l4/mod.rs:176:34
+    |
+176 |         Backend::SeccompTrace => seccomp_trace::child_install(),
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+    |
+    = note: consult the function's documentation for information on how to avoid undefined behavior
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `tokimo-package-sandbox` (lib) generated 28 warnings (run `cargo fix --lib -p tokimo-package-sandbox` to apply 6 suggestions)
+warning: unused import: `decode_frame`
+  --> src/bin/tokimo-sandbox-init/server.rs:24:46
+   |
+24 | use tokimo_package_sandbox::protocol::wire::{decode_frame, encode_frame};
+   |                                              ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `tokimo-package-sandbox` (bin "tokimo-sandbox-init") generated 1 warning (run `cargo fix --bin "tokimo-sandbox-init" -p tokimo-package-sandbox` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 16.31s
+/mnt/f/tokimo-package-sandbox/target/x86_64-unknown-linux-musl/release/tokimo-sandbox-init: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
+-rwxr-xr-x 2 william william 1434880 Apr 29 21:45 /mnt/f/tokimo-package-sandbox/target/x86_64-unknown-linux-musl/release/tokimo-sandbox-init
+===== 3. Assembling rootfs =====
+Extracting Ubuntu base...
+Extracting kernel modules .deb...
+  linux-modules-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb
+  linux-modules-extra-6.8.0-106-generic_6.8.0-106.106~22.04.1_amd64.deb
+
+--- Module check ---
+  OK 9pnet: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/net/9p/9pnet.ko
+  OK 9pnet_fd: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/net/9p/9pnet_fd.ko
+  OK 9p: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/fs/9p/9p.ko
+  OK hv_sock: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/net/vmw_vsock/hv_sock.ko
+  OK vsock: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/net/vmw_vsock/vsock.ko
+  OK vsock_loopback: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/net/vmw_vsock/vsock_loopback.ko
+  OK hv_vmbus: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/drivers/hv/hv_vmbus.ko
+  OK hv_storvsc: /tmp/tokimo-build/rootfs/lib/modules/6.8.0-106-generic/kernel/drivers/scsi/hv_storvsc.ko
+Compiling vsock9p...
+Slimming rootfs...
+Pruning unneeded kernel modules...
+
+===== 4. Building ext4 image =====
+mke2fs 1.47.0 (5-Feb-2023)
+Discarding device blocks:      0/102400             done                            
+Creating filesystem with 102400 4k blocks and 102400 inodes
+Filesystem UUID: dab74655-c80a-4517-9453-529f988bcbe6
+Superblock backups stored on blocks: 
+	32768, 98304
+
+Allocating group tables: 0/4   done                            
+Writing inode tables: 0/4   done                            
+Creating journal (4096 blocks): done
+Copying files into the device: done
+Writing superblocks and filesystem accounting information: 0/4   done
+
+-rw-r--r-- 1 william william 419430400 Apr 29 21:45 /tmp/tokimo-build/rootfs.img
+
+===== 5. Converting to VHDX =====
+image: /tmp/tokimo-build/out/rootfs.vhdx
+file format: vhdx
+virtual size: 400 MiB (419430400 bytes)
+disk size: 339 MiB
+cluster_size: 8388608
+Child node '/file':
+    filename: /tmp/tokimo-build/out/rootfs.vhdx
+    protocol type: file
+    file length: 376 MiB (394264576 bytes)
+    disk size: 339 MiB
+-rw-r--r-- 1 william william 394264576 Apr 29 21:45 /tmp/tokimo-build/out/rootfs.vhdx
+
+===== 6. Staging kernel + initrd =====
+total 534684
+drwxr-xr-x 2 william william      4096 Apr 29 21:45 .
+drwxr-xr-x 6 william william      4096 Apr 29 21:45 ..
+-rwxr-xr-x 1 william william 177303315 Apr 29 21:45 initrd
+-rw-r--r-- 1 william william 394264576 Apr 29 21:45 rootfs.vhdx
+-rwxr-xr-x 1 william william  14993800 Apr 29 21:45 vmlinuz
+
+===== DONE =====
+Artifacts ready at /tmp/tokimo-build/out/
+
+Next: run scripts/install-artifacts.ps1 (PowerShell) to copy them into
+%USERPROFILE%\.tokimo\ for use by tokimo-sandbox-svc.
+EXIT=0

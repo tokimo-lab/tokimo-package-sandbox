@@ -1,29 +1,33 @@
 //! Windows sandbox: SYSTEM service via named pipe.
 //!
 //! All VM operations are delegated to `tokimo-sandbox-svc.exe`, a Windows
-//! service running as `localSystem`. The library auto-installs the service
-//! on first use via a one-time UAC prompt.
+//! service running as `localSystem`. The recommended way to install it is
+//! the MSIX in `packaging/windows/`, which registers the service via
+//! `desktop6:Service` (no UAC). For local development the legacy
+//! `--install` / `--console` flags still work.
 //!
-//! ## Debugging
+//! ## Network policy
 //!
-//! Run the service in console mode for local development:
+//! Windows currently only supports two policies:
+//!   * `NetworkPolicy::Blocked` — no NIC is attached to the VM.
+//!   * `NetworkPolicy::AllowAll` — default Hyper-V NAT NIC.
 //!
-//! ```text
-//! cargo build --bin tokimo-sandbox-svc
-//! .\target\debug\tokimo-sandbox-svc.exe --console
-//! ```
-//!
-//! The library auto-detects a console-mode service already running and skips
-//! the auto-install step.
+//! `Observed` and `Gated` policies are Linux/macOS only; on Windows they
+//! are rejected at config validation time so callers don't get silent
+//! downgrades.
 
 mod client;
+mod init_client;
+pub(crate) mod ov_pipe;
 pub mod protocol;
+pub(crate) mod safe_path;
+mod session;
 
-use crate::{Error, ExecutionResult, Result};
+use crate::{Error, ExecutionResult, NetworkPolicy, Result};
 
 use std::path::PathBuf;
 
-const DEFAULT_MEMORY_MB: u64 = 512;
+const DEFAULT_MEMORY_MB: u64 = 2048;
 const DEFAULT_CPUS: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -35,18 +39,46 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
         return Err(Error::validation("empty command"));
     }
 
-    let shell_cmd = cmd
-        .iter()
-        .map(|s| shell_escape(s.as_ref()))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let network = translate_network(&cfg.network)?;
+
+    let kernel = find_kernel()?;
+    let initrd = find_initrd()?;
+    let rootfs_dir = find_rootfs_vhdx()?;
+    let workspace = ensure_workspace(cfg)?;
+
+    // Write stdin buffer to the workspace so the guest can read it.
+    // The init script (in the rootfs initrd) picks up `.vz_stdin` and pipes
+    // it into the chrooted command.
+    if let Some(ref stdin_data) = cfg.stdin {
+        let stdin_path = workspace.join(".vz_stdin");
+        std::fs::write(&stdin_path, stdin_data).map_err(|e| Error::exec(format!("write stdin file: {e}")))?;
+    }
+
+    // Build a self-contained shell one-liner that handles cwd, env, and the
+    // actual command. Stdin redirection is handled by init.sh outside the
+    // chroot so we don't have to worry about path mapping here.
+    let mut shell_cmd = String::new();
+
+    if let Some(ref cwd) = cfg.cwd {
+        shell_cmd.push_str(&format!("cd {} && ", shell_escape(&cwd.to_string_lossy())));
+    }
+    for (k, v) in &cfg.env {
+        shell_cmd.push_str(&format!(
+            "export {}={} && ",
+            k.to_string_lossy(),
+            shell_escape(&v.to_string_lossy())
+        ));
+    }
+    shell_cmd.push_str(
+        &cmd.iter()
+            .map(|s| shell_escape(s.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 
     use base64::Engine;
     let cmd_b64 = base64::engine::general_purpose::STANDARD.encode(shell_cmd.as_bytes());
 
-    let kernel = find_kernel()?;
-    let initrd = find_initrd()?;
-    let rootfs = find_rootfs(cfg)?;
     let memory_mb: u64 = std::env::var("TOKIMO_MEMORY")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -56,20 +88,96 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CPUS);
 
-    client::exec_vm(&kernel, &initrd, &rootfs, &cmd_b64, memory_mb, cpu_count)
+    client::exec_vm(
+        &kernel,
+        &initrd,
+        &rootfs_dir,
+        &workspace,
+        &cmd_b64,
+        memory_mb,
+        cpu_count,
+        network,
+    )
 }
 
-pub(crate) fn spawn_session_shell(_cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {
-    Err(Error::validation(
-        "Session not yet supported on Windows. Use run() for one-shot execution.",
-    ))
+pub(crate) fn spawn_session_shell(cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {
+    session::spawn_session_shell(cfg)
 }
 
 pub(crate) fn run_without_sandbox<S: AsRef<str>>(
-    _cmd: &[S],
-    _cfg: &crate::config::SandboxConfig,
+    cmd: &[S],
+    cfg: &crate::config::SandboxConfig,
 ) -> Result<ExecutionResult> {
-    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
+    use std::process::{Command, Stdio};
+
+    if cmd.is_empty() {
+        return Err(Error::validation("empty command"));
+    }
+
+    let mut c = Command::new(cmd[0].as_ref());
+    for a in &cmd[1..] {
+        c.arg(a.as_ref());
+    }
+
+    c.stdin(Stdio::piped());
+    c.stdout(Stdio::piped());
+    c.stderr(if cfg.stream_stderr {
+        Stdio::inherit()
+    } else {
+        Stdio::piped()
+    });
+
+    for (k, v) in &cfg.env {
+        c.env(k, v);
+    }
+
+    if let Some(cwd) = &cfg.cwd {
+        c.current_dir(cwd);
+    } else {
+        c.current_dir(&cfg.work_dir);
+    }
+
+    let mut child = c.spawn().map_err(|e| Error::exec(format!("spawn failed: {e}")))?;
+
+    // Write stdin on a separate thread so we can read stdout/stderr concurrently.
+    if let Some(ref stdin_data) = cfg.stdin {
+        let mut stdin = child.stdin.take().unwrap();
+        let data = stdin_data.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+        });
+    } else {
+        drop(child.stdin.take());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::exec(format!("wait failed: {e}")))?;
+
+    Ok(ExecutionResult {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+        timed_out: false,
+        oom_killed: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NetworkPolicy translation
+// ---------------------------------------------------------------------------
+
+fn translate_network(p: &NetworkPolicy) -> Result<protocol::SvcNetwork> {
+    match p {
+        NetworkPolicy::Blocked => Ok(protocol::SvcNetwork::Blocked),
+        NetworkPolicy::AllowAll => Ok(protocol::SvcNetwork::AllowAll),
+        NetworkPolicy::Observed { .. } | NetworkPolicy::Gated { .. } => Err(Error::validation(
+            "NetworkPolicy::Observed / Gated are not implemented on Windows. \
+             Use Blocked or AllowAll. \
+             See docs/network-observability.md for the roadmap.",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,88 +194,103 @@ fn shell_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Path discovery (kernel, initrd, rootfs)
+// Path discovery
 // ---------------------------------------------------------------------------
+//
+// VM artifacts live under `<repo>/vm/`:
+//   * `vm/vmlinuz`    — Linux kernel
+//   * `vm/initrd.img` — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
+//   * `vm/rootfs.vhdx` — ext4 VHDX rootfs
+//
+// Both are produced by the tokimo-package-rootfs CI:
+//   https://github.com/tokimo-lab/tokimo-package-rootfs/releases
+//
+// Use `scripts/fetch-vm.ps1` to download them into `vm/`.
+//
+// Resolution order — find first directory containing all three files:
+//   1. `<exe>/vm/`
+//   2. walking up from `<exe>` looking for `vm/`
+//   3. walking up from `cwd` looking for `vm/`
+// All three must exist together; we reject partial directories so a stray
+// `vm/` folder elsewhere in the tree won't be picked up by mistake.
 
-fn find_kernel() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_KERNEL") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Ok(pb);
+const VM_DIR_NAME: &str = "vm";
+const KERNEL_FILE: &str = "vmlinuz";
+const INITRD_FILE: &str = "initrd.img";
+const ROOTFS_FILE: &str = "rootfs.vhdx";
+
+fn vm_dir_complete(d: &std::path::Path) -> bool {
+    d.join(KERNEL_FILE).is_file()
+        && d.join(INITRD_FILE).is_file()
+        && d.join(ROOTFS_FILE).is_file()
+}
+
+fn find_vm_dir() -> Result<PathBuf> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    let mut probe = |p: PathBuf| -> Option<PathBuf> {
+        if vm_dir_complete(&p) {
+            Some(p)
+        } else {
+            tried.push(p);
+            None
         }
-        return Err(Error::exec(format!("TOKIMO_KERNEL={} not found", pb.display())));
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/kernel/vmlinuz");
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
+    };
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in &["vmlinuz", "bzImage", "kernel"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
+            if let Some(hit) = probe(dir.join(VM_DIR_NAME)) {
+                return Ok(hit);
+            }
+            // walk up
+            let mut cur = Some(dir);
+            while let Some(d) = cur {
+                if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
+                    return Ok(hit);
                 }
+                cur = d.parent();
             }
         }
     }
-    Err(Error::validation(
-        "Linux kernel not found. Set TOKIMO_KERNEL=/path/to/vmlinuz or place it at \
-         ~/.tokimo/kernel/vmlinuz. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
-    ))
-}
 
-fn find_initrd() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_INITRD") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Ok(pb);
-        }
-        return Err(Error::exec(format!("TOKIMO_INITRD={} not found", pb.display())));
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/initrd.img");
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &["initrd.img", "initramfs.cpio.gz", "initrd"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
-                }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: Option<&std::path::Path> = Some(&cwd);
+        while let Some(d) = cur {
+            if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
+                return Ok(hit);
             }
+            cur = d.parent();
         }
     }
-    Err(Error::validation(
-        "Initrd not found. Set TOKIMO_INITRD=/path/to/initrd.img or place it at \
-         ~/.tokimo/initrd.img. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
-    ))
+
+    let probed = tried
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    Err(Error::validation(format!(
+        "VM artifacts not found. Expected `{KERNEL_FILE}`, `{INITRD_FILE}`, `{ROOTFS_FILE}` \
+         in a `{VM_DIR_NAME}/` directory. Run `scripts/fetch-vm.ps1` to download them.\n\
+         Tried:\n  {probed}"
+    )))
 }
 
-fn find_rootfs(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_ROOTFS") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Ok(pb);
-        }
-        return Err(Error::exec(format!("TOKIMO_ROOTFS={} not found", pb.display())));
+pub(crate) fn find_kernel() -> Result<PathBuf> {
+    Ok(find_vm_dir()?.join(KERNEL_FILE))
+}
+
+pub(crate) fn find_initrd() -> Result<PathBuf> {
+    Ok(find_vm_dir()?.join(INITRD_FILE))
+}
+
+pub(crate) fn find_rootfs_vhdx() -> Result<PathBuf> {
+    Ok(find_vm_dir()?.join(ROOTFS_FILE))
+}
+
+pub(crate) fn ensure_workspace(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {
+    let work = cfg.work_dir.clone();
+    if !work.exists() {
+        std::fs::create_dir_all(&work).map_err(|e| Error::exec(format!("create work dir: {e}")))?;
     }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/rootfs");
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
-    if cfg.work_dir.join("usr").exists() {
-        return Ok(cfg.work_dir.clone());
-    }
-    Err(Error::validation(
-        "Rootfs not found. Set TOKIMO_ROOTFS=/path/to/rootfs or place it at \
-         ~/.tokimo/rootfs/. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
-    ))
+    Ok(work)
 }

@@ -1,0 +1,25 @@
+# Tokimo monorepo pre-commit hooks (Lefthook)
+# 触发：git commit 时自动按文件类型并行 fmt staged 文件
+# 文档：https://lefthook.dev
+#
+# 安装/启用：./scripts/install-hooks.sh（也会在 pnpm install 时自动跑）
+# 同步到所有 submodule：./scripts/sync-hooks-to-submodules.sh
+
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      tags: rust fmt
+      glob: "*.rs"
+      # Shell script in a separate file avoids inline quoting issues on Windows.
+      run: scripts/lefthook-rustfmt.sh {staged_files}
+      stage_fixed: true
+
+    biome:
+      tags: web fmt
+      glob: "*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,css}"
+      run: |
+        files="{staged_files}"
+        [ -z "$files" ] && exit 0
+        pnpm exec biome format --write --no-errors-on-unmatched $files
+      stage_fixed: true

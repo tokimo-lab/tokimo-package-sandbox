@@ -40,15 +40,23 @@ impl Fixture {
     }
 }
 
+/// Call at start of each session test. Returns early if prerequisites
+/// are missing or sessions aren't supported.
+macro_rules! require_session {
+    () => {
+        if common::skip_unless_platform_ready() || common::skip_unless_session_supported() {
+            return;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn session_exec_echo() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let out = f.sess.exec("echo hello").expect("exec echo");
     assert_eq!(out.stdout.trim(), "hello");
@@ -57,9 +65,7 @@ fn session_exec_echo() {
 
 #[test]
 fn session_exec_env_persistence() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     f.sess.exec("export FOO=bar42").expect("set env");
     let out = f.sess.exec("echo $FOO").expect("read env");
@@ -68,9 +74,7 @@ fn session_exec_env_persistence() {
 
 #[test]
 fn session_exec_cwd_persistence() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     f.sess
         .exec("mkdir -p /tmp/tps_cwd_test && cd /tmp/tps_cwd_test")
@@ -81,9 +85,7 @@ fn session_exec_cwd_persistence() {
 
 #[test]
 fn session_exec_stderr_capture() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let out = f.sess.exec("echo to-stderr 1>&2").expect("stderr test");
     assert_eq!(out.stderr.trim(), "to-stderr");
@@ -92,9 +94,7 @@ fn session_exec_stderr_capture() {
 
 #[test]
 fn session_exec_exit_code_nonzero() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let out = f.sess.exec("bash -c 'exit 7'").expect("exit 7");
     assert_eq!(out.exit_code, 7);
@@ -102,9 +102,7 @@ fn session_exec_exit_code_nonzero() {
 
 #[test]
 fn session_exec_large_output() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let out = f.sess.exec("seq 1 500").expect("seq");
     let lines: Vec<&str> = out.stdout.lines().collect();
@@ -115,9 +113,7 @@ fn session_exec_large_output() {
 
 #[test]
 fn session_exec_timeout_tears_down_session() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     f.sess.set_exec_timeout(Duration::from_millis(500));
     let err = f.sess.exec("sleep 10").unwrap_err();
@@ -130,9 +126,7 @@ fn session_exec_timeout_tears_down_session() {
 
 #[test]
 fn session_spawn_captures_output() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let job = f.sess.spawn("echo spawn-hello && echo spawn-err 1>&2").expect("spawn");
     let out = job.wait_with_timeout(Duration::from_secs(10)).expect("wait");
@@ -143,9 +137,7 @@ fn session_spawn_captures_output() {
 
 #[test]
 fn session_spawn_inherits_cwd() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     f.sess
         .exec("mkdir -p /tmp/spawn_cwd_inherit && cd /tmp/spawn_cwd_inherit")
@@ -157,9 +149,7 @@ fn session_spawn_inherits_cwd() {
 
 #[test]
 fn session_spawn_timeout_kills_job() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let job = f.sess.spawn("sleep 60").expect("spawn sleep");
     let out = job.wait_with_timeout(Duration::from_secs(2)).expect("wait");
@@ -172,9 +162,7 @@ fn session_spawn_timeout_kills_job() {
 
 #[test]
 fn session_kill_job_keeps_session_alive() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let job = f.sess.spawn("sleep 60").expect("spawn sleep");
     let jid = job.id();
@@ -188,9 +176,7 @@ fn session_kill_job_keeps_session_alive() {
 
 #[test]
 fn session_spawn_concurrent_no_crosstalk() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     let j1 = f.sess.spawn("echo JOB1_MARKER_ABC").expect("spawn j1");
     let j2 = f.sess.spawn("echo JOB2_MARKER_XYZ").expect("spawn j2");
@@ -204,18 +190,14 @@ fn session_spawn_concurrent_no_crosstalk() {
 
 #[test]
 fn session_close_cleans_up() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let f = Fixture::new();
     f.sess.close().expect("close");
 }
 
 #[test]
 fn session_spawn_exec_mixed() {
-    if common::skip_unless_platform_ready() {
-        return;
-    }
+    require_session!();
     let mut f = Fixture::new();
     f.sess.exec("export MIX_TEST=one").expect("exec export");
     f.sess

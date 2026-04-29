@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Latest rootfs release known to work with this test suite.
-const ROOTFS_VERSION: &str = "v1.4.0";
+const ROOTFS_VERSION: &str = "v1.4.2";
 const ROOTFS_REPO: &str = "https://github.com/tokimo-lab/tokimo-package-rootfs";
 
 /// Directory where artifacts are stored.
@@ -67,6 +67,57 @@ pub fn has_vz_artifacts() -> bool {
     kernel.exists() && initrd.exists() && rootfs.exists()
 }
 
+/// Check if Windows sandbox artifacts (kernel + initrd + rootfs.vhdx) are present
+/// in a `vm/` directory walking up from CARGO_MANIFEST_DIR / current_exe.
+pub fn has_windows_artifacts() -> bool {
+    find_vm_dir().is_some()
+}
+
+/// Walk up from CARGO_MANIFEST_DIR (then current_exe) looking for a `vm/`
+/// directory containing all three required files.
+fn find_vm_dir() -> Option<PathBuf> {
+    fn complete(d: &std::path::Path) -> bool {
+        d.join("vmlinuz").is_file()
+            && d.join("initrd.img").is_file()
+            && d.join("rootfs.vhdx").is_file()
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CARGO_MANIFEST_DIR") {
+        roots.push(PathBuf::from(p));
+    }
+    if let Ok(p) = std::env::current_exe() {
+        if let Some(parent) = p.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    for root in roots {
+        let mut cur: Option<&std::path::Path> = Some(&root);
+        while let Some(d) = cur {
+            let candidate = d.join("vm");
+            if candidate.is_dir() && complete(&candidate) {
+                return Some(candidate);
+            }
+            cur = d.parent();
+        }
+    }
+    None
+}
+
+/// Check if the tokimo-sandbox-svc named pipe is available.
+pub fn has_windows_service() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::System::Pipes::WaitNamedPipeW;
+        let name = HSTRING::from("\\\\.\\pipe\\tokimo-sandbox-svc");
+        unsafe { WaitNamedPipeW(&name, 100).as_bool() }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Skip helpers
 // ---------------------------------------------------------------------------
@@ -76,6 +127,7 @@ pub fn has_vz_artifacts() -> bool {
 ///
 /// On Linux: skips if bwrap is not installed.
 /// On macOS: skips if VZ is unavailable or artifacts are missing.
+/// On Windows: skips if kernel/initrd/rootfs artifacts are missing.
 pub fn skip_unless_platform_ready() -> bool {
     if is_linux() {
         if !has_bwrap() {
@@ -91,9 +143,43 @@ pub fn skip_unless_platform_ready() -> bool {
             eprintln!("SKIP: VZ artifacts not found. Run download_vz_artifacts() first.");
             return true;
         }
+    } else if cfg!(target_os = "windows") {
+        if !has_windows_artifacts() {
+            eprintln!(
+                "SKIP: Windows sandbox artifacts missing. \
+                 Place vmlinuz / initrd.img / rootfs.vhdx in <repo>/vm/. \
+                 Run `pwsh scripts/fetch-vm.ps1` to download from \
+                 tokimo-package-rootfs GitHub releases."
+            );
+            return true;
+        }
+        if !has_windows_service() {
+            eprintln!(
+                "SKIP: tokimo-sandbox-svc pipe not available. \
+                 Run `tokimo-sandbox-svc --console` or install the service first."
+            );
+            return true;
+        }
     } else {
         eprintln!("SKIP: unsupported platform ({})", std::env::consts::OS);
         return true;
+    }
+    false
+}
+
+/// Returns `true` if the test should be skipped because the platform
+/// doesn't support persistent sandbox sessions (`Session::open`).
+pub fn skip_unless_session_supported() -> bool {
+    if cfg!(target_os = "windows") {
+        // Windows: requires the SYSTEM service + VM artifacts.
+        if !has_windows_service() {
+            eprintln!("SKIP: tokimo-sandbox-svc not running");
+            return true;
+        }
+        if !has_windows_artifacts() {
+            eprintln!("SKIP: Windows VM artifacts missing in <repo>/vm/ (run pwsh scripts/fetch-vm.ps1)");
+            return true;
+        }
     }
     false
 }
@@ -159,6 +245,68 @@ pub fn download_vz_artifacts() -> Result<(), String> {
     eprintln!("VZ artifacts installed to {}", dir.display());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Automatic artifact download (Windows)
+// ---------------------------------------------------------------------------
+
+/// Download kernel + initrd + rootfs VHDX from GitHub releases for Windows.
+///
+/// Delegates to `scripts/setup-windows-artifacts.ps1` which downloads
+/// `tokimo-os-amd64.tar.zst` (kernel + initrd) and `rootfs-amd64.vhdx.zip`,
+/// extracting them to `%USERPROFILE%\.tokimo\`.
+///
+/// Skips if all artifacts are already present.
+pub fn download_windows_artifacts() -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    if has_windows_artifacts() {
+        let dir = std::env::var("USERPROFILE")
+            .map(|h| PathBuf::from(h).join(".tokimo"))
+            .unwrap_or_else(|_| PathBuf::from(".tokimo"));
+        eprintln!("Windows artifacts already present in {}", dir.display());
+        return Ok(());
+    }
+
+    // Find the setup script relative to the workspace root.
+    let script = find_setup_script()?;
+
+    eprintln!("Running: pwsh -NoProfile -ExecutionPolicy Bypass -File {}", script.display());
+    let status = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script.to_str().ok_or("script path not valid UTF-8")?,
+        ])
+        .status()
+        .map_err(|e| format!("failed to run pwsh: {e}. Is PowerShell 7+ installed? (winget install Microsoft.PowerShell)"))?;
+
+    if !status.success() {
+        return Err(format!("setup script exited with {status}"));
+    }
+    Ok(())
+}
+
+/// Walk up from the crate root to find `scripts/setup-windows-artifacts.ps1`.
+fn find_setup_script() -> Result<PathBuf, String> {
+    let mut dir = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    loop {
+        let candidate = dir.join("scripts").join("setup-windows-artifacts.ps1");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        if !dir.pop() {
+            return Err("setup-windows-artifacts.ps1 not found (expected in scripts/)".into());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn download_to_temp(url: &str) -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir().join(format!("tokimo-dl-{}", rand_suffix()));

@@ -12,7 +12,12 @@ mod error;
 mod host;
 mod session;
 
+pub mod diagnostics;
 pub mod protocol;
+pub mod util;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod profile;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -30,10 +35,17 @@ pub mod svc_protocol {
     pub use crate::windows::protocol::*;
 }
 
+/// TOCTOU-safe path canonicalisation used by the SYSTEM service. Exposed
+/// for test harnesses; library callers don't normally need it.
+#[cfg(target_os = "windows")]
+pub use windows::safe_path::canonicalize_safe;
+
 pub use config::{Mount, NetworkPolicy, ResourceLimits, SandboxConfig, SystemLayout};
+pub use diagnostics::is_session_fatal_message;
 pub use error::{Error, ExecutionResult, Result};
 pub use host::net_observer::{DnsPolicy, HostPattern, Layer, NetEvent, NetEventSink, Proto, Verdict};
 pub use session::{ExecOutput, JobHandle, OpenPtyFn, PtyHandle, RunOneshotFn, Session};
+pub use util::safe_session_name;
 
 #[cfg(target_os = "linux")]
 pub use linux::init_client::{InitClient, SpawnInfo};
@@ -101,7 +113,6 @@ fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<
 }
 
 #[cfg(windows)]
-fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], _cfg: &SandboxConfig) -> Result<ExecutionResult> {
-    let _ = cmd;
-    Err(Error::validation("SAFEBOX_DISABLE is not supported on Windows"))
+fn run_without_sandbox<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
+    windows::run_without_sandbox(cmd, cfg)
 }

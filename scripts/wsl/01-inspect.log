@@ -1,0 +1,378 @@
+===== 0. 检查依赖 =====
+===== 1. 验证文件存在 =====
+-rwxr-xr-x 1 william william  177303315 Apr 29 19:23 /mnt/c/Users/William/AppData/Local/Claude-3p/vm_bundles/claudevm.bundle/initrd
+-rwxr-xr-x 1 william william 9453961216 Apr 29 19:23 /mnt/c/Users/William/AppData/Local/Claude-3p/vm_bundles/claudevm.bundle/rootfs.vhdx
+-rwxr-xr-x 1 william william   37748736 Apr 29 19:33 /mnt/c/Users/William/AppData/Local/Claude-3p/vm_bundles/claudevm.bundle/smol-bin.vhdx
+-rwxr-xr-x 1 william william   14993800 Apr 29 19:23 /mnt/c/Users/William/AppData/Local/Claude-3p/vm_bundles/claudevm.bundle/vmlinuz
+
+===== 2. vmlinuz 信息 =====
+/mnt/c/Users/William/AppData/Local/Claude-3p/vm_bundles/claudevm.bundle/vmlinuz: Linux kernel x86 boot executable bzImage, version 6.8.0-106-generic (buildd@lcy02-amd64-085) #106~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 08:44:59 UTC , RO-rootFS, swap_dev 0XE, Normal VGA
+6.8.0-106-generic (buildd@lcy02-amd64-085) #106~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 08:44:59 UTC 
+6.8.0-106-generic (buildd@lcy02-amd64-085) (x86_64-linux-gnu-gcc-12 (Ubuntu 12.3.0-1ubuntu1~22.04.3) 12.3.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #106~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 08:44:59 UTC 
+
+===== 3. 解开 initrd =====
+size: 177303315 bytes
+00000000: 3037 3037 3031                           070701
+(magic: 0707 01 = cpio newc)
+[seg 0] off=0 kind=cpio
+  extracted 14800684 bytes -> seg01/
+[seg 1] off=14800896 kind=zstd
+  decompressed 482513408 bytes -> seg02/
+total segments: 2
+
+--- segment summary ---
+  seg01/      size=15M       has=
+  seg02/      size=469M      has=/init lib/modules 
+main segment: seg02/
+
+===== 4. initrd 顶层结构 =====
+total 48
+drwxr-xr-x  9 william william 4096 Apr 29 21:39 .
+drwxr-xr-x  4 william william 4096 Apr 29 21:39 ..
+-rw-r--r--  1 william william 4096 Mar 31 01:45 .random-seed
+lrwxrwxrwx  1 william william    7 Mar 31 01:45 bin -> usr/bin
+drwxr-xr-x  3 william william 4096 Apr 29 21:39 conf
+drwxr-xr-x  2 william william 4096 Apr 29 21:39 cryptroot
+drwxr-xr-x 11 william william 4096 Apr 29 21:39 etc
+-rwxr-xr-x  1 william william 7284 Mar 19  2024 init
+lrwxrwxrwx  1 william william    7 Mar 31 01:45 lib -> usr/lib
+lrwxrwxrwx  1 william william    9 Mar 31 01:45 lib32 -> usr/lib32
+lrwxrwxrwx  1 william william    9 Mar 31 01:45 lib64 -> usr/lib64
+lrwxrwxrwx  1 william william   10 Mar 31 01:45 libx32 -> usr/libx32
+drwxr-xr-x  2 william william 4096 Mar 31 01:45 run
+lrwxrwxrwx  1 william william    8 Mar 31 01:45 sbin -> usr/sbin
+drwxr-xr-x 10 william william 4096 Apr 29 21:39 scripts
+drwxr-xr-x 10 william william 4096 Apr 29 21:39 usr
+drwxr-xr-x  3 william william 4096 Apr 29 21:39 var
+
+===== 5. /init 脚本（cowork 启动协议关键） =====
+--- init (size 7284) ---
+init: POSIX shell script, ASCII text executable
+#!/bin/sh
+
+# Default PATH differs between shells, and is not automatically exported
+# by klibc dash.  Make it consistent.
+# Furthermore, this PATH ends up being used by the init, set it to the
+# Standard PATH, without /snap/bin as documented in
+# https://wiki.ubuntu.com/PATH
+# This also matches /etc/environment, but without games path
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[ -d /dev ] || mkdir -m 0755 /dev
+[ -d /root ] || mkdir -m 0700 /root
+[ -d /sys ] || mkdir /sys
+[ -d /proc ] || mkdir /proc
+[ -d /tmp ] || mkdir /tmp
+mkdir -p /var/lock
+mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
+mount -t proc -o nodev,noexec,nosuid proc /proc
+
+# shellcheck disable=SC2013
+for x in $(cat /proc/cmdline); do
+	case $x in
+	initramfs.clear)
+		clear
+		;;
+	quiet)
+		quiet=y
+		;;
+	esac
+done
+
+if [ "$quiet" != "y" ]; then
+	quiet=n
+	echo "Loading, please wait..."
+fi
+export quiet
+
+# Note that this only becomes /dev on the real filesystem if udev's scripts
+# are used; which they will be, but it's worth pointing out
+mount -t devtmpfs -o nosuid,mode=0755 udev /dev
+mkdir /dev/pts
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
+
+# Export the dpkg architecture
+export DPKG_ARCH=
+. /conf/arch.conf
+
+# Set modprobe env
+export MODPROBE_OPTIONS="-qb"
+
+# Export relevant variables
+export ROOT=
+export ROOTDELAY=
+export ROOTFLAGS=
+export ROOTFSTYPE=
+export IP=
+export IP6=
+export VLAN=
+export DEVICE=
+export BOOT=
+export BOOTIF=
+export UBIMTD=
+export NETWORK_SKIP_ENSLAVED=
+export break=
+export init=/sbin/init
+export readonly=y
+export rootmnt=/root
+export debug=
+export panic=
+export blacklist=
+export resume=
+export resume_offset=
+export noresume=
+export drop_caps=
+export fastboot=n
+export forcefsck=n
+export fsckfix=
+
+
+# mdadm needs hostname to be set. This has to be done before the udev rules are called!
+if [ -f "/etc/hostname" ]; then
+        /bin/hostname -F /etc/hostname >/dev/null 2>&1
+fi
+
+# Bring in the main config
+. /conf/initramfs.conf
+for conf in conf/conf.d/*; do
+	[ -f "${conf}" ] && . "${conf}"
+done
+. /scripts/functions
+
+# Parse command line options
+# shellcheck disable=SC2013
+for x in $(cat /proc/cmdline); do
+	case $x in
+	init=*)
+		init=${x#init=}
+		;;
+	root=*)
+		ROOT=${x#root=}
+		if [ -z "${BOOT}" ] && [ "$ROOT" = "/dev/nfs" ]; then
+			BOOT=nfs
+		fi
+		;;
+	rootflags=*)
+		ROOTFLAGS="-o ${x#rootflags=}"
+		;;
+	rootfstype=*)
+		ROOTFSTYPE="${x#rootfstype=}"
+		;;
+	rootdelay=*)
+		ROOTDELAY="${x#rootdelay=}"
+		case ${ROOTDELAY} in
+		*[![:digit:].]*)
+			ROOTDELAY=
+			;;
+		esac
+		;;
+	roottimeout=*)
+		ROOTDELAY="${x#roottimeout=}"
+		case ${ROOTDELAY} in
+		*[![:digit:].]*)
+			ROOTDELAY=
+			;;
+		esac
+		;;
+	loop=*)
+		# shellcheck disable=SC2034
+		LOOP="${x#loop=}"
+		;;
+	loopflags=*)
+		# shellcheck disable=SC2034
+		LOOPFLAGS="-o ${x#loopflags=}"
+		;;
+	loopfstype=*)
+		# shellcheck disable=SC2034
+		LOOPFSTYPE="${x#loopfstype=}"
+		;;
+	nfsroot=*)
+		# shellcheck disable=SC2034
+		NFSROOT="${x#nfsroot=}"
+		;;
+	initramfs.runsize=*)
+		RUNSIZE="${x#initramfs.runsize=}"
+		;;
+	ip=*)
+		IP="${x#ip=}"
+		;;
+	ip6=*)
+		IP6="${x#ip6=}"
+		;;
+	vlan=*)
+		VLAN="${x#vlan=}"
+		;;
+	boot=*)
+		BOOT=${x#boot=}
+		;;
+	ubi.mtd=*)
+		UBIMTD=${x#ubi.mtd=}
+		;;
+	resume=*)
+		RESUME="${x#resume=}"
+		case $RESUME in
+		UUID=*)
+			RESUME="/dev/disk/by-uuid/${RESUME#UUID=}"
+		esac
+		;;
+	resume_offset=*)
+		resume_offset="${x#resume_offset=}"
+		;;
+	noresume)
+		noresume=y
+		;;
+	drop_capabilities=*)
+		drop_caps="-d ${x#drop_capabilities=}"
+		;;
+	panic=*)
+		panic="${x#panic=}"
+		;;
+	ro)
+		readonly=y
+		;;
+	rw)
+		readonly=n
+		;;
+	debug)
+		debug=y
+		quiet=n
+		if [ -n "${netconsole}" ]; then
+			log_output=/dev/kmsg
+		else
+			log_output=/run/initramfs/initramfs.debug
+		fi
+		set -x
+		;;
+	debug=*)
+		debug=y
+		quiet=n
+		set -x
+		;;
+
+--- 末尾 80 行 ---
+	mountfs /usr
+	log_end_msg
+fi
+
+# Mount cleanup
+mount_bottom
+nfs_bottom
+local_bottom
+
+maybe_break bottom
+[ "$quiet" != "y" ] && log_begin_msg "Running /scripts/init-bottom"
+# We expect udev's init-bottom script to move /dev to ${rootmnt}/dev
+run_scripts /scripts/init-bottom
+[ "$quiet" != "y" ] && log_end_msg
+
+# Move /run to the root
+mount -n -o move /run ${rootmnt}/run
+
+validate_init() {
+	run-init -n "${rootmnt}" "${1}"
+}
+
+# Check init is really there
+if ! validate_init "$init"; then
+	echo "Target filesystem doesn't have requested ${init}."
+	init=
+	for inittest in /sbin/init /etc/init /bin/init /bin/sh; do
+		if validate_init "${inittest}"; then
+			init="$inittest"
+			break
+		fi
+	done
+fi
+
+# No init on rootmount
+if ! validate_init "${init}" ; then
+	panic "No init found. Try passing init= bootarg."
+fi
+
+maybe_break init
+
+# don't leak too much of env - some init(8) don't clear it
+# (keep init, rootmnt, drop_caps)
+unset debug
+unset MODPROBE_OPTIONS
+unset DPKG_ARCH
+unset ROOTFLAGS
+unset ROOTFSTYPE
+unset ROOTDELAY
+unset ROOT
+unset IP
+unset IP6
+unset VLAN
+unset BOOT
+unset BOOTIF
+unset DEVICE
+unset UBIMTD
+unset blacklist
+unset break
+unset noresume
+unset panic
+unset quiet
+unset readonly
+unset resume
+unset resume_offset
+unset noresume
+unset fastboot
+unset forcefsck
+unset fsckfix
+unset starttime
+
+# Move virtual filesystems over to the real filesystem
+mount -n -o move /sys ${rootmnt}/sys
+mount -n -o move /proc ${rootmnt}/proc
+
+# Chain to real filesystem
+# shellcheck disable=SC2086,SC2094
+exec run-init ${drop_caps} "${rootmnt}" "${init}" "$@" <"${rootmnt}/dev/console" >"${rootmnt}/dev/console" 2>&1
+echo "Something went badly wrong in the initramfs."
+panic "Please file a bug on initramfs-tools."
+
+===== 6. 关键二进制 =====
+-rwxr-xr-x 1 william william 7284 Mar 19  2024 init
+init: POSIX shell script, ASCII text executable
+
+===== 7. 内核模块清单（HV / 9p / vsock / scsi 相关） =====
+lib/modules/6.8.0-106-generic/kernel/drivers/hv/hv_utils.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/hv/hv_vmbus.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/net/hyperv/hv_netvsc.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/net/vsockmon.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/device_handler/scsi_dh_alua.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/device_handler/scsi_dh_emc.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/device_handler/scsi_dh_hp_sw.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/device_handler/scsi_dh_rdac.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/hv_storvsc.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_debug.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_transport_fc.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_transport_iscsi.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_transport_sas.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_transport_spi.ko
+lib/modules/6.8.0-106-generic/kernel/drivers/scsi/scsi_transport_srp.ko
+lib/modules/6.8.0-106-generic/kernel/fs/netfs/netfs.ko
+lib/modules/6.8.0-106-generic/kernel/net/vmw_vsock/vsock.ko
+
+===== 8. 查找内核版本目录 =====
+lib/modules
+lib/modules/6.8.0-106-generic
+lib/modules/6.8.0-106-generic/kernel
+
+===== 9. Claude 的 init 中引用的 cmdline 参数 =====
+console=
+init=
+init=/sbin/init
+ip=
+panic=
+root=
+
+===== 10. 关键 /etc 文件（如果存在） =====
+--- etc/fstab ---
+
+===== 11. 大致总结 =====
+initrd extracted to: /tmp/tokimo-claude-inspect/initrd-extract
+total entries: 4118
+total size:    469M
+
+===== DONE — 请把上面输出全部贴回来 =====
