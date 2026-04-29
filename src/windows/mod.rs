@@ -196,119 +196,95 @@ fn shell_escape(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Path discovery
 // ---------------------------------------------------------------------------
+//
+// VM artifacts live under `<repo>/vm/`:
+//   * `vm/vmlinuz`    — Linux kernel
+//   * `vm/initrd.img` — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
+//   * `vm/rootfs.vhdx` — ext4 VHDX rootfs
+//
+// Both are produced by the tokimo-package-rootfs CI:
+//   https://github.com/tokimo-lab/tokimo-package-rootfs/releases
+//
+// Use `scripts/fetch-vm.ps1` to download them into `vm/`.
+//
+// Resolution order — find first directory containing all three files:
+//   1. `<exe>/vm/`
+//   2. walking up from `<exe>` looking for `vm/`
+//   3. walking up from `cwd` looking for `vm/`
+// All three must exist together; we reject partial directories so a stray
+// `vm/` folder elsewhere in the tree won't be picked up by mistake.
 
-pub(crate) fn find_kernel() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_KERNEL") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Ok(pb);
+const VM_DIR_NAME: &str = "vm";
+const KERNEL_FILE: &str = "vmlinuz";
+const INITRD_FILE: &str = "initrd.img";
+const ROOTFS_FILE: &str = "rootfs.vhdx";
+
+fn vm_dir_complete(d: &std::path::Path) -> bool {
+    d.join(KERNEL_FILE).is_file()
+        && d.join(INITRD_FILE).is_file()
+        && d.join(ROOTFS_FILE).is_file()
+}
+
+fn find_vm_dir() -> Result<PathBuf> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    let mut probe = |p: PathBuf| -> Option<PathBuf> {
+        if vm_dir_complete(&p) {
+            Some(p)
+        } else {
+            tried.push(p);
+            None
         }
-        return Err(Error::exec(format!("TOKIMO_KERNEL={} not found", pb.display())));
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/kernel/vmlinuz");
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
+    };
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in &["vmlinuz", "bzImage", "kernel"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
+            if let Some(hit) = probe(dir.join(VM_DIR_NAME)) {
+                return Ok(hit);
+            }
+            // walk up
+            let mut cur = Some(dir);
+            while let Some(d) = cur {
+                if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
+                    return Ok(hit);
                 }
+                cur = d.parent();
             }
         }
     }
-    Err(Error::validation(
-        "Linux kernel not found. Set TOKIMO_KERNEL=/path/to/vmlinuz or place it at \
-         ~/.tokimo/kernel/vmlinuz. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
-    ))
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: Option<&std::path::Path> = Some(&cwd);
+        while let Some(d) = cur {
+            if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
+                return Ok(hit);
+            }
+            cur = d.parent();
+        }
+    }
+
+    let probed = tried
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    Err(Error::validation(format!(
+        "VM artifacts not found. Expected `{KERNEL_FILE}`, `{INITRD_FILE}`, `{ROOTFS_FILE}` \
+         in a `{VM_DIR_NAME}/` directory. Run `scripts/fetch-vm.ps1` to download them.\n\
+         Tried:\n  {probed}"
+    )))
+}
+
+pub(crate) fn find_kernel() -> Result<PathBuf> {
+    Ok(find_vm_dir()?.join(KERNEL_FILE))
 }
 
 pub(crate) fn find_initrd() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_INITRD") {
-        let pb = PathBuf::from(&p);
-        if pb.exists() {
-            return Ok(pb);
-        }
-        return Err(Error::exec(format!("TOKIMO_INITRD={} not found", pb.display())));
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/initrd.img");
-        if pb.exists() {
-            return Ok(pb);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &["initrd.img", "initramfs.cpio.gz", "initrd"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
-                }
-            }
-        }
-    }
-    Err(Error::validation(
-        "Initrd not found. Set TOKIMO_INITRD=/path/to/initrd.img or place it at \
-         ~/.tokimo/initrd.img. Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
-    ))
+    Ok(find_vm_dir()?.join(INITRD_FILE))
 }
 
-/// Locate the rootfs directory.
-///
-/// Search order:
-///   1. `$TOKIMO_ROOTFS`
-///   2. `%USERPROFILE%\.tokimo\rootfs`
-///   3. `<exe-dir>\rootfs`
-///
-/// VHDX mode is **not** supported: the tokimo-os initrd does not implement
-/// disk-mounted root, only Plan9-over-vsock from the host shares.
-/// Locate the rootfs VHDX file.
-///
-/// Search order:
-///   1. `$TOKIMO_ROOTFS_VHDX`
-///   2. `$TOKIMO_ROOTFS` (compat: file ending in .vhdx)
-///   3. `%USERPROFILE%\.tokimo\rootfs.vhdx`
-///   4. `<exe-dir>\rootfs.vhdx`
-///
-/// The file must be an ext4 VHDX containing the sandbox rootfs (built by
-/// `scripts/wsl/02-build-rootfs.sh`). The guest mounts it as `/dev/sda`
-/// via SCSI; initramfs-tools then switch_root's into it.
 pub(crate) fn find_rootfs_vhdx() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_ROOTFS_VHDX") {
-        let pb = PathBuf::from(&p);
-        if pb.is_file() {
-            return Ok(pb);
-        }
-        return Err(Error::exec(format!("TOKIMO_ROOTFS_VHDX={} not found", pb.display())));
-    }
-    if let Ok(p) = std::env::var("TOKIMO_ROOTFS") {
-        let pb = PathBuf::from(&p);
-        if pb.is_file() && pb.extension().map(|e| e == "vhdx").unwrap_or(false) {
-            return Ok(pb);
-        }
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/rootfs.vhdx");
-        if pb.is_file() {
-            return Ok(pb);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let pb = dir.join("rootfs.vhdx");
-            if pb.is_file() {
-                return Ok(pb);
-            }
-        }
-    }
-    Err(Error::validation(
-        "Rootfs VHDX not found. Build it with `scripts/wsl/02-build-rootfs.sh` (in WSL) \
-         and place at ~/.tokimo/rootfs.vhdx (or set TOKIMO_ROOTFS_VHDX).",
-    ))
+    Ok(find_vm_dir()?.join(ROOTFS_FILE))
 }
 
 pub(crate) fn ensure_workspace(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {

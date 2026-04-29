@@ -104,25 +104,23 @@ The Windows backend uses a **SYSTEM-level service** (`tokimo-sandbox-svc.exe`) t
 
 Open **Windows Features** → check **Virtual Machine Platform** → restart.
 
-### 2. Install artifacts
+### 2. Install VM artifacts
+
+VM artifacts (kernel + initrd + rootfs.vhdx) are built by the sister project
+[tokimo-lab/tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases)
+and downloaded into `<repo>/vm/` via:
 
 ```powershell
-# Download
-curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/tokimo-os-amd64.tar.zst
-curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/rootfs-amd64.tar.zst
-
-# Extract
-zstd -d tokimo-os-amd64.tar.zst; tar -xpf tokimo-os-amd64.tar -C $env:USERPROFILE\.tokimo\
-mkdir -p $env:USERPROFILE\.tokimo\rootfs
-zstd -d rootfs-amd64.tar.zst; tar -xpf rootfs-amd64.tar -C $env:USERPROFILE\.tokimo\rootfs\
+pwsh scripts/fetch-vm.ps1                 # latest release
+pwsh scripts/fetch-vm.ps1 -Tag v1.6.0     # specific tag
 ```
 
 Expected layout:
 ```
-~\.tokimo\
-  kernel\vmlinuz      ← Linux kernel
-  initrd.img          ← initramfs
-  rootfs\             ← Debian 13 filesystem
+<repo>/vm/
+  vmlinuz             ← Linux kernel
+  initrd.img          ← initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
+  rootfs.vhdx         ← Debian 13 ext4 VHDX
 ```
 
 ### 3. First run
@@ -133,7 +131,8 @@ Expected layout:
 let out = tokimo_package_sandbox::run(&["python3", "--version"], &cfg)?;
 ```
 
-Custom paths via env vars: `TOKIMO_KERNEL`, `TOKIMO_INITRD`, `TOKIMO_ROOTFS`, `TOKIMO_MEMORY`, `TOKIMO_CPUS`.
+The service walks up the filesystem from its own location to find a `vm/`
+directory containing all three artifacts. No environment variables are read.
 
 ### Distribution
 

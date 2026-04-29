@@ -124,10 +124,15 @@ pwsh ./scripts/build-msix.ps1
 | Variable | Purpose |
 |---|---|
 | `SAFEBOX_DISABLE=1` | Bypass sandbox entirely, run natively (debug escape hatch) |
-| `TOKIMO_KERNEL` | Path to Linux kernel image (`vmlinuz`) |
-| `TOKIMO_INITRD` | Path to initrd |
-| `TOKIMO_ROOTFS_VHDX` | Path to rootfs VHDX (preferred) |
-| `TOKIMO_ROOTFS` | Path to extracted rootfs directory (legacy Plan9 mode) |
-| `TOKIMO_MEMORY` | VM memory in MB (default: 512) |
-| `TOKIMO_CPUS` | VM vCPU count (default: 2) |
 | `TOKIMO_VERIFY_CALLER=1` | Enforce Authenticode verification of pipe clients |
+
+## Windows VM artifacts
+
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published by the sister project [tokimo-lab/tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases). Download via:
+
+```powershell
+pwsh scripts/fetch-vm.ps1                 # latest
+pwsh scripts/fetch-vm.ps1 -Tag v1.6.0     # specific
+```
+
+`src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**

@@ -67,31 +67,40 @@ pub fn has_vz_artifacts() -> bool {
     kernel.exists() && initrd.exists() && rootfs.exists()
 }
 
-/// Check if Windows sandbox artifacts (kernel + initrd + rootfs) are present.
-///
-/// Supports both VHDX mode (`rootfs.vhdx`) and legacy Plan9 root mode
-/// (`rootfs/` directory). VHDX is preferred.
+/// Check if Windows sandbox artifacts (kernel + initrd + rootfs.vhdx) are present
+/// in a `vm/` directory walking up from CARGO_MANIFEST_DIR / current_exe.
 pub fn has_windows_artifacts() -> bool {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let tokimo = PathBuf::from(&home).join(".tokimo");
+    find_vm_dir().is_some()
+}
 
-    let kernel = std::env::var("TOKIMO_KERNEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| tokimo.join("kernel").join("vmlinuz"));
-    let initrd = std::env::var("TOKIMO_INITRD")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| tokimo.join("initrd.img"));
-
-    if !kernel.exists() || !initrd.exists() {
-        return false;
+/// Walk up from CARGO_MANIFEST_DIR (then current_exe) looking for a `vm/`
+/// directory containing all three required files.
+fn find_vm_dir() -> Option<PathBuf> {
+    fn complete(d: &std::path::Path) -> bool {
+        d.join("vmlinuz").is_file()
+            && d.join("initrd.img").is_file()
+            && d.join("rootfs.vhdx").is_file()
     }
-
-    // Rootfs is now a single VHDX file (cowork-style: SCSI boot disk).
-    let rootfs = std::env::var("TOKIMO_ROOTFS_VHDX")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("TOKIMO_ROOTFS").map(PathBuf::from))
-        .unwrap_or_else(|_| tokimo.join("rootfs.vhdx"));
-    rootfs.is_file()
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CARGO_MANIFEST_DIR") {
+        roots.push(PathBuf::from(p));
+    }
+    if let Ok(p) = std::env::current_exe() {
+        if let Some(parent) = p.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    for root in roots {
+        let mut cur: Option<&std::path::Path> = Some(&root);
+        while let Some(d) = cur {
+            let candidate = d.join("vm");
+            if candidate.is_dir() && complete(&candidate) {
+                return Some(candidate);
+            }
+            cur = d.parent();
+        }
+    }
+    None
 }
 
 /// Check if the tokimo-sandbox-svc named pipe is available.
@@ -138,10 +147,9 @@ pub fn skip_unless_platform_ready() -> bool {
         if !has_windows_artifacts() {
             eprintln!(
                 "SKIP: Windows sandbox artifacts missing. \
-                 Place kernel at ~/.tokimo/kernel/vmlinuz, initrd at ~/.tokimo/initrd.img, \
-                 and an extracted rootfs at ~/.tokimo/rootfs/. \
-                 Or set TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS env vars. \
-                 Run `pwsh ./scripts/setup-windows-artifacts.ps1` to download automatically."
+                 Place vmlinuz / initrd.img / rootfs.vhdx in <repo>/vm/. \
+                 Run `pwsh scripts/fetch-vm.ps1` to download from \
+                 tokimo-package-rootfs GitHub releases."
             );
             return true;
         }
@@ -169,7 +177,7 @@ pub fn skip_unless_session_supported() -> bool {
             return true;
         }
         if !has_windows_artifacts() {
-            eprintln!("SKIP: Windows VM artifacts missing (TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS)");
+            eprintln!("SKIP: Windows VM artifacts missing in <repo>/vm/ (run pwsh scripts/fetch-vm.ps1)");
             return true;
         }
     }
