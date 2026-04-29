@@ -7,5 +7,7 @@ Cargo.lock
 /.test-rootfs/
 # Windows VM artifacts (downloaded by scripts/fetch-vm.ps1)
 /vm/
+# Compiled init binary (built by scripts/build-vm-local.ps1)
+/packaging/vm-local/tokimo-sandbox-init
 # IDE / agent config (per-developer)
 /.claude/
