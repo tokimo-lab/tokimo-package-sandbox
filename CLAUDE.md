@@ -14,9 +14,12 @@ host process (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (Local
                                                 └── ComputeCore.dll (HCS API) ──▶ Hyper-V micro-VM
 ```
 
-The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using a JSON length-prefixed wire protocol (`src/windows/protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (optionally with a VHDX rootfs) via HCS Schema 2.0, mounts the workspace over Plan9, runs the command inside the VM, and returns stdout/stderr/exit code.
+The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using a JSON length-prefixed wire protocol (`src/windows/protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
 
-The recommended deployment path is MSIX (`packaging/windows/`, `scripts/build-msix.ps1`), which registers the service with SCM via `desktop6:Service`. Legacy `--install` / `--console` flags exist for local development.
+Two deployment modes:
+- **MSIX** (`packaging/windows/`, `scripts/build-msix.ps1`): recommended for production — registers service name `TokimoSandboxSvc` via `desktop6:Service`.
+- **CLI install** (`--install` / `--uninstall`): registers service name `tokimo-sandbox-svc` (lowercase-kebab) — for development. The two names are intentionally different so both can coexist on the same machine.
+- **Console mode** (`--console`): foreground dev mode, no SCM registration needed.
 
 ## Windows APIs — all through the `windows` crate (verified)
 
@@ -90,12 +93,16 @@ These three are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependenci
 |---|---|
 | `src/lib.rs` | Public API: `run()`, `SandboxConfig`, `NetworkPolicy`, `ExecutionResult` |
 | `src/windows/mod.rs` | Windows backend entry point (library side): path discovery, network policy translation |
-| `src/windows/client.rs` | Named-pipe client: `WaitNamedPipeW` → `CreateFileW` → send request → read response |
+| `src/windows/session.rs` | `Session::open()`: path discovery → named-pipe OpenSession → `WinInitClient::new` → `hello()` → `open_shell()` |
+| `src/windows/client.rs` | Named-pipe client: `WaitNamedPipeW` → `CreateFileW` (FILE_FLAG_OVERLAPPED) → send OpenSession request → read SessionOpened response |
+| `src/windows/ov_pipe.rs` | **Critical**: OVERLAPPED Read/Write wrapper. Windows sync pipes serialize ReadFile+WriteFile on the same instance even across threads; OVERLAPPED mode is required for concurrent I/O |
+| `src/windows/init_client.rs` | Runs the init control protocol (Hello/Spawn/Exec/Kill…) over the transparent pipe tunnel; reader thread + Mutex writer |
 | `src/windows/protocol.rs` | Wire protocol types: `SvcRequest`, `SvcResponse`, length-prefixed framing |
 | `src/windows/safe_path.rs` | TOCTOU-safe `canonicalize_safe`: rejects symlinks/junctions/hardlinks via `GetFileInformationByHandle` |
-| `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, `ExecVm` handler |
+| `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, per-session session handler |
 | `src/bin/tokimo-sandbox-svc/imp/hcs.rs` | HCS API wrapper: loads `ComputeCore.dll`, exposes `create/start/terminate/close/poll` |
-| `src/bin/tokimo-sandbox-svc/imp/vmconfig.rs` | HCS Schema 2.0 JSON config builder |
+| `src/bin/tokimo-sandbox-svc/imp/vmconfig.rs` | HCS Schema 2.x JSON config builder; `alloc_session_init_port()` for per-session hvsock GUIDs |
+| `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` | AF_HYPERV listener: `HV_GUID_WILDCARD` VmId (required by Hyper-V parent-partition rules) + per-session `ServiceId` |
 | `src/host/` | Cross-platform helpers (stdio plumbing, PTY, net observer) |
 | `src/linux/` | Linux backend: bwrap + seccomp + init client |
 | `src/macos/` | macOS backend: VZ virtual machine + vsock comms |
@@ -108,10 +115,20 @@ These three are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependenci
 # Build everything
 cargo build
 
-# Windows service (requires admin for --console mode)
+# Console mode (dev, admin required — runs in foreground, no SCM)
 cargo run --bin tokimo-sandbox-svc -- --console
 
-# Tests
+# Install as SCM service (admin, registers as "tokimo-sandbox-svc")
+.\target\debug\tokimo-sandbox-svc.exe --install
+# Uninstall
+.\target\debug\tokimo-sandbox-svc.exe --uninstall
+
+# Tests (concurrent — 14 Windows session integration tests)
+cargo test --test session -- --test-threads=4
+# Or sequential (slower but no concurrency needed)
+cargo test --test session -- --test-threads=1
+
+# Unit tests only
 cargo test --lib
 cargo test --bin tokimo-sandbox-svc --lib
 
@@ -132,7 +149,17 @@ Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>
 
 ```powershell
 pwsh scripts/fetch-vm.ps1                 # latest
-pwsh scripts/fetch-vm.ps1 -Tag v1.6.0     # specific
+pwsh scripts/fetch-vm.ps1 -Tag v1.7.1     # specific
 ```
 
 `src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**
+
+## HvSocket concurrency — critical design note
+
+Each session allocates a **unique vsock port** via `vmconfig::alloc_session_init_port()`, which encodes into a unique HvSocket service GUID (`{port:08X}-FACB-11E6-BD58-64006A7986D3`). This is required because:
+
+1. Hyper-V requires `(VmId, ServiceId)` to be unique for host-side listeners.
+2. The parent partition **must** use `HV_GUID_WILDCARD` as the listener VmId — binding a specific child's RuntimeId returns `WSAEACCES (10013)`.
+3. Two wildcard listeners on the same ServiceId → `WSAEADDRINUSE (10048)`.
+
+Therefore, the **only** way to run concurrent sessions is one `ServiceId` per session. Each service GUID is also registered in `HKLM\...\GuestCommunicationServices\<guid>` and the vsock port is passed to the guest kernel as `tokimo.init_port=<port>` on the cmdline.
