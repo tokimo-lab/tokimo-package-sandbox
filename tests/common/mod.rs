@@ -86,11 +86,12 @@ pub fn has_windows_artifacts() -> bool {
         return false;
     }
 
-    // Plan9 rootfs directory (the only supported mode).
-    let rootfs = std::env::var("TOKIMO_ROOTFS")
+    // Rootfs is now a single VHDX file (cowork-style: SCSI boot disk).
+    let rootfs = std::env::var("TOKIMO_ROOTFS_VHDX")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| tokimo.join("rootfs"));
-    rootfs.is_dir()
+        .or_else(|_| std::env::var("TOKIMO_ROOTFS").map(PathBuf::from))
+        .unwrap_or_else(|_| tokimo.join("rootfs.vhdx"));
+    rootfs.is_file()
 }
 
 /// Check if the tokimo-sandbox-svc named pipe is available.
@@ -160,12 +161,17 @@ pub fn skip_unless_platform_ready() -> bool {
 
 /// Returns `true` if the test should be skipped because the platform
 /// doesn't support persistent sandbox sessions (`Session::open`).
-///
-/// On Windows: sessions are not yet implemented (only `run()` one-shot).
 pub fn skip_unless_session_supported() -> bool {
     if cfg!(target_os = "windows") {
-        eprintln!("SKIP: Session not yet supported on Windows (use run() for one-shot)");
-        return true;
+        // Windows: requires the SYSTEM service + VM artifacts.
+        if !has_windows_service() {
+            eprintln!("SKIP: tokimo-sandbox-svc not running");
+            return true;
+        }
+        if !has_windows_artifacts() {
+            eprintln!("SKIP: Windows VM artifacts missing (TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS)");
+            return true;
+        }
     }
     false
 }

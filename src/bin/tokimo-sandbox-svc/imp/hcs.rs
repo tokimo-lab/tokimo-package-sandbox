@@ -203,9 +203,51 @@ impl HcsApi {
         }
     }
 
+    /// Query the runtime ID GUID assigned by HCS to this compute system.
+    /// Returns the bare GUID string (no braces) on success.
+    pub fn get_runtime_id(&self, handle: CsHandle) -> Option<String> {
+        let q = wide_z(r#"{"PropertyTypes":[]}"#);
+        let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
+        if op.is_null() {
+            return None;
+        }
+        let hr = unsafe { (self.get_props)(handle, op, q.as_ptr()) };
+        if hr < 0 {
+            unsafe { (self.close_op)(op) };
+            return None;
+        }
+        let mut result_ptr: *mut u16 = ptr::null_mut();
+        let hr2 = unsafe { (self.wait_op)(op, 5_000, &mut result_ptr) };
+        unsafe { (self.close_op)(op) };
+        if hr2 < 0 || result_ptr.is_null() {
+            if !result_ptr.is_null() {
+                unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+            }
+            return None;
+        }
+        let json = unsafe { wide_to_string(result_ptr) };
+        unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+        let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-props.json", &json);
+        let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+        // RuntimeId may live at top level or under VirtualMachine depending
+        // on schema. Try several locations.
+        for path in [
+            v.get("RuntimeId"),
+            v.get("VirtualMachine").and_then(|m| m.get("RuntimeId")),
+            v.get("RuntimeID"),
+        ] {
+            if let Some(s) = path.and_then(|x| x.as_str()) {
+                let g = s.trim_matches(|c| c == '{' || c == '}');
+                if !g.is_empty() {
+                    return Some(g.to_string());
+                }
+            }
+        }
+        None
+    }
+
     pub fn poll_state(&self, handle: CsHandle) -> HcsState {
-        // Query default properties (includes State). Using PropertyTypes array
-        // per HCS schema v2.x — not the invalid {"Property":"State"} format.
+        // Query default properties (includes State).
         let q = wide_z(r#"{"PropertyTypes":[]}"#);
         let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
         if op.is_null() {

@@ -17,13 +17,15 @@ use windows::Win32::Security::WinTrust::{
     WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO,
     WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
 };
-use windows::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
+use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
@@ -38,6 +40,7 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::svc_protocol::{ExecVmResult, SvcError, SvcNetwork, SvcRequest, SvcResponse};
 
 mod hcs;
+mod hvsock;
 mod vmconfig;
 
 // ---------------------------------------------------------------------------
@@ -325,7 +328,7 @@ fn pipe_server_loop(console_mode: bool) {
         let pipe = unsafe {
             CreateNamedPipeW(
                 &pipe_name,
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -340,16 +343,30 @@ fn pipe_server_loop(console_mode: bool) {
             continue;
         }
 
-        let connected = unsafe { ConnectNamedPipe(pipe, None) };
-        if connected.is_err() {
-            // ERROR_PIPE_CONNECTED (535) means the client connected between
-            // CreateNamedPipe and ConnectNamedPipe. That's fine.
-            let last = unsafe { GetLastError() }.0;
-            if last != 535 {
+        // Overlapped ConnectNamedPipe: returns immediately with ERROR_IO_PENDING,
+        // wait on the OVERLAPPED event for actual connection.
+        let connect_evt = match create_event() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[svc] CreateEventW failed: {e}");
                 let _ = unsafe { CloseHandle(pipe) };
                 continue;
             }
+        };
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = connect_evt;
+        let connected = unsafe { ConnectNamedPipe(pipe, Some(&mut ov)) };
+        let last = unsafe { GetLastError() }.0;
+        if connected.is_err() && last != 535 /* ERROR_PIPE_CONNECTED */ && last != 997 /* ERROR_IO_PENDING */ {
+            let _ = unsafe { CloseHandle(connect_evt) };
+            let _ = unsafe { CloseHandle(pipe) };
+            continue;
         }
+        if last == 997 {
+            // Wait for the connection to actually complete.
+            unsafe { WaitForSingleObject(connect_evt, u32::MAX) };
+        }
+        let _ = unsafe { CloseHandle(connect_evt) };
 
         // Hand the pipe to a worker thread. We carry the raw pointer as a
         // `usize` to side-step `HANDLE`'s lack of `Send` — there is exactly
@@ -430,6 +447,28 @@ fn handle_client(pipe: HANDLE) {
                 &rootfs_dir,
                 &workspace_path,
                 &cmd_b64,
+                memory_mb,
+                cpu_count,
+                network,
+            );
+        }
+        SvcRequest::OpenSession {
+            id,
+            kernel_path,
+            initrd_path,
+            rootfs_dir,
+            workspace_path,
+            memory_mb,
+            cpu_count,
+            network,
+        } => {
+            handle_open_session(
+                pipe,
+                id,
+                &kernel_path,
+                &initrd_path,
+                &rootfs_dir,
+                &workspace_path,
                 memory_mb,
                 cpu_count,
                 network,
@@ -628,20 +667,21 @@ fn scopeguard_close(api: Arc<hcs::HcsApi>, handle: hcs::CsHandle) -> impl Drop {
 /// Hosts the named pipe server for COM1 and tails everything HCS writes to
 /// it into `C:\tokimo-debug\last-vm-com1.log`. Truncates the log first.
 fn spawn_com1_logger(vm_id: &str) {
-    let pipe_name = format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}");
-    let log_path = r"C:\tokimo-debug\last-vm-com1.log";
-    let _ = std::fs::write(log_path, b"");
+    spawn_com_logger(&format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}"), r"C:\tokimo-debug\last-vm-com1.log");
+}
 
+/// Generic version: any COM port to any log path.
+fn spawn_com_logger(pipe_name: &str, log_path: &'static str) {
+    let _ = std::fs::write(log_path, b"");
     let pipe_w = HSTRING::from(pipe_name);
     std::thread::spawn(move || {
-        // 60s budget — VM lifetime cap during tests.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
         while std::time::Instant::now() < deadline {
             let pipe = unsafe {
                 CreateNamedPipeW(
                     &pipe_w,
                     PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     1,
                     4096,
                     4096,
@@ -662,7 +702,6 @@ fn spawn_com1_logger(vm_id: &str) {
                     continue;
                 }
             }
-            // Read until EOF / VM dies.
             let mut buf = [0u8; 1024];
             loop {
                 let mut got: u32 = 0;
@@ -702,20 +741,80 @@ fn read_request(pipe: HANDLE) -> std::io::Result<SvcRequest> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("json: {e}")))
 }
 
+fn create_event() -> std::io::Result<HANDLE> {
+    let h = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
+    Ok(h)
+}
+
+/// Synchronous-style ReadFile on an OVERLAPPED handle. Issues an
+/// overlapped read and waits for completion via WaitForSingleObject.
+unsafe fn ov_read(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<u32> {
+    let evt = create_event()?;
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = evt;
+    let mut got: u32 = 0;
+    let r = unsafe { ReadFile(pipe, Some(buf), Some(&mut got), Some(&mut ov)) };
+    let last = unsafe { GetLastError() }.0;
+    tunnel_log(&format!("ov_read ReadFile r.is_err={} last={last} got={got}", r.is_err()));
+    if r.is_err() {
+        if last == 997 /* ERROR_IO_PENDING */ {
+            tunnel_log("ov_read waiting on event");
+            unsafe { WaitForSingleObject(evt, u32::MAX) };
+            tunnel_log("ov_read event signaled");
+            let mut transferred: u32 = 0;
+            let ok = unsafe {
+                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
+            };
+            unsafe { let _ = CloseHandle(evt); }
+            if ok.is_err() {
+                let last2 = unsafe { GetLastError() }.0;
+                return Err(std::io::Error::from_raw_os_error(last2 as i32));
+            }
+            return Ok(transferred);
+        }
+        unsafe { let _ = CloseHandle(evt); }
+        return Err(std::io::Error::from_raw_os_error(last as i32));
+    }
+    unsafe { let _ = CloseHandle(evt); }
+    Ok(got)
+}
+
+unsafe fn ov_write(pipe: HANDLE, buf: &[u8]) -> std::io::Result<u32> {
+    let evt = create_event()?;
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = evt;
+    let mut wrote: u32 = 0;
+    let r = unsafe { WriteFile(pipe, Some(buf), Some(&mut wrote), Some(&mut ov)) };
+    if r.is_err() {
+        let last = unsafe { GetLastError() }.0;
+        if last == 997 {
+            unsafe { WaitForSingleObject(evt, u32::MAX) };
+            let mut transferred: u32 = 0;
+            let ok = unsafe {
+                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
+            };
+            unsafe { let _ = CloseHandle(evt); }
+            if ok.is_err() {
+                let last2 = unsafe { GetLastError() }.0;
+                return Err(std::io::Error::from_raw_os_error(last2 as i32));
+            }
+            return Ok(transferred);
+        }
+        unsafe { let _ = CloseHandle(evt); }
+        return Err(std::io::Error::from_raw_os_error(last as i32));
+    }
+    unsafe { let _ = CloseHandle(evt); }
+    Ok(wrote)
+}
+
 fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<()> {
     let mut off = 0;
     while off < buf.len() {
-        let mut got: u32 = 0;
-        let chunk = &mut buf[off..];
-        let len = chunk.len() as u32;
-        unsafe {
-            ReadFile(pipe, Some(chunk), Some(&mut got), None)
-                .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-        }
+        let got = unsafe { ov_read(pipe, &mut buf[off..])? };
         if got == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pipe closed"));
         }
-        let _ = len;
         off += got as usize;
     }
     Ok(())
@@ -724,12 +823,7 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<()> {
 fn write_all(pipe: HANDLE, buf: &[u8]) -> std::io::Result<()> {
     let mut off = 0;
     while off < buf.len() {
-        let mut written: u32 = 0;
-        let chunk = &buf[off..];
-        unsafe {
-            WriteFile(pipe, Some(chunk), Some(&mut written), None)
-                .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-        }
+        let written = unsafe { ov_write(pipe, &buf[off..])? };
         if written == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pipe closed"));
         }
@@ -793,6 +887,68 @@ fn verify_caller_required() -> bool {
     };
     let _ = unsafe { RegCloseKey(hk) };
     r.is_ok() && data != 0
+}
+
+/// Register an HvSocket service GUID under
+/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\<guid>`.
+/// Idempotent — if the key already exists we just refresh the friendly name.
+fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE,
+        REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    };
+
+    let subkey = HSTRING::from(format!(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\{svc_guid}"
+    ));
+    let mut hk = HKEY::default();
+    let mut disp = REG_CREATE_KEY_DISPOSITION(0);
+    let r = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            &subkey,
+            None,
+            windows::core::PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hk,
+            Some(&mut disp),
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return Err(format!("RegCreateKeyExW {svc_guid}: {:?}", r));
+    }
+    let value_name = HSTRING::from("ElementName");
+    let wide: Vec<u16> = friendly_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
+    };
+    let r2 = unsafe { RegSetValueExW(hk, &value_name, None, REG_SZ, Some(bytes)) };
+
+    // Set SecurityDescriptor REG_SZ so the guest's hv_sock connect to this
+    // service GUID is granted access. Without this the guest's connect can
+    // be silently dropped (ETIMEDOUT) — Hyper-V doesn't surface a refusal.
+    let sd_name = HSTRING::from("SecurityDescriptor");
+    let sd_str = "D:(A;;GA;;;WD)";
+    let sd_wide: Vec<u16> = sd_str
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let sd_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2)
+    };
+    let _ = unsafe { RegSetValueExW(hk, &sd_name, None, REG_SZ, Some(sd_bytes)) };
+
+    let _ = unsafe { RegCloseKey(hk) };
+    if r2 != ERROR_SUCCESS {
+        return Err(format!("RegSetValueExW: {:?}", r2));
+    }
+    Ok(())
 }
 
 fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
@@ -864,5 +1020,377 @@ impl EncodeWideExtra for std::ffi::OsStr {
     fn encode_wide_extra(&self) -> std::os::windows::ffi::EncodeWide<'_> {
         use std::os::windows::ffi::OsStrExt;
         self.encode_wide()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenSession — long-lived VM, COM1 tunneled to client pipe
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn handle_open_session(
+    pipe: HANDLE,
+    id: String,
+    kernel_path: &str,
+    initrd_path: &str,
+    rootfs_dir_str: &str,
+    workspace_path: &str,
+    memory_mb: u64,
+    cpu_count: usize,
+    network: SvcNetwork,
+) {
+    if network == SvcNetwork::AllowAll {
+        let _ = send_error_raw(
+            pipe,
+            &id,
+            "not_implemented",
+            "NetworkPolicy::AllowAll is not yet implemented on Windows. Use Blocked.",
+        );
+        return;
+    }
+
+    let kernel = match canonicalize_safe(Path::new(kernel_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "bad_path", &format!("kernel: {e}"));
+            return;
+        }
+    };
+    let initrd = match canonicalize_safe(Path::new(initrd_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "bad_path", &format!("initrd: {e}"));
+            return;
+        }
+    };
+    let workspace = match canonicalize_safe(Path::new(workspace_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "bad_path", &format!("workspace: {e}"));
+            return;
+        }
+    };
+    let rootfs_dir = match canonicalize_safe(Path::new(rootfs_dir_str)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "bad_path", &format!("rootfs_dir: {e}"));
+            return;
+        }
+    };
+
+    // Generate a session id and let HCS auto-assign the RuntimeId; we
+    // read it back after start to use as the AF_HYPERV VmId.
+    let vm_id = format!(
+        "tokimo-sess-{}-{}",
+        std::process::id(),
+        rand_session_suffix()
+    );
+
+    // Clone rootfs.vhdx to a per-session writable copy in the workspace
+    // so concurrent sessions don't corrupt each other's filesystem.
+    let session_vhdx = match clone_rootfs_for_session(&rootfs_dir, &workspace, &vm_id) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "vhdx_clone", &e);
+            return;
+        }
+    };
+
+    // Make sure the HvSocket service GUID for our vsock port is
+    // registered in HKLM. Without this the host's AF_HYPERV connect
+    // fails with WSAETIMEDOUT.
+    let svc_id = vmconfig::hvsock_service_id(vmconfig::PORT_INIT_CONTROL);
+    if let Err(e) = ensure_hvsocket_service_registered(&svc_id, "Tokimo Sandbox Init") {
+        let _ = send_error_raw(pipe, &id, "hvsock_register", &e);
+        return;
+    }
+
+    let cfg_json = vmconfig::build_ex(
+        &vm_id,
+        &kernel,
+        &initrd,
+        &session_vhdx,
+        &workspace,
+        "",
+        memory_mb,
+        cpu_count,
+        true,
+        None,
+    );
+    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
+
+    // COM2 logger: kernel kmsg.
+    spawn_com_logger(
+        &format!(r"\\.\pipe\tokimo-vm-com2-{vm_id}"),
+        r"C:\tokimo-debug\last-vm-com2.log",
+    );
+
+    // Cowork architecture: host listens on AF_HYPERV, guest connects.
+    // Bind the listener BEFORE starting the VM so the guest can reach us
+    // as soon as init brings up vsock.
+    let svc_id_str = vmconfig::hvsock_service_id(vmconfig::PORT_INIT_CONTROL);
+    let svc_guid = match parse_guid(&svc_id_str) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "guid", &e);
+            return;
+        }
+    };
+    let listener = match hvsock::listen_for_guest(svc_guid) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "hvsock_listen", &e.to_string());
+            return;
+        }
+    };
+    eprintln!("[svc] session {vm_id} listening on AF_HYPERV service {svc_id_str}");
+
+    // Boot VM.
+    let api = match hcs::HcsApi::init() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "hcs_init", &e);
+            return;
+        }
+    };
+    let cs = match api.create_compute_system(&vm_id, &cfg_json) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-error.txt", &e);
+            let _ = send_error_raw(pipe, &id, "hcs_create", &e);
+            return;
+        }
+    };
+    if let Err(e) = api.start_compute_system(cs) {
+        api.close_compute_system(cs);
+        let _ = send_error_raw(pipe, &id, "hcs_start", &e);
+        return;
+    }
+
+    // Wait for the guest to connect. The guest's init binary opens an
+    // AF_VSOCK stream to (CID=VMADDR_CID_HOST, PORT_INIT_CONTROL) which
+    // Hyper-V translates to an AF_HYPERV accept on the host's listener.
+    let mut hv = match hvsock::accept_guest(&listener, Duration::from_secs(60)) {
+        Ok(s) => s,
+        Err(e) => {
+            api.terminate_compute_system(cs).ok();
+            api.close_compute_system(cs);
+            let _ = send_error_raw(pipe, &id, "hvsock", &e.to_string());
+            return;
+        }
+    };
+    drop(listener);
+    eprintln!("[svc] session {vm_id} hvsock connected (guest dialed in)");
+
+    if let Err(e) = send_response_raw(pipe, &SvcResponse::SessionOpened { id: id.clone() }) {
+        api.terminate_compute_system(cs).ok();
+        api.close_compute_system(cs);
+        eprintln!("[svc] failed to send SessionOpened: {e}");
+        return;
+    }
+
+    // Tunnel: spawn one thread that copies client(pipe)→hvsock and run
+    // hvsock→client(pipe) inline. When either side errors out we tear
+    // down everything.
+    let mut hv2 = match hv.try_clone() {
+        Ok(h) => h,
+        Err(e) => {
+            api.terminate_compute_system(cs).ok();
+            api.close_compute_system(cs);
+            eprintln!("[svc] hvsock clone failed: {e}");
+            return;
+        }
+    };
+    let client_ptr = pipe.0 as usize;
+    // Duplicate the pipe handle so read and write threads use independent
+    // SYNCHRONOUS handles. The named pipe was created without
+    // FILE_FLAG_OVERLAPPED so each ReadFile/WriteFile blocks the handle
+    // it uses; sharing one handle would serialize read against write.
+    let cli_read_h: usize = unsafe {
+        use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut dup = HANDLE(std::ptr::null_mut());
+        let proc = GetCurrentProcess();
+        let _ = windows::Win32::Foundation::DuplicateHandle(
+            proc, HANDLE(client_ptr as *mut _), proc, &mut dup,
+            0, false, DUPLICATE_SAME_ACCESS,
+        );
+        dup.0 as usize
+    };
+    let dead = Arc::new(AtomicBool::new(false));
+
+    let dead_a = dead.clone();
+    let _t = std::thread::spawn(move || {
+        tunnel_log("client→hv thread started");
+        let cli = HANDLE(cli_read_h as *mut _);
+        let mut buf = [0u8; 8192];
+        let mut total = 0u64;
+        loop {
+            if dead_a.load(Ordering::Relaxed) {
+                break;
+            }
+            let got = match unsafe { ov_read(cli, &mut buf) } {
+                Ok(g) => g,
+                Err(e) => {
+                    tunnel_log(&format!("client→hv read failed: {e}"));
+                    break;
+                }
+            };
+            if got == 0 {
+                tunnel_log(&format!("client→hv EOF total={total}"));
+                break;
+            }
+            total += got as u64;
+            tunnel_log(&format!("client→hv +{got}B (total {total})"));
+            use std::io::Write;
+            if let Err(e) = hv2.write_all(&buf[..got as usize]) {
+                tunnel_log(&format!("client→hv write failed: {e}"));
+                break;
+            }
+        }
+        dead_a.store(true, Ordering::Relaxed);
+    });
+
+    // hvsock → client.
+    {
+        tunnel_log("hv→client loop start");
+        let cli = HANDLE(client_ptr as *mut _);
+        let mut buf = [0u8; 8192];
+        let mut total = 0u64;
+        use std::io::Read;
+        loop {
+            if dead.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = match hv.read(&mut buf) {
+                Ok(0) => {
+                    tunnel_log(&format!("hv→client EOF total={total}"));
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tunnel_log(&format!("hv→client read failed: {e}"));
+                    break;
+                }
+            };
+            total += n as u64;
+            tunnel_log(&format!("hv→client +{n}B (total {total})"));
+            let mut off = 0usize;
+            while off < n {
+                tunnel_log(&format!("hv→client about to ov_write {}B", n - off));
+                let wrote = match unsafe { ov_write(cli, &buf[off..n]) } {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tunnel_log(&format!("hv→client ov_write failed: {e}"));
+                        break;
+                    }
+                };
+                if wrote == 0 {
+                    tunnel_log("hv→client ov_write zero");
+                    break;
+                }
+                tunnel_log(&format!("hv→client wrote {wrote}B"));
+                off += wrote as usize;
+            }
+            let _ = unsafe { FlushFileBuffers(cli) };
+        }
+        dead.store(true, Ordering::Relaxed);
+    }
+
+    eprintln!("[svc] session {vm_id} tunnel closed, tearing down VM");
+    api.terminate_compute_system(cs).ok();
+    api.close_compute_system(cs);
+    let _ = std::fs::remove_file(&session_vhdx);
+}
+
+/// Clone the read-only rootfs VHDX template into a per-session writable
+/// copy living next to the workspace. The copy is named
+/// `.tokimo-rootfs-<vm_id>.vhdx` so it's hidden from typical workspace
+/// listings and easy to identify for cleanup.
+fn clone_rootfs_for_session(template: &Path, workspace: &Path, vm_id: &str) -> Result<PathBuf, String> {
+    if !template.is_file() {
+        return Err(format!(
+            "rootfs template not a file: {} (expected rootfs.vhdx)",
+            template.display()
+        ));
+    }
+    let dst = workspace.join(format!(".tokimo-rootfs-{vm_id}.vhdx"));
+    if dst.exists() {
+        let _ = std::fs::remove_file(&dst);
+    }
+    std::fs::copy(template, &dst)
+        .map_err(|e| format!("clone {} -> {}: {e}", template.display(), dst.display()))?;
+    Ok(dst)
+}
+
+fn rand_u16() -> u16 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (n & 0xFFFF) as u16 ^ ((n >> 16) as u16)
+}
+
+fn rand_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    n.wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+/// Parse a string GUID `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` into a
+/// `windows::core::GUID`.
+fn parse_guid(s: &str) -> Result<windows::core::GUID, String> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return Err(format!("bad GUID format: {s}"));
+    }
+    let data1 = u32::from_str_radix(parts[0], 16).map_err(|e| e.to_string())?;
+    let data2 = u16::from_str_radix(parts[1], 16).map_err(|e| e.to_string())?;
+    let data3 = u16::from_str_radix(parts[2], 16).map_err(|e| e.to_string())?;
+    if parts[3].len() != 4 || parts[4].len() != 12 {
+        return Err(format!("bad GUID part lengths: {s}"));
+    }
+    let mut data4 = [0u8; 8];
+    for i in 0..2 {
+        data4[i] =
+            u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+    }
+    for i in 0..6 {
+        data4[2 + i] =
+            u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+    }
+    Ok(windows::core::GUID {
+        data1,
+        data2,
+        data3,
+        data4,
+    })
+}
+
+fn rand_session_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{:08x}", nanos)
+}
+
+fn tunnel_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\tokimo-debug\last-vm-tunnel.log")
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{now}] {msg}");
     }
 }

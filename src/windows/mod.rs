@@ -17,14 +17,17 @@
 //! downgrades.
 
 mod client;
+mod init_client;
+pub(crate) mod ov_pipe;
 pub mod protocol;
 pub(crate) mod safe_path;
+mod session;
 
 use crate::{Error, ExecutionResult, NetworkPolicy, Result};
 
 use std::path::PathBuf;
 
-const DEFAULT_MEMORY_MB: u64 = 512;
+const DEFAULT_MEMORY_MB: u64 = 2048;
 const DEFAULT_CPUS: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -40,7 +43,7 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
 
     let kernel = find_kernel()?;
     let initrd = find_initrd()?;
-    let rootfs_dir = find_rootfs_dir()?;
+    let rootfs_dir = find_rootfs_vhdx()?;
     let workspace = ensure_workspace(cfg)?;
 
     // Write stdin buffer to the workspace so the guest can read it.
@@ -97,10 +100,8 @@ pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &crate::config::SandboxConfig) 
     )
 }
 
-pub(crate) fn spawn_session_shell(_cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {
-    Err(Error::validation(
-        "Session not yet supported on Windows. Use run() for one-shot execution.",
-    ))
+pub(crate) fn spawn_session_shell(cfg: &crate::config::SandboxConfig) -> Result<crate::session::ShellHandle> {
+    session::spawn_session_shell(cfg)
 }
 
 pub(crate) fn run_without_sandbox<S: AsRef<str>>(
@@ -196,7 +197,7 @@ fn shell_escape(s: &str) -> String {
 // Path discovery
 // ---------------------------------------------------------------------------
 
-fn find_kernel() -> Result<PathBuf> {
+pub(crate) fn find_kernel() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_KERNEL") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
@@ -226,7 +227,7 @@ fn find_kernel() -> Result<PathBuf> {
     ))
 }
 
-fn find_initrd() -> Result<PathBuf> {
+pub(crate) fn find_initrd() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TOKIMO_INITRD") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
@@ -265,37 +266,52 @@ fn find_initrd() -> Result<PathBuf> {
 ///
 /// VHDX mode is **not** supported: the tokimo-os initrd does not implement
 /// disk-mounted root, only Plan9-over-vsock from the host shares.
-fn find_rootfs_dir() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("TOKIMO_ROOTFS") {
+/// Locate the rootfs VHDX file.
+///
+/// Search order:
+///   1. `$TOKIMO_ROOTFS_VHDX`
+///   2. `$TOKIMO_ROOTFS` (compat: file ending in .vhdx)
+///   3. `%USERPROFILE%\.tokimo\rootfs.vhdx`
+///   4. `<exe-dir>\rootfs.vhdx`
+///
+/// The file must be an ext4 VHDX containing the sandbox rootfs (built by
+/// `scripts/wsl/02-build-rootfs.sh`). The guest mounts it as `/dev/sda`
+/// via SCSI; initramfs-tools then switch_root's into it.
+pub(crate) fn find_rootfs_vhdx() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("TOKIMO_ROOTFS_VHDX") {
         let pb = PathBuf::from(&p);
-        if pb.is_dir() {
+        if pb.is_file() {
             return Ok(pb);
         }
-        return Err(Error::exec(format!("TOKIMO_ROOTFS={} not found", pb.display())));
+        return Err(Error::exec(format!("TOKIMO_ROOTFS_VHDX={} not found", pb.display())));
+    }
+    if let Ok(p) = std::env::var("TOKIMO_ROOTFS") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() && pb.extension().map(|e| e == "vhdx").unwrap_or(false) {
+            return Ok(pb);
+        }
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
-        let pb = PathBuf::from(&home).join(".tokimo/rootfs");
-        if pb.is_dir() {
+        let pb = PathBuf::from(&home).join(".tokimo/rootfs.vhdx");
+        if pb.is_file() {
             return Ok(pb);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let pb = dir.join("rootfs");
-            if pb.is_dir() {
+            let pb = dir.join("rootfs.vhdx");
+            if pb.is_file() {
                 return Ok(pb);
             }
         }
     }
     Err(Error::validation(
-        "Rootfs directory not found. Place an extracted Debian rootfs at \
-         ~/.tokimo/rootfs (or set TOKIMO_ROOTFS). \
-         Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases \
-         (rootfs-amd64.tar.zst)",
+        "Rootfs VHDX not found. Build it with `scripts/wsl/02-build-rootfs.sh` (in WSL) \
+         and place at ~/.tokimo/rootfs.vhdx (or set TOKIMO_ROOTFS_VHDX).",
     ))
 }
 
-fn ensure_workspace(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {
+pub(crate) fn ensure_workspace(cfg: &crate::config::SandboxConfig) -> Result<PathBuf> {
     let work = cfg.work_dir.clone();
     if !work.exists() {
         std::fs::create_dir_all(&work).map_err(|e| Error::exec(format!("create work dir: {e}")))?;

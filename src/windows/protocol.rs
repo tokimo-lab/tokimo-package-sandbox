@@ -47,6 +47,24 @@ pub enum SvcRequest {
         #[serde(default = "default_network")]
         network: SvcNetwork,
     },
+
+    /// Boot a Linux VM in **session** mode. After the response
+    /// (`SessionOpened`) the client pipe enters tunnel mode: every byte
+    /// written by the client is forwarded raw to the guest's COM1 (which
+    /// is the data channel for `tokimo-sandbox-init`'s init protocol),
+    /// and every byte the guest writes to COM1 is forwarded back to the
+    /// client. The VM is torn down when the client pipe disconnects.
+    OpenSession {
+        id: String,
+        kernel_path: String,
+        initrd_path: String,
+        rootfs_dir: String,
+        workspace_path: String,
+        memory_mb: u64,
+        cpu_count: usize,
+        #[serde(default = "default_network")]
+        network: SvcNetwork,
+    },
 }
 
 fn default_network() -> SvcNetwork {
@@ -78,6 +96,10 @@ pub enum SvcResponse {
         #[serde(flatten)]
         result: ExecVmResult,
     },
+    /// Successful response to `OpenSession`. The client pipe is now a
+    /// transparent byte tunnel to/from the guest's COM1 (init protocol).
+    #[serde(rename = "SessionOpened")]
+    SessionOpened { id: String },
     #[serde(rename = "Error")]
     Error { id: String, error: SvcError },
 }

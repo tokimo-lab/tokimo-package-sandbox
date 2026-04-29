@@ -32,7 +32,7 @@ use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, listen, socket};
+use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, connect, listen, socket};
 #[cfg(target_os = "linux")]
 use nix::unistd::getpid;
 
@@ -45,15 +45,62 @@ const ENV_VSOCK_PORT: &str = "TOKIMO_SANDBOX_VSOCK_PORT";
 /// If set, use stdin/stdout (the virtio serial console) for the control
 /// channel instead of a VSOCK or Unix socket. Used when the kernel lacks
 /// AF_VSOCK support.
+#[cfg(target_os = "linux")]
 const ENV_SERIAL_MODE: &str = "TOKIMO_SANDBOX_SERIAL_MODE";
 
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {
+    // Subcommand: load kernel modules from the rootfs.
+    //
+    // Usage: tokimo-sandbox-init --load-modules <module-path> [<module-path>...]
+    //
+    // Each module-path is the absolute path to a .ko file inside the
+    // rootfs. The shim uses this to bring up vsock + 9p before mounting
+    // the workspace, since a minimal Ubuntu base has no `modprobe`.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--load-modules") {
+        let mut failed = 0usize;
+        for path in &args[2..] {
+            match load_kernel_module(path) {
+                Ok(()) => eprintln!("[tokimo-init] loaded {path}"),
+                Err(e) => {
+                    eprintln!("[tokimo-init] WARN {path}: {e}");
+                    failed += 1;
+                }
+            }
+        }
+        return if failed > 0 { ExitCode::from(1) } else { ExitCode::from(0) };
+    }
+
     if let Err(e) = run() {
         eprintln!("[tokimo-sandbox-init] fatal: {e}");
         return ExitCode::from(1);
     }
     ExitCode::from(0)
+}
+
+/// Load a kernel module from a file path using the `finit_module(2)`
+/// syscall. Idempotent: returns `Ok` if the module is already loaded
+/// (`EEXIST`).
+#[cfg(target_os = "linux")]
+fn load_kernel_module(path: &str) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let empty = CString::new("").unwrap();
+    // SYS_finit_module is 313 on x86_64.
+    let r = unsafe {
+        libc::syscall(libc::SYS_finit_module, f.as_raw_fd(), empty.as_ptr(), 0i32)
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let errno = unsafe { *libc::__errno_location() };
+    if errno == libc::EEXIST {
+        // Already loaded — fine.
+        return Ok(());
+    }
+    Err(format!("finit_module errno={errno}"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -76,7 +123,12 @@ fn run() -> Result<(), String> {
     // second `mount(2)` of procfs from inside an unprivileged userns is
     // refused with EPERM (not EBUSY), so we cannot attempt it blindly.
     let is_vm_mode = env::var(ENV_VSOCK_PORT).is_ok() || env::var(ENV_SERIAL_MODE).is_ok();
-    if is_vm_mode {
+    // In `serial=stdio` mode (legacy Windows HCS) or `pre_chrooted=1` mode
+    // (current Windows HCS vsock path) init.sh has already done the
+    // mounts + chroot before exec'ing us; skip the VM-mode setup.
+    let serial_stdio = env::var(ENV_SERIAL_MODE).as_deref() == Ok("stdio");
+    let pre_chrooted = env::var("TOKIMO_SANDBOX_PRE_CHROOTED").as_deref() == Ok("1");
+    if is_vm_mode && !serial_stdio && !pre_chrooted {
         for (src, tgt, fstype) in &[
             ("proc", "/proc", "proc"),
             ("sysfs", "/sys", "sysfs"),
@@ -145,7 +197,7 @@ fn run() -> Result<(), String> {
         let port: u32 = port_str
             .parse()
             .map_err(|e| format!("{ENV_VSOCK_PORT}={port_str}: {e}"))?;
-        (bind_vsock(port)?, None, server::Transport::Vsock)
+        (connect_vsock(port)?, None, server::Transport::Vsock)
     } else {
         (bind_unix()?, None, server::Transport::SeqPacket)
     };
@@ -156,7 +208,20 @@ fn run() -> Result<(), String> {
     std::mem::forget(sigfd);
 
     eprintln!("[tokimo-sandbox-init] READY");
+    klog("READY-mainline, calling run_loop");
     server::run_loop(listener, write_fd, sigfd_owned, base_env, transport).map_err(|e| format!("event loop: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn klog(s: &str) {
+    let line = format!("[tokimo-init-klog] {s}\n");
+    unsafe {
+        let fd = libc::open(c"/dev/kmsg".as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, line.as_ptr().cast(), line.len());
+            libc::close(fd);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -182,12 +247,65 @@ fn bind_unix() -> Result<OwnedFd, String> {
     Ok(fd)
 }
 
-/// Serial mode: use a mailbox file on the virtiofs share for bidirectional
-/// communication. The host writes ops to `.tps_host_to_guest` and the guest
-/// writes replies to `.tps_guest_to_host`. We poll the control file with a
-/// simple file-based loop. No sockets needed — works with any kernel.
+/// Serial mode.
+///
+/// `TOKIMO_SANDBOX_SERIAL_MODE=stdio` (Windows HCS): control channel is
+/// fd 0 (read) and fd 1 (write) — i.e. a serial console (COM1) directly
+/// wired by `init.sh` via `exec 0<>/dev/ttyS0 1>&0`. We dup the fds
+/// (so the rest of init can repoint stdio to /dev/null) and put both in
+/// non-blocking mode.
+///
+/// Any other value (legacy path): use a virtiofs mailbox at
+/// `/mnt/work/.tps_{host_to_guest,guest_to_host}`.
 #[cfg(target_os = "linux")]
 fn bind_serial() -> Result<(OwnedFd, Option<OwnedFd>), String> {
+    if env::var(ENV_SERIAL_MODE).as_deref() == Ok("stdio") {
+        eprintln!("[tokimo-sandbox-init] serial mode: stdio (fd 0/1)");
+        // Put the TTY in raw mode (no echo, no canonical processing).
+        // Otherwise the kernel line discipline garbles our binary frames.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                libc::cfmakeraw(&mut t);
+                let _ = libc::cfsetspeed(&mut t, libc::B4000000);
+                t.c_cc[libc::VMIN] = 1;
+                t.c_cc[libc::VTIME] = 0;
+                let _ = libc::tcsetattr(0, libc::TCSANOW, &t);
+            }
+        }
+        let r = unsafe { libc::dup(0) };
+        if r < 0 {
+            return Err(format!("dup(0): {}", std::io::Error::last_os_error()));
+        }
+        let w = unsafe { libc::dup(1) };
+        if w < 0 {
+            unsafe { libc::close(r) };
+            return Err(format!("dup(1): {}", std::io::Error::last_os_error()));
+        }
+        // Set O_NONBLOCK on the read fd so the mio poll loop doesn't stall.
+        unsafe {
+            let flags = libc::fcntl(r, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(r, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            // Set CLOEXEC on both.
+            libc::fcntl(r, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(w, libc::F_SETFD, libc::FD_CLOEXEC);
+            // Repoint our own stdin/stdout to /dev/null so child processes
+            // launched by init don't accidentally write debug to the wire.
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            if null >= 0 {
+                libc::dup2(null, 0);
+                libc::dup2(null, 1);
+                libc::close(null);
+            }
+        }
+        return Ok((
+            unsafe { OwnedFd::from_raw_fd(r) },
+            Some(unsafe { OwnedFd::from_raw_fd(w) }),
+        ));
+    }
+
     eprintln!("[tokimo-sandbox-init] serial mode: virtiofs mailbox on /mnt/work");
     // Open the FIFO-like mailbox: read from host→guest file.
     let r = unsafe {
@@ -336,23 +454,46 @@ fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data
     Ok(())
 }
 
-/// Bind an AF_VSOCK listener on `port`. The socket is non-blocking so it
-/// integrates with the mio event loop (same as the Unix path).
+/// Open an AF_VSOCK stream to the host's `(VMADDR_CID_HOST, port)`. Cowork
+/// architecture: the host listens on AF_HYPERV and the guest dials in.
+/// Retries on connection-refused for a short window while Hyper-V sets up
+/// the per-VM hvsock plumbing after VM start.
 #[cfg(target_os = "linux")]
-fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
-    let fd = socket(
-        AddressFamily::Vsock,
-        SockType::Stream,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
-        None,
-    )
-    .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
-
-    // Bind to VMADDR_CID_ANY on the guest side.
-    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
-    bind(fd.as_raw_fd(), &addr).map_err(|e| format!("bind VSOCK port {port}: {e}"))?;
-    listen(&fd, Backlog::new(8).unwrap()).map_err(|e| format!("listen VSOCK: {e}"))?;
-
-    eprintln!("[tokimo-sandbox-init] listening on VSOCK port {port}");
-    Ok(fd)
+fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, port);
+    loop {
+        let fd = socket(
+            AddressFamily::Vsock,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
+        match connect(fd.as_raw_fd(), &addr) {
+            Ok(()) => {
+                eprintln!(
+                    "[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}"
+                );
+                // Set non-blocking AFTER connect succeeds so the mio event
+                // loop can poll the socket the same way as the listener
+                // path used to.
+                unsafe {
+                    let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0);
+                    if flags >= 0 {
+                        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+                return Ok(fd);
+            }
+            Err(e) => {
+                drop(fd);
+                if Instant::now() >= deadline {
+                    return Err(format!("connect VSOCK CID=HOST port {port}: {e}"));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
