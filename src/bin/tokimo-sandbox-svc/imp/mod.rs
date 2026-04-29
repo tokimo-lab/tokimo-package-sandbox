@@ -4,46 +4,38 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LocalFree, HLOCAL,
-};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree};
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Security::WinTrust::{
-    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-    WINTRUST_DATA_PROVIDER_FLAGS, WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION,
-    WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_UI_NONE,
+    WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_DATA_PROVIDER_FLAGS,
+    WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO,
+    WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
 };
-use windows::Win32::Storage::FileSystem::{
-    FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
-};
+use windows::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
+    ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use tokimo_package_sandbox::svc_protocol::{
-    ExecVmResult, SvcError, SvcNetwork, SvcRequest, SvcResponse,
-};
 use tokimo_package_sandbox::canonicalize_safe;
+use tokimo_package_sandbox::svc_protocol::{ExecVmResult, SvcError, SvcNetwork, SvcRequest, SvcResponse};
 
 mod hcs;
 mod vmconfig;
@@ -56,7 +48,7 @@ const SERVICE_NAME: &str = "TokimoSandboxSvc";
 const SERVICE_DISPLAY: &str = "Tokimo Sandbox Service";
 const PIPE_NAME: &str = r"\\.\pipe\tokimo-sandbox-svc";
 
-/// SDDL for the named pipe.
+/// SDDL for the named pipe when running as a service (LocalSystem).
 ///
 /// `O:SY` owner = LocalSystem
 /// `G:SY` group = LocalSystem
@@ -64,11 +56,14 @@ const PIPE_NAME: &str = r"\\.\pipe\tokimo-sandbox-svc";
 ///   * `(A;;GA;;;SY)` - LocalSystem: GENERIC_ALL
 ///   * `(A;;0x12019b;;;IU)` - Interactive Users: read|write|sync without
 ///     delete/changeperms (FILE_GENERIC_READ | FILE_GENERIC_WRITE).
+const PIPE_SDDL_SERVICE: &str = "O:SYG:SYD:(A;;GA;;;SY)(A;;0x12019b;;;IU)";
+
+/// SDDL for the named pipe when running in console (dev) mode.
 ///
-/// `IU` (Interactive Users) is the well-known SID `S-1-5-4`. It is **not**
-/// the same as `BU` (Built-in Users, `S-1-5-32-545`); BU includes
-/// `NETWORK SERVICE`, `LOCAL SERVICE`, and (depending on policy) Guest.
-const PIPE_SDDL: &str = "O:SYG:SYD:(A;;GA;;;SY)(A;;0x12019b;;;IU)";
+/// Does not require LocalSystem as owner so it works under a privileged
+/// admin account without `SeRestorePrivilege`. The DACL grants access to
+/// the current interactive user session only.
+const PIPE_SDDL_CONSOLE: &str = "D:(A;;GA;;;IU)";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -85,9 +80,12 @@ pub fn run() {
             "--install" => return install_service(),
             "--uninstall" => return uninstall_service(),
             "--console" => return run_console(),
+            // MSIX packaged service passes --service; fall through to the
+            // service_dispatcher below.
+            "--service" => {}
             "-h" | "--help" => {
                 println!("tokimo-sandbox-svc v{VERSION}");
-                println!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console]");
+                println!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console|--service]");
                 return;
             }
             other => {
@@ -108,9 +106,16 @@ pub fn run() {
 fn run_console() {
     println!("Tokimo Sandbox Service v{VERSION} (console mode)");
     println!("Pipe: {PIPE_NAME}");
-    println!("Caller verification: {}", if verify_caller_required() { "ENFORCED" } else { "log-only" });
+    println!(
+        "Caller verification: {}",
+        if verify_caller_required() {
+            "ENFORCED"
+        } else {
+            "log-only"
+        }
+    );
     println!("Waiting for connections... (Ctrl+C to stop)");
-    pipe_server_loop();
+    pipe_server_loop(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +154,7 @@ fn run_as_service() -> windows_service::Result<()> {
         process_id: None,
     })?;
 
-    pipe_server_loop();
+    pipe_server_loop(false);
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -276,18 +281,16 @@ impl Drop for SdGuard {
     }
 }
 
-fn build_security_attributes() -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
-    let sddl = HSTRING::from(PIPE_SDDL);
+fn build_security_attributes(console_mode: bool) -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
+    let sddl_str = if console_mode {
+        PIPE_SDDL_CONSOLE
+    } else {
+        PIPE_SDDL_SERVICE
+    };
+    let sddl = HSTRING::from(sddl_str);
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &sddl,
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )
-    }
-    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
+    unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
 
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -297,8 +300,8 @@ fn build_security_attributes() -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)
     Ok((attrs, SdGuard(sd)))
 }
 
-fn pipe_server_loop() {
-    let (mut sa, _sd_guard) = match build_security_attributes() {
+fn pipe_server_loop(console_mode: bool) {
+    let (mut sa, _sd_guard) = match build_security_attributes(console_mode) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Failed to build pipe SDDL: {e}");
@@ -323,7 +326,7 @@ fn pipe_server_loop() {
             CreateNamedPipeW(
                 &pipe_name,
                 PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
                 64 * 1024,
@@ -412,7 +415,7 @@ fn handle_client(pipe: HANDLE) {
             id,
             kernel_path,
             initrd_path,
-            rootfs_vhdx,
+            rootfs_dir,
             workspace_path,
             cmd_b64,
             memory_mb,
@@ -424,7 +427,7 @@ fn handle_client(pipe: HANDLE) {
                 id,
                 &kernel_path,
                 &initrd_path,
-                rootfs_vhdx.as_deref(),
+                &rootfs_dir,
                 &workspace_path,
                 &cmd_b64,
                 memory_mb,
@@ -465,7 +468,7 @@ fn handle_exec_vm(
     id: String,
     kernel_path: &str,
     initrd_path: &str,
-    rootfs_vhdx: Option<&str>,
+    rootfs_dir_str: &str,
     workspace_path: &str,
     cmd_b64: &str,
     memory_mb: u64,
@@ -495,15 +498,12 @@ fn handle_exec_vm(
             return;
         }
     };
-    let vhdx = match rootfs_vhdx {
-        Some(p) => match canonicalize_safe(Path::new(p)) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                let _ = send_error_raw(pipe, &id, "bad_path", &format!("rootfs_vhdx: {e}"));
-                return;
-            }
-        },
-        None => None,
+    let rootfs_dir = match canonicalize_safe(Path::new(rootfs_dir_str)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_error_raw(pipe, &id, "bad_path", &format!("rootfs_dir: {e}"));
+            return;
+        }
     };
 
     if network == SvcNetwork::AllowAll {
@@ -517,7 +517,15 @@ fn handle_exec_vm(
         return;
     }
 
-    match run_vm(&kernel, &initrd, vhdx.as_deref(), &workspace, cmd_b64, memory_mb, cpu_count) {
+    match run_vm(
+        &kernel,
+        &initrd,
+        &rootfs_dir,
+        &workspace,
+        cmd_b64,
+        memory_mb,
+        cpu_count,
+    ) {
         Ok(result) => {
             let _ = send_response_raw(pipe, &SvcResponse::ExecVmResult { id, result });
         }
@@ -530,7 +538,7 @@ fn handle_exec_vm(
 fn run_vm(
     kernel: &Path,
     initrd: &Path,
-    vhdx: Option<&Path>,
+    rootfs_dir: &Path,
     workspace: &Path,
     cmd_b64: &str,
     memory_mb: u64,
@@ -542,10 +550,25 @@ fn run_vm(
     let _ = std::fs::remove_file(workspace.join(".vz_exit_code"));
 
     let vm_id = format!("tokimo-svc-{}", std::process::id());
-    let cfg_json = vmconfig::build(&vm_id, kernel, initrd, vhdx, workspace, cmd_b64, memory_mb, cpu_count);
+    let cfg_json = vmconfig::build(&vm_id, kernel, initrd, rootfs_dir, workspace, cmd_b64, memory_mb, cpu_count);
+
+    // Debug: dump the HCS config JSON to a known location so failures can
+    // be inspected post-mortem from the test harness.
+    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-config.json", &cfg_json);
+
+    // Spawn a thread that hosts the COM1 named pipe server and tails serial
+    // output into C:\tokimo-debug\last-vm-com1.log. HCS connects to this pipe
+    // when the VM starts; we keep accepting reads until the VM stops.
+    spawn_com1_logger(&vm_id);
 
     let api = hcs::HcsApi::init()?;
-    let handle = api.create_compute_system(&vm_id, &cfg_json)?;
+    let handle = match api.create_compute_system(&vm_id, &cfg_json) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-error.txt", &e);
+            return Err(e);
+        }
+    };
     let _guard = scopeguard_close(api.clone(), handle);
 
     api.start_compute_system(handle)?;
@@ -600,6 +623,66 @@ fn scopeguard_close(api: Arc<hcs::HcsApi>, handle: hcs::CsHandle) -> impl Drop {
         }
     }
     G(api, handle)
+}
+
+/// Hosts the named pipe server for COM1 and tails everything HCS writes to
+/// it into `C:\tokimo-debug\last-vm-com1.log`. Truncates the log first.
+fn spawn_com1_logger(vm_id: &str) {
+    let pipe_name = format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}");
+    let log_path = r"C:\tokimo-debug\last-vm-com1.log";
+    let _ = std::fs::write(log_path, b"");
+
+    let pipe_w = HSTRING::from(pipe_name);
+    std::thread::spawn(move || {
+        // 60s budget — VM lifetime cap during tests.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    &pipe_w,
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    4096,
+                    4096,
+                    50,
+                    None,
+                )
+            };
+            if pipe == INVALID_HANDLE_VALUE {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            let connected = unsafe { ConnectNamedPipe(pipe, None) };
+            if connected.is_err() {
+                let last = unsafe { GetLastError() }.0;
+                if last != 535 {
+                    let _ = unsafe { CloseHandle(pipe) };
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            }
+            // Read until EOF / VM dies.
+            let mut buf = [0u8; 1024];
+            loop {
+                let mut got: u32 = 0;
+                let r = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut got), None) };
+                if r.is_err() || got == 0 {
+                    break;
+                }
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_path)
+                {
+                    let _ = f.write_all(&buf[..got as usize]);
+                }
+            }
+            let _ = unsafe { CloseHandle(pipe) };
+            return;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +769,7 @@ fn verify_caller_required() -> bool {
     }
     // Check HKLM\SOFTWARE\Tokimo\SandboxSvc\VerifyCaller
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
     };
     let subkey = HSTRING::from(r"SOFTWARE\Tokimo\SandboxSvc");
     let value = HSTRING::from("VerifyCaller");
@@ -719,7 +802,14 @@ fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
     let proc_h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut buf = [0u16; 32 * 1024];
     let mut sz: u32 = buf.len() as u32;
-    let r = unsafe { QueryFullProcessImageNameW(proc_h, PROCESS_NAME_FORMAT(0), windows::core::PWSTR(buf.as_mut_ptr()), &mut sz) };
+    let r = unsafe {
+        QueryFullProcessImageNameW(
+            proc_h,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut sz,
+        )
+    };
     let _ = unsafe { CloseHandle(proc_h) };
     if r.is_err() || sz == 0 {
         return None;

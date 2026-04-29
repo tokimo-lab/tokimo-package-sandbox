@@ -32,8 +32,9 @@ macro_rules! try_run {
             },
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("0x8037011B") || msg.contains("0x8037") {
-                    eprintln!("SKIP: Hyper-V not available");
+                // Only skip on the specific "Hyper-V not present" error.
+                if msg.contains("0x8037011B") {
+                    eprintln!("SKIP: Hyper-V / HCS not available");
                     return;
                 }
                 panic!("run failed: {e}");

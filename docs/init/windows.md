@@ -4,8 +4,6 @@
 Claude Desktop 的 `cowork-vm-service`：一个 LocalSystem 服务通过命名管道接收宿主进程
 的请求，并调用 HCS API 启动 Hyper‑V 微 VM。
 
-旧版（手动 `--install` + UAC 提权）的文档已归档至 `windows.legacy.md`。
-
 ## 架构
 
 ```

@@ -14,11 +14,11 @@
     * A code-signing cert chained to a root the target machine trusts.
 
   Build pipeline (see scripts\build-msix.ps1):
-    1. cargo build --release --bin tokimo-sandbox-svc
+    1. cargo build -release -bin tokimo-sandbox-svc
     2. Stage AppxManifest.xml + tokimo-sandbox-svc.exe + assets/* into a
        layout dir.
-    3. MakeAppx.exe pack /d <layout> /p Tokimo.SandboxSvc.msix
-    4. SignTool.exe sign /fd SHA256 /a /f <pfx> /p <pwd> Tokimo.SandboxSvc.msix
+    3. MakeAppx.exe pack /d (layout) /p Tokimo.SandboxSvc.msix
+    4. SignTool.exe sign /fd SHA256 /a /f (pfx) /p (pwd) Tokimo.SandboxSvc.msix
 -->
 <Package
     xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -68,9 +68,7 @@
           <desktop6:Service
               Name="TokimoSandboxSvc"
               StartupType="manual"
-              StartAccount="localSystem">
-            <desktop6:StartupArguments>--service</desktop6:StartupArguments>
-          </desktop6:Service>
+              StartAccount="localSystem" />
         </desktop6:Extension>
       </Extensions>
     </Application>

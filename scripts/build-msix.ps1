@@ -72,8 +72,11 @@ foreach ($name in $logos) {
     }
 }
 
-# 3. Locate MakeAppx.exe.
+# 3. Locate MakeAppx.exe. Filter for version-numbered directories
+#    (10.0.xxxxx.0) so we don't accidentally pick "x86"/"x64" which sort
+#    after digits in descending order.
 $kit = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue |
+       Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } |
        Sort-Object Name -Descending | Select-Object -First 1
 if (-not $kit) { throw "Windows 10 SDK not found. Install one to get MakeAppx.exe." }
 $makeAppx = Join-Path $kit.FullName "x64\MakeAppx.exe"

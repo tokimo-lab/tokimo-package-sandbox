@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Latest rootfs release known to work with this test suite.
-const ROOTFS_VERSION: &str = "v1.4.0";
+const ROOTFS_VERSION: &str = "v1.4.2";
 const ROOTFS_REPO: &str = "https://github.com/tokimo-lab/tokimo-package-rootfs";
 
 /// Directory where artifacts are stored.
@@ -68,6 +68,9 @@ pub fn has_vz_artifacts() -> bool {
 }
 
 /// Check if Windows sandbox artifacts (kernel + initrd + rootfs) are present.
+///
+/// Supports both VHDX mode (`rootfs.vhdx`) and legacy Plan9 root mode
+/// (`rootfs/` directory). VHDX is preferred.
 pub fn has_windows_artifacts() -> bool {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let tokimo = PathBuf::from(&home).join(".tokimo");
@@ -78,11 +81,16 @@ pub fn has_windows_artifacts() -> bool {
     let initrd = std::env::var("TOKIMO_INITRD")
         .map(PathBuf::from)
         .unwrap_or_else(|_| tokimo.join("initrd.img"));
+
+    if !kernel.exists() || !initrd.exists() {
+        return false;
+    }
+
+    // Plan9 rootfs directory (the only supported mode).
     let rootfs = std::env::var("TOKIMO_ROOTFS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| tokimo.join("rootfs"));
-
-    kernel.exists() && initrd.exists() && rootfs.exists()
+    rootfs.is_dir()
 }
 
 /// Check if the tokimo-sandbox-svc named pipe is available.
@@ -130,7 +138,9 @@ pub fn skip_unless_platform_ready() -> bool {
             eprintln!(
                 "SKIP: Windows sandbox artifacts missing. \
                  Place kernel at ~/.tokimo/kernel/vmlinuz, initrd at ~/.tokimo/initrd.img, \
-                 and rootfs at ~/.tokimo/rootfs/. Or set TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS env vars."
+                 and an extracted rootfs at ~/.tokimo/rootfs/. \
+                 Or set TOKIMO_KERNEL/TOKIMO_INITRD/TOKIMO_ROOTFS env vars. \
+                 Run `pwsh ./scripts/setup-windows-artifacts.ps1` to download automatically."
             );
             return true;
         }
@@ -221,6 +231,68 @@ pub fn download_vz_artifacts() -> Result<(), String> {
     eprintln!("VZ artifacts installed to {}", dir.display());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Automatic artifact download (Windows)
+// ---------------------------------------------------------------------------
+
+/// Download kernel + initrd + rootfs VHDX from GitHub releases for Windows.
+///
+/// Delegates to `scripts/setup-windows-artifacts.ps1` which downloads
+/// `tokimo-os-amd64.tar.zst` (kernel + initrd) and `rootfs-amd64.vhdx.zip`,
+/// extracting them to `%USERPROFILE%\.tokimo\`.
+///
+/// Skips if all artifacts are already present.
+pub fn download_windows_artifacts() -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    if has_windows_artifacts() {
+        let dir = std::env::var("USERPROFILE")
+            .map(|h| PathBuf::from(h).join(".tokimo"))
+            .unwrap_or_else(|_| PathBuf::from(".tokimo"));
+        eprintln!("Windows artifacts already present in {}", dir.display());
+        return Ok(());
+    }
+
+    // Find the setup script relative to the workspace root.
+    let script = find_setup_script()?;
+
+    eprintln!("Running: pwsh -NoProfile -ExecutionPolicy Bypass -File {}", script.display());
+    let status = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script.to_str().ok_or("script path not valid UTF-8")?,
+        ])
+        .status()
+        .map_err(|e| format!("failed to run pwsh: {e}. Is PowerShell 7+ installed? (winget install Microsoft.PowerShell)"))?;
+
+    if !status.success() {
+        return Err(format!("setup script exited with {status}"));
+    }
+    Ok(())
+}
+
+/// Walk up from the crate root to find `scripts/setup-windows-artifacts.ps1`.
+fn find_setup_script() -> Result<PathBuf, String> {
+    let mut dir = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    loop {
+        let candidate = dir.join("scripts").join("setup-windows-artifacts.ps1");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        if !dir.pop() {
+            return Err("setup-windows-artifacts.ps1 not found (expected in scripts/)".into());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn download_to_temp(url: &str) -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir().join(format!("tokimo-dl-{}", rand_suffix()));

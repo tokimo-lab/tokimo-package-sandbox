@@ -4,3 +4,5 @@ Cargo.lock
 .DS_Store
 # Local test rootfs (downloaded by CI / dev via TOKIMO_TEST_ROOTFS env)
 /.test-rootfs/
+# IDE / agent config (per-developer)
+/.claude/

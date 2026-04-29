@@ -35,7 +35,7 @@ const CONNECT_TIMEOUT_MS: u32 = 5_000;
 pub(crate) fn exec_vm(
     kernel_path: &Path,
     initrd_path: &Path,
-    rootfs_vhdx: Option<&Path>,
+    rootfs_dir: &Path,
     workspace_path: &Path,
     cmd_b64: &str,
     memory_mb: u64,
@@ -55,7 +55,7 @@ pub(crate) fn exec_vm(
         id: id.clone(),
         kernel_path: kernel_path.to_string_lossy().into_owned(),
         initrd_path: initrd_path.to_string_lossy().into_owned(),
-        rootfs_vhdx: rootfs_vhdx.map(|p| p.to_string_lossy().into_owned()),
+        rootfs_dir: rootfs_dir.to_string_lossy().into_owned(),
         workspace_path: workspace_path.to_string_lossy().into_owned(),
         cmd_b64: cmd_b64.to_string(),
         memory_mb,
@@ -91,50 +91,45 @@ pub(crate) fn is_service_available() -> bool {
 // Pipe I/O
 // ---------------------------------------------------------------------------
 
-/// Open the pipe as a `std::fs::File`. Pipe handles in Windows behave like
-/// file handles: `Read`/`Write` Just Work. We retry once on `ERROR_PIPE_BUSY`
-/// after waiting up to `CONNECT_TIMEOUT_MS`.
+/// Open the pipe as a `std::fs::File`. Retries on `ERROR_PIPE_BUSY` with
+/// backoff — tests run in parallel and can race for pipe instances even
+/// after `WaitNamedPipeW` returns.
 fn open_pipe() -> std::io::Result<std::fs::File> {
     let name = HSTRING::from(PIPE_NAME);
+    let mut attempts = 0;
 
-    // Wait until the server has an available instance.
-    let waited = unsafe { WaitNamedPipeW(&name, CONNECT_TIMEOUT_MS) };
-    if !waited.as_bool() {
-        let code = unsafe { GetLastError() }.0;
-        return Err(std::io::Error::from_raw_os_error(code as i32));
-    }
-
-    // Open it. We use CreateFileW directly (rather than OpenOptions) so we
-    // can pass exact share/create flags.
-    let handle = unsafe {
-        CreateFileW(
-            &name,
-            (GENERIC_READ.0 | GENERIC_WRITE.0) as u32,
-            FILE_SHARE_NONE,
-            Some(std::ptr::null::<SECURITY_ATTRIBUTES>()),
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        )
-    }
-    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-
-    // ERROR_PIPE_BUSY shouldn't happen after WaitNamedPipeW returned OK, but
-    // handle it defensively.
-    let raw = handle.0 as isize;
-    if raw == -1 {
-        let last = unsafe { GetLastError() };
-        if last == ERROR_PIPE_BUSY {
-            std::thread::sleep(Duration::from_millis(50));
-            return Err(std::io::Error::from_raw_os_error(ERROR_PIPE_BUSY.0 as i32));
+    loop {
+        let waited = unsafe { WaitNamedPipeW(&name, CONNECT_TIMEOUT_MS) };
+        if !waited.as_bool() {
+            let code = unsafe { GetLastError() }.0;
+            return Err(std::io::Error::from_raw_os_error(code as i32));
         }
-        return Err(std::io::Error::from_raw_os_error(last.0 as i32));
-    }
 
-    // Adopt the HANDLE as a std::fs::File. Note: File takes ownership and
-    // will close it on drop. From-raw-handle is the documented way.
-    use std::os::windows::io::FromRawHandle;
-    Ok(unsafe { std::fs::File::from_raw_handle(handle.0 as _) })
+        match unsafe {
+            CreateFileW(
+                &name,
+                (GENERIC_READ.0 | GENERIC_WRITE.0) as u32,
+                FILE_SHARE_NONE,
+                Some(std::ptr::null::<SECURITY_ATTRIBUTES>()),
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        } {
+            Ok(handle) => {
+                use std::os::windows::io::FromRawHandle;
+                return Ok(unsafe { std::fs::File::from_raw_handle(handle.0 as _) });
+            }
+            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
+                attempts += 1;
+                if attempts >= 10 {
+                    return Err(std::io::Error::from_raw_os_error(ERROR_PIPE_BUSY.0 as i32));
+                }
+                std::thread::sleep(Duration::from_millis(50 * attempts));
+            }
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e.code().0)),
+        }
+    }
 }
 
 fn next_req_id() -> u64 {

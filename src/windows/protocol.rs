@@ -34,13 +34,12 @@ pub enum SvcRequest {
         id: String,
         kernel_path: String,
         initrd_path: String,
-        /// Optional read/write VHDX attached as the root SCSI disk. When
-        /// present, the guest is expected to mount it as `/` and use
-        /// `workspace_path` only as `/work`. When `None`, the guest mounts
-        /// `workspace_path` itself as `/` via Plan9 (legacy behaviour).
-        rootfs_vhdx: Option<String>,
-        /// Host directory shared as Plan9 tag `work`. The guest writes
-        /// `.vz_stdout`, `.vz_stderr`, `.vz_exit_code` here.
+        /// Host directory shared as Plan9 tag `rootshare` and used as the
+        /// Debian rootfs (the guest does `switch_root` into it).
+        rootfs_dir: String,
+        /// Host directory shared as Plan9 tag `work`. The guest mounts it
+        /// at `/mnt/work` inside the rootfs and writes `.vz_stdout`,
+        /// `.vz_stderr`, `.vz_exit_code` here.
         workspace_path: String,
         cmd_b64: String,
         memory_mb: u64,
@@ -142,12 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_vm_roundtrip_with_vhdx() {
+    fn test_exec_vm_roundtrip_with_rootfs_dir() {
         let req = SvcRequest::ExecVm {
             id: "vm-1".into(),
             kernel_path: r"C:\tokimo\vmlinuz".into(),
             initrd_path: r"C:\tokimo\initrd.img".into(),
-            rootfs_vhdx: Some(r"C:\tokimo\rootfs.vhdx".into()),
+            rootfs_dir: r"C:\tokimo\rootfs".into(),
             workspace_path: r"C:\Users\me\work".into(),
             cmd_b64: "ZWNobyBoZWxsbw==".into(),
             memory_mb: 512,
@@ -158,11 +157,11 @@ mod tests {
         let parsed: SvcRequest = serde_json::from_slice(&json).unwrap();
         match parsed {
             SvcRequest::ExecVm {
-                rootfs_vhdx,
+                rootfs_dir,
                 network,
                 ..
             } => {
-                assert!(rootfs_vhdx.is_some());
+                assert_eq!(rootfs_dir, r"C:\tokimo\rootfs");
                 assert_eq!(network, SvcNetwork::Blocked);
             }
             _ => panic!("expected ExecVm"),
@@ -171,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_exec_vm_legacy_default_network() {
-        let json = br#"{"op":"ExecVm","id":"x","kernel_path":"k","initrd_path":"i","rootfs_vhdx":null,"workspace_path":"w","cmd_b64":"","memory_mb":1,"cpu_count":1}"#;
+        let json = br#"{"op":"ExecVm","id":"x","kernel_path":"k","initrd_path":"i","rootfs_dir":"r","workspace_path":"w","cmd_b64":"","memory_mb":1,"cpu_count":1}"#;
         let parsed: SvcRequest = serde_json::from_slice(json).unwrap();
         match parsed {
             SvcRequest::ExecVm { network, .. } => assert_eq!(network, SvcNetwork::Blocked),

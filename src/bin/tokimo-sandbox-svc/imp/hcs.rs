@@ -11,9 +11,9 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, OnceLock};
 
-use windows::core::{HSTRING, PCSTR};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE, LocalFree, HLOCAL};
+use windows::Win32::Foundation::{FreeLibrary, HLOCAL, HMODULE, LocalFree};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::core::{HSTRING, PCSTR};
 
 pub type CsHandle = *mut c_void;
 type Op = *mut c_void;
@@ -109,7 +109,8 @@ impl HcsApi {
             unsafe { (self.close_op)(op) };
             return Err(format!("HcsCreateComputeSystem: 0x{:08X}", hr as u32));
         }
-        self.wait_and_close(op, 30_000).map_err(|e| format!("HcsCreateComputeSystem wait: {e}"))?;
+        self.wait_and_close(op, 30_000)
+            .map_err(|e| format!("HcsCreateComputeSystem wait: {e}"))?;
         Ok(handle)
     }
 
@@ -120,7 +121,8 @@ impl HcsApi {
             unsafe { (self.close_op)(op) };
             return Err(format!("HcsStartComputeSystem: 0x{:08X}", hr as u32));
         }
-        self.wait_and_close(op, 30_000).map_err(|e| format!("HcsStartComputeSystem wait: {e}"))
+        self.wait_and_close(op, 30_000)
+            .map_err(|e| format!("HcsStartComputeSystem wait: {e}"))
     }
 
     pub fn terminate_compute_system(&self, handle: CsHandle) -> Result<(), String> {
@@ -130,7 +132,8 @@ impl HcsApi {
             unsafe { (self.close_op)(op) };
             return Err(format!("HcsTerminateComputeSystem: 0x{:08X}", hr as u32));
         }
-        self.wait_and_close(op, 10_000).map_err(|e| format!("Terminate wait: {e}"))
+        self.wait_and_close(op, 10_000)
+            .map_err(|e| format!("Terminate wait: {e}"))
     }
 
     pub fn close_compute_system(&self, handle: CsHandle) {
@@ -142,25 +145,68 @@ impl HcsApi {
     fn wait_and_close(&self, op: Op, timeout_ms: u32) -> Result<(), String> {
         let mut result_ptr: *mut u16 = ptr::null_mut();
         let hr = unsafe { (self.wait_op)(op, timeout_ms, &mut result_ptr) };
+
+        // On failure HCS may still return a result JSON with error details.
+        let detail = if !result_ptr.is_null() {
+            let json = unsafe { wide_to_string(result_ptr) };
+            unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+            json
+        } else {
+            String::new()
+        };
+
+        unsafe { (self.close_op)(op) };
+
         if hr < 0 {
-            unsafe { (self.close_op)(op) };
+            if !detail.is_empty() {
+                return Err(format!("HcsWaitForOperationResult: 0x{:08X} — {}", hr as u32, detail));
+            }
             return Err(format!("HcsWaitForOperationResult: 0x{:08X}", hr as u32));
         }
-        let ok = if result_ptr.is_null() {
-            true
+
+        let ok = if detail.is_empty() { true } else { check_result(&detail) };
+        if ok {
+            Ok(())
         } else {
-            let json = unsafe { wide_to_string(result_ptr) };
-            unsafe {
-                let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
-            }
-            check_result(&json)
-        };
+            Err("operation did not succeed".into())
+        }
+    }
+
+    /// Query the VM's exit code via `HcsGetComputeSystemProperties`.
+    /// Returns `None` if the property is unavailable.
+    pub fn get_exit_code(&self, handle: CsHandle) -> Option<i32> {
+        let q = wide_z(r#"{"PropertyTypes":[]}"#);
+        let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
+        if op.is_null() {
+            return None;
+        }
+        let hr = unsafe { (self.get_props)(handle, op, q.as_ptr()) };
+        if hr < 0 {
+            unsafe { (self.close_op)(op) };
+            return None;
+        }
+        let mut result_ptr: *mut u16 = ptr::null_mut();
+        let hr2 = unsafe { (self.wait_op)(op, 5_000, &mut result_ptr) };
         unsafe { (self.close_op)(op) };
-        if ok { Ok(()) } else { Err("operation did not succeed".into()) }
+        if hr2 < 0 || result_ptr.is_null() {
+            if !result_ptr.is_null() {
+                unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+            }
+            return None;
+        }
+        let json = unsafe { wide_to_string(result_ptr) };
+        unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+            v["ExitCode"].as_i64().map(|n| n as i32)
+        } else {
+            None
+        }
     }
 
     pub fn poll_state(&self, handle: CsHandle) -> HcsState {
-        let q = wide_z(r#"{"Property":"State"}"#);
+        // Query default properties (includes State). Using PropertyTypes array
+        // per HCS schema v2.x — not the invalid {"Property":"State"} format.
+        let q = wide_z(r#"{"PropertyTypes":[]}"#);
         let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
         if op.is_null() {
             return HcsState::Error;
@@ -186,11 +232,18 @@ impl HcsApi {
             let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-            match v["State"].as_str() {
-                Some("Running") => HcsState::Running,
-                Some("Stopped") => HcsState::Stopped,
-                _ => HcsState::Error,
+            // HCS returns different JSON shapes depending on VM lifecycle:
+            //   Running: {"State":"Running", ...}
+            //   Stopped: {"State":"Stopped", ...}  OR  {"Stopped":true,"ExitType":"GracefulExit"}
+            match v.get("State").and_then(|s| s.as_str()) {
+                Some("Running") => return HcsState::Running,
+                Some("Stopped") => return HcsState::Stopped,
+                _ => {}
             }
+            if v.get("Stopped").and_then(|s| s.as_bool()).unwrap_or(false) {
+                return HcsState::Stopped;
+            }
+            HcsState::Error
         } else {
             HcsState::Error
         }
