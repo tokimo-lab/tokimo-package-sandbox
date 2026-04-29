@@ -49,10 +49,11 @@ fn ensure_wsa_started() {
     });
 }
 
-/// Bind an AF_HYPERV listener for `service_id`, accepting connections from
-/// any guest VmId (HV_GUID_WILDCARD). Returns the listening socket which
-/// must be passed to [`accept_guest`] to retrieve the connected client.
-pub fn listen_for_guest(service_id: GUID) -> io::Result<HvSock> {
+/// Bind an AF_HYPERV listener for `(vm_id, service_id)`. Pass
+/// [`HV_GUID_WILDCARD`] as `vm_id` to accept connections from any guest, or
+/// the specific RuntimeId of a VM to make the listener tuple unique
+/// (required when multiple sessions share the same `service_id`).
+pub fn listen_for_guest(vm_id: GUID, service_id: GUID) -> io::Result<HvSock> {
     ensure_wsa_started();
     let s = match unsafe { socket(AF_HYPERV as i32, SOCK_STREAM, HV_PROTOCOL_RAW) } {
         Ok(s) if s != INVALID_SOCKET => s,
@@ -65,7 +66,7 @@ pub fn listen_for_guest(service_id: GUID) -> io::Result<HvSock> {
     let addr = SockaddrHv {
         family: AF_HYPERV,
         reserved: 0,
-        vm_id: HV_GUID_WILDCARD,
+        vm_id,
         service_id,
     };
     let r = unsafe {

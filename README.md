@@ -98,7 +98,17 @@ Env vars: `TOKIMO_VZ_KERNEL`, `TOKIMO_VZ_INITRD`, `TOKIMO_VZ_ROOTFS`, `TOKIMO_VZ
 
 ## Windows setup
 
-The Windows backend uses a **SYSTEM-level service** (`tokimo-sandbox-svc.exe`) that creates Hyper-V VMs on behalf of non-admin users. Same architecture as Docker Desktop and Claude Desktop.
+### Windows setup
+
+The Windows backend runs a **SYSTEM-level service** (`tokimo-sandbox-svc.exe`) that creates Hyper-V VMs on behalf of non-admin users. Each `Session::open()` call:
+
+1. Boots an isolated micro-VM (kernel + initrd + per-session VHDX clone)
+2. Connects host ↔ guest via AF_HYPERV/HvSocket (per-session service GUID)
+3. Bridges the init control protocol over a named pipe to the library
+
+Multiple concurrent sessions are supported — each gets its own VM and unique HvSocket service GUID.
+
+For a detailed architecture reference, see [`docs/windows-architecture.md`](docs/windows-architecture.md).
 
 ### 1. Enable Virtual Machine Platform
 
@@ -112,7 +122,7 @@ and downloaded into `<repo>/vm/` via:
 
 ```powershell
 pwsh scripts/fetch-vm.ps1                 # latest release
-pwsh scripts/fetch-vm.ps1 -Tag v1.6.0     # specific tag
+pwsh scripts/fetch-vm.ps1 -Tag v1.7.1     # specific tag
 ```
 
 Expected layout:
@@ -123,43 +133,36 @@ Expected layout:
   rootfs.vhdx         ← Debian 13 ext4 VHDX
 ```
 
-### 3. First run
+### 3. Install service and run
 
-```rust
-// On first call, the library auto-installs the service via UAC.
-// User clicks "Yes" once. After that, everything is transparent.
-let out = tokimo_package_sandbox::run(&["python3", "--version"], &cfg)?;
-```
-
-The service walks up the filesystem from its own location to find a `vm/`
-directory containing all three artifacts. No environment variables are read.
-
-### Distribution
-
-When shipping an application that uses this library, bundle `tokimo-sandbox-svc.exe` alongside your binary:
-
-```
-your-app\
-  your-app.exe
-  tokimo-sandbox-svc.exe   ← copy from cargo build output
-```
-
-The library finds the service binary next to the process executable and auto-installs it on first use.
-
-### Debugging
+**Development (console mode — foreground, no SCM):**
 
 ```powershell
-# Terminal 1: run service in foreground (see all logs)
 cargo build --bin tokimo-sandbox-svc
+# Run as administrator:
 .\target\debug\tokimo-sandbox-svc.exe --console
-
-# Terminal 2: run examples
-cargo run --example hv_smoke
 ```
 
-In console mode, no UAC or service installation is needed — the library auto-detects the pipe and connects directly.
+**Development (SCM service — persistent, survives shell exit):**
 
-To uninstall: `.\tokimo-sandbox-svc.exe --uninstall` (needs admin).
+```powershell
+# Install and start as "tokimo-sandbox-svc" (admin required, one-time)
+.\target\debug\tokimo-sandbox-svc.exe --install
+# Verify
+Get-Service tokimo-sandbox-svc  # Status = Running
+
+# Uninstall when done
+.\target\debug\tokimo-sandbox-svc.exe --uninstall
+```
+
+> If `--install` reports `(os error 1078)`, an MSIX-packaged instance is already installed (same display name). Remove it first: `Get-AppxPackage Tokimo.SandboxSvc | Remove-AppxPackage`
+
+**Production (MSIX — registers service `TokimoSandboxSvc` via `desktop6:Service`):**
+
+```powershell
+pwsh scripts/build-msix.ps1
+# Then double-click the .msix or deploy via MDM/WinGet
+```
 
 ## Crate structure
 
@@ -279,32 +282,43 @@ macOS host
 ```
 Windows host
   │
-  ├─ run() → resolve paths → svc::client::exec_vm()
+  ├─ Session::open() / run()
   │     │
-  │     │  named pipe \\.\pipe\tokimo-sandbox-svc
+  │     │  named pipe \\.\pipe\tokimo-sandbox-svc (OVERLAPPED)
   │     │
   │     ├─ tokimo-sandbox-svc.exe (NT AUTHORITY\SYSTEM)
   │     │     │
+  │     │     ├─ alloc per-session vsock port + HvSocket service GUID
+  │     │     ├─ register GUID in HKLM GuestCommunicationServices
+  │     │     ├─ clone rootfs.vhdx → per-session copy
+  │     │     ├─ bind AF_HYPERV listener (HV_GUID_WILDCARD, session GUID)
+  │     │     │
   │     │     ├─ HcsCreateComputeSystem(schema)
-  │     │     │     └─ LinuxKernel(kernel, initrd)
-  │     │     │     └─ Plan9("work") → rootfs shared via 9p
+  │     │     │     └─ LinuxKernelDirect(vmlinuz, initrd.img)
+  │     │     │     └─ SCSI: per-session rootfs.vhdx
+  │     │     │     └─ Plan9("work") → workspace via vsock 9p
+  │     │     │     └─ HvSocket ServiceTable[session-guid]
   │     │     │
   │     │     ├─ HcsStartComputeSystem
   │     │     │
-  │     │     │  ┌─────── Linux VM (amd64) ──────┐
-  │     │     │  │  initrd init                  │
-  │     │     │  │    ├─ mount 9p → /mnt/work    │
-  │     │     │  │    ├─ chroot /mnt/work        │
-  │     │     │  │    └─ bash -c "<cmd>"         │
-  │     │     │  │                               │
-  │     │     │  │  Result → .vz_stdout/.vz_stderr│
-  │     │     │  └───────────────────────────────┘
+  │     │     │  ┌─────── Linux VM (amd64) ────────────────────┐
+  │     │     │  │  initrd init.sh                             │
+  │     │     │  │    ├─ modprobe hv_vmbus hv_sock …           │
+  │     │     │  │    ├─ mount /dev/sda (ext4 rootfs)          │
+  │     │     │  │    └─ chroot → exec tokimo-sandbox-init     │
+  │     │     │  │                                             │
+  │     │     │  │  tokimo-sandbox-init (PID 1)                │
+  │     │     │  │    ├─ AF_VSOCK connect(CID=2, port=<sess>)  │
+  │     │     │  │    ├─ mount Plan9 "work" → /mnt/work        │
+  │     │     │  │    └─ Op::OpenShell / Spawn / Exec …        │
+  │     │     │  └─────────────────────────────────────────────┘
   │     │     │
-  │     │     └─ Send response over pipe
+  │     │     ├─ accept hvsock → bridge pipe ↔ hvsock (tunnel)
+  │     │     └─ reply SessionOpened → pipe tunnel active
   │     │
-  │     └─ Parse response → ExecutionResult
+  │     └─ WinInitClient: Hello / OpenShell / Spawn / Exec over tunnel
   │
-  └─ Service auto-installs via UAC on first use
+  └─ ~600ms cold boot-to-first-exec
 ```
 
 **Shared across macOS and Windows:**
@@ -328,7 +342,7 @@ pub struct ExecutionResult {
 }
 ```
 
-### Persistent sessions (Linux + macOS)
+### Persistent sessions (all platforms including Windows)
 
 ```rust
 let mut sess = Session::open(&cfg)?;
@@ -340,8 +354,7 @@ let pty = sess.open_pty(24, 80, &["/bin/bash".into()], &[], None)?;
 sess.close()?;
 ```
 
-Windows currently exposes only one-shot `run()`. Sessions on Windows are
-tracked but not yet implemented.
+Windows sessions use the same API. PTY support on Windows is planned but not yet implemented.
 
 ### Configuration
 
@@ -396,7 +409,11 @@ cargo run --example hv_smoke            # Windows Hyper-V SYSTEM service
 
 ```bash
 cargo test --lib --bins                  # unit tests, all platforms
-cargo test --tests                       # + integration tests (Linux only)
+cargo test --tests                       # + integration tests
+
+# Windows session integration tests (14 cases, concurrent)
+cargo test --test session -- --test-threads=4    # ~16s
+cargo test --test session -- --test-threads=1    # ~60s sequential
 ```
 
 Linux integration tests need a real rootfs to bind-mount inside bwrap.
@@ -426,9 +443,9 @@ for the seccomp-notify + loopback-proxy interaction we hit there. It
 runs fine locally and on self-hosted runners.
 
 macOS-only integration tests (`vz_session`, `vz_workspace`) are
-`#[cfg(target_os = "macos")]` and only build on a Mac. There is no
-Windows integration test crate yet — Windows coverage is exercised
-through `cargo run --example hv_smoke` from an elevated shell.
+`#[cfg(target_os = "macos")]` and only build on a Mac.
+
+Windows integration tests live in `tests/session.rs` — 14 session tests covering exec, spawn, concurrency, timeout, kill, PTY setup, and cleanup. They require the service running (`--console` or installed) and VM artifacts in `vm/`. See [`docs/windows-architecture.md`](docs/windows-architecture.md) for setup.
 
 ## Init control protocol (v1, Linux)
 

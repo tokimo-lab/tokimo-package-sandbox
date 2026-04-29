@@ -25,8 +25,11 @@ $vmDir = Join-Path $repoRoot "vm"
 $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 
 $repo = "tokimo-lab/tokimo-package-rootfs"
-$bootAsset = "tokimo-$Arch-boot.tar.zst"
-$vhdxAsset = "tokimo-$Arch-ext4-rootfs.vhdx.zip"
+# New artifact naming (v1.7.0+): tokimo-linux-<component>-<arch>.<ext>
+# arch in the artifact filename is x86_64 / arm64.
+$archName = if ($Arch -eq "amd64") { "x86_64" } else { "arm64" }
+$kernelAsset = "tokimo-linux-kernel-$archName.tar.zst"
+$vhdxAsset   = "tokimo-linux-rootfs-$archName.vhdx.zip"
 
 if ($Tag -eq "latest") {
     $base = "https://github.com/$repo/releases/latest/download"
@@ -51,10 +54,10 @@ function Download($url, $out) {
     Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
 }
 
-# 1) boot bundle (vmlinuz + initrd.img, zstd)
-$bootZst = Join-Path $work $bootAsset
+# 1) kernel bundle (vmlinuz + initrd.img, zstd-compressed tarball)
+$bootZst = Join-Path $work $kernelAsset
 $bootTar = $bootZst -replace '\.zst$', ''
-Download "$base/$bootAsset" $bootZst
+Download "$base/$kernelAsset" $bootZst
 
 # Need zstd. Try ambient, then fall back to MSYS / scoop / chocolatey.
 $zstd = Get-Command zstd -ErrorAction SilentlyContinue
