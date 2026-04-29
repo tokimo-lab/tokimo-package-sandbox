@@ -65,15 +65,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
 
     // Open service-side session — returns the named pipe that's now a
     // raw byte tunnel to the guest's COM1 (= init's stdin/stdout).
-    let pipe = client::open_session(
-        &kernel,
-        &initrd,
-        &rootfs_dir,
-        &workspace,
-        memory_mb,
-        cpu_count,
-        network,
-    )?;
+    let pipe = client::open_session(&kernel, &initrd, &rootfs_dir, &workspace, memory_mb, cpu_count, network)?;
 
     let init = WinInitClient::new(pipe)?;
     init.hello()?;
@@ -84,11 +76,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
         env_overlay.push((k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()));
     }
 
-    let info: SpawnInfo = init.open_shell(
-        &["/bin/bash", "--noprofile", "--norc"],
-        &env_overlay,
-        Some("/mnt/work"),
-    )?;
+    let info: SpawnInfo = init.open_shell(&["/bin/bash", "--noprofile", "--norc"], &env_overlay, Some("/mnt/work"))?;
     let child_id = info.child_id;
 
     // Build ShellHandle.
@@ -97,23 +85,15 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
         child_id: child_id.clone(),
         closed: false,
     });
-    let stdout: Box<dyn std::io::Read + Send> = Box::new(InitReader::new(
-        init.clone(),
-        child_id.clone(),
-        InitStream::Stdout,
-    ));
-    let stderr: Box<dyn std::io::Read + Send> = Box::new(InitReader::new(
-        init.clone(),
-        child_id.clone(),
-        InitStream::Stderr,
-    ));
+    let stdout: Box<dyn std::io::Read + Send> =
+        Box::new(InitReader::new(init.clone(), child_id.clone(), InitStream::Stdout));
+    let stderr: Box<dyn std::io::Read + Send> =
+        Box::new(InitReader::new(init.clone(), child_id.clone(), InitStream::Stderr));
 
     // try_wait: shell child exited?
     let tw_client = init.clone();
     let tw_cid = child_id.clone();
-    let try_wait = Box::new(move || -> bool {
-        tw_client.is_dead() || tw_client.child_exited(&tw_cid)
-    });
+    let try_wait = Box::new(move || -> bool { tw_client.is_dead() || tw_client.child_exited(&tw_cid) });
 
     // kill: SIGKILL the shell.
     let kill_client = init.clone();
@@ -124,31 +104,23 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
 
     // run_oneshot: reuse init's pipes-mode children.
     let oneshot_client = init.clone();
-    let run_oneshot: crate::session::RunOneshotFn =
-        Box::new(move |cmd: &str, timeout: Duration| -> Result<crate::session::ExecOutput> {
-            let (out, err, code) = oneshot_client.run_oneshot(
-                &["/bin/bash", "-c", cmd],
-                &[],
-                Some("/mnt/work"),
-                timeout,
-            )?;
+    let run_oneshot: crate::session::RunOneshotFn = Box::new(
+        move |cmd: &str, timeout: Duration| -> Result<crate::session::ExecOutput> {
+            let (out, err, code) =
+                oneshot_client.run_oneshot(&["/bin/bash", "-c", cmd], &[], Some("/mnt/work"), timeout)?;
             Ok(crate::session::ExecOutput {
                 stdout: String::from_utf8_lossy(&out).into_owned(),
                 stderr: String::from_utf8_lossy(&err).into_owned(),
                 exit_code: code,
             })
-        });
+        },
+    );
 
     // spawn_async: like macOS — backgrounded child that inherits cwd/env from the shell.
     let spawn_client = init.clone();
     let spawn_shell_cid = child_id.clone();
     let spawn_async: crate::session::SpawnAsyncFn = Box::new(move |_job_id: u64, cmd: &str| {
-        let info = spawn_client.spawn_pipes_inherit(
-            &["/bin/bash", "-c", cmd],
-            &[],
-            None,
-            Some(&spawn_shell_cid),
-        )?;
+        let info = spawn_client.spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
         Ok(Box::new(WinJobOutput {
             client: spawn_client.clone(),
             child_id: info.child_id,
@@ -170,6 +142,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
         open_pty: None,
         run_oneshot: Some(Arc::new(run_oneshot)),
         spawn_async: Some(Arc::new(spawn_async)),
+        shell_exit_code: Box::new(|| None),
     })
 }
 

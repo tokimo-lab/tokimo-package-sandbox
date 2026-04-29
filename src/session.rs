@@ -1014,8 +1014,8 @@ pub(crate) fn shell_handle_from_child(
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         kill_spawn: None,
         shell_exit_code: Box::new(move || {
-            if let Ok(g) = child.lock() {
-                if let Some(c) = g.as_ref() {
+            if let Ok(mut g) = child.lock() {
+                if let Some(c) = g.as_mut() {
                     return c.try_wait().ok().flatten().and_then(|s| s.code());
                 }
             }
