@@ -15,8 +15,8 @@
 - `Session::exec()` 的 `early_eof` 路径：先调用 `shell_exit_code`，若拿到退出码则返回 `Ok(ExecOutput{exit_code: N})`
 - `src/macos/vz_session.rs`: VZ 的 `SessionLifecycle.exit_code` 已追踪退出码，接入 `shell_exit_code`
 - `src/linux/mod.rs`: Linux 同
-- `src/session.rs` (Windows): stub 返回 `None`
-- `src/windows/session.rs`: 补充 `shell_exit_code` 字段
+- `src/session.rs` (Windows): stub 返回 `None`（后续 commit `09c8a6a`）
+- `src/windows/session.rs`: 补充 `shell_exit_code` 字段（后续 commit `09c8a6a`）
 
 ### Fix 2: `kill_job` 幂等性 + 双重 spawn
 
@@ -57,7 +57,13 @@ VM start: Internal error (code=-1): Start operation cancelled
 
 ### 根因
 
-所有 VZ 测试共用同一个 writable rootfs 目录 `~/.tokimo/rootfs/` 作为 virtiofs share（通过 `SharedDirectory::new(rootfs_path, writable=false)` 创建）。macOS 的 virtiofs / `VZSharedDirectory` 不允许第二个 VM 挂载已被其他 VM 占用的写入共享目录。
+两个叠加问题导致并发测试失败：
+
+**问题 A：共享 rootfs 写冲突**
+所有 VZ 测试共用同一个 rootfs 目录 `~/.tokimo/rootfs/`。`SharedDirectory::new(path, false)` 中第二个参数 `false` 对应 Apple API 的 `readOnly=false`，即挂载为可读写。macOS virtiofs 不允许多个 VM 同时挂载同一可读写目录。
+
+**问题 B：macOS 并发 VM 启动限制**
+即使每个 VM 有独立的 rootfs，macOS Virtualization.framework 对同时启动的 VM 数量有隐式限制（大约 1 个）。超过限制时 `vm.start()` 返回 "Start operation cancelled"。
 
 关键路径：
 ```
@@ -66,74 +72,91 @@ Fixture::new() / test setup
     → Session::open()
       → boot_session_vm()
         → find_rootfs()           → ~/.tokimo/rootfs/  (所有 VM 共用!)
-        → SharedDirectory::new(rootfs, false)  → writable virtiofs share
-        → vm.start()
+        → SharedDirectory::new(rootfs, false)  → readOnly=false (可读写)
+        → vm.start()              → 并发启动时 "Start operation cancelled"
 ```
 
-### 已验证的修复方案
+### 已实现的修复方案
 
-每个测试创建 rootfs 的 CoW clone（APFS `cp -cR`，瞬间完成，不占额外空间），让每个 VM 有独立的 writable virtiofs 源：
+**问题 A 修复：每个测试 CoW clone rootfs**
+
+每个测试创建 rootfs 的 CoW clone（APFS `cp -cR`，瞬间完成，不占额外空间），让每个 VM 有独立的 virtiofs 源：
 
 ```rust
 // tests/common/mod.rs
 #[cfg(target_os = "macos")]
-pub fn clone_rootfs_to(dest: &Path) -> Result<(), String> {
-    static CLONE_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = CLONE_LOCK.lock()...;
-
+pub fn clone_rootfs_to(dest: &Path) {
     let src = tokimo_dir().join("rootfs");
     Command::new("cp").args(["-cR", "--"]).arg(&src).arg(dest).status()?;
-    // Rename dest/rootfs/* → dest/* so find_rootfs sees dest/usr
+    // cp -cR src dest 创建 dest/rootfs/，需上移一层让 find_rootfs 的
+    // cfg.work_dir.join("usr").exists() fallback 生效
     ...
 }
-
-// tests/session.rs Fixture::new()
-common::clone_rootfs_to(work.path()).expect("clone rootfs");
 ```
 
-**验证结果**：`cargo test --test session -- --test-threads=4` → 14/14 passed（session.rs 全部通过）。
+已应用到所有三个测试文件：
+- `tests/session.rs`：`Fixture::new()` 中调用 `common::clone_rootfs_to(work.path())`
+- `tests/vz_session.rs`：`setup_work_dir()` helper，每个测试调用
+- `tests/vz_workspace.rs`：同上
 
-### ⚠️ 待验证的依赖项
+**问题 B 修复：`--test-threads=1`**
 
-`clone_rootfs_to` 修复需要以下前置条件就绪才能完整应用：
+macOS Virtualization.framework 不支持真正的并发 VM 启动。即使用独立 rootfs，2+ 并发仍会 "Start operation cancelled"。唯一可靠方案是 `--test-threads=1`。
 
-1. **init binary rebuild 问题**（见下节）— env 继承测试（`vz_session.rs` 的 2 个 spawn env value 测试）需要 init binary 的 env dump 读取逻辑
-2. **测试文件更新** — 除 `session.rs` 外，`vz_session.rs` 和 `vz_workspace.rs` 也需要加 `setup_work_dir()` → `clone_rootfs_to()` 调用
-3. **验证 CoW clone 对 test 耗时的影响** — `cp -cR` 在 Mutex 下串行执行，14 个测试 × CoW 等待时间，需要基准测试
+**验证结果**：
+
+| 测试文件 | 结果 | 耗时 |
+|---|---|---|
+| `session.rs` (--test-threads=1) | 14/14 passed | ~320s |
+| `vz_session.rs` (--test-threads=1) | 14/14 passed | ~322s |
+| `vz_workspace.rs` (--test-threads=1) | 7/7 passed | ~166s |
 
 ---
 
-## Init Binary Rebuild 问题
+## Init Binary VSOCK 回归问题（已修复）
 
-### 现象
+### 根因
 
-修改后的 init binary（`aarch64-unknown-linux-musl` target）编译通过，但 VM 启动后 VSOCK 连接超时：
+commit `094e413` ("windows: align with cowork") 将 guest 侧 VSOCK 从 `bind_vsock`（listen + accept）改为 `connect_vsock`（connect to host），为 Windows HCS 的 cowork 架构适配。但这破坏了 macOS VZ 的 VSOCK 模型：
 
+| 平台 | Host 行为 | Guest 行为 | 正确模式 |
+|---|---|---|---|
+| macOS VZ | `socket_dev.connect(port)` → 连接 guest | 应 listen + accept | `bind_vsock` |
+| Windows HCS | AF_HYPERV listen | connect to host | `connect_vsock` |
+
+commit 后 guest 使用 `connect_vsock`（连接 CID_HOST），但 host 也用 `socket_dev.connect(port)` 连接 guest。双方都在连接，无人监听 → 超时。
+
+### 修复
+
+在 `src/bin/tokimo-sandbox-init/main.rs` 中恢复 `bind_vsock` 函数，并根据 `TOKIMO_SANDBOX_PRE_CHROOTED` 环境变量选择模式：
+
+```rust
+if pre_chrooted {
+    // Windows HCS: host listens, guest connects.
+    (connect_vsock(port)?, None, server::Transport::Vsock)
+} else {
+    // macOS VZ / Linux: guest listens, host connects.
+    (bind_vsock(port)?, None, server::Transport::Vsock)
+}
 ```
-Console: tokimo-init: mounted virtiofs
-tokimo-init: session mode detected (TOKIMO_SANDBOX_VSOCK_PORT=1)
-[tokimo-sandbox-init] finit_module(.../vsock.ko.xz) failed: Exec format error
-[tokimo-sandbox-init] chroot to /mnt/work
-(no "READY" or "connected VSOCK" message)
-Host: VSOCK connect timed out after 15s
-```
 
-### 排查过程
+`bind_vsock` 会 listen → accept（阻塞等待 host 连接）→ 返回已连接的 fd，然后 `run_loop` 将其注册为 pre-connected client。
 
-| 测试 | 结果 |
-|---|---|
-| 备份 initrd (`initrd.img.bak`, 原始 binary) | ✅ 正常工作 |
-| 纯 repack（无任何修改: gunzip→cpio→repack→gzip） | ✅ 工作 |
-| revert server.rs 到原始版本 + rebuild → repack | ❌ VSOCK 超时 |
-| revert server.rs + strip binary → repack | ❌ VSOCK 超时 |
+### 附带修复：`load_vsock_modules()` 路径
 
-**结论**：不是代码逻辑问题，而是 rebuild 环境（交叉编译 toolchain / Cargo.lock 依赖）产出二进制与原始备份不一致。`Cargo.lock` 在 `.gitignore` 中，依赖版本可能漂移。
+新增对 CI 风格 `/modules/*.ko` 布局的支持（除原有的 `/lib/modules/<kver>/...` 布局外）。
 
-### 待修复
+### CI `build.sh` 修复
 
-1. 确认 `aarch64-unknown-linux-musl` toolchain 版本和依赖锁定
-2. 将 `Cargo.lock` 从 `.gitignore` 移出（或至少锁定 init binary 的依赖版本）
-3. 建立 initrd 的确定性构建流程（脚本化：build → strip → cpio → gzip → 验证）
+arm64 构建新增 `vmw_vsock_virtio_transport` 模块（macOS VZ 需要的 virtio vsock 传输层）。
+
+### 验证结果
+
+| 测试文件 | 结果 | 耗时 |
+|---|---|---|
+| `session.rs` (--test-threads=1) | 14/14 passed | ~320s |
+| `vz_session.rs` (--test-threads=1) | 14/14 passed | ~322s |
+| `vz_workspace.rs` (--test-threads=1) | 7/7 passed | ~166s |
 
 ---
 
@@ -162,18 +185,18 @@ Host: VSOCK connect timed out after 15s
 ### 3. 测试基础设施统一
 
 **现状**：
-- `tests/session.rs` 使用 `Fixture::new()` + `require_session!()` macro
-- `tests/vz_session.rs` 每个测试手动创建 `TempDir` + `SandboxConfig`
+- `tests/session.rs` 使用 `Fixture::new()` + `require_session!()` macro，内含 `clone_rootfs_to`
+- `tests/vz_session.rs` 使用 `setup_work_dir()` helper + `skip_if_no_vz()`
 - `tests/vz_workspace.rs` 同上
-- 入口不统一，加一个新步骤（如 rootfs clone）需要每处重复
+- `common/mod.rs` 提供 `clone_rootfs_to` 共享实现
 
 **建议**：
-- 抽取 `VzTestFixture` 到 `tests/common/mod.rs`，封装 rootfs clone + SandboxConfig 构造
-- 所有 macOS VZ 测试统一使用 fixture
+- `vz_session.rs` 和 `vz_workspace.rs` 考虑也使用 `common::skip_unless_platform_ready()` 而非各自重复 `skip_if_no_vz()`
+- 长期可抽取 `VzTestFixture` 统一封装 rootfs clone + SandboxConfig 构造
 
 ### 4. `Workspace::exec` 的 env 追踪
 
-**现状**：修改后 `Workspace::exec` 通过解析 `export KEY=VALUE` 字符串来追踪 env 修改。脆弱且无法处理复杂 env 修改（`source`、`eval`、反引号等）。
+**现状**：修改后 `Workspace::exec` 通过解析 `export KEY=VALUE` 字符串来追踪 env 修改（`parse_export_cmd`）。仅处理 `export KEY=VALUE` 形式，无法处理 `export` + 变量引用、`export -n`、`declare -x`、`source`、`eval`、反引号等。Session 侧的 `export -p > /.tps_env_$$` dump 也有类似局限（需要 init binary 配合读取，见 init binary rebuild 问题）。
 
 **建议**：
 - 将 workspace user shell 改为 stateful（通过 stdin 发送命令，类似 Session::exec 的 sentinel 协议）
@@ -193,16 +216,21 @@ Host: VSOCK connect timed out after 15s
 ## 测试运行命令
 
 ```bash
-# macOS 当前正确运行方式：
+# macOS 正确运行方式（必须 --test-threads=1）：
 cargo test --no-run && \
   for bin in target/debug/deps/session-* target/debug/deps/vz_session-* \
-             target/debug/deps/vz_workspace-* target/debug/deps/windows_run-*; do
+             target/debug/deps/vz_workspace-*; do
     codesign --force --sign - --entitlements vz.entitlements "$bin"
   done && \
   cargo test -- --test-threads=1
+
+# 运行单个测试文件：
+codesign --force --sign - --entitlements vz.entitlements target/debug/deps/session-* && \
+  cargo test --test session -- --test-threads=1
 
 # 所有 VZ 测试需要：
 #   - macOS Apple Silicon (Virtualization.framework)
 #   - ~/.tokimo/ 下有 kernel/vmlinuz, initrd.img, rootfs/
 #   - 测试二进制需签名 com.apple.security.virtualization entitlement
+#   - 必须 --test-threads=1（macOS VZ 不支持并发 VM 启动）
 ```

@@ -34,6 +34,9 @@ impl Fixture {
         common::download_vz_artifacts().expect("download artifacts");
 
         let work = tempfile::tempdir().expect("work tempdir");
+        // Give each test its own rootfs copy so VMs don't contend on
+        // a shared writable virtiofs mount.
+        common::clone_rootfs_to(work.path());
         let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
         let sess = Session::open(&cfg).expect("Session::open");
         Self { _work: work, sess }

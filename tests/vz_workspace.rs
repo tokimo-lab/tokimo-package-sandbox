@@ -5,9 +5,16 @@
 
 #![cfg(target_os = "macos")]
 
-use std::time::Duration;
+mod common;
 
 use tokimo_package_sandbox::{UserConfig, Workspace, WorkspaceConfig};
+
+/// Create a tempdir with a per-test rootfs CoW clone inside it.
+fn setup_work_dir() -> tempfile::TempDir {
+    let work = tempfile::tempdir().expect("work tempdir");
+    common::clone_rootfs_to(work.path());
+    work
+}
 
 fn skip_if_no_vz() -> bool {
     let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL").ok().or_else(|| {
@@ -35,7 +42,7 @@ fn two_users_exec_independently() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
@@ -72,7 +79,7 @@ fn add_user_creates_isolated_tmp() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
@@ -92,7 +99,7 @@ fn remove_user_does_not_affect_other() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
@@ -116,7 +123,7 @@ fn add_user_after_remove() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("alice")).expect("add alice");
@@ -134,7 +141,7 @@ fn three_users_concurrent_exec() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("u1")).expect("add u1");
@@ -164,7 +171,7 @@ fn user_count_reflects_add_remove() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     assert_eq!(ws.user_count(), 0);
@@ -186,7 +193,7 @@ fn workspace_close_cleans_up() {
     if skip_if_no_vz() {
         return;
     }
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = setup_work_dir();
     let cfg = WorkspaceConfig::new(tmp.path());
     let mut ws = Workspace::open(&cfg).expect("Workspace::open");
     ws.add_user(&UserConfig::new("alice")).expect("add alice");

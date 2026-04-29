@@ -32,7 +32,9 @@ use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, connect, listen, socket};
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, connect, listen, socket,
+};
 #[cfg(target_os = "linux")]
 use nix::unistd::getpid;
 
@@ -69,7 +71,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        return if failed > 0 { ExitCode::from(1) } else { ExitCode::from(0) };
+        return if failed > 0 {
+            ExitCode::from(1)
+        } else {
+            ExitCode::from(0)
+        };
     }
 
     if let Err(e) = run() {
@@ -88,16 +94,12 @@ fn load_kernel_module(path: &str) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let empty = CString::new("").unwrap();
-    // SYS_finit_module is 313 on x86_64.
-    let r = unsafe {
-        libc::syscall(libc::SYS_finit_module, f.as_raw_fd(), empty.as_ptr(), 0i32)
-    };
+    let r = unsafe { libc::syscall(libc::SYS_finit_module, f.as_raw_fd(), empty.as_ptr(), 0i32) };
     if r == 0 {
         return Ok(());
     }
     let errno = unsafe { *libc::__errno_location() };
     if errno == libc::EEXIST {
-        // Already loaded — fine.
         return Ok(());
     }
     Err(format!("finit_module errno={errno}"))
@@ -190,6 +192,8 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("signalfd: {e}"))?;
 
     // Choose transport.
+    // macOS VZ: guest listens (bind_vsock), host connects to guest.
+    // Windows HCS: guest connects (connect_vsock), host listens.
     let (listener, write_fd, transport) = if env::var(ENV_SERIAL_MODE).is_ok() {
         let (r, w) = bind_serial()?;
         (r, w, server::Transport::Serial)
@@ -197,7 +201,13 @@ fn run() -> Result<(), String> {
         let port: u32 = port_str
             .parse()
             .map_err(|e| format!("{ENV_VSOCK_PORT}={port_str}: {e}"))?;
-        (connect_vsock(port)?, None, server::Transport::Vsock)
+        if pre_chrooted {
+            // Windows HCS: host listens, guest connects.
+            (connect_vsock(port)?, None, server::Transport::Vsock)
+        } else {
+            // macOS VZ / Linux: guest listens, host connects.
+            (bind_vsock(port)?, None, server::Transport::Vsock)
+        }
     } else {
         (bind_unix()?, None, server::Transport::SeqPacket)
     };
@@ -338,83 +348,64 @@ fn bind_serial() -> Result<(OwnedFd, Option<OwnedFd>), String> {
 /// We load them here before binding the VSOCK socket.
 #[cfg(target_os = "linux")]
 fn load_vsock_modules() -> Result<(), String> {
-    // Find the module directory (e.g. /mnt/work/lib/modules/6.12.74+...)
-    // Try initrd first (/lib/modules), then rootfs (/mnt/work/lib/modules).
-    let mod_base = if std::fs::metadata("/lib/modules").map(|m| m.is_dir()).unwrap_or(false) {
-        "/lib/modules"
-    } else if std::fs::metadata("/mnt/work/lib/modules")
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        "/mnt/work/lib/modules"
-    } else {
-        eprintln!("[tokimo-sandbox-init] no /lib/modules found, skipping vsock modprobe");
-        return Ok(());
-    };
-    let entries = match std::fs::read_dir(mod_base) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[tokimo-sandbox-init] read_dir({mod_base}): {e}");
-            return Ok(());
-        }
-    };
-    let mut kernel_dir = None;
-    for e in entries.flatten() {
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            kernel_dir = Some(e.path());
-            break;
-        }
-    }
-    let Some(kdir) = kernel_dir else {
-        eprintln!("[tokimo-sandbox-init] no kernel module dir found");
-        return Ok(());
-    };
-
-    // Load modules in dependency order.
+    // Module names needed for vsock, in dependency order.
     let vsock_mods: &[&str] = &[
-        "kernel/net/vmw_vsock/vsock.ko.xz",
-        "kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko.xz",
-        "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.xz",
-    ];
-    // Also try uncompressed variants.
-    let vsock_mods_alt: &[&str] = &[
-        "kernel/net/vmw_vsock/vsock.ko",
-        "kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko",
-        "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko",
+        "vsock",
+        "vmw_vsock_virtio_transport_common",
+        "vmw_vsock_virtio_transport",
     ];
 
-    for (compressed, uncompressed) in vsock_mods.iter().zip(vsock_mods_alt.iter()) {
-        let path = kdir.join(compressed);
-        let alt = kdir.join(uncompressed);
-        let mod_path = if path.exists() {
-            &path
-        } else if alt.exists() {
-            &alt
-        } else {
+    // Layout 1: CI-style flat directory at /modules/*.ko (uncompressed).
+    if std::fs::metadata("/modules").map(|m| m.is_dir()).unwrap_or(false) {
+        for name in vsock_mods {
+            let path = format!("/modules/{name}.ko");
+            load_one_module(&path).ok();
+        }
+        return Ok(());
+    }
+
+    // Layout 2: Traditional /lib/modules/<kver>/... tree (may be .ko.xz).
+    let mod_bases: &[&str] = &["/lib/modules", "/mnt/work/lib/modules"];
+    let rel_paths: &[&str] = &["kernel/net/vmw_vsock", "drivers/vhost"];
+    for base in mod_bases {
+        if !std::fs::metadata(base).map(|m| m.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(base) else { continue };
+        let Some(kdir) = entries
+            .flatten()
+            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+        else {
             continue;
         };
-        let path_c =
-            std::ffi::CString::new(mod_path.to_string_lossy().as_bytes()).map_err(|e| format!("CString: {e}"))?;
-        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            eprintln!("[tokimo-sandbox-init] open({}) failed", mod_path.display());
-            continue;
+
+        for name in vsock_mods {
+            let mut found = false;
+            for rel in rel_paths {
+                for ext in &[".ko", ".ko.xz"] {
+                    let path = kdir.join(rel).join(format!("{name}{ext}"));
+                    if path.exists() {
+                        load_one_module(&path.to_string_lossy()).ok();
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
         }
-        // finit_module syscall (not in libc crate for all targets).
-        let rc = unsafe { libc::syscall(libc::SYS_finit_module, fd, c"".as_ptr(), 0usize) };
-        unsafe { libc::close(fd) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            eprintln!(
-                "[tokimo-sandbox-init] finit_module({}) failed: {err}",
-                mod_path.display()
-            );
-            // Continue — maybe already loaded or not needed.
-        } else {
-            eprintln!("[tokimo-sandbox-init] loaded {}", mod_path.display());
-        }
+        return Ok(());
     }
+
+    eprintln!("[tokimo-sandbox-init] no module directory found, skipping vsock modprobe");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn load_one_module(path: &str) -> Result<(), String> {
+    load_kernel_module(path)
 }
 
 /// Chroot and chdir to the given path.
@@ -454,6 +445,38 @@ fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data
     Ok(())
 }
 
+/// Bind and listen on an AF_VSOCK port (macOS VZ / Linux bwrap model).
+/// The host connects TO the guest on this port. Blocks until the host
+/// connects, then returns the accepted (connected) fd.
+#[cfg(target_os = "linux")]
+fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
+    let lfd = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+        .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
+
+    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
+    bind(lfd.as_raw_fd(), &addr).map_err(|e| format!("bind VSOCK port {port}: {e}"))?;
+    listen(&lfd, Backlog::new(1).unwrap()).map_err(|e| format!("listen VSOCK: {e}"))?;
+
+    eprintln!("[tokimo-sandbox-init] listening on VSOCK port {port}, waiting for host...");
+
+    // Accept the host's connection. This blocks until the host connects.
+    let conn_raw = nix::sys::socket::accept(lfd.as_raw_fd()).map_err(|e| format!("accept VSOCK: {e}"))?;
+
+    // Set non-blocking after accept so mio can poll it.
+    unsafe {
+        let flags = libc::fcntl(conn_raw, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(conn_raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    // Close the listening socket — we only need one connection.
+    drop(lfd);
+
+    eprintln!("[tokimo-sandbox-init] accepted VSOCK connection on port {port}");
+    Ok(unsafe { OwnedFd::from_raw_fd(conn_raw) })
+}
+
 /// Open an AF_VSOCK stream to the host's `(VMADDR_CID_HOST, port)`. Cowork
 /// architecture: the host listens on AF_HYPERV and the guest dials in.
 /// Retries on connection-refused for a short window while Hyper-V sets up
@@ -464,18 +487,11 @@ fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let addr = VsockAddr::new(libc::VMADDR_CID_HOST, port);
     loop {
-        let fd = socket(
-            AddressFamily::Vsock,
-            SockType::Stream,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        )
-        .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
+        let fd = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
         match connect(fd.as_raw_fd(), &addr) {
             Ok(()) => {
-                eprintln!(
-                    "[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}"
-                );
+                eprintln!("[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}");
                 // Set non-blocking AFTER connect succeeds so the mio event
                 // loop can poll the socket the same way as the listener
                 // path used to.

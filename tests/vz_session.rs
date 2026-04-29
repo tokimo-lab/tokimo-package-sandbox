@@ -6,9 +6,18 @@
 
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::time::Duration;
 
 use tokimo_package_sandbox::{NetworkPolicy, SandboxConfig, Session};
+
+/// Create a tempdir with a per-test rootfs CoW clone inside it.
+fn setup_work_dir() -> tempfile::TempDir {
+    let work = tempfile::tempdir().expect("work tempdir");
+    common::clone_rootfs_to(work.path());
+    work
+}
 
 fn skip_if_no_vz() -> bool {
     let vmlinuz = std::env::var("TOKIMO_VZ_KERNEL").ok().or_else(|| {
@@ -37,7 +46,7 @@ fn session_exec_echo_returns_stdout() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let out = sess.exec("echo hello").expect("exec echo");
@@ -50,7 +59,7 @@ fn session_exec_preserves_env() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     sess.exec("export FOO=bar42").expect("set env");
@@ -63,7 +72,7 @@ fn session_exec_preserves_cwd() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     sess.exec("cd /tmp && mkdir -p tps_cwd_test && cd tps_cwd_test")
@@ -81,7 +90,7 @@ fn session_exec_exit_code_nonzero() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let out = sess.exec("exit 7").expect("exec exit 7");
@@ -93,7 +102,7 @@ fn session_exec_captures_stderr() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let out = sess.exec("echo to-stderr 1>&2").expect("exec stderr");
@@ -106,7 +115,7 @@ fn session_exec_large_output_no_truncation() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let out = sess.exec("seq 1 500").expect("exec seq");
@@ -121,7 +130,7 @@ fn session_exec_timeout_tears_down_session() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     sess.set_exec_timeout(Duration::from_millis(500));
@@ -138,7 +147,7 @@ fn session_spawn_captures_output() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let job = sess.spawn("echo spawn-hello && echo spawn-err 1>&2").expect("spawn");
@@ -153,7 +162,7 @@ fn session_spawn_inherits_env_and_cwd() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     sess.exec("export MYSPAWNVAR=inherited42").expect("export");
@@ -178,7 +187,7 @@ fn session_spawn_timeout_kills_job() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let job = sess.spawn("sleep 60").expect("spawn sleep");
@@ -195,7 +204,7 @@ fn session_kill_job_keeps_session_alive() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let job = sess.spawn("sleep 60").expect("spawn sleep");
@@ -213,7 +222,7 @@ fn session_spawn_concurrent_no_crosstalk() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     let j1 = sess.spawn("echo JOB1_MARKER_ABC123").expect("spawn j1");
@@ -231,7 +240,7 @@ fn session_spawn_exec_mixed_inherits_state() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
     sess.exec("export MIX_TEST=one").expect("exec export");
@@ -249,7 +258,7 @@ fn session_close_cleans_up() {
     if skip_if_no_vz() {
         return;
     }
-    let work = tempfile::tempdir().expect("work tempdir");
+    let work = setup_work_dir();
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let sess = Session::open(&cfg).expect("Session::open");
     sess.close().expect("close");

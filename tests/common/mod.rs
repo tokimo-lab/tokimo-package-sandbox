@@ -77,9 +77,7 @@ pub fn has_windows_artifacts() -> bool {
 /// directory containing all three required files.
 fn find_vm_dir() -> Option<PathBuf> {
     fn complete(d: &std::path::Path) -> bool {
-        d.join("vmlinuz").is_file()
-            && d.join("initrd.img").is_file()
-            && d.join("rootfs.vhdx").is_file()
+        d.join("vmlinuz").is_file() && d.join("initrd.img").is_file() && d.join("rootfs.vhdx").is_file()
     }
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(p) = std::env::var("CARGO_MANIFEST_DIR") {
@@ -107,8 +105,8 @@ fn find_vm_dir() -> Option<PathBuf> {
 pub fn has_windows_service() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use windows::core::HSTRING;
         use windows::Win32::System::Pipes::WaitNamedPipeW;
+        use windows::core::HSTRING;
         let name = HSTRING::from("\\\\.\\pipe\\tokimo-sandbox-svc");
         unsafe { WaitNamedPipeW(&name, 100).as_bool() }
     }
@@ -272,7 +270,10 @@ pub fn download_windows_artifacts() -> Result<(), String> {
     // Find the setup script relative to the workspace root.
     let script = find_setup_script()?;
 
-    eprintln!("Running: pwsh -NoProfile -ExecutionPolicy Bypass -File {}", script.display());
+    eprintln!(
+        "Running: pwsh -NoProfile -ExecutionPolicy Bypass -File {}",
+        script.display()
+    );
     let status = Command::new("pwsh")
         .args([
             "-NoProfile",
@@ -282,7 +283,9 @@ pub fn download_windows_artifacts() -> Result<(), String> {
             script.to_str().ok_or("script path not valid UTF-8")?,
         ])
         .status()
-        .map_err(|e| format!("failed to run pwsh: {e}. Is PowerShell 7+ installed? (winget install Microsoft.PowerShell)"))?;
+        .map_err(|e| {
+            format!("failed to run pwsh: {e}. Is PowerShell 7+ installed? (winget install Microsoft.PowerShell)")
+        })?;
 
     if !status.success() {
         return Err(format!("setup script exited with {status}"));
@@ -303,6 +306,47 @@ fn find_setup_script() -> Result<PathBuf, String> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-test rootfs isolation (macOS)
+// ---------------------------------------------------------------------------
+
+/// Clone `~/.tokimo/rootfs/` into `dest` using APFS copy-on-write (`cp -cR`).
+/// This gives each test its own writable virtiofs source, preventing the
+/// "Start operation cancelled" error when multiple VMs try to mount the
+/// same shared directory concurrently.
+///
+/// After cloning, `dest` contains the rootfs tree directly (i.e.
+/// `dest/usr/...`), so `find_rootfs()` discovers it via the
+/// `cfg.work_dir.join("usr").exists()` fallback.
+#[cfg(target_os = "macos")]
+pub fn clone_rootfs_to(dest: &std::path::Path) {
+    let src = tokimo_dir().join("rootfs");
+    assert!(src.exists(), "rootfs not found at {}", src.display());
+
+    let status = std::process::Command::new("cp")
+        .args(["-cR", "--"])
+        .arg(&src)
+        .arg(dest)
+        .status()
+        .expect("cp -cR failed");
+    assert!(status.success(), "cp -cR exited with {status}");
+
+    // `cp -cR src dest` creates dest/rootfs/ when dest already exists.
+    // Move contents up one level so dest/usr/ exists (required by find_rootfs).
+    let nested = dest.join("rootfs");
+    if nested.is_dir() {
+        for entry in std::fs::read_dir(&nested).unwrap() {
+            let entry = entry.unwrap();
+            let target = dest.join(entry.file_name());
+            std::fs::rename(entry.path(), target).expect("rename rootfs entry");
+        }
+        let _ = std::fs::remove_dir(&nested);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn clone_rootfs_to(_dest: &std::path::Path) {}
 
 // ---------------------------------------------------------------------------
 // Helpers
