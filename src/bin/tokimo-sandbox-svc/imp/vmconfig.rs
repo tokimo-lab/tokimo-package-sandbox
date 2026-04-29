@@ -27,9 +27,24 @@ fn strip_extended_prefix(p: &Path) -> String {
 /// vsock port for the workspace Plan9 share.
 pub const PORT_WORK: u32 = 50002;
 /// AF_VSOCK port the init binary listens on for the host↔guest control
-/// protocol in session mode. Maps to HvSocket service GUID
-/// `0000C353-FACB-11E6-BD58-64006A7986D3`.
+/// protocol in session mode (default; per-session overrides may be used).
+/// Maps to HvSocket service GUID `0000C353-FACB-11E6-BD58-64006A7986D3`.
 pub const PORT_INIT_CONTROL: u32 = 50003;
+
+/// Allocate a unique vsock port per session so concurrent VMs get distinct
+/// HvSocket service GUIDs (Hyper-V requires `(VmId, ServiceId)` to be
+/// unique for a host-side WILDCARD listener; binding a specific child's
+/// VmId from the parent partition fails with WSAEACCES).
+pub fn alloc_session_init_port() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Use a large, unallocated u32 range. Wraps every ~16M sessions which
+    // is fine for any realistic process lifetime.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 0x40000000 .. 0x40FFFFFF — avoids well-known low-port range and
+    // keeps the encoded service GUID prefix recognizable in logs.
+    0x4000_0000 | (n & 0x00FF_FFFF)
+}
 
 /// Build the HvSocket service GUID for a given vsock port.
 /// Hyper-V's mapping: GUID = `XXXXXXXX-FACB-11E6-BD58-64006A7986D3`,
@@ -60,6 +75,7 @@ pub fn build(
         cpu_count,
         false,
         None,
+        PORT_INIT_CONTROL,
     )
 }
 
@@ -75,6 +91,7 @@ pub fn build_ex(
     cpu_count: usize,
     session: bool,
     runtime_id: Option<&str>,
+    init_port: u32,
 ) -> String {
     let kernel_s = strip_extended_prefix(kernel);
     let initrd_s = strip_extended_prefix(initrd);
@@ -121,7 +138,7 @@ pub fn build_ex(
     // AllowWildcardBinds=true so the host listener bound on
     // HV_GUID_WILDCARD VmId is reachable from this VM. Cowork uses the
     // same pattern (strings show ServiceTable + AllowWildcardBinds).
-    let init_svc_guid = hvsock_service_id(PORT_INIT_CONTROL);
+    let init_svc_guid = hvsock_service_id(init_port);
     devices.insert(
         "HvSocket".into(),
         serde_json::json!({
@@ -163,7 +180,7 @@ pub fn build_ex(
         format!(
             "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
              tokimo.session=1 tokimo.work_port={PORT_WORK} \
-             tokimo.init_port={PORT_INIT_CONTROL}"
+             tokimo.init_port={init_port}"
         )
     } else {
         format!(
@@ -260,6 +277,7 @@ mod tests {
             2,
             true,
             None,
+            PORT_INIT_CONTROL,
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]

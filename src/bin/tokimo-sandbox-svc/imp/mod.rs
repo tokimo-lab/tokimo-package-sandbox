@@ -47,7 +47,16 @@ mod vmconfig;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Service name used by MSIX-packaged deployment (declared in
+/// `packaging/windows/AppxManifest.xml`'s `desktop6:Service Name=`).
+/// The MSIX subsystem registers this name with SCM, so we keep it as the
+/// well-known dispatcher name for compatibility.
 const SERVICE_NAME: &str = "TokimoSandboxSvc";
+/// Service name used by the CLI `--install` / `--uninstall` flow.
+/// Deliberately *different* from `SERVICE_NAME` (PascalCase) so a developer
+/// install can coexist with an MSIX-packaged install on the same machine
+/// — the two names point at distinct SCM entries.
+const INSTALL_SERVICE_NAME: &str = "tokimo-sandbox-svc";
 const SERVICE_DISPLAY: &str = "Tokimo Sandbox Service";
 const PIPE_NAME: &str = r"\\.\pipe\tokimo-sandbox-svc";
 
@@ -187,13 +196,13 @@ fn install_service() {
     };
 
     let info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
+        name: OsString::from(INSTALL_SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe,
-        launch_arguments: vec![],
+        launch_arguments: vec![OsString::from("--service")],
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -205,21 +214,47 @@ fn install_service() {
             // host services are up.
             let _ = svc.set_delayed_auto_start(true);
             if let Err(e) = svc.start::<&str>(&[]) {
-                eprintln!("StartService failed (the service is still installed): {e}");
+                eprintln!("StartService failed (the service is still installed): {}", format_ws_error(&e));
             } else {
-                println!("Service installed and started: {SERVICE_NAME}");
+                println!("Service installed and started: {INSTALL_SERVICE_NAME}");
             }
         }
         Err(e) => {
-            // SERVICE_EXISTS is OK.
-            let msg = e.to_string();
-            if msg.contains("1073") || msg.to_lowercase().contains("exist") {
-                println!("Service already installed: {SERVICE_NAME}");
-            } else {
-                eprintln!("CreateService failed: {e}");
-                std::process::exit(1);
+            // ERROR_SERVICE_EXISTS (1073) and ERROR_DUPLICATE_SERVICE_NAME
+            // (1078) both mean "name is already taken"; treat as no-op.
+            match ws_error_code(&e) {
+                Some(1073) => println!("Service already installed: {INSTALL_SERVICE_NAME}"),
+                Some(1078) => {
+                    eprintln!(
+                        "Cannot create service '{INSTALL_SERVICE_NAME}': another service is using the same display name '{SERVICE_DISPLAY}' (ERROR_DUPLICATE_SERVICE_NAME 1078). \
+This usually means an MSIX package (service '{SERVICE_NAME}') is already installed. Uninstall it via `Get-AppxPackage Tokimo.SandboxSvc | Remove-AppxPackage` and retry."
+                    );
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("CreateService failed: {}", format_ws_error(&e));
+                    std::process::exit(1);
+                }
             }
         }
+    }
+}
+
+/// Extract the underlying OS error code from a `windows_service::Error`.
+/// The crate's `Display` impl is famously useless ("IO error in winapi call")
+/// and hides the actual code, so we reach through `Error::source()` for it.
+fn ws_error_code(e: &windows_service::Error) -> Option<i32> {
+    use std::error::Error;
+    e.source()
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .and_then(|io| io.raw_os_error())
+}
+
+/// Format a `windows_service::Error` with its OS code attached.
+fn format_ws_error(e: &windows_service::Error) -> String {
+    match ws_error_code(e) {
+        Some(code) => format!("{e} (os error {code})"),
+        None => e.to_string(),
     }
 }
 
@@ -233,17 +268,16 @@ fn uninstall_service() {
     };
 
     let svc = match manager.open_service(
-        SERVICE_NAME,
+        INSTALL_SERVICE_NAME,
         ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
     ) {
         Ok(s) => s,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("1060") || msg.to_lowercase().contains("does not exist") {
-                println!("Service not installed: {SERVICE_NAME}");
+            if matches!(ws_error_code(&e), Some(1060)) {
+                println!("Service not installed: {INSTALL_SERVICE_NAME}");
                 return;
             }
-            eprintln!("OpenService failed: {e}");
+            eprintln!("OpenService failed: {}", format_ws_error(&e));
             std::process::exit(1);
         }
     };
@@ -262,10 +296,10 @@ fn uninstall_service() {
     }
 
     if let Err(e) = svc.delete() {
-        eprintln!("DeleteService failed: {e}");
+        eprintln!("DeleteService failed: {}", format_ws_error(&e));
         std::process::exit(1);
     }
-    println!("Service uninstalled: {SERVICE_NAME}");
+    println!("Service uninstalled: {INSTALL_SERVICE_NAME}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,11 +1130,15 @@ fn handle_open_session(
         }
     };
 
-    // Make sure the HvSocket service GUID for our vsock port is
-    // registered in HKLM. Without this the host's AF_HYPERV connect
-    // fails with WSAETIMEDOUT.
-    let svc_id = vmconfig::hvsock_service_id(vmconfig::PORT_INIT_CONTROL);
-    if let Err(e) = ensure_hvsocket_service_registered(&svc_id, "Tokimo Sandbox Init") {
+    // Allocate a unique AF_VSOCK port for THIS session so the host-side
+    // HvSocket listener uses a distinct service GUID. Hyper-V requires
+    // `(VmId, ServiceId)` to be unique for a host listener, and bind()
+    // with a specific child VmId from the parent partition is rejected
+    // (WSAEACCES) — the only way to support concurrent sessions is one
+    // service GUID per session.
+    let init_port = vmconfig::alloc_session_init_port();
+    let svc_id_str = vmconfig::hvsock_service_id(init_port);
+    if let Err(e) = ensure_hvsocket_service_registered(&svc_id_str, "Tokimo Sandbox Init") {
         let _ = send_error_raw(pipe, &id, "hvsock_register", &e);
         return;
     }
@@ -1116,6 +1154,7 @@ fn handle_open_session(
         cpu_count,
         true,
         None,
+        init_port,
     );
     let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
 
@@ -1125,10 +1164,6 @@ fn handle_open_session(
         r"C:\tokimo-debug\last-vm-com2.log",
     );
 
-    // Cowork architecture: host listens on AF_HYPERV, guest connects.
-    // Bind the listener BEFORE starting the VM so the guest can reach us
-    // as soon as init brings up vsock.
-    let svc_id_str = vmconfig::hvsock_service_id(vmconfig::PORT_INIT_CONTROL);
     let svc_guid = match parse_guid(&svc_id_str) {
         Ok(g) => g,
         Err(e) => {
@@ -1136,7 +1171,12 @@ fn handle_open_session(
             return;
         }
     };
-    let listener = match hvsock::listen_for_guest(svc_guid) {
+    // Bind listener BEFORE starting the VM (using HV_GUID_WILDCARD which
+    // is the only legal VmId for a parent-partition listener) so the
+    // guest can dial in as soon as init.sh brings up vsock. Per-session
+    // service_ids guarantee distinct (vm_id, service_id) tuples even with
+    // concurrent sessions.
+    let listener = match hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, svc_guid) {
         Ok(l) => l,
         Err(e) => {
             let _ = send_error_raw(pipe, &id, "hvsock_listen", &e.to_string());
@@ -1145,7 +1185,6 @@ fn handle_open_session(
     };
     eprintln!("[svc] session {vm_id} listening on AF_HYPERV service {svc_id_str}");
 
-    // Boot VM.
     let api = match hcs::HcsApi::init() {
         Ok(a) => a,
         Err(e) => {
