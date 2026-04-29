@@ -160,7 +160,6 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
         if vm.state() != VirtualMachineState::Running {
             return Err(Error::exec(format!("VM not running: {:?}", vm.state())));
         }
-
         // Connect VSOCK control channel. Read serial console while waiting
         // to capture init error messages.
         tracing::info!("VSOCK connecting to guest port {VSOCK_CONTROL_PORT}...");
@@ -372,6 +371,11 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     let try_wait =
         Box::new(move || -> bool { try_wait_lifecycle.exit_code.lock().map(|g| g.is_some()).unwrap_or(true) });
 
+    // shell_exit_code: returns the exit code when bash has exited.
+    let exit_lifecycle = lifecycle.clone();
+    let shell_exit_code: Box<dyn FnMut() -> Option<i32> + Send> =
+        Box::new(move || -> Option<i32> { exit_lifecycle.exit_code.lock().ok().and_then(|g| *g) });
+
     // kill: best-effort SIGKILL the bash pgrp.
     let kill_client = client.clone();
     let kill_child_id = child_id.clone();
@@ -435,14 +439,13 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
     let job_map: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let spawn_job_map = job_map.clone();
     let spawn_async: crate::session::SpawnAsyncFn = Box::new(move |job_id: u64, cmd: &str| {
-        let info = spawn_client.spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
-        let cid = info.child_id.clone();
+        let handle =
+            spawn_client.spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
+        let cid = handle.child_id().to_string();
         spawn_job_map
             .lock()
             .map_err(|_| Error::exec("job map poisoned"))?
             .insert(job_id, cid);
-        let handle =
-            spawn_client.spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &[], None, Some(&spawn_shell_cid))?;
         Ok(Box::new(VsockJobOutput {
             handle,
             _client: spawn_client.clone(),
@@ -457,13 +460,12 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
             let map = kill_job_map.lock().map_err(|_| Error::exec("job map poisoned"))?;
             map.get(&job_id).cloned()
         };
-        match child_id {
-            Some(cid) => {
-                kill_client.signal(&cid, libc::SIGKILL, true)?;
-                Ok(())
-            }
-            None => Err(Error::exec(format!("unknown job id {job_id}"))),
+        if let Some(cid) = child_id {
+            // Best-effort: send SIGKILL, ignore result (child may already be dead).
+            let _ = kill_client.signal(&cid, libc::SIGKILL, true);
         }
+        // Always return Ok — caller uses wait_with_timeout to confirm death.
+        Ok(())
     });
 
     Ok(ShellHandle {
@@ -477,6 +479,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
         run_oneshot: Some(Arc::new(run_oneshot)),
         spawn_async: Some(Arc::new(spawn_async)),
         kill_spawn: Some(Arc::new(kill_spawn)),
+        shell_exit_code,
     })
 }
 

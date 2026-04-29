@@ -711,6 +711,10 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
         }
     });
 
+    let exit_lifecycle = lifecycle.clone();
+    let shell_exit_code: Box<dyn FnMut() -> Option<i32> + Send> =
+        Box::new(move || -> Option<i32> { exit_lifecycle.exit_code.lock().ok().and_then(|g| *g) });
+
     let stop_for_keepalive = stop.clone();
     let keepalive = Box::new(InitKeepalive {
         spawned: Some(spawned),
@@ -792,6 +796,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session:
         run_oneshot: Some(Arc::new(run_oneshot)),
         spawn_async: Some(Arc::new(spawn_async)),
         kill_spawn: Some(Arc::new(kill_spawn)),
+        shell_exit_code,
     })
 }
 

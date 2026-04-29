@@ -971,10 +971,51 @@ fn resolve_child_cwd(state: &State, child_id: &str) -> Option<String> {
 
 fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, String)>> {
     let rec = state.children.get(child_id)?;
-    let _path = format!("/proc/{}/environ", rec.pid);
-    let rec = state.children.get(child_id)?;
+    // Prefer the dynamic env dump written by bash after each exec
+    // (`export -p > /.tps_env_<pid>`). This captures env vars set via
+    // `export` at runtime, which /proc/<pid>/environ (frozen at execve) misses.
+    let dump_path = format!("/.tps_env_{}", rec.pid);
+    if let Ok(data) = std::fs::read_to_string(&dump_path) {
+        if let Some(env) = parse_export_p(&data) {
+            return Some(env);
+        }
+    }
+    // Fall back to /proc/<pid>/environ (snapshot from execve time).
     let path = format!("/proc/{}/environ", rec.pid);
     let data = std::fs::read(&path).ok()?;
+    Some(parse_proc_environ(&data))
+}
+
+/// Parse `export -p` output: `declare -x KEY="value"` lines.
+/// Some vars have no value (e.g. `declare -x OLDPWD`); those are skipped.
+fn parse_export_p(data: &str) -> Option<Vec<(String, String)>> {
+    let mut env = Vec::new();
+    for line in data.lines() {
+        let line = line.trim();
+        if !line.starts_with("declare -x ") {
+            continue;
+        }
+        let rest = &line["declare -x ".len()..];
+        let Some(eq) = rest.find('=') else {
+            continue; // variable with no value, skip
+        };
+        let key = rest[..eq].to_string();
+        let mut val = rest[eq + 1..].to_string();
+        // Unquote: remove surrounding double or single quotes.
+        if val.len() >= 2 {
+            let first = val.as_bytes()[0];
+            let last = val.as_bytes()[val.len() - 1];
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                val = val[1..val.len() - 1].to_string();
+            }
+        }
+        env.push((key, val));
+    }
+    if env.is_empty() { None } else { Some(env) }
+}
+
+/// Parse NUL-separated `KEY=VALUE` pairs from /proc/<pid>/environ.
+fn parse_proc_environ(data: &[u8]) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for chunk in data.split(|&b| b == 0) {
         if chunk.is_empty() {
@@ -986,7 +1027,7 @@ fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, Strin
             }
         }
     }
-    Some(env)
+    env
 }
 
 fn kill_all_children(state: &mut State) {

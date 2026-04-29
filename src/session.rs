@@ -225,6 +225,9 @@ pub(crate) struct ShellHandle {
     /// Kill a background job by its session-local id.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub kill_spawn: Option<Arc<KillSpawnFn>>,
+    /// Returns the shell's exit code if it has exited, `None` if still running.
+    /// Used by `Session::exec` when the shell dies unexpectedly (e.g. `exit 7`).
+    pub shell_exit_code: Box<dyn FnMut() -> Option<i32> + Send>,
 }
 
 pub struct Session {
@@ -245,6 +248,8 @@ pub struct Session {
     /// Kill a background job by its session-local id.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     kill_spawn: Option<Arc<KillSpawnFn>>,
+    /// Returns the shell's exit code when it has exited.
+    shell_exit_code: Box<dyn FnMut() -> Option<i32> + Send>,
 }
 
 impl Session {
@@ -271,6 +276,10 @@ impl Session {
         let spawn_async = handle.spawn_async.clone();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let kill_spawn = handle.kill_spawn.clone();
+        let shell_exit_code = std::mem::replace(
+            &mut handle.shell_exit_code,
+            Box::new(|| None) as Box<dyn FnMut() -> Option<i32> + Send>,
+        );
 
         Ok(Self {
             handle: Some(handle),
@@ -287,6 +296,7 @@ impl Session {
             spawn_async,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             kill_spawn,
+            shell_exit_code,
         })
     }
 
@@ -387,6 +397,7 @@ impl Session {
              exec 3>&1 4>&2 5<&0 0</dev/null >\"$__o\" 2>\"$__e\"; \
              eval \"$(cat <<'{delim}'\n{cmd}\n{delim}\n)\"; \
              __sb_rc=$?; \
+             export -p > /.tps_env_$$ 2>/dev/null || true; \
              exec 0<&5 5<&- >&3 2>&4 3>&- 4>&-; \
              cat \"$__o\"; \
              printf '\\n__SBOUT_{sid}_{id} %d\\n' \"$__sb_rc\"; \
@@ -413,6 +424,13 @@ impl Session {
         let mut guard = lock.lock().map_err(|_| Error::exec("session state poisoned"))?;
         loop {
             if guard.early_eof {
+                if let Some(code) = (self.shell_exit_code)() {
+                    return Ok(ExecOutput {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: code,
+                    });
+                }
                 return Err(Error::exec(
                     "session shell exited unexpectedly (read EOF before sentinels)",
                 ));
@@ -989,11 +1007,19 @@ pub(crate) fn shell_handle_from_child(
                 }
             }
         }),
-        keepalive: Box::new((child, keepalive)),
+        keepalive: Box::new((child.clone(), keepalive)),
         open_pty: None,
         run_oneshot: None,
         spawn_async: None,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         kill_spawn: None,
+        shell_exit_code: Box::new(move || {
+            if let Ok(g) = child.lock() {
+                if let Some(c) = g.as_ref() {
+                    return c.try_wait().ok().flatten().and_then(|s| s.code());
+                }
+            }
+            None
+        }),
     })
 }

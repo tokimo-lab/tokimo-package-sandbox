@@ -8,9 +8,9 @@
 //!
 //! ```no_run
 //! use std::time::Duration;
-//! use tokimo_package_sandbox::{SandboxConfig, Workspace, UserConfig};
+//! use tokimo_package_sandbox::{WorkspaceConfig, Workspace, UserConfig};
 //!
-//! let ws = Workspace::open(&SandboxConfig::new("/tmp/ws"))?;
+//! let mut ws = Workspace::open(&WorkspaceConfig::new("/tmp/ws"))?;
 //! ws.add_user(&UserConfig::new("alice"))?;
 //! let out = ws.exec("alice", "echo hello", Duration::from_secs(10))?;
 //! assert_eq!(out.stdout.trim(), "hello");
@@ -21,6 +21,7 @@
 
 mod any_init;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +142,10 @@ pub struct UserHandle {
     client: AnyInitClient,
     shell_id: String,
     timeout: Duration,
+    /// Effective env of the user's shell, tracked by the host so we can pass
+    /// it as `env_overlay` for exec/spawn. Updated after `export` commands.
+    /// Wrapped in `RefCell` because `Workspace::exec` takes `&self`.
+    env: RefCell<Vec<(String, String)>>,
 }
 
 /// A shared sandbox container hosting multiple isolated users.
@@ -171,11 +176,19 @@ impl Workspace {
         let cwd = cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
         let info = client.add_user(&cfg.user_id, &env_overlay, cwd.as_deref())?;
 
+        // Build the effective env that init sets for this user's shell.
+        // Init sets: base_env + env_overlay, with TMPDIR and HOME overridden.
+        let mut user_env: Vec<(String, String)> = env_overlay;
+        user_env.retain(|(k, _)| k != "TMPDIR" && k != "HOME");
+        user_env.push(("TMPDIR".into(), format!("/tmp/{}", cfg.user_id)));
+        user_env.push(("HOME".into(), format!("/home/{}", cfg.user_id)));
+
         let handle = UserHandle {
             user_id: cfg.user_id.clone(),
             client,
-            shell_id: info.child_id,
+            shell_id: info.child_id.clone(),
             timeout: cfg.exec_timeout,
+            env: RefCell::new(user_env),
         };
         self.users.insert(cfg.user_id.clone(), handle);
         Ok(())
@@ -194,20 +207,61 @@ impl Workspace {
     /// Execute a command in the user's bash environment. Uses cwd/env
     /// inheritance from the user's shell. On timeout, only the spawned
     /// child is killed — the user's bash and other users are unaffected.
+    ///
+    /// Env modifications via `export KEY=VALUE` are tracked on the host and
+    /// passed as `env_overlay` to subsequent calls. This complements the
+    /// init's `inherit_from_child` mechanism (which reads the frozen
+    /// `/proc/<pid>/environ` snapshot).
     pub fn exec(&self, user_id: &str, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
         let user = self
             .users
             .get(user_id)
             .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
+        let env = user.env.borrow();
         let handle =
             user.client
-                .spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &[], None, Some(&user.shell_id))?;
+                .spawn_pipes_inherit_async(&["/bin/bash", "-c", cmd], &env, None, Some(&user.shell_id))?;
+        drop(env);
         let (stdout, stderr, code) = handle.wait_with_timeout(timeout)?;
+        // Track env modifications from `export KEY=VALUE` so they carry over
+        // to subsequent exec/spawn calls.
+        if let Some(new_env) = Self::parse_export_cmd(cmd) {
+            let mut env = user.env.borrow_mut();
+            for (k, _) in &new_env {
+                env.retain(|(ek, _)| ek != k);
+            }
+            env.extend(new_env);
+        }
         Ok(ExecOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code: code,
         })
+    }
+
+    /// Parse `export KEY=VALUE` from a command string.
+    /// Returns `None` if no export is detected.
+    fn parse_export_cmd(cmd: &str) -> Option<Vec<(String, String)>> {
+        let cmd = cmd.trim();
+        let rest = cmd.strip_prefix("export ")?;
+        // Simple split on whitespace for the common `export KEY=VALUE` case.
+        let mut env = Vec::new();
+        for part in rest.split_whitespace() {
+            if let Some(eq) = part.find('=') {
+                let key = part[..eq].to_string();
+                let mut val = part[eq + 1..].to_string();
+                // Strip surrounding quotes if present.
+                if val.len() >= 2 {
+                    let first = val.as_bytes()[0];
+                    let last = val.as_bytes()[val.len() - 1];
+                    if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                        val = val[1..val.len() - 1].to_string();
+                    }
+                }
+                env.push((key, val));
+            }
+        }
+        if env.is_empty() { None } else { Some(env) }
     }
 
     /// Execute a command using the user's default timeout.
@@ -227,9 +281,10 @@ impl Workspace {
             .users
             .get(user_id)
             .ok_or_else(|| Error::exec(format!("user {user_id} not found")))?;
+        let env = user.env.borrow();
         let info = user
             .client
-            .spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &[], None, Some(&user.shell_id))?;
+            .spawn_pipes_inherit(&["/bin/bash", "-c", cmd], &env, None, Some(&user.shell_id))?;
         Ok(info.child_id)
     }
 
@@ -245,6 +300,7 @@ impl Workspace {
             client: handle.client.clone_arc(),
             shell_id: info.child_id,
             timeout: handle.timeout,
+            env: RefCell::new(handle.env.borrow().clone()),
         };
         self.users.insert(user_id.to_string(), new_handle);
         Ok(())
