@@ -220,9 +220,7 @@ const INITRD_FILE: &str = "initrd.img";
 const ROOTFS_FILE: &str = "rootfs.vhdx";
 
 fn vm_dir_complete(d: &std::path::Path) -> bool {
-    d.join(KERNEL_FILE).is_file()
-        && d.join(INITRD_FILE).is_file()
-        && d.join(ROOTFS_FILE).is_file()
+    d.join(KERNEL_FILE).is_file() && d.join(INITRD_FILE).is_file() && d.join(ROOTFS_FILE).is_file()
 }
 
 fn find_vm_dir() -> Result<PathBuf> {

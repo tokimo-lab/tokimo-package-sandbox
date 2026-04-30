@@ -190,10 +190,7 @@ impl WinInitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -384,10 +381,7 @@ impl WinInitClient {
                 if ok {
                     Ok(())
                 } else {
-                    Err(Error::exec(format!(
-                        "init op failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
+                    Err(Error::exec(format!("init op failed: {:?}", error.map(|e| e.message))))
                 }
             }
             other => Err(Error::exec(format!("expected Ack, got {other:?}"))),
@@ -565,9 +559,9 @@ impl Read for InitReader {
         // Block on the client's Condvar until something is available.
         loop {
             let (lock, cv) = &*self.client.inner.state;
-            let mut g = lock.lock().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned")
-            })?;
+            let mut g = lock
+                .lock()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned"))?;
             loop {
                 let entry_has_data = g
                     .children
@@ -623,9 +617,9 @@ impl Read for InitReader {
                     }
                     return Ok(0); // EOF
                 }
-                let g2 = cv.wait(g).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned")
-                })?;
+                let g2 = cv
+                    .wait(g)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned"))?;
                 g = g2;
             }
         }

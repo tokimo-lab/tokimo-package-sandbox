@@ -11,8 +11,8 @@ use std::io::{self, Read, Write};
 use std::time::Duration;
 
 use windows::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SEND_RECV_FLAGS, SOCK_STREAM, SOCKET, WSADATA, WSAGetLastError, WSAStartup,
-    accept, bind, closesocket, connect, listen, recv, send, socket,
+    INVALID_SOCKET, SEND_RECV_FLAGS, SOCK_STREAM, SOCKET, WSADATA, WSAGetLastError, WSAStartup, accept, bind,
+    closesocket, connect, listen, recv, send, socket,
 };
 use windows::core::GUID;
 
@@ -28,8 +28,7 @@ pub const HV_GUID_WILDCARD: GUID = GUID::from_u128(0x00000000_0000_0000_0000_000
 /// honored for cross-partition bind from a Windows host listening for a Linux
 /// guest connector.
 #[allow(dead_code)]
-pub const HV_GUID_CHILDREN: GUID =
-    GUID::from_u128(0x90db8b89_0d35_4f79_8ce9_49ea0ac8b7cd);
+pub const HV_GUID_CHILDREN: GUID = GUID::from_u128(0x90db8b89_0d35_4f79_8ce9_49ea0ac8b7cd);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,13 +77,17 @@ pub fn listen_for_guest(vm_id: GUID, service_id: GUID) -> io::Result<HvSock> {
     };
     if r != 0 {
         let err = unsafe { WSAGetLastError() }.0;
-        unsafe { let _ = closesocket(s); }
+        unsafe {
+            let _ = closesocket(s);
+        }
         return Err(io::Error::other(format!("AF_HYPERV bind: WSA={err}")));
     }
     let r = unsafe { listen(s, 4) };
     if r != 0 {
         let err = unsafe { WSAGetLastError() }.0;
-        unsafe { let _ = closesocket(s); }
+        unsafe {
+            let _ = closesocket(s);
+        }
         return Err(io::Error::other(format!("AF_HYPERV listen: WSA={err}")));
     }
     Ok(HvSock { s })
@@ -105,9 +108,7 @@ pub fn accept_guest(listener: &HvSock, timeout: Duration) -> io::Result<HvSock> 
             tv_sec: remaining.as_secs().min(60) as i32,
             tv_usec: 0,
         };
-        let nready = unsafe {
-            windows::Win32::Networking::WinSock::select(0, Some(&mut rfds), None, None, Some(&tv))
-        };
+        let nready = unsafe { windows::Win32::Networking::WinSock::select(0, Some(&mut rfds), None, None, Some(&tv)) };
         if nready < 0 {
             let err = unsafe { WSAGetLastError() }.0;
             return Err(io::Error::other(format!("AF_HYPERV select: WSA={err}")));
@@ -117,13 +118,7 @@ pub fn accept_guest(listener: &HvSock, timeout: Duration) -> io::Result<HvSock> 
         }
         let mut peer: SockaddrHv = unsafe { std::mem::zeroed() };
         let mut len: i32 = std::mem::size_of::<SockaddrHv>() as i32;
-        let c = unsafe {
-            accept(
-                listener.s,
-                Some(&mut peer as *mut _ as *mut _),
-                Some(&mut len),
-            )
-        };
+        let c = unsafe { accept(listener.s, Some(&mut peer as *mut _ as *mut _), Some(&mut len)) };
         match c {
             Ok(s) if s != INVALID_SOCKET => return Ok(HvSock { s }),
             _ => {
@@ -178,9 +173,7 @@ pub fn connect_to_guest(vm_id: GUID, service_id: GUID, timeout: Duration) -> io:
             let _ = closesocket(s);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(io::Error::other(format!(
-                "AF_HYPERV connect failed: WSA={err}"
-            )));
+            return Err(io::Error::other(format!("AF_HYPERV connect failed: WSA={err}")));
         }
         std::thread::sleep(Duration::from_millis(100));
     }

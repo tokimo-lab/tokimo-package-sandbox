@@ -19,13 +19,12 @@
 use std::io::{self, Read, Write};
 
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
+    ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, WaitForSingleObject,
-};
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, INFINITE, WaitForSingleObject};
 use windows::core::PCWSTR;
 
 /// Overlapped-mode named pipe handle. Owns the HANDLE and an event used
@@ -54,16 +53,8 @@ impl OvPipe {
         let mut dup = HANDLE::default();
         unsafe {
             let cur = GetCurrentProcess();
-            DuplicateHandle(
-                cur,
-                self.pipe,
-                cur,
-                &mut dup,
-                0,
-                false,
-                DUPLICATE_SAME_ACCESS,
-            )
-            .map_err(|_| io::Error::from_raw_os_error(GetLastError().0 as i32))?;
+            DuplicateHandle(cur, self.pipe, cur, &mut dup, 0, false, DUPLICATE_SAME_ACCESS)
+                .map_err(|_| io::Error::from_raw_os_error(GetLastError().0 as i32))?;
         }
         Self::from_handle(dup)
     }
@@ -95,7 +86,10 @@ where
         }
         let w = unsafe { WaitForSingleObject(event, INFINITE) };
         if w != WAIT_OBJECT_0 {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("WaitForSingleObject = {:?}", w)));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("WaitForSingleObject = {:?}", w),
+            ));
         }
     }
     let mut transferred: u32 = 0;

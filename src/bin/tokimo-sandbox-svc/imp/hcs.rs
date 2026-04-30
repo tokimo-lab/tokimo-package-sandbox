@@ -149,7 +149,9 @@ impl HcsApi {
         // On failure HCS may still return a result JSON with error details.
         let detail = if !result_ptr.is_null() {
             let json = unsafe { wide_to_string(result_ptr) };
-            unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
+            }
             json
         } else {
             String::new()
@@ -190,12 +192,16 @@ impl HcsApi {
         unsafe { (self.close_op)(op) };
         if hr2 < 0 || result_ptr.is_null() {
             if !result_ptr.is_null() {
-                unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
+                }
             }
             return None;
         }
         let json = unsafe { wide_to_string(result_ptr) };
-        unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
             v["ExitCode"].as_i64().map(|n| n as i32)
         } else {
@@ -221,12 +227,16 @@ impl HcsApi {
         unsafe { (self.close_op)(op) };
         if hr2 < 0 || result_ptr.is_null() {
             if !result_ptr.is_null() {
-                unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+                unsafe {
+                    let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
+                }
             }
             return None;
         }
         let json = unsafe { wide_to_string(result_ptr) };
-        unsafe { let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _))); }
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(result_ptr as *mut _)));
+        }
         let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-props.json", &json);
         let v: serde_json::Value = serde_json::from_str(&json).ok()?;
         // RuntimeId may live at top level or under VirtualMachine depending

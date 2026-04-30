@@ -179,9 +179,7 @@ mod tests {
         let parsed: SvcRequest = serde_json::from_slice(&json).unwrap();
         match parsed {
             SvcRequest::ExecVm {
-                rootfs_dir,
-                network,
-                ..
+                rootfs_dir, network, ..
             } => {
                 assert_eq!(rootfs_dir, r"C:\tokimo\rootfs");
                 assert_eq!(network, SvcNetwork::Blocked);

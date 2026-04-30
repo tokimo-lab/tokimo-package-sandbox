@@ -49,10 +49,7 @@ pub fn canonicalize_safe(path: &Path) -> io::Result<PathBuf> {
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "path {} is a symlink or junction, refusing to open",
-                    probe.display()
-                ),
+                format!("path {} is a symlink or junction, refusing to open", probe.display()),
             ));
         }
     }

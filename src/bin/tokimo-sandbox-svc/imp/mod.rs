@@ -17,7 +17,9 @@ use windows::Win32::Security::WinTrust::{
     WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO,
     WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
 };
-use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+};
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
@@ -214,7 +216,10 @@ fn install_service() {
             // host services are up.
             let _ = svc.set_delayed_auto_start(true);
             if let Err(e) = svc.start::<&str>(&[]) {
-                eprintln!("StartService failed (the service is still installed): {}", format_ws_error(&e));
+                eprintln!(
+                    "StartService failed (the service is still installed): {}",
+                    format_ws_error(&e)
+                );
             } else {
                 println!("Service installed and started: {INSTALL_SERVICE_NAME}");
             }
@@ -362,7 +367,8 @@ fn pipe_server_loop(console_mode: bool) {
         let pipe = unsafe {
             CreateNamedPipeW(
                 &pipe_name,
-                PIPE_ACCESS_DUPLEX | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
+                PIPE_ACCESS_DUPLEX
+                    | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -391,7 +397,9 @@ fn pipe_server_loop(console_mode: bool) {
         ov.hEvent = connect_evt;
         let connected = unsafe { ConnectNamedPipe(pipe, Some(&mut ov)) };
         let last = unsafe { GetLastError() }.0;
-        if connected.is_err() && last != 535 /* ERROR_PIPE_CONNECTED */ && last != 997 /* ERROR_IO_PENDING */ {
+        if connected.is_err() && last != 535 /* ERROR_PIPE_CONNECTED */ && last != 997
+        /* ERROR_IO_PENDING */
+        {
             let _ = unsafe { CloseHandle(connect_evt) };
             let _ = unsafe { CloseHandle(pipe) };
             continue;
@@ -590,15 +598,7 @@ fn handle_exec_vm(
         return;
     }
 
-    match run_vm(
-        &kernel,
-        &initrd,
-        &rootfs_dir,
-        &workspace,
-        cmd_b64,
-        memory_mb,
-        cpu_count,
-    ) {
+    match run_vm(&kernel, &initrd, &rootfs_dir, &workspace, cmd_b64, memory_mb, cpu_count) {
         Ok(result) => {
             let _ = send_response_raw(pipe, &SvcResponse::ExecVmResult { id, result });
         }
@@ -623,7 +623,9 @@ fn run_vm(
     let _ = std::fs::remove_file(workspace.join(".vz_exit_code"));
 
     let vm_id = format!("tokimo-svc-{}", std::process::id());
-    let cfg_json = vmconfig::build(&vm_id, kernel, initrd, rootfs_dir, workspace, cmd_b64, memory_mb, cpu_count);
+    let cfg_json = vmconfig::build(
+        &vm_id, kernel, initrd, rootfs_dir, workspace, cmd_b64, memory_mb, cpu_count,
+    );
 
     // Debug: dump the HCS config JSON to a known location so failures can
     // be inspected post-mortem from the test harness.
@@ -701,7 +703,10 @@ fn scopeguard_close(api: Arc<hcs::HcsApi>, handle: hcs::CsHandle) -> impl Drop {
 /// Hosts the named pipe server for COM1 and tails everything HCS writes to
 /// it into `C:\tokimo-debug\last-vm-com1.log`. Truncates the log first.
 fn spawn_com1_logger(vm_id: &str) {
-    spawn_com_logger(&format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}"), r"C:\tokimo-debug\last-vm-com1.log");
+    spawn_com_logger(
+        &format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}"),
+        r"C:\tokimo-debug\last-vm-com1.log",
+    );
 }
 
 /// Generic version: any COM port to any log path.
@@ -744,11 +749,7 @@ fn spawn_com_logger(pipe_name: &str, log_path: &'static str) {
                     break;
                 }
                 use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)
-                {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
                     let _ = f.write_all(&buf[..got as usize]);
                 }
             }
@@ -790,27 +791,36 @@ unsafe fn ov_read(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<u32> {
     let mut got: u32 = 0;
     let r = unsafe { ReadFile(pipe, Some(buf), Some(&mut got), Some(&mut ov)) };
     let last = unsafe { GetLastError() }.0;
-    tunnel_log(&format!("ov_read ReadFile r.is_err={} last={last} got={got}", r.is_err()));
+    tunnel_log(&format!(
+        "ov_read ReadFile r.is_err={} last={last} got={got}",
+        r.is_err()
+    ));
     if r.is_err() {
-        if last == 997 /* ERROR_IO_PENDING */ {
+        if last == 997
+        /* ERROR_IO_PENDING */
+        {
             tunnel_log("ov_read waiting on event");
             unsafe { WaitForSingleObject(evt, u32::MAX) };
             tunnel_log("ov_read event signaled");
             let mut transferred: u32 = 0;
-            let ok = unsafe {
-                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
-            };
-            unsafe { let _ = CloseHandle(evt); }
+            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
+            unsafe {
+                let _ = CloseHandle(evt);
+            }
             if ok.is_err() {
                 let last2 = unsafe { GetLastError() }.0;
                 return Err(std::io::Error::from_raw_os_error(last2 as i32));
             }
             return Ok(transferred);
         }
-        unsafe { let _ = CloseHandle(evt); }
+        unsafe {
+            let _ = CloseHandle(evt);
+        }
         return Err(std::io::Error::from_raw_os_error(last as i32));
     }
-    unsafe { let _ = CloseHandle(evt); }
+    unsafe {
+        let _ = CloseHandle(evt);
+    }
     Ok(got)
 }
 
@@ -825,20 +835,24 @@ unsafe fn ov_write(pipe: HANDLE, buf: &[u8]) -> std::io::Result<u32> {
         if last == 997 {
             unsafe { WaitForSingleObject(evt, u32::MAX) };
             let mut transferred: u32 = 0;
-            let ok = unsafe {
-                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
-            };
-            unsafe { let _ = CloseHandle(evt); }
+            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
+            unsafe {
+                let _ = CloseHandle(evt);
+            }
             if ok.is_err() {
                 let last2 = unsafe { GetLastError() }.0;
                 return Err(std::io::Error::from_raw_os_error(last2 as i32));
             }
             return Ok(transferred);
         }
-        unsafe { let _ = CloseHandle(evt); }
+        unsafe {
+            let _ = CloseHandle(evt);
+        }
         return Err(std::io::Error::from_raw_os_error(last as i32));
     }
-    unsafe { let _ = CloseHandle(evt); }
+    unsafe {
+        let _ = CloseHandle(evt);
+    }
     Ok(wrote)
 }
 
@@ -929,8 +943,8 @@ fn verify_caller_required() -> bool {
 fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Result<(), String> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE,
-        REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
     };
 
     let subkey = HSTRING::from(format!(
@@ -955,13 +969,8 @@ fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Re
         return Err(format!("RegCreateKeyExW {svc_guid}: {:?}", r));
     }
     let value_name = HSTRING::from("ElementName");
-    let wide: Vec<u16> = friendly_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
-    };
+    let wide: Vec<u16> = friendly_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
     let r2 = unsafe { RegSetValueExW(hk, &value_name, None, REG_SZ, Some(bytes)) };
 
     // Set SecurityDescriptor REG_SZ so the guest's hv_sock connect to this
@@ -969,13 +978,8 @@ fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Re
     // be silently dropped (ETIMEDOUT) — Hyper-V doesn't surface a refusal.
     let sd_name = HSTRING::from("SecurityDescriptor");
     let sd_str = "D:(A;;GA;;;WD)";
-    let sd_wide: Vec<u16> = sd_str
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let sd_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2)
-    };
+    let sd_wide: Vec<u16> = sd_str.encode_utf16().chain(std::iter::once(0)).collect();
+    let sd_bytes: &[u8] = unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
     let _ = unsafe { RegSetValueExW(hk, &sd_name, None, REG_SZ, Some(sd_bytes)) };
 
     let _ = unsafe { RegCloseKey(hk) };
@@ -1114,11 +1118,7 @@ fn handle_open_session(
 
     // Generate a session id and let HCS auto-assign the RuntimeId; we
     // read it back after start to use as the AF_HYPERV VmId.
-    let vm_id = format!(
-        "tokimo-sess-{}-{}",
-        std::process::id(),
-        rand_session_suffix()
-    );
+    let vm_id = format!("tokimo-sess-{}-{}", std::process::id(), rand_session_suffix());
 
     // Clone rootfs.vhdx to a per-session writable copy in the workspace
     // so concurrent sessions don't corrupt each other's filesystem.
@@ -1251,8 +1251,13 @@ fn handle_open_session(
         let mut dup = HANDLE(std::ptr::null_mut());
         let proc = GetCurrentProcess();
         let _ = windows::Win32::Foundation::DuplicateHandle(
-            proc, HANDLE(client_ptr as *mut _), proc, &mut dup,
-            0, false, DUPLICATE_SAME_ACCESS,
+            proc,
+            HANDLE(client_ptr as *mut _),
+            proc,
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
         );
         dup.0 as usize
     };
@@ -1357,8 +1362,7 @@ fn clone_rootfs_for_session(template: &Path, workspace: &Path, vm_id: &str) -> R
     if dst.exists() {
         let _ = std::fs::remove_file(&dst);
     }
-    std::fs::copy(template, &dst)
-        .map_err(|e| format!("clone {} -> {}: {e}", template.display(), dst.display()))?;
+    std::fs::copy(template, &dst).map_err(|e| format!("clone {} -> {}: {e}", template.display(), dst.display()))?;
     Ok(dst)
 }
 
@@ -1395,12 +1399,10 @@ fn parse_guid(s: &str) -> Result<windows::core::GUID, String> {
     }
     let mut data4 = [0u8; 8];
     for i in 0..2 {
-        data4[i] =
-            u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[i] = u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     for i in 0..6 {
-        data4[2 + i] =
-            u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[2 + i] = u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     Ok(windows::core::GUID {
         data1,

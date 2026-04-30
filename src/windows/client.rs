@@ -124,8 +124,8 @@ pub(crate) fn open_session(
     };
 
     super::protocol::send_request(&mut pipe, &req).map_err(|e| Error::exec(format!("send OpenSession: {e}")))?;
-    let resp = super::protocol::recv_response(&mut pipe)
-        .map_err(|e| Error::exec(format!("recv SessionOpened: {e}")))?;
+    let resp =
+        super::protocol::recv_response(&mut pipe).map_err(|e| Error::exec(format!("recv SessionOpened: {e}")))?;
     match resp {
         SvcResponse::SessionOpened { .. } => Ok(pipe),
         SvcResponse::Error { error, .. } => Err(Error::exec(format!(

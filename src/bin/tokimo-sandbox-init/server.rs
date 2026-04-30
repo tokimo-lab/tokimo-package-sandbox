@@ -547,8 +547,7 @@ fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &
             Some(p) => p,
             None => break,
         };
-        let frame: Frame = serde_json::from_slice(&payload)
-            .map_err(|e| format!("parse wire frame: {e}"))?;
+        let frame: Frame = serde_json::from_slice(&payload).map_err(|e| format!("parse wire frame: {e}"))?;
         match frame {
             Frame::Op(op) => handle_op(op, client_fd, state, registry),
             other => eprintln!("[init] client sent non-Op frame: {other:?}"),
