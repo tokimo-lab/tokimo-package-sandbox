@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol revision. Bumped on any breaking change to op / event
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -135,6 +135,22 @@ pub enum Op {
     },
     /// Unmount a previously bind-mounted path.
     Unmount { id: String, target: String },
+    /// Sent once per session, immediately after `Hello` and before any
+    /// `OpenShell` / `Spawn`. Tells the guest to dial each `vsock_port`
+    /// and 9p-mount the resulting fd at `guest_path`. Required on
+    /// platforms that pre-allocate one Plan9 share per host directory
+    /// (currently Windows only). On platforms whose backend mounts the
+    /// workspace itself (Linux bwrap, macOS VZ) hosts simply omit this op.
+    MountManifest { id: String, entries: Vec<MountEntry> },
+}
+
+/// One Plan9-over-vsock mount the guest must perform during `MountManifest`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MountEntry {
+    pub vsock_port: u32,
+    pub guest_path: String,
+    pub aname: String,
+    pub read_only: bool,
 }
 
 fn default_true() -> bool {
@@ -172,6 +188,16 @@ pub enum Reply {
     Ack {
         id: String,
         ok: bool,
+        #[serde(default)]
+        error: Option<ErrorReply>,
+    },
+    /// Reply to `Op::MountManifest`. On failure `failing_index` points at
+    /// the first entry that could not be mounted.
+    MountManifest {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        failing_index: Option<u32>,
         #[serde(default)]
         error: Option<ErrorReply>,
     },
@@ -253,5 +279,6 @@ pub fn default_features() -> Vec<String> {
         "removeuser".into(),
         "bindmount".into(),
         "unmount".into(),
+        "mount_manifest".into(),
     ]
 }

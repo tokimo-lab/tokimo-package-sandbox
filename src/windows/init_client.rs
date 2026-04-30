@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
+use crate::protocol::types::{Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
 use crate::{Error, Result};
 
@@ -242,6 +242,44 @@ impl WinInitClient {
         self.ack_op(&id, op)
     }
 
+    /// Send a `MountManifest` op listing every share the guest must dial
+    /// and 9p-mount. Sent after `Hello` and before any `OpenShell`. The
+    /// service has already created an AF_HYPERV listener for each port
+    /// before booting the VM, so the guest can dial them without races.
+    /// The mount fds live forever inside init's `State` so the kernel
+    /// keeps the channels alive — there is no `Unmount` reply path for
+    /// shares; tearing the session down tears the mounts down.
+    pub fn send_mount_manifest(&self, entries: Vec<MountEntry>) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::MountManifest {
+            id: id.clone(),
+            entries,
+        };
+        // Mounting is a blocking operation in the guest (one vsock dial
+        // + one mount(2) per entry); allow plenty of time for slow boots
+        // / many shares before declaring the session dead.
+        let reply = self.send_op_sync(&id, op, Duration::from_secs(60))?;
+        match reply {
+            Reply::MountManifest {
+                ok,
+                failing_index,
+                error,
+                ..
+            } => {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(Error::exec(format!(
+                        "MountManifest failed at entry {:?}: {:?}",
+                        failing_index,
+                        error.map(|e| e.message),
+                    )))
+                }
+            }
+            other => Err(Error::exec(format!("expected MountManifest reply, got {other:?}"))),
+        }
+    }
+
     // -- Event drain --------------------------------------------------------
 
     pub fn drain_stdout(&self, child_id: &str) -> Vec<Vec<u8>> {
@@ -265,10 +303,10 @@ impl WinInitClient {
         let (lock, cv) = &*self.inner.state;
         let mut g = lock.lock().expect("client state");
         loop {
-            if let Some(c) = g.children.get(child_id) {
-                if !c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some() {
-                    return true;
-                }
+            if let Some(c) = g.children.get(child_id)
+                && (!c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some())
+            {
+                return true;
             }
             if g.eof {
                 return true;
@@ -431,7 +469,9 @@ pub struct SpawnInfo {
 
 fn reply_id(r: &Reply) -> String {
     match r {
-        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } | Reply::MountManifest { id, .. } => {
+            id.clone()
+        }
     }
 }
 
@@ -561,7 +601,7 @@ impl Read for InitReader {
             let (lock, cv) = &*self.client.inner.state;
             let mut g = lock
                 .lock()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned"))?;
+                .map_err(|_| std::io::Error::other("client state poisoned"))?;
             loop {
                 let entry_has_data = g
                     .children
@@ -617,9 +657,7 @@ impl Read for InitReader {
                     }
                     return Ok(0); // EOF
                 }
-                let g2 = cv
-                    .wait(g)
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "client state poisoned"))?;
+                let g2 = cv.wait(g).map_err(|_| std::io::Error::other("client state poisoned"))?;
                 g = g2;
             }
         }

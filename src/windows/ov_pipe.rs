@@ -86,10 +86,7 @@ where
         }
         let w = unsafe { WaitForSingleObject(event, INFINITE) };
         if w != WAIT_OBJECT_0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("WaitForSingleObject = {:?}", w),
-            ));
+            return Err(io::Error::other(format!("WaitForSingleObject = {:?}", w)));
         }
     }
     let mut transferred: u32 = 0;

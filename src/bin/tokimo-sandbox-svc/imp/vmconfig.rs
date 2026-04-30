@@ -46,6 +46,15 @@ pub fn alloc_session_init_port() -> u32 {
     0x4000_0000 | (n & 0x00FF_FFFF)
 }
 
+/// Allocate a unique vsock port for a per-session Plan9 share. Distinct
+/// from the init-control range above so log GUID prefixes stay readable.
+pub fn alloc_share_port() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    0x4100_0000 | (n & 0x00FF_FFFF)
+}
+
 /// Build the HvSocket service GUID for a given vsock port.
 /// Hyper-V's mapping: GUID = `XXXXXXXX-FACB-11E6-BD58-64006A7986D3`,
 /// where `XXXXXXXX` is the vsock port in big-endian hex.
@@ -213,6 +222,130 @@ pub fn build_ex(
     top.to_string()
 }
 
+/// One share for a V2 multi-share session config.
+pub struct V2Share<'a> {
+    pub host_path: &'a Path,
+    pub name: &'a str,
+    pub port: u32,
+    pub read_only: bool,
+}
+
+/// Build an HCS Schema 2.x JSON config for **session mode V2** with an
+/// arbitrary list of Plan9-over-vsock shares and an explicit rootfs
+/// VHDX. The rootfs is mounted on SCSI controller 0 attachment 0
+/// (`/dev/sda`) read-write — persistent vs ephemeral lifecycle is
+/// managed at a higher layer (`vhdx_pool`).
+///
+/// The kernel cmdline carries only `tokimo.init_port=`; the legacy
+/// `tokimo.work_port=` is intentionally absent because the V2 init
+/// learns about every share through a `MountManifest` op on the init
+/// vsock channel after `Hello` and before any shells are spawned.
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_v2(
+    vm_id: &str,
+    kernel: &Path,
+    initrd: &Path,
+    rootfs_vhdx: &Path,
+    shares: &[V2Share<'_>],
+    memory_mb: u64,
+    cpu_count: usize,
+    init_port: u32,
+) -> String {
+    let kernel_s = strip_extended_prefix(kernel);
+    let initrd_s = strip_extended_prefix(initrd);
+    let rootfs_s = strip_extended_prefix(rootfs_vhdx);
+
+    let scsi = serde_json::json!({
+        "0": {
+            "Attachments": {
+                "0": {
+                    "Type": "VirtualDisk",
+                    "Path": rootfs_s,
+                    "ReadOnly": false
+                }
+            }
+        }
+    });
+
+    let plan9_shares: Vec<serde_json::Value> = shares
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "Name": s.name,
+                "AccessName": s.name,
+                "Path": strip_extended_prefix(s.host_path),
+                "Port": s.port,
+                "ReadOnly": s.read_only
+            })
+        })
+        .collect();
+    let plan9 = serde_json::json!({ "Shares": plan9_shares });
+
+    let mut devices = serde_json::Map::new();
+    devices.insert("Scsi".into(), scsi);
+    devices.insert("Plan9".into(), plan9);
+
+    // Register the per-session init-control HvSocket service GUID so the
+    // WILDCARD-bound listener on the host is reachable from this VM.
+    //
+    // Plan9 share ports are NOT added to this table — HCS provides the
+    // 9p server internally for each `Plan9.Shares[i]` entry and owns the
+    // host-side endpoint on `Port`. Adding them here (or binding our own
+    // listener) would race HCS's listener for the same vsock service GUID.
+    let mut svc_table = serde_json::Map::new();
+    let entry = serde_json::json!({
+        "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
+        "ConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
+        "AllowWildcardBinds": true
+    });
+    svc_table.insert(hvsock_service_id(init_port), entry);
+    let _ = shares; // ports referenced via Plan9.Shares above
+    devices.insert(
+        "HvSocket".into(),
+        serde_json::json!({
+            "HvSocketConfig": {
+                "DefaultBindSecurityDescriptor":    "D:(A;;GA;;;WD)",
+                "DefaultConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
+                "ServiceTable": svc_table
+            }
+        }),
+    );
+
+    devices.insert(
+        "ComPorts".into(),
+        serde_json::json!({
+            "1": { "NamedPipe": format!(r"\\.\pipe\tokimo-vm-com2-{}", vm_id) }
+        }),
+    );
+
+    let kernel_cmdline = format!(
+        "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
+         tokimo.session=1 tokimo.init_port={init_port}"
+    );
+
+    let vm = serde_json::json!({
+        "ComputeTopology": {
+            "Memory": { "SizeInMB": memory_mb },
+            "Processor": { "Count": cpu_count }
+        },
+        "Chipset": {
+            "LinuxKernelDirect": {
+                "KernelFilePath": kernel_s,
+                "InitRdPath": initrd_s,
+                "KernelCmdLine": kernel_cmdline
+            }
+        },
+        "Devices": devices
+    });
+
+    let top = serde_json::json!({
+        "SchemaVersion": { "Major": 2, "Minor": 5 },
+        "Owner": "tokimo-sandbox-svc",
+        "VirtualMachine": vm
+    });
+    top.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +419,83 @@ mod tests {
         assert!(cmdline.contains("tokimo.session=1"));
         assert!(cmdline.contains("tokimo.init_port=50003"));
         assert!(cmdline.contains("console=ttyS1"));
+    }
+
+    #[test]
+    fn v2_multi_share_schema_and_cmdline() {
+        let work = PathBuf::from(r"C:\work");
+        let ro = PathBuf::from(r"C:\readonly");
+        let rootfs = PathBuf::from(r"C:\persist.vhdx");
+        let shares = [
+            V2Share {
+                host_path: &work,
+                name: "s0",
+                port: 0x4100_0001,
+                read_only: false,
+            },
+            V2Share {
+                host_path: &ro,
+                name: "s1",
+                port: 0x4100_0002,
+                read_only: true,
+            },
+        ];
+        let s = build_session_v2(
+            "id",
+            &PathBuf::from(r"C:\k"),
+            &PathBuf::from(r"C:\i"),
+            &rootfs,
+            &shares,
+            1024,
+            2,
+            0x4000_0001,
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        // SCSI carries the persistent rootfs path.
+        assert_eq!(
+            v["VirtualMachine"]["Devices"]["Scsi"]["0"]["Attachments"]["0"]["Path"],
+            r"C:\persist.vhdx"
+        );
+
+        // Plan9 has both shares, in order, with read_only flags.
+        let arr = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["Name"], "s0");
+        assert_eq!(arr[0]["ReadOnly"], false);
+        assert_eq!(arr[1]["Name"], "s1");
+        assert_eq!(arr[1]["ReadOnly"], true);
+        assert_eq!(arr[1]["Port"], 0x4100_0002);
+
+        // HvSocket service table registers ONLY the init port — share
+        // ports are owned by HCS's internal Plan9 server.
+        let table = v["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
+            .as_object()
+            .unwrap();
+        assert!(table.contains_key(&hvsock_service_id(0x4000_0001)));
+        assert!(!table.contains_key(&hvsock_service_id(0x4100_0001)));
+        assert!(!table.contains_key(&hvsock_service_id(0x4100_0002)));
+
+        let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
+            .as_str()
+            .unwrap();
+        assert!(cmdline.contains("tokimo.init_port=1073741825"));
+        // V2 cmdline must NOT carry the legacy single-share work_port.
+        assert!(
+            !cmdline.contains("tokimo.work_port="),
+            "v2 cmdline should not carry tokimo.work_port=, got: {cmdline}"
+        );
+    }
+
+    #[test]
+    fn share_port_allocator_distinct_from_init() {
+        let i1 = alloc_session_init_port();
+        let s1 = alloc_share_port();
+        let s2 = alloc_share_port();
+        assert_ne!(i1, s1);
+        assert_ne!(s1, s2);
+        // Different prefixes for log readability.
+        assert_eq!(i1 & 0xFF00_0000, 0x4000_0000);
+        assert_eq!(s1 & 0xFF00_0000, 0x4100_0000);
     }
 }
