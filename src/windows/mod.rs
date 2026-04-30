@@ -255,18 +255,19 @@ fn find_vm_dir() -> Result<PathBuf> {
     }
 
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            if let Some(hit) = probe(dir.join(VM_DIR_NAME)) {
+        && let Some(dir) = exe.parent()
+    {
+        if let Some(hit) = probe(dir.join(VM_DIR_NAME)) {
+            return Ok(hit);
+        }
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
                 return Ok(hit);
             }
-            let mut cur = Some(dir);
-            while let Some(d) = cur {
-                if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
-                    return Ok(hit);
-                }
-                cur = d.parent();
-            }
+            cur = d.parent();
         }
+    }
 
     if let Ok(cwd) = std::env::current_dir() {
         let mut cur: Option<&std::path::Path> = Some(&cwd);

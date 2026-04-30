@@ -304,9 +304,10 @@ impl WinInitClient {
         let mut g = lock.lock().expect("client state");
         loop {
             if let Some(c) = g.children.get(child_id)
-                && (!c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some()) {
-                    return true;
-                }
+                && (!c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some())
+            {
+                return true;
+            }
             if g.eof {
                 return true;
             }
@@ -656,9 +657,7 @@ impl Read for InitReader {
                     }
                     return Ok(0); // EOF
                 }
-                let g2 = cv
-                    .wait(g)
-                    .map_err(|_| std::io::Error::other("client state poisoned"))?;
+                let g2 = cv.wait(g).map_err(|_| std::io::Error::other("client state poisoned"))?;
                 g = g2;
             }
         }

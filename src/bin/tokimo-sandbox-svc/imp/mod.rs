@@ -291,16 +291,17 @@ fn uninstall_service() {
     };
 
     if let Ok(status) = svc.query_status()
-        && status.current_state != ServiceState::Stopped {
-            let _ = svc.stop();
-            // Wait briefly.
-            for _ in 0..30 {
-                std::thread::sleep(Duration::from_millis(200));
-                if matches!(svc.query_status().map(|s| s.current_state), Ok(ServiceState::Stopped)) {
-                    break;
-                }
+        && status.current_state != ServiceState::Stopped
+    {
+        let _ = svc.stop();
+        // Wait briefly.
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(200));
+            if matches!(svc.query_status().map(|s| s.current_state), Ok(ServiceState::Stopped)) {
+                break;
             }
         }
+    }
 
     if let Err(e) = svc.delete() {
         eprintln!("DeleteService failed: {}", format_ws_error(&e));
