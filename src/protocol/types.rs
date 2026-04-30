@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol revision. Bumped on any breaking change to op / event
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2: added [`Op::MountManifest`] / [`Reply::MountManifest`] / [`FsType`]
+///     for macOS multi-mount support.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -135,6 +138,34 @@ pub enum Op {
     },
     /// Unmount a previously bind-mounted path.
     Unmount { id: String, target: String },
+    /// Mount a batch of host-provided shares into the guest at boot time.
+    /// Currently used by macOS VZ (virtiofs tag-based shares) for multi-mount
+    /// support equivalent to Linux `extra_mounts`. The host side wires up
+    /// each share as a virtiofs device with a unique tag (`source`) and asks
+    /// init to mount each at the requested `target`.
+    MountManifest { id: String, entries: Vec<MountEntry> },
+}
+
+/// Filesystem type for a [`MountEntry`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FsType {
+    /// VZ virtiofs share. `source` is the device tag set on the host
+    /// (`VirtioFileSystemDeviceConfiguration::new(<tag>)`), `target` is the
+    /// absolute guest path. Init does:
+    /// `mount(source, target, "virtiofs", MS_NODEV|MS_NOSUID|<RO?>, NULL)`.
+    Virtiofs,
+}
+
+/// One entry in [`Op::MountManifest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountEntry {
+    /// Tag/share name visible to the guest mount call.
+    pub source: String,
+    /// Absolute guest path. Init will `mkdir -p` it before mounting.
+    pub target: String,
+    pub fs_type: FsType,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 fn default_true() -> bool {
@@ -172,6 +203,16 @@ pub enum Reply {
     Ack {
         id: String,
         ok: bool,
+        #[serde(default)]
+        error: Option<ErrorReply>,
+    },
+    /// Reply to [`Op::MountManifest`]. On failure, `failed_index` points at
+    /// the first entry that failed; remaining entries are not attempted.
+    MountManifest {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        failed_index: Option<usize>,
         #[serde(default)]
         error: Option<ErrorReply>,
     },
@@ -253,5 +294,6 @@ pub fn default_features() -> Vec<String> {
         "removeuser".into(),
         "bindmount".into(),
         "unmount".into(),
+        "mount_manifest".into(),
     ]
 }

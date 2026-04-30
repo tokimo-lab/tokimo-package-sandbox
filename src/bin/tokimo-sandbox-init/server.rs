@@ -19,7 +19,8 @@ use nix::sys::socket::{SockFlag, accept4};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::protocol::types::{
-    ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
+    ErrorCode, ErrorReply, Event, Frame, FsType, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode,
+    default_features,
 };
 use tokimo_package_sandbox::protocol::wire::encode_frame;
 use tokimo_package_sandbox::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
@@ -855,7 +856,80 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             })();
             ack(state, client_fd, id, res);
         }
+        Op::MountManifest { id, entries } => {
+            let mut failed: Option<(usize, ErrorReply)> = None;
+            for (idx, entry) in entries.iter().enumerate() {
+                if let Err(e) = mount_manifest_entry(entry) {
+                    failed = Some((idx, e));
+                    break;
+                }
+            }
+            let reply = match failed {
+                None => Reply::MountManifest {
+                    id,
+                    ok: true,
+                    failed_index: None,
+                    error: None,
+                },
+                Some((idx, e)) => Reply::MountManifest {
+                    id,
+                    ok: false,
+                    failed_index: Some(idx),
+                    error: Some(e),
+                },
+            };
+            state.send_to_client(client_fd, &Frame::Reply(reply), None);
+        }
     }
+}
+
+/// Mount a single [`MountEntry`] inside the guest. Creates the target
+/// directory if missing. Currently supports virtiofs only; future variants
+/// can be added as new [`FsType`] arms.
+fn mount_manifest_entry(entry: &tokimo_package_sandbox::protocol::types::MountEntry) -> Result<(), ErrorReply> {
+    // Ensure the mount point exists.
+    if let Err(e) = std::fs::create_dir_all(&entry.target) {
+        return Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("mkdir {}: {e}", entry.target),
+        ));
+    }
+    let src = std::ffi::CString::new(entry.source.as_str())
+        .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
+    let tgt = std::ffi::CString::new(entry.target.as_str())
+        .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
+    let (fstype, mut flags) = match entry.fs_type {
+        FsType::Virtiofs => {
+            let fstype = std::ffi::CString::new("virtiofs").expect("static cstr");
+            let flags: libc::c_ulong = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
+            (fstype, flags)
+        }
+    };
+    if entry.read_only {
+        flags |= libc::MS_RDONLY as libc::c_ulong;
+    }
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    if rc != 0 {
+        return Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!(
+                "mount {} -> {} ({:?}): {}",
+                entry.source,
+                entry.target,
+                entry.fs_type,
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn ack(state: &State, client_fd: RawFd, id: String, res: Result<(), ErrorReply>) {
@@ -1126,5 +1200,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::RemoveUser { .. } => "RemoveUser",
         Op::BindMount { .. } => "BindMount",
         Op::Unmount { .. } => "Unmount",
+        Op::MountManifest { .. } => "MountManifest",
     }
 }

@@ -38,8 +38,9 @@ use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 
 use super::vz::{DEFAULT_CPUS, DEFAULT_MEMORY_MB, find_initrd, find_kernel, find_rootfs};
-use crate::config::{NetworkPolicy, SandboxConfig};
+use crate::config::{Mount, NetworkPolicy, SandboxConfig};
 use crate::host::net_observer::{self, ProxyConfig, ProxyHandle};
+use crate::protocol::types::{FsType, MountEntry};
 use crate::session::ShellHandle;
 use crate::{Error, Result};
 
@@ -104,6 +105,20 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
     let rootfs_s = rootfs_path.to_string_lossy().into_owned();
     let rootfs_keep = rootfs_path.clone();
 
+    // Snapshot extra_mounts: moved into the async block, also kept on the
+    // host side for sending the post-Hello MountManifest.
+    let mount_specs: Vec<Mount> = cfg.extra_mounts.clone();
+    let manifest_entries: Vec<MountEntry> = mount_specs
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| MountEntry {
+            source: format!("s{idx}"),
+            target: m.guest.as_ref().unwrap_or(&m.host).to_string_lossy().into_owned(),
+            fs_type: FsType::Virtiofs,
+            read_only: m.read_only,
+        })
+        .collect();
+
     // Boot VM and establish VSOCK connection.
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -128,6 +143,28 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
             .map_err(|e| Error::exec(format!("VirtioFileSystemDevice: {e}")))?;
         fs_config.set_share(single_share);
 
+        // Build per-mount virtiofs devices. Tag = "s{idx}" (0..N). The
+        // matching `MountManifest` is sent post-Hello so init mounts each at
+        // its requested guest path. We canonicalize each mount.host up front
+        // so the SharedDirectory pin is the resolved path.
+        let mut extra_share_configs = Vec::with_capacity(mount_specs.len());
+        for (idx, m) in mount_specs.iter().enumerate() {
+            let host = m
+                .host
+                .canonicalize()
+                .map_err(|e| Error::exec(format!("canonicalize {}: {e}", m.host.display())))?;
+            let host_s = host.to_string_lossy().into_owned();
+            let tag = format!("s{idx}");
+            let dir = SharedDirectory::new(&host_s, m.read_only)
+                .map_err(|e| Error::exec(format!("SharedDirectory({host_s}): {e}")))?;
+            let single =
+                SingleDirectoryShare::new(dir).map_err(|e| Error::exec(format!("SingleDirectoryShare({tag}): {e}")))?;
+            let mut cfg_dev = VirtioFileSystemDeviceConfiguration::new(&tag)
+                .map_err(|e| Error::exec(format!("VirtioFileSystemDevice({tag}): {e}")))?;
+            cfg_dev.set_share(single);
+            extra_share_configs.push(cfg_dev);
+        }
+
         let serial = SerialPortConfiguration::virtio_console().map_err(|e| Error::exec(format!("SerialPort: {e}")))?;
         let serial_read_fd = serial.read_fd(); // capture before move
 
@@ -141,6 +178,9 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
             .add_socket_device(SocketDeviceConfiguration::new().map_err(|e| Error::exec(format!("Socket: {e}")))?)
             .add_serial_port(serial)
             .add_directory_share(fs_config);
+        for dev in extra_share_configs {
+            config.add_directory_share(dev);
+        }
 
         // Network: only add virtio-net when not fully blocked.
         match cfg.network {
@@ -212,6 +252,15 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
 
         Ok::<_, Error>((vm, client))
     })?;
+
+    // Apply the host-built mount manifest (no-op when there are no
+    // extra_mounts). Each entry corresponds to a virtiofs device added
+    // above with tag `s{idx}`. Sent after the async block so we don't
+    // have to make the async closure `move`.
+    if !manifest_entries.is_empty() {
+        tracing::info!(count = manifest_entries.len(), "sending MountManifest");
+        client.mount_manifest(manifest_entries)?;
+    }
 
     Ok(VzSessionRunner {
         vm,

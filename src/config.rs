@@ -206,6 +206,20 @@ pub struct SandboxConfig {
     pub cwd: Option<PathBuf>,
     /// If true, forward the child's stderr to our stderr in real time.
     pub stream_stderr: bool,
+    /// Caller-provided root filesystem path. Semantics per backend:
+    ///
+    /// * **macOS VZ**: host directory shared via virtiofs as the guest rootfs
+    ///   (mounted by `init.sh` before chroot). Caller is responsible for
+    ///   per-agent isolation (give each agent its own copy).
+    /// * **Windows HCS**: VHDX template path (the host-side service may clone
+    ///   it per-agent).
+    /// * **Linux**: currently unused — may be hooked into [`SystemLayout`]
+    ///   in the future.
+    ///
+    /// `None` falls back to backend-specific defaults (env vars, `work_dir`,
+    /// `~/.tokimo/rootfs`, …). The library does **not** track agent identity
+    /// or perform cloning — that is the caller's responsibility.
+    pub rootfs_dir: Option<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -221,6 +235,7 @@ impl SandboxConfig {
             stdin: None,
             cwd: None,
             stream_stderr: false,
+            rootfs_dir: None,
         }
     }
     pub fn name(mut self, n: impl Into<String>) -> Self {
@@ -237,6 +252,10 @@ impl SandboxConfig {
     }
     pub fn system_layout(mut self, layout: SystemLayout) -> Self {
         self.system_layout = layout;
+        self
+    }
+    pub fn rootfs_dir(mut self, p: impl Into<PathBuf>) -> Self {
+        self.rootfs_dir = Some(p.into());
         self
     }
     pub fn mount(mut self, m: Mount) -> Self {

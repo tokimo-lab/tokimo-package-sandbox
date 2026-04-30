@@ -315,6 +315,15 @@ pub(crate) fn find_initrd() -> Result<PathBuf> {
 }
 
 pub(crate) fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
+    if let Some(p) = &cfg.rootfs_dir {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+        return Err(Error::exec(format!(
+            "SandboxConfig.rootfs_dir={} not found",
+            p.display()
+        )));
+    }
     if let Ok(p) = std::env::var("TOKIMO_VZ_ROOTFS") {
         let pb = PathBuf::from(&p);
         if pb.exists() {
@@ -333,7 +342,7 @@ pub(crate) fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
         return Ok(cfg.work_dir.clone());
     }
     Err(Error::validation(
-        "VZ rootfs not found. Set TOKIMO_VZ_ROOTFS=/path/to/rootfs\n\
+        "VZ rootfs not found. Set SandboxConfig.rootfs_dir or TOKIMO_VZ_ROOTFS=/path/to/rootfs\n\
          Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
     ))
 }

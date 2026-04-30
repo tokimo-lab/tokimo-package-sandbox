@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
+use crate::protocol::types::{Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
 use crate::{Error, Result};
 
@@ -402,6 +402,39 @@ impl VsockInitClient {
         self.ack_op(&id, op)
     }
 
+    /// Send a [`Op::MountManifest`] and wait for the matching reply. Empty
+    /// `entries` is a no-op (skips the round-trip entirely).
+    pub fn mount_manifest(&self, entries: Vec<MountEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let id = next_id(&self.inner.counter);
+        let op = Op::MountManifest {
+            id: id.clone(),
+            entries,
+        };
+        let reply = self.send_op_sync(&id, op, Duration::from_secs(15))?;
+        match reply {
+            Reply::MountManifest {
+                ok,
+                failed_index,
+                error,
+                ..
+            } => {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(Error::exec(format!(
+                        "MountManifest failed at entry {:?}: {:?}",
+                        failed_index,
+                        error.map(|e| e.message),
+                    )))
+                }
+            }
+            other => Err(Error::exec(format!("expected MountManifest reply, got {other:?}"))),
+        }
+    }
+
     // -- Event draining -----------------------------------------------------
 
     pub fn drain_stdout(&self, child_id: &str) -> Vec<Vec<u8>> {
@@ -657,7 +690,9 @@ impl VsockInitClient {
 
 fn reply_id(r: &Reply) -> String {
     match r {
-        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } | Reply::MountManifest { id, .. } => {
+            id.clone()
+        }
     }
 }
 
