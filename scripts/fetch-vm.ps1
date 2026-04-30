@@ -1,11 +1,11 @@
 #!/usr/bin/env pwsh
 # Download VM artifacts (kernel + initrd + rootfs.vhdx) from
-# tokimo-package-rootfs GitHub releases into <repo>/vm/.
+# tokimo-package-sandbox GitHub releases (tag prefix vm-v*) into <repo>/vm/.
 #
 # Usage:
-#   pwsh scripts/fetch-vm.ps1                  # latest release, amd64
-#   pwsh scripts/fetch-vm.ps1 -Tag v1.6.0      # specific tag
-#   pwsh scripts/fetch-vm.ps1 -Arch arm64      # arm64 (less tested)
+#   pwsh scripts/fetch-vm.ps1                       # latest vm-v* release, amd64
+#   pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0        # specific tag
+#   pwsh scripts/fetch-vm.ps1 -Arch arm64           # arm64 (less tested)
 #
 # Layout produced (all read-only at runtime):
 #   vm/vmlinuz        — Linux kernel
@@ -24,9 +24,12 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $vmDir = Join-Path $repoRoot "vm"
 $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 
-$repo = "tokimo-lab/tokimo-package-rootfs"
-# New artifact naming (v1.7.0+): tokimo-linux-<component>-<arch>.<ext>
+$repo = "tokimo-lab/tokimo-package-sandbox"
+# Artifacts are named: tokimo-linux-<component>-<arch>.<ext>
 # arch in the artifact filename is x86_64 / arm64.
+# Tag prefix is "vm-v*" (vm-image.yml releases). Pre-vm-v1.9.0 the tag prefix
+# was "v*" on tokimo-package-rootfs — switch your -Tag accordingly when
+# pinning to old versions.
 $archName = if ($Arch -eq "amd64") { "x86_64" } else { "arm64" }
 $kernelAsset = "tokimo-linux-kernel-$archName.tar.zst"
 $vhdxAsset   = "tokimo-linux-rootfs-$archName.vhdx.zip"

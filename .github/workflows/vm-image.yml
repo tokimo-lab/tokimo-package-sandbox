@@ -1,0 +1,195 @@
+name: vm-image
+
+# Fast path — combines the latest vm-base-v* release with a freshly-built
+# tokimo-sandbox-init binary (from this repo) into the user-facing vm-v*
+# release. No debootstrap, no docker — just `cargo build` + cpio repack.
+#
+# Trigger:
+#   * push tag vm-v*               → release using vm-base "latest"
+#   * workflow_dispatch            → release using the supplied base_tag
+#
+# Wall time target: < 5 min per arch.
+
+on:
+  push:
+    tags: ['vm-v*']
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "vm-base-v* tag to consume (default: latest)"
+        required: false
+        default: "latest"
+      release_tag:
+        description: "Tag to publish (e.g. vm-v1.9.0). Leave empty for dry run."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  rebake:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            suffix: x86_64
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            rust_target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: vm-image-${{ github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools zstd cpio gzip qemu-utils zip
+
+      - name: Build tokimo-sandbox-init (musl static)
+        run: cargo build --release --target ${{ matrix.rust_target }} --bin tokimo-sandbox-init
+
+      - name: Resolve base_tag
+        id: base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          T="${{ github.event.inputs.base_tag }}"
+          [ -z "$T" ] && T=latest
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+          echo "Using vm-base tag: $T"
+
+      - name: Download vm-base release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p base
+          T="${{ steps.base.outputs.tag }}"
+          SFX=${{ matrix.suffix }}
+          if [ "$T" = "latest" ]; then
+            gh release download --repo ${{ github.repository }} \
+              --pattern "tokimo-linux-kernel-${SFX}.tar.zst" \
+              --pattern "tokimo-linux-rootfs-${SFX}.tar.zst" \
+              --pattern "tokimo-linux-rootfs-${SFX}.vhdx.zip" \
+              --dir base || true
+            # gh's "latest" picks the most recent non-prerelease; we want the
+            # most recent vm-base-v* specifically.
+            if [ ! -f "base/tokimo-linux-kernel-${SFX}.tar.zst" ]; then
+              T=$(gh release list --repo ${{ github.repository }} --limit 50 \
+                | awk '{print $3}' | grep '^vm-base-v' | head -1)
+              echo "Resolved latest vm-base tag: $T"
+              echo "tag=$T" >> "$GITHUB_OUTPUT"
+              gh release download "$T" --repo ${{ github.repository }} \
+                --pattern "tokimo-linux-kernel-${SFX}.tar.zst" \
+                --pattern "tokimo-linux-rootfs-${SFX}.tar.zst" \
+                --pattern "tokimo-linux-rootfs-${SFX}.vhdx.zip" \
+                --dir base
+            fi
+          else
+            gh release download "$T" --repo ${{ github.repository }} \
+              --pattern "tokimo-linux-kernel-${SFX}.tar.zst" \
+              --pattern "tokimo-linux-rootfs-${SFX}.tar.zst" \
+              --pattern "tokimo-linux-rootfs-${SFX}.vhdx.zip" \
+              --dir base
+          fi
+          ls -lh base/
+
+      - name: Unpack base kernel bundle
+        run: |
+          SFX=${{ matrix.suffix }}
+          mkdir -p work
+          zstd -d "base/tokimo-linux-kernel-${SFX}.tar.zst" -o "work/kernel.tar"
+          tar -xf work/kernel.tar -C work
+          ls -lh work/
+
+      - name: Rebake initrd with tokimo-sandbox-init
+        run: |
+          bash packaging/vm-image/scripts/rebake-initrd.sh \
+            --base     work/initrd.img \
+            --init-bin target/${{ matrix.rust_target }}/release/tokimo-sandbox-init \
+            --out      work/initrd.img.rebaked
+          mv work/initrd.img.rebaked work/initrd.img
+
+      - name: Repackage kernel bundle
+        run: |
+          SFX=${{ matrix.suffix }}
+          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C work vmlinuz initrd.img
+          zstd -10 -T0 "tokimo-linux-kernel-${SFX}.tar" -o "tokimo-linux-kernel-${SFX}.tar.zst"
+          sha256sum "tokimo-linux-kernel-${SFX}.tar.zst" > "tokimo-linux-kernel-${SFX}.tar.zst.sha256"
+          rm "tokimo-linux-kernel-${SFX}.tar"
+
+      - name: Pass-through rootfs.tar.zst
+        run: |
+          SFX=${{ matrix.suffix }}
+          cp "base/tokimo-linux-rootfs-${SFX}.tar.zst" .
+          sha256sum "tokimo-linux-rootfs-${SFX}.tar.zst" > "tokimo-linux-rootfs-${SFX}.tar.zst.sha256"
+
+      - name: Pass-through rootfs.vhdx.zip (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: |
+          SFX=${{ matrix.suffix }}
+          cp "base/tokimo-linux-rootfs-${SFX}.vhdx.zip" .
+          sha256sum "tokimo-linux-rootfs-${SFX}.vhdx.zip" > "tokimo-linux-rootfs-${SFX}.vhdx.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-image-${{ matrix.suffix }}
+          path: |
+            tokimo-linux-rootfs-${{ matrix.suffix }}.tar.zst*
+            tokimo-linux-kernel-${{ matrix.suffix }}.tar.zst*
+            tokimo-linux-rootfs-${{ matrix.suffix }}.vhdx.zip*
+
+  release:
+    needs: rebake
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: vm-image-x86_64, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: vm-image-arm64,  path: dist }
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          make_latest: true
+          body: |
+            VM image (kernel + initrd + rootfs) for tokimo-package-sandbox.
+
+            ## Artifacts
+
+            | File | Consumed by |
+            |------|-------------|
+            | `tokimo-linux-rootfs-x86_64.tar.zst` | Linux x86_64 (bwrap) |
+            | `tokimo-linux-rootfs-arm64.tar.zst`  | macOS arm64 (VZ virtiofs) |
+            | `tokimo-linux-rootfs-x86_64.vhdx.zip` | Windows x86_64 (HCS) |
+            | `tokimo-linux-kernel-x86_64.tar.zst` | Windows x86_64 (HCS) |
+            | `tokimo-linux-kernel-arm64.tar.zst`  | macOS arm64 (VZ) |
+
+            Pull via `pwsh scripts/fetch-vm.ps1 -Tag ${{ steps.meta.outputs.tag }}`.
+          files: dist/*
