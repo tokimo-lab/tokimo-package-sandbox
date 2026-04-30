@@ -270,13 +270,13 @@ pub(crate) fn find_kernel() -> Result<PathBuf> {
             return Ok(pb);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &["vmlinuz", "bzImage", "kernel"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for name in &["vmlinuz", "bzImage", "kernel"] {
+            let pb = dir.join(name);
+            if pb.exists() {
+                return Ok(pb);
             }
         }
     }
@@ -299,13 +299,13 @@ pub(crate) fn find_initrd() -> Result<PathBuf> {
             return Ok(pb);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &["initrd.img", "initramfs.cpio.gz", "initrd"] {
-                let pb = dir.join(name);
-                if pb.exists() {
-                    return Ok(pb);
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        for name in &["initrd.img", "initramfs.cpio.gz", "initrd"] {
+            let pb = dir.join(name);
+            if pb.exists() {
+                return Ok(pb);
             }
         }
     }

@@ -83,10 +83,11 @@ fn find_vm_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CARGO_MANIFEST_DIR") {
         roots.push(PathBuf::from(p));
     }
-    if let Ok(p) = std::env::current_exe() {
-        if let Some(parent) = p.parent() {
-            roots.push(parent.to_path_buf());
-        }
+    if let Some(parent) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        roots.push(parent);
     }
     for root in roots {
         let mut cur: Option<&std::path::Path> = Some(&root);
@@ -432,10 +433,10 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
             if path.file_name().map(|n| n == name).unwrap_or(false) {
                 return Some(path);
             }
-            if path.is_dir() {
-                if let Some(f) = find_file(&path, name) {
-                    return Some(f);
-                }
+            if path.is_dir()
+                && let Some(f) = find_file(&path, name)
+            {
+                return Some(f);
             }
         }
     }
