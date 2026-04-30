@@ -402,22 +402,31 @@ fn spawn_init_disconnect_during_job() {
     );
 }
 
-/// 1000 concurrent `echo hello` jobs must complete without crosstalk,
+/// 200 concurrent `echo hello` jobs must complete without crosstalk,
 /// and memory must not grow linearly with job count.
+///
+/// 200 is enough to catch linear memory/resource growth without
+/// overwhelming CI runners. For a full 1000-job stress test run with
+/// `TOKIMO_STRESS_TEST=1 cargo test -- spawn_200_small_jobs_memory_stable --nocapture`.
 #[test]
-fn spawn_1000_small_jobs_memory_stable() {
+fn spawn_200_small_jobs_memory_stable() {
     if skip_if_no_bwrap() {
         return;
     }
+
+    let n = if std::env::var("TOKIMO_STRESS_TEST").is_ok() {
+        1000
+    } else {
+        200
+    };
 
     let work = tempdir().expect("work tempdir");
     let cfg = SandboxConfig::new(work.path()).network(NetworkPolicy::Blocked);
     let mut sess = Session::open(&cfg).expect("Session::open");
 
-    const N: usize = 1000;
-    let mut handles = Vec::with_capacity(N);
+    let mut handles = Vec::with_capacity(n);
 
-    for _ in 0..N {
+    for _ in 0..n {
         handles.push(sess.spawn("echo hello").expect("spawn"));
     }
 

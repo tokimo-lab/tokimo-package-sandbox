@@ -1080,12 +1080,16 @@ pub fn spawn_init(cfg: &SandboxConfig) -> Result<SpawnedInit> {
         })
         .map_err(|e| Error::exec(format!("spawn sandbox-init-spawner thread: {e}")))?;
 
-    let child = result_rx
+    let mut child = result_rx
         .recv()
         .map_err(|e| Error::exec(format!("recv child from spawner thread: {e}")))?
         .map_err(|e| Error::exec(format!("spawn bwrap init failed: {e}")))?;
     let child_pid = child.id() as i32;
     let _ = keepalive.finalize_l4(child_pid)?;
+
+    // Drain stderr in a background thread so debug eprintln! from init can't
+    // fill the pipe buffer and block the single-threaded event loop.
+    spawn_stderr_drain(&mut child);
 
     let guard = SessionSpawnerGuard {
         _stop: stop_tx,
@@ -1096,6 +1100,28 @@ pub fn spawn_init(cfg: &SandboxConfig) -> Result<SpawnedInit> {
         host_control_dir,
         keepalive: Box::new((keepalive, guard)),
     })
+}
+
+/// Spawn a background thread that drains `child.stderr` to /dev/null.
+/// Without this, debug output from init fills the 64 KB pipe buffer and
+/// blocks the single-threaded event loop (write() on fd 2 hangs).
+fn spawn_stderr_drain(child: &mut std::process::Child) {
+    if let Some(stderr) = child.stderr.take() {
+        use std::io::Read;
+        std::thread::Builder::new()
+            .name("tps-init-stderr-drain".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut s = stderr;
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .ok();
+    }
 }
 
 /// Like [`spawn_init`] but without bwrap-level seccomp. Instead init
@@ -1164,12 +1190,14 @@ pub fn spawn_init_workspace(cfg: &SandboxConfig) -> Result<SpawnedInit> {
         })
         .map_err(|e| Error::exec(format!("spawn sandbox-init-spawner thread: {e}")))?;
 
-    let child = result_rx
+    let mut child = result_rx
         .recv()
         .map_err(|e| Error::exec(format!("recv child from spawner thread: {e}")))?
         .map_err(|e| Error::exec(format!("spawn bwrap init failed: {e}")))?;
     let child_pid = child.id() as i32;
     let _ = keepalive.finalize_l4(child_pid)?;
+
+    spawn_stderr_drain(&mut child);
 
     let guard = SessionSpawnerGuard {
         _stop: stop_tx,
