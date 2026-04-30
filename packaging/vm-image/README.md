@@ -7,10 +7,9 @@ image consumed by tokimo-package-sandbox at runtime:
 * **macOS VZ** (arm64) — `vmlinuz` + `initrd.img` + `rootfs.tar.zst`
 * **Linux bwrap** — `rootfs.tar.zst` (chroot template)
 
-The contents migrated here from the now-archived
-[tokimo-lab/tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs)
-repository so that the `tokimo-sandbox-init` source and the image that bakes
-it are versioned together.
+The `tokimo-sandbox-init` source (in `src/bin/tokimo-sandbox-init/`) and the
+image that bakes it are versioned together in this repo, so a single tag pins
+both halves.
 
 ## Layout
 

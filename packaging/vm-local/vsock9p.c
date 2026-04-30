@@ -1,6 +1,6 @@
 /*
  * vsock9p — minimal vsock-based 9p mount helper for Windows HCS.
- * Vendored from tokimo-lab/tokimo-package-rootfs.
+ * Local-dev copy. The authoritative copy is packaging/vm-image/vsock9p.c.
  *
  * Usage: vsock9p <target_dir> <port> <aname>
  *

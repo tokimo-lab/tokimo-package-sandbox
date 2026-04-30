@@ -334,6 +334,6 @@ pub(crate) fn find_rootfs(cfg: &SandboxConfig) -> Result<PathBuf> {
     }
     Err(Error::validation(
         "VZ rootfs not found. Set TOKIMO_VZ_ROOTFS=/path/to/rootfs\n\
-         Download: https://github.com/tokimo-lab/tokimo-package-rootfs/releases",
+         Download: https://github.com/tokimo-lab/tokimo-package-sandbox/releases (tag vm-v*)",
     ))
 }

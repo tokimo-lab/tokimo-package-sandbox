@@ -148,7 +148,7 @@ pub fn skip_unless_platform_ready() -> bool {
                 "SKIP: Windows sandbox artifacts missing. \
                  Place vmlinuz / initrd.img / rootfs.vhdx in <repo>/vm/. \
                  Run `pwsh scripts/fetch-vm.ps1` to download from \
-                 tokimo-package-rootfs GitHub releases."
+                 this repo's vm-v* GitHub releases."
             );
             return true;
         }

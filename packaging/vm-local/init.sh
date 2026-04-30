@@ -1,6 +1,7 @@
 #!/bin/busybox sh
 # tokimo-sandbox initrd init (PID 1)
-# Vendored from tokimo-lab/tokimo-package-rootfs.
+# Local-dev copy. The authoritative copy is packaging/vm-image/init.sh — keep
+# them in sync until the local-dev flow is consolidated.
 
 set -e
 

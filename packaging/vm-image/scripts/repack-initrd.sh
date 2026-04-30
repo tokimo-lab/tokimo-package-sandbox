@@ -5,12 +5,12 @@
 # Usage (inside WSL):
 #   bash scripts/repack-initrd.sh
 #
-# Output:
-#   /mnt/f/tokimo-package-rootfs/initrd-new.img
-#   /mnt/f/tokimo-package-rootfs/tokimo-os-amd64/initrd.img  (overwritten)
+# Output (paths assume a local dev checkout at /mnt/f/tokimo-package-sandbox):
+#   /mnt/f/tokimo-package-sandbox/initrd-new.img
+#   /mnt/f/tokimo-package-sandbox/packaging/vm-image/tokimo-os-amd64/initrd.img  (overwritten)
 set -euo pipefail
 
-ROOTFS_PROJ=/mnt/f/tokimo-package-rootfs
+ROOTFS_PROJ=/mnt/f/tokimo-package-sandbox/packaging/vm-image
 PREP="$ROOTFS_PROJ/initrd-prep"
 FINAL="$ROOTFS_PROJ/tokimo-os-amd64/initrd.img"
 OUT=/tmp/tokimo-initrd.img

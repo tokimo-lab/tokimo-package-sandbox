@@ -27,9 +27,7 @@ $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 $repo = "tokimo-lab/tokimo-package-sandbox"
 # Artifacts are named: tokimo-linux-<component>-<arch>.<ext>
 # arch in the artifact filename is x86_64 / arm64.
-# Tag prefix is "vm-v*" (vm-image.yml releases). Pre-vm-v1.9.0 the tag prefix
-# was "v*" on tokimo-package-rootfs — switch your -Tag accordingly when
-# pinning to old versions.
+# Tag prefix is "vm-v*" (produced by .github/workflows/vm-image.yml).
 $archName = if ($Arch -eq "amd64") { "x86_64" } else { "arm64" }
 $kernelAsset = "tokimo-linux-kernel-$archName.tar.zst"
 $vhdxAsset   = "tokimo-linux-rootfs-$archName.vhdx.zip"
