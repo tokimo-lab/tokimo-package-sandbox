@@ -48,23 +48,56 @@ pub enum SvcRequest {
         network: SvcNetwork,
     },
 
-    /// Boot a Linux VM in **session** mode. After the response
-    /// (`SessionOpened`) the client pipe enters tunnel mode: every byte
-    /// written by the client is forwarded raw to the guest's COM1 (which
-    /// is the data channel for `tokimo-sandbox-init`'s init protocol),
-    /// and every byte the guest writes to COM1 is forwarded back to the
-    /// client. The VM is torn down when the client pipe disconnects.
+    /// Boot a Linux VM in **session** mode.
+    ///
+    /// V2 (`protocol_version = 2`): the caller provides:
+    ///   - `rootfs`: ephemeral or persistent rootfs VHDX policy
+    ///   - `shares`: ordered list of host directories to expose as
+    ///     Plan9-over-vsock shares; the first share is conventionally the
+    ///     primary workspace mounted at `/mnt/work`.
+    ///
+    /// On success the service replies `SessionOpened { init_port,
+    /// share_ports }`, then the named pipe enters tunnel mode and forwards
+    /// raw bytes between the client and the guest's init control HvSocket.
+    /// The guest dials each `share_ports[i]` itself in response to a
+    /// `MountManifest` op carried over the init protocol.
     OpenSession {
         id: String,
+        protocol_version: u32,
         kernel_path: String,
         initrd_path: String,
-        rootfs_dir: String,
-        workspace_path: String,
+        rootfs: RootfsSpec,
+        shares: Vec<ShareSpec>,
         memory_mb: u64,
         cpu_count: usize,
         #[serde(default = "default_network")]
         network: SvcNetwork,
     },
+}
+
+/// Wire protocol version negotiated at `OpenSession` time. Bumped on
+/// breaking changes to the V2 schema.
+pub const WIRE_PROTOCOL_VERSION: u32 = 2;
+
+/// Caller-controlled rootfs policy. Persistent rootfs lets a single
+/// caller-owned VHDX file survive across sessions; ephemeral clones the
+/// template into a per-session temporary that is deleted on teardown.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum RootfsSpec {
+    Ephemeral { template: String },
+    Persistent { template: String, target: String },
+}
+
+/// One Plan9 share to expose to the guest. Each share lands on its own
+/// vsock port (allocated by the service) and the guest mounts it at
+/// `guest_path` after the init `MountManifest` op completes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ShareSpec {
+    pub host_path: String,
+    pub guest_path: String,
+    pub read_only: bool,
+    pub name: String,
 }
 
 fn default_network() -> SvcNetwork {
@@ -97,9 +130,16 @@ pub enum SvcResponse {
         result: ExecVmResult,
     },
     /// Successful response to `OpenSession`. The client pipe is now a
-    /// transparent byte tunnel to/from the guest's COM1 (init protocol).
+    /// transparent byte tunnel to/from the guest's init HvSocket service.
+    /// `init_port` is the vsock port for the init control channel.
+    /// `share_ports[i]` matches `OpenSession.shares[i]`.
     #[serde(rename = "SessionOpened")]
-    SessionOpened { id: String },
+    SessionOpened {
+        id: String,
+        protocol_version: u32,
+        init_port: u32,
+        share_ports: Vec<u32>,
+    },
     #[serde(rename = "Error")]
     Error { id: String, error: SvcError },
 }
@@ -195,6 +235,84 @@ mod tests {
         match parsed {
             SvcRequest::ExecVm { network, .. } => assert_eq!(network, SvcNetwork::Blocked),
             _ => panic!("expected ExecVm"),
+        }
+    }
+
+    #[test]
+    fn test_open_session_v2_roundtrip() {
+        let req = SvcRequest::OpenSession {
+            id: "sess-1".into(),
+            protocol_version: WIRE_PROTOCOL_VERSION,
+            kernel_path: r"C:\vmlinuz".into(),
+            initrd_path: r"C:\initrd.img".into(),
+            rootfs: RootfsSpec::Ephemeral {
+                template: r"C:\rootfs.vhdx".into(),
+            },
+            shares: vec![
+                ShareSpec {
+                    host_path: r"C:\work".into(),
+                    guest_path: "/mnt/work".into(),
+                    read_only: false,
+                    name: "s0".into(),
+                },
+                ShareSpec {
+                    host_path: r"C:\readonly".into(),
+                    guest_path: "/mnt/ro".into(),
+                    read_only: true,
+                    name: "s1".into(),
+                },
+            ],
+            memory_mb: 2048,
+            cpu_count: 2,
+            network: SvcNetwork::Blocked,
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let parsed: SvcRequest = serde_json::from_slice(&json).unwrap();
+        match parsed {
+            SvcRequest::OpenSession {
+                shares,
+                rootfs,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, 2);
+                assert_eq!(shares.len(), 2);
+                assert!(matches!(rootfs, RootfsSpec::Ephemeral { .. }));
+                assert!(shares[1].read_only);
+            }
+            _ => panic!("expected OpenSession"),
+        }
+    }
+
+    #[test]
+    fn test_persistent_rootfs_serde() {
+        let s = RootfsSpec::Persistent {
+            template: r"C:\template.vhdx".into(),
+            target: r"C:\caller\rootfs.vhdx".into(),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        let p: RootfsSpec = serde_json::from_str(&j).unwrap();
+        assert_eq!(s, p);
+    }
+
+    #[test]
+    fn test_session_opened_v2() {
+        let r = SvcResponse::SessionOpened {
+            id: "x".into(),
+            protocol_version: WIRE_PROTOCOL_VERSION,
+            init_port: 0x4000_0001,
+            share_ports: vec![0x4100_0001, 0x4100_0002],
+        };
+        let j = serde_json::to_vec(&r).unwrap();
+        let p: SvcResponse = serde_json::from_slice(&j).unwrap();
+        match p {
+            SvcResponse::SessionOpened {
+                share_ports, init_port, ..
+            } => {
+                assert_eq!(init_port, 0x4000_0001);
+                assert_eq!(share_ports.len(), 2);
+            }
+            _ => panic!(),
         }
     }
 

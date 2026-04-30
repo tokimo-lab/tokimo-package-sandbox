@@ -19,7 +19,7 @@ use nix::sys::socket::{SockFlag, accept4};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::protocol::types::{
-    ErrorCode, ErrorReply, Event, Frame, FsType, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode,
+    ErrorCode, ErrorReply, Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode,
     default_features,
 };
 use tokimo_package_sandbox::protocol::wire::encode_frame;
@@ -91,6 +91,10 @@ pub struct State {
     pub client_slots: Vec<Option<RawFd>>,
     /// If true the listener is VSOCK (stream framing); else Unix SEQPACKET.
     pub transport: Transport,
+    /// 9p-over-vsock fds kept alive for the lifetime of the session;
+    /// dropping them would tear down the share.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub mount_fds: Vec<OwnedFd>,
 }
 
 impl State {
@@ -152,6 +156,7 @@ pub fn run_loop(
         clients: HashMap::new(),
         client_slots: Vec::new(),
         transport,
+        mount_fds: Vec::new(),
     };
     let mut shutdown = false;
 
@@ -857,74 +862,34 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             ack(state, client_fd, id, res);
         }
         Op::MountManifest { id, entries } => {
-            let mut failed: Option<(usize, ErrorReply)> = None;
-            for (idx, entry) in entries.iter().enumerate() {
-                if let Err(e) = mount_manifest_entry(entry) {
-                    failed = Some((idx, e));
-                    break;
-                }
-            }
-            let reply = match failed {
-                None => Reply::MountManifest {
-                    id,
-                    ok: true,
-                    failed_index: None,
-                    error: None,
-                },
-                Some((idx, e)) => Reply::MountManifest {
-                    id,
-                    ok: false,
-                    failed_index: Some(idx),
-                    error: Some(e),
-                },
-            };
-            state.send_to_client(client_fd, &Frame::Reply(reply), None);
+            handle_mount_manifest(state, client_fd, id, entries);
         }
     }
 }
 
-/// Mount a single [`MountEntry`] inside the guest. Creates the target
-/// directory if missing. Currently supports virtiofs only; future variants
-/// can be added as new [`FsType`] arms.
-fn mount_manifest_entry(entry: &tokimo_package_sandbox::protocol::types::MountEntry) -> Result<(), ErrorReply> {
-    // Ensure the mount point exists.
-    if let Err(e) = std::fs::create_dir_all(&entry.target) {
-        return Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("mkdir {}: {e}", entry.target),
-        ));
+/// Mount a single virtiofs [`MountEntry`] inside the guest. Creates the
+/// target directory if missing.
+fn mount_virtiofs_entry(source: &str, target: &str, read_only: bool) -> Result<(), ErrorReply> {
+    if let Err(e) = std::fs::create_dir_all(target) {
+        return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {}: {e}", target)));
     }
-    let src = std::ffi::CString::new(entry.source.as_str())
-        .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
-    let tgt = std::ffi::CString::new(entry.target.as_str())
-        .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
-    let (fstype, mut flags) = match entry.fs_type {
-        FsType::Virtiofs => {
-            let fstype = std::ffi::CString::new("virtiofs").expect("static cstr");
-            let flags: libc::c_ulong = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
-            (fstype, flags)
-        }
-    };
-    if entry.read_only {
+    let src =
+        std::ffi::CString::new(source).map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
+    let tgt =
+        std::ffi::CString::new(target).map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
+    let fstype = std::ffi::CString::new("virtiofs").expect("static cstr");
+    let mut flags: libc::c_ulong = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
+    if read_only {
         flags |= libc::MS_RDONLY as libc::c_ulong;
     }
-    let rc = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            tgt.as_ptr(),
-            fstype.as_ptr(),
-            flags,
-            std::ptr::null::<libc::c_void>(),
-        )
-    };
+    let rc = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fstype.as_ptr(), flags, std::ptr::null()) };
     if rc != 0 {
         return Err(ErrorReply::new(
             ErrorCode::Internal,
             format!(
-                "mount {} -> {} ({:?}): {}",
-                entry.source,
-                entry.target,
-                entry.fs_type,
+                "mount {} -> {} (virtiofs): {}",
+                source,
+                target,
                 std::io::Error::last_os_error()
             ),
         ));
@@ -946,6 +911,157 @@ fn ack(state: &State, client_fd: RawFd, id: String, res: Result<(), ErrorReply>)
         },
     };
     state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+/// Handle `MountManifest`: mount each entry according to its type.
+///
+/// * **Virtiofs** (macOS): `mount(2)` directly — the virtiofs device is
+///   already wired up by the host VZ backend.
+/// * **Plan9** (Windows): dial each share's vsock port from the guest,
+///   mount the fd as 9p2000.L, and stash the fd in `state.mount_fds` so
+///   the kernel keeps the channel open.
+///
+/// On partial failure the failed index is reported and partial mounts are
+/// left in place (caller tears the session down).
+#[cfg(target_os = "linux")]
+fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, entries: Vec<MountEntry>) {
+    let mut failed_index: Option<usize> = None;
+    let mut error: Option<ErrorReply> = None;
+
+    for (i, entry) in entries.iter().enumerate() {
+        let result = match entry {
+            MountEntry::Virtiofs {
+                source,
+                target,
+                read_only,
+            } => mount_virtiofs_entry(source, target, *read_only).map(|()| None),
+            MountEntry::Plan9 {
+                vsock_port,
+                guest_path,
+                aname,
+                read_only,
+            } => mount_plan9_entry(*vsock_port, guest_path, aname, *read_only).map(Some),
+        };
+        match result {
+            Ok(maybe_fd) => {
+                if let Some(fd) = maybe_fd {
+                    state.mount_fds.push(fd);
+                }
+            }
+            Err(e) => {
+                failed_index = Some(i);
+                error = Some(e);
+                break;
+            }
+        }
+    }
+
+    let reply = Reply::MountManifest {
+        id,
+        ok: error.is_none(),
+        failed_index,
+        error,
+    };
+    state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, entries: Vec<MountEntry>) {
+    // Non-Linux guests only support virtiofs (macOS VZ path).
+    let mut failed_index: Option<usize> = None;
+    let mut error: Option<ErrorReply> = None;
+
+    for (i, entry) in entries.iter().enumerate() {
+        let result = match entry {
+            MountEntry::Virtiofs {
+                source,
+                target,
+                read_only,
+            } => mount_virtiofs_entry(source, target, *read_only),
+            MountEntry::Plan9 { .. } => Err(ErrorReply::new(ErrorCode::Internal, "Plan9 mounts are Linux-only")),
+        };
+        if let Err(e) = result {
+            failed_index = Some(i);
+            error = Some(e);
+            break;
+        }
+    }
+
+    let reply = Reply::MountManifest {
+        id,
+        ok: error.is_none(),
+        failed_index,
+        error,
+    };
+    state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+/// Dial a Plan9-over-vsock share and mount it as 9p at `guest_path`.
+/// Returns the vsock fd (must be kept alive for the kernel 9p transport).
+#[cfg(target_os = "linux")]
+fn mount_plan9_entry(vsock_port: u32, guest_path: &str, aname: &str, read_only: bool) -> Result<OwnedFd, ErrorReply> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
+    use std::time::{Duration, Instant};
+
+    // Blocking AF_VSOCK dial — unlike `connect_vsock` in main.rs we do NOT
+    // toggle O_NONBLOCK afterwards because the 9p kernel fs uses the fd
+    // synchronously and would not appreciate EAGAIN on every transaction.
+    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, vsock_port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let fd: OwnedFd = loop {
+        let f = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("socket(AF_VSOCK): {e}")))?;
+        match connect(f.as_raw_fd(), &addr) {
+            Ok(()) => break f,
+            Err(e) => {
+                drop(f);
+                if Instant::now() >= deadline {
+                    return Err(ErrorReply::new(
+                        ErrorCode::Internal,
+                        format!("connect VSOCK port {}: {e}", vsock_port),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    std::fs::create_dir_all(guest_path)
+        .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("mkdir {}: {e}", guest_path)))?;
+
+    let mut flags: libc::c_ulong = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
+    if read_only {
+        flags |= libc::MS_RDONLY as libc::c_ulong;
+    }
+    let raw = fd.as_raw_fd();
+    let data = format!("trans=fd,rfdno={raw},wfdno={raw},msize=262144,aname={aname},cache=mmap,version=9p2000.L");
+
+    mount_fs("nodev", guest_path, "9p", flags, &data).map_err(|msg| ErrorReply::new(ErrorCode::Internal, msg))?;
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> Result<(), String> {
+    let src = std::ffi::CString::new(source).map_err(|e| format!("source CString: {e}"))?;
+    let tgt = std::ffi::CString::new(target).map_err(|e| format!("target CString: {e}"))?;
+    let fst = std::ffi::CString::new(fstype).map_err(|e| format!("fstype CString: {e}"))?;
+    let dat = std::ffi::CString::new(data).map_err(|e| format!("data CString: {e}"))?;
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            flags,
+            dat.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "mount {source} on {target}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

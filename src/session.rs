@@ -717,11 +717,11 @@ impl JobOutput for FileJobOutput {
         let (lock, cv) = &*self.state;
         let mut guard = lock.lock().map_err(|_| Error::exec("session state poisoned"))?;
         let exit_code = loop {
-            if let Some(slot) = guard.completed.get(&self.id) {
-                if slot.job_done {
-                    let slot = guard.completed.remove(&self.id).unwrap();
-                    break slot.exit_code;
-                }
+            if let Some(slot) = guard.completed.get(&self.id)
+                && slot.job_done
+            {
+                let slot = guard.completed.remove(&self.id).unwrap();
+                break slot.exit_code;
             }
             if guard.early_eof {
                 return Err(Error::exec("session shell exited before background job completed"));
@@ -1000,12 +1000,12 @@ pub(crate) fn shell_handle_from_child(
             }
         }),
         kill: Box::new(move || {
-            if let Ok(mut g) = kill_child.lock() {
-                if let Some(c) = g.as_mut() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    *g = None;
-                }
+            if let Ok(mut g) = kill_child.lock()
+                && let Some(c) = g.as_mut()
+            {
+                let _ = c.kill();
+                let _ = c.wait();
+                *g = None;
             }
         }),
         keepalive: Box::new((child.clone(), keepalive)),
@@ -1015,10 +1015,10 @@ pub(crate) fn shell_handle_from_child(
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         kill_spawn: None,
         shell_exit_code: Box::new(move || {
-            if let Ok(mut g) = child.lock() {
-                if let Some(c) = g.as_mut() {
-                    return c.try_wait().ok().flatten().and_then(|s| s.code());
-                }
+            if let Ok(mut g) = child.lock()
+                && let Some(c) = g.as_mut()
+            {
+                return c.try_wait().ok().flatten().and_then(|s| s.code());
             }
             None
         }),

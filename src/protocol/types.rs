@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 /// Current protocol revision. Bumped on any breaking change to op / event
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
 ///
-/// v2: added [`Op::MountManifest`] / [`Reply::MountManifest`] / [`FsType`]
-///     for macOS multi-mount support.
+/// v2: added [`Op::MountManifest`] / [`Reply::MountManifest`] / [`MountEntry`]
+///     for multi-mount support (macOS virtiofs, Windows Plan9).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
@@ -139,33 +139,35 @@ pub enum Op {
     /// Unmount a previously bind-mounted path.
     Unmount { id: String, target: String },
     /// Mount a batch of host-provided shares into the guest at boot time.
-    /// Currently used by macOS VZ (virtiofs tag-based shares) for multi-mount
-    /// support equivalent to Linux `extra_mounts`. The host side wires up
-    /// each share as a virtiofs device with a unique tag (`source`) and asks
-    /// init to mount each at the requested `target`.
+    /// Supported variants: macOS VZ (virtiofs tag-based), Windows Plan9
+    /// (vsock fd-based). Linux bwrap mounts the workspace itself, so hosts
+    /// on that platform simply omit this op.
     MountManifest { id: String, entries: Vec<MountEntry> },
 }
 
-/// Filesystem type for a [`MountEntry`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FsType {
-    /// VZ virtiofs share. `source` is the device tag set on the host
+/// One entry in [`Op::MountManifest`]. Tagged by filesystem type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "fs")]
+pub enum MountEntry {
+    /// macOS VZ virtiofs share. `source` is the device tag set on the host
     /// (`VirtioFileSystemDeviceConfiguration::new(<tag>)`), `target` is the
     /// absolute guest path. Init does:
     /// `mount(source, target, "virtiofs", MS_NODEV|MS_NOSUID|<RO?>, NULL)`.
-    Virtiofs,
-}
-
-/// One entry in [`Op::MountManifest`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MountEntry {
-    /// Tag/share name visible to the guest mount call.
-    pub source: String,
-    /// Absolute guest path. Init will `mkdir -p` it before mounting.
-    pub target: String,
-    pub fs_type: FsType,
-    #[serde(default)]
-    pub read_only: bool,
+    Virtiofs {
+        source: String,
+        target: String,
+        #[serde(default)]
+        read_only: bool,
+    },
+    /// Windows Plan9-over-vsock share. Guest dials `vsock_port` on the host,
+    /// mounts the fd as 9p at `guest_path`. `aname` is the Plan9 attach name.
+    Plan9 {
+        vsock_port: u32,
+        guest_path: String,
+        aname: String,
+        #[serde(default)]
+        read_only: bool,
+    },
 }
 
 fn default_true() -> bool {
@@ -206,8 +208,9 @@ pub enum Reply {
         #[serde(default)]
         error: Option<ErrorReply>,
     },
-    /// Reply to [`Op::MountManifest`]. On failure, `failed_index` points at
-    /// the first entry that failed; remaining entries are not attempted.
+    /// Reply to `Op::MountManifest`. On failure `failed_index` points at
+    /// the first entry that could not be mounted; remaining entries are
+    /// not attempted.
     MountManifest {
         id: String,
         ok: bool,

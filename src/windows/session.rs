@@ -51,7 +51,7 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
 
     let kernel = super::find_kernel()?;
     let initrd = super::find_initrd()?;
-    let rootfs_dir = super::find_rootfs_vhdx()?;
+    let rootfs_template = super::find_rootfs_vhdx()?;
     let workspace = super::ensure_workspace(cfg)?;
 
     let memory_mb: u64 = std::env::var("TOKIMO_MEMORY")
@@ -63,12 +63,73 @@ pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<ShellHandle> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CPUS);
 
+    // Build the V2 RootfsSpec from the caller's rootfs_dir choice.
+    let rootfs = match &cfg.rootfs_dir {
+        Some(target) => super::protocol::RootfsSpec::Persistent {
+            template: rootfs_template.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+        },
+        None => super::protocol::RootfsSpec::Ephemeral {
+            template: rootfs_template.to_string_lossy().into_owned(),
+        },
+    };
+
+    // Build the V2 shares list. Slot 0 is always the workspace mounted RW
+    // at /mnt/work. Subsequent slots come from cfg.extra_mounts in order.
+    let mut shares: Vec<super::protocol::ShareSpec> = Vec::with_capacity(1 + cfg.extra_mounts.len());
+    shares.push(super::protocol::ShareSpec {
+        host_path: workspace.to_string_lossy().into_owned(),
+        guest_path: "/mnt/work".into(),
+        read_only: false,
+        name: "s0".into(),
+    });
+    for (i, m) in cfg.extra_mounts.iter().enumerate() {
+        let guest = m
+            .guest
+            .clone()
+            .unwrap_or_else(|| m.host.clone())
+            .to_string_lossy()
+            .into_owned();
+        shares.push(super::protocol::ShareSpec {
+            host_path: m.host.to_string_lossy().into_owned(),
+            guest_path: guest,
+            read_only: m.read_only,
+            // Plan9 share names are limited to a short alnum identifier; the
+            // protocol's `aname` is what the guest mounts so the meaningful
+            // identifier is in `guest_path`. A simple `s<N>` is sufficient.
+            name: format!("s{}", i + 1),
+        });
+    }
+
     // Open service-side session — returns the named pipe that's now a
-    // raw byte tunnel to the guest's COM1 (= init's stdin/stdout).
-    let pipe = client::open_session(&kernel, &initrd, &rootfs_dir, &workspace, memory_mb, cpu_count, network)?;
+    // raw byte tunnel to the guest's init HvSocket service, plus the
+    // per-share vsock ports the guest will dial.
+    let (pipe, _init_port, share_ports) =
+        client::open_session(&kernel, &initrd, rootfs, shares.clone(), memory_mb, cpu_count, network)?;
+
+    if share_ports.len() != shares.len() {
+        return Err(Error::exec(format!(
+            "service returned {} share ports for {} shares",
+            share_ports.len(),
+            shares.len()
+        )));
+    }
 
     let init = WinInitClient::new(pipe)?;
     init.hello()?;
+
+    // Tell the guest to dial each share's vsock port and 9p-mount it.
+    let mount_entries: Vec<crate::protocol::types::MountEntry> = shares
+        .iter()
+        .zip(share_ports.iter())
+        .map(|(s, port)| crate::protocol::types::MountEntry::Plan9 {
+            vsock_port: *port,
+            guest_path: s.guest_path.clone(),
+            aname: s.name.clone(),
+            read_only: s.read_only,
+        })
+        .collect();
+    init.send_mount_manifest(mount_entries)?;
 
     // Build the env overlay.
     let mut env_overlay: Vec<(String, String)> = Vec::new();

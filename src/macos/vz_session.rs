@@ -40,7 +40,7 @@ use mio::{Events, Interest, Poll, Token};
 use super::vz::{DEFAULT_CPUS, DEFAULT_MEMORY_MB, find_initrd, find_kernel, find_rootfs};
 use crate::config::{Mount, NetworkPolicy, SandboxConfig};
 use crate::host::net_observer::{self, ProxyConfig, ProxyHandle};
-use crate::protocol::types::{FsType, MountEntry};
+use crate::protocol::types::MountEntry;
 use crate::session::ShellHandle;
 use crate::{Error, Result};
 
@@ -111,10 +111,9 @@ pub(crate) fn boot_session_vm(cfg: &SandboxConfig) -> Result<VzSessionRunner> {
     let manifest_entries: Vec<MountEntry> = mount_specs
         .iter()
         .enumerate()
-        .map(|(idx, m)| MountEntry {
+        .map(|(idx, m)| MountEntry::Virtiofs {
             source: format!("s{idx}"),
             target: m.guest.as_ref().unwrap_or(&m.host).to_string_lossy().into_owned(),
-            fs_type: FsType::Virtiofs,
             read_only: m.read_only,
         })
         .collect();

@@ -211,8 +211,13 @@ pub struct SandboxConfig {
     /// * **macOS VZ**: host directory shared via virtiofs as the guest rootfs
     ///   (mounted by `init.sh` before chroot). Caller is responsible for
     ///   per-agent isolation (give each agent its own copy).
-    /// * **Windows HCS**: VHDX template path (the host-side service may clone
-    ///   it per-agent).
+    /// * **Windows HCS**: caller-supplied target VHDX path used as the
+    ///   session rootfs. On first use the file is created by cloning the
+    ///   VM rootfs template; on subsequent uses it is reused, so writes to
+    ///   `/usr`, `/etc`, `/var`, etc. survive across `Session::open` calls.
+    ///   The path is exclusive: a second concurrent `Session::open` for the
+    ///   same target fails with a clear error. `None` = default ephemeral
+    ///   behaviour.
     /// * **Linux**: currently unused — may be hooked into [`SystemLayout`]
     ///   in the future.
     ///
@@ -297,7 +302,6 @@ impl SandboxConfig {
         self.stream_stderr = on;
         self
     }
-
     pub(crate) fn validate(&self) -> crate::Result<()> {
         if !self.work_dir.exists() {
             return Err(crate::Error::validation(format!(

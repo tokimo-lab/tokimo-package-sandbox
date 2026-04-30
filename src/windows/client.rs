@@ -89,20 +89,26 @@ pub(crate) fn is_service_available() -> bool {
     unsafe { WaitNamedPipeW(&name, 500).as_bool() }
 }
 
-/// Open a session VM. Sends `OpenSession`, reads `SessionOpened`, then
-/// returns the underlying pipe `File` — at this point the service has
-/// flipped the pipe into transparent tunnel mode and any further bytes
-/// flow directly to/from the guest's COM1 (the init protocol channel).
+/// Open a session VM. Sends `OpenSession` (V2: `RootfsSpec` + multi
+/// `ShareSpec`), reads `SessionOpened`, then returns:
+///   - the underlying overlapped pipe `OvPipe` — the service has now
+///     flipped it into transparent tunnel mode and any further bytes
+///     flow directly to/from the guest's init HvSocket service;
+///   - the `init_port` the service registered for the init control
+///     channel (informational; encoded in the service GUID);
+///   - `share_ports`, parallel to the input `shares` slice — the guest
+///     will dial these from inside the VM in response to a
+///     `MountManifest` op sent over the init protocol.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_session(
     kernel_path: &Path,
     initrd_path: &Path,
-    rootfs_dir: &Path,
-    workspace_path: &Path,
+    rootfs: super::protocol::RootfsSpec,
+    shares: Vec<super::protocol::ShareSpec>,
     memory_mb: u64,
     cpu_count: usize,
     network: SvcNetwork,
-) -> Result<OvPipe> {
+) -> Result<(OvPipe, u32, Vec<u32>)> {
     let mut pipe = open_pipe().map_err(|e| {
         Error::exec(format!(
             "tokimo-sandbox-svc not reachable on {PIPE_NAME}: {e}. \
@@ -114,10 +120,11 @@ pub(crate) fn open_session(
     let id = format!("svc-{}-{}", std::process::id(), next_req_id());
     let req = SvcRequest::OpenSession {
         id: id.clone(),
+        protocol_version: super::protocol::WIRE_PROTOCOL_VERSION,
         kernel_path: kernel_path.to_string_lossy().into_owned(),
         initrd_path: initrd_path.to_string_lossy().into_owned(),
-        rootfs_dir: rootfs_dir.to_string_lossy().into_owned(),
-        workspace_path: workspace_path.to_string_lossy().into_owned(),
+        rootfs,
+        shares,
         memory_mb,
         cpu_count,
         network,
@@ -127,11 +134,19 @@ pub(crate) fn open_session(
     let resp =
         super::protocol::recv_response(&mut pipe).map_err(|e| Error::exec(format!("recv SessionOpened: {e}")))?;
     match resp {
-        SvcResponse::SessionOpened { .. } => Ok(pipe),
-        SvcResponse::Error { error, .. } => Err(Error::exec(format!(
-            "service error [{}]: {}",
-            error.code, error.message
-        ))),
+        SvcResponse::SessionOpened {
+            init_port, share_ports, ..
+        } => Ok((pipe, init_port, share_ports)),
+        SvcResponse::Error { error, .. } => {
+            // Translate well-known structured codes to the typed library error.
+            if error.code == "session_busy" || error.code == "persistent_busy" {
+                return Err(Error::SessionAlreadyActive);
+            }
+            Err(Error::exec(format!(
+                "service error [{}]: {}",
+                error.code, error.message
+            )))
+        }
         other => Err(Error::exec(format!("unexpected response: {other:?}"))),
     }
 }
@@ -157,7 +172,7 @@ fn open_pipe() -> std::io::Result<OvPipe> {
         match unsafe {
             CreateFileW(
                 &name,
-                (GENERIC_READ.0 | GENERIC_WRITE.0) as u32,
+                GENERIC_READ.0 | GENERIC_WRITE.0,
                 FILE_SHARE_NONE,
                 Some(std::ptr::null::<SECURITY_ATTRIBUTES>()),
                 OPEN_EXISTING,
