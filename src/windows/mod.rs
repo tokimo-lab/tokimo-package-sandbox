@@ -202,10 +202,9 @@ fn shell_escape(s: &str) -> String {
 //   * `vm/initrd.img` — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
 //   * `vm/rootfs.vhdx` — ext4 VHDX rootfs
 //
-// Both are produced by the tokimo-package-rootfs CI:
-//   https://github.com/tokimo-lab/tokimo-package-rootfs/releases
-//
-// Use `scripts/fetch-vm.ps1` to download them into `vm/`.
+// All three are produced by `.github/workflows/vm-image.yml` and published
+// under tags with prefix `vm-v*`. Use `scripts/fetch-vm.ps1` to download
+// them into `vm/`.
 //
 // Resolution order — find first directory containing all three files:
 //   1. `<exe>/vm/`

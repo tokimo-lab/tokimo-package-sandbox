@@ -43,7 +43,7 @@ let out = tokimo_package_sandbox::run(&["rm", "-rf", "/"], &cfg)?;
 | Platform | Requirement |
 |---|---|
 | **Linux** | `sudo apt install bubblewrap` (firejail fallback) |
-| **macOS** | Linux kernel + initrd + rootfs from [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) |
+| **macOS** | Linux kernel + initrd + rootfs from this repo's `vm-v*` GitHub releases (built by `.github/workflows/vm-image.yml`) |
 | **Windows** | Enable "Virtual Machine Platform" in Windows Features (Win 10 1903+, all editions). One-time UAC to install the SYSTEM service. |
 
 ## What's inside the sandbox
@@ -61,21 +61,26 @@ All platforms run the same **Debian 13 (Trixie) Linux rootfs** with pre-installe
 | **Network** | curl, wget, dig, ping, rsync, git |
 | **Other** | jq, zstd, bash-completion |
 
-Artifacts are built by [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — a single CI pipeline produces kernel + initrd + rootfs for both macOS and Windows.
+VM artifacts (kernel + initrd + Debian rootfs) are built in-repo by a two-layer
+CI pipeline (`.github/workflows/vm-base.yml` + `vm-image.yml`, see
+[`packaging/vm-image/README.md`](packaging/vm-image/README.md)) and published
+under tags with prefix `vm-v*`. The same release feeds both macOS and Windows.
 
 ## macOS setup
 
 The macOS backend boots a lightweight Linux VM via Virtualization.framework (macOS 11+).
 
 ```bash
-# 1. Download artifacts
-curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/tokimo-os-arm64.tar.zst
-curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/rootfs-arm64.tar.zst
+# 1. Download artifacts (replace x86_64 with arm64 on Apple Silicon? — both are
+#    built; pick whichever matches the host arch you'll boot the guest under)
+BASE=https://github.com/tokimo-lab/tokimo-package-sandbox/releases/latest/download
+curl -LO $BASE/tokimo-linux-kernel-arm64.tar.zst
+curl -LO $BASE/tokimo-linux-rootfs-arm64.tar.zst
 
 # 2. Extract to ~/.tokimo/
-zstd -d tokimo-os-arm64.tar.zst && tar -xpf tokimo-os-arm64.tar -C ~/.tokimo/
+zstd -d tokimo-linux-kernel-arm64.tar.zst && tar -xpf tokimo-linux-kernel-arm64.tar -C ~/.tokimo/
 mkdir -p ~/.tokimo/rootfs
-zstd -d rootfs-arm64.tar.zst && tar -xpf rootfs-arm64.tar -C ~/.tokimo/rootfs/
+zstd -d tokimo-linux-rootfs-arm64.tar.zst && tar -xpf tokimo-linux-rootfs-arm64.tar -C ~/.tokimo/rootfs/
 
 # 3. Sign the binary with virtualization entitlement
 codesign --entitlements vz.entitlements --force -s - target/debug/your-app
@@ -116,13 +121,13 @@ Open **Windows Features** → check **Virtual Machine Platform** → restart.
 
 ### 2. Install VM artifacts
 
-VM artifacts (kernel + initrd + rootfs.vhdx) are built by the sister project
-[tokimo-lab/tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases)
-and downloaded into `<repo>/vm/` via:
+VM artifacts (kernel + initrd + rootfs.vhdx) are produced by the in-repo
+[`vm-image.yml`](.github/workflows/vm-image.yml) workflow and published under
+tags with prefix `vm-v*`. Download into `<repo>/vm/` via:
 
 ```powershell
 pwsh scripts/fetch-vm.ps1                 # latest release
-pwsh scripts/fetch-vm.ps1 -Tag v1.7.1     # specific tag
+pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0  # specific tag
 ```
 
 Expected layout:
@@ -482,7 +487,9 @@ init   → client { "event": "Exit",   "child_id": "c2", "code": 0 }
 
 ## Related
 
-- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — TokimoOS bundle (kernel + initrd + Debian rootfs)
+- [`packaging/vm-image/README.md`](packaging/vm-image/README.md) — how the
+  in-repo Debian rootfs + kernel + initrd are built (two-layer CI cache:
+  `vm-base.yml` slow rebuild, `vm-image.yml` fast init-binary rebake)
 
 ## License
 

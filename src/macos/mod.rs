@@ -1,7 +1,8 @@
 //! macOS sandbox: Virtualization.framework backend.
 //!
 //! Boots a lightweight Linux VM for Linux-grade isolation on macOS.
-//! Requires a Linux kernel + initrd from tokimo-package-rootfs.
+//! Requires a Linux kernel + initrd produced by the in-repo
+//! `.github/workflows/vm-image.yml` (tag prefix `vm-v*`).
 
 #![cfg(target_os = "macos")]
 

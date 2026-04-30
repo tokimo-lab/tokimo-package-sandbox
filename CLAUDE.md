@@ -145,11 +145,11 @@ pwsh ./scripts/build-msix.ps1
 
 ## Windows VM artifacts
 
-Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published by the sister project [tokimo-lab/tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs/releases). Download via:
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm-image.yml` under tags with prefix `vm-v*` (see `packaging/vm-image/README.md` for the build pipeline). Download via:
 
 ```powershell
 pwsh scripts/fetch-vm.ps1                 # latest
-pwsh scripts/fetch-vm.ps1 -Tag v1.7.1     # specific
+pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0  # specific
 ```
 
 `src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**

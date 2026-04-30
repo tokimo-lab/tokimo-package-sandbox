@@ -49,20 +49,21 @@ Linux 上 bwrap 可以直接 mount 宿主机文件系统（`--ro-bind /usr /usr`
 如果你想用预装了完整工具链的 Debian rootfs（含 Node.js、Python、pandoc、ffmpeg 等）：
 
 ```bash
-# 下载预构建 rootfs
-curl -LO https://github.com/tokimo-lab/tokimo-package-rootfs/releases/latest/download/rootfs-amd64.tar.zst
-zstd -d rootfs-amd64.tar.zst
+# 下载预构建 rootfs（本仓库 vm-image.yml 发布，tag 前缀 vm-v*）
+BASE=https://github.com/tokimo-lab/tokimo-package-sandbox/releases/latest/download
+curl -LO $BASE/tokimo-linux-rootfs-x86_64.tar.zst
+zstd -d tokimo-linux-rootfs-x86_64.tar.zst
 
 # 解压到任意目录
 mkdir -p /opt/tokimo/rootfs
-tar -xpf rootfs-amd64.tar -C /opt/tokimo/rootfs/
+tar -xpf tokimo-linux-rootfs-x86_64.tar -C /opt/tokimo/rootfs/
 ```
 
 ### 选项 C：用 Docker 构建自己的 rootfs
 
 ```bash
-git clone https://github.com/tokimo-lab/tokimo-package-rootfs.git
-cd tokimo-package-rootfs
+# 仓库内置构建脚本
+cd packaging/vm-image
 bash build.sh amd64
 # 产出在 ./tokimo-os-amd64/rootfs/
 ```
@@ -162,4 +163,4 @@ sess.close()?;
 
 - [Windows 初始化](./windows.md)
 - [macOS 初始化](./macos.md)
-- [tokimo-package-rootfs](https://github.com/tokimo-lab/tokimo-package-rootfs) — 制品构建
+- [`packaging/vm-image/`](../../packaging/vm-image/) — rootfs / kernel / initrd 构建管线

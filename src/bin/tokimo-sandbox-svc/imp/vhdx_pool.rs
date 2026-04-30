@@ -137,11 +137,24 @@ fn acquire_persistent(template: &Path, target: &Path) -> Result<VhdxLease, PoolE
     // Canonicalize target against parent + filename so that we can lock
     // even before the file exists.
     let canonical = canonicalize_target_path(target)?;
-    {
-        let mut g = registry().lock().expect("vhdx pool registry");
-        if !g.insert(canonical.clone()) {
+    // The previous session's handler tears down the VM and releases the
+    // lease *after* the client-side `close()` returns (terminate +
+    // close_compute_system are blocking on the host, but the tunnel
+    // drain-and-drop happens on a worker thread). Poll briefly so a
+    // legitimate "close → reopen same persistent target" sequence
+    // doesn't trip the busy guard.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let mut g = registry().lock().expect("vhdx pool registry");
+            if g.insert(canonical.clone()) {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(PoolError::Busy(canonical));
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let lease_path = canonical.clone();
     if !lease_path.exists() {

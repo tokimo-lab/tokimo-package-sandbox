@@ -206,7 +206,6 @@ pub fn run_loop(
             return Err(format!("poll: {e}"));
         }
         let n_evs = events.iter().count();
-        eprintln!("[init] poll returned {n_evs} events");
         if n_evs == 0 {
             // Heartbeat: try writing a marker byte to the write fd, and log
             // poll state to kmsg so we can verify whether (a) we're being
