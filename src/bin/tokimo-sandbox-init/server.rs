@@ -19,7 +19,8 @@ use nix::sys::socket::{SockFlag, accept4};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::protocol::types::{
-    ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
+    ErrorCode, ErrorReply, Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode,
+    default_features,
 };
 use tokimo_package_sandbox::protocol::wire::encode_frame;
 use tokimo_package_sandbox::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
@@ -90,6 +91,10 @@ pub struct State {
     pub client_slots: Vec<Option<RawFd>>,
     /// If true the listener is VSOCK (stream framing); else Unix SEQPACKET.
     pub transport: Transport,
+    /// 9p-over-vsock fds kept alive for the lifetime of the session;
+    /// dropping them would tear down the share.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub mount_fds: Vec<OwnedFd>,
 }
 
 impl State {
@@ -151,6 +156,7 @@ pub fn run_loop(
         clients: HashMap::new(),
         client_slots: Vec::new(),
         transport,
+        mount_fds: Vec::new(),
     };
     let mut shutdown = false;
 
@@ -855,6 +861,9 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             })();
             ack(state, client_fd, id, res);
         }
+        Op::MountManifest { id, entries } => {
+            handle_mount_manifest(state, client_fd, id, entries);
+        }
     }
 }
 
@@ -872,6 +881,117 @@ fn ack(state: &State, client_fd: RawFd, id: String, res: Result<(), ErrorReply>)
         },
     };
     state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+/// Handle V2 `MountManifest`: dial each share's vsock port from the guest
+/// (the host has unique AF_HYPERV listeners ready and waiting), mount the
+/// resulting fd as a 9p2000.L share at `entry.guest_path`, and stash the
+/// fd in `state.mount_fds` so the kernel keeps the channel open. The
+/// reply tells the host whether every entry succeeded; on partial
+/// failure the failing index is reported and the partial mounts are
+/// left in place (caller tears the session down).
+#[cfg(target_os = "linux")]
+fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, entries: Vec<MountEntry>) {
+    let mut failing_index: Option<u32> = None;
+    let mut error: Option<ErrorReply> = None;
+
+    for (i, entry) in entries.iter().enumerate() {
+        match mount_one(entry) {
+            Ok(fd) => {
+                state.mount_fds.push(fd);
+            }
+            Err(msg) => {
+                failing_index = Some(i as u32);
+                error = Some(ErrorReply::new(ErrorCode::Internal, msg));
+                break;
+            }
+        }
+    }
+
+    let ok = error.is_none();
+    let reply = Reply::MountManifest {
+        id,
+        ok,
+        failing_index,
+        error,
+    };
+    state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, _entries: Vec<MountEntry>) {
+    let reply = Reply::MountManifest {
+        id,
+        ok: false,
+        failing_index: Some(0),
+        error: Some(ErrorReply::new(ErrorCode::Internal, "MountManifest is Linux-only")),
+    };
+    state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+#[cfg(target_os = "linux")]
+fn mount_one(entry: &MountEntry) -> Result<OwnedFd, String> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
+    use std::time::{Duration, Instant};
+
+    // Blocking AF_VSOCK dial — unlike `connect_vsock` in main.rs we do NOT
+    // toggle O_NONBLOCK afterwards because the 9p kernel fs uses the fd
+    // synchronously and would not appreciate EAGAIN on every transaction.
+    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, entry.vsock_port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let fd: OwnedFd = loop {
+        let f = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+            .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
+        match connect(f.as_raw_fd(), &addr) {
+            Ok(()) => break f,
+            Err(e) => {
+                drop(f);
+                if Instant::now() >= deadline {
+                    return Err(format!("connect VSOCK port {}: {e}", entry.vsock_port));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    std::fs::create_dir_all(&entry.guest_path).map_err(|e| format!("mkdir {}: {e}", entry.guest_path))?;
+
+    let mut flags: libc::c_ulong = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
+    if entry.read_only {
+        flags |= libc::MS_RDONLY as libc::c_ulong;
+    }
+    let raw = fd.as_raw_fd();
+    let data = format!(
+        "trans=fd,rfdno={raw},wfdno={raw},msize=262144,aname={},cache=mmap,version=9p2000.L",
+        entry.aname
+    );
+
+    mount_fs("nodev", &entry.guest_path, "9p", flags, &data)?;
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> Result<(), String> {
+    let src = std::ffi::CString::new(source).map_err(|e| format!("source CString: {e}"))?;
+    let tgt = std::ffi::CString::new(target).map_err(|e| format!("target CString: {e}"))?;
+    let fst = std::ffi::CString::new(fstype).map_err(|e| format!("fstype CString: {e}"))?;
+    let dat = std::ffi::CString::new(data).map_err(|e| format!("data CString: {e}"))?;
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            flags,
+            dat.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "mount {source} on {target}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1126,5 +1246,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::RemoveUser { .. } => "RemoveUser",
         Op::BindMount { .. } => "BindMount",
         Op::Unmount { .. } => "Unmount",
+        Op::MountManifest { .. } => "MountManifest",
     }
 }

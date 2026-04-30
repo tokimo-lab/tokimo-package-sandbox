@@ -206,6 +206,14 @@ pub struct SandboxConfig {
     pub cwd: Option<PathBuf>,
     /// If true, forward the child's stderr to our stderr in real time.
     pub stream_stderr: bool,
+    /// **Windows only** — caller-supplied target VHDX path used as the
+    /// session rootfs. On first use the file is created by cloning the
+    /// VM rootfs template; on subsequent uses it is reused, so writes to
+    /// `/usr`, `/etc`, `/var`, etc. survive across `Session::open` calls
+    /// for that path. The path is exclusive: a second concurrent
+    /// `Session::open` for the same target fails with a clear error.
+    /// `None` = default ephemeral behaviour.
+    pub persistent_rootfs: Option<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -221,6 +229,7 @@ impl SandboxConfig {
             stdin: None,
             cwd: None,
             stream_stderr: false,
+            persistent_rootfs: None,
         }
     }
     pub fn name(mut self, n: impl Into<String>) -> Self {
@@ -276,6 +285,11 @@ impl SandboxConfig {
     }
     pub fn stream_stderr(mut self, on: bool) -> Self {
         self.stream_stderr = on;
+        self
+    }
+    /// **Windows only.** See [`SandboxConfig::persistent_rootfs`].
+    pub fn persistent_rootfs(mut self, p: impl Into<PathBuf>) -> Self {
+        self.persistent_rootfs = Some(p.into());
         self
     }
 

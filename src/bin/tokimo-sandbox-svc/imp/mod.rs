@@ -39,10 +39,13 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use tokimo_package_sandbox::canonicalize_safe;
-use tokimo_package_sandbox::svc_protocol::{ExecVmResult, SvcError, SvcNetwork, SvcRequest, SvcResponse};
+use tokimo_package_sandbox::svc_protocol::{
+    ExecVmResult, RootfsSpec, ShareSpec, SvcError, SvcNetwork, SvcRequest, SvcResponse, WIRE_PROTOCOL_VERSION,
+};
 
 mod hcs;
 mod hvsock;
+mod vhdx_pool;
 mod vmconfig;
 
 // ---------------------------------------------------------------------------
@@ -287,8 +290,8 @@ fn uninstall_service() {
         }
     };
 
-    if let Ok(status) = svc.query_status() {
-        if status.current_state != ServiceState::Stopped {
+    if let Ok(status) = svc.query_status()
+        && status.current_state != ServiceState::Stopped {
             let _ = svc.stop();
             // Wait briefly.
             for _ in 0..30 {
@@ -298,7 +301,6 @@ fn uninstall_service() {
                 }
             }
         }
-    }
 
     if let Err(e) = svc.delete() {
         eprintln!("DeleteService failed: {}", format_ws_error(&e));
@@ -496,10 +498,11 @@ fn handle_client(pipe: HANDLE) {
         }
         SvcRequest::OpenSession {
             id,
+            protocol_version,
             kernel_path,
             initrd_path,
-            rootfs_dir,
-            workspace_path,
+            rootfs,
+            shares,
             memory_mb,
             cpu_count,
             network,
@@ -507,10 +510,11 @@ fn handle_client(pipe: HANDLE) {
             handle_open_session(
                 pipe,
                 id,
+                protocol_version,
                 &kernel_path,
                 &initrd_path,
-                &rootfs_dir,
-                &workspace_path,
+                rootfs,
+                shares,
                 memory_mb,
                 cpu_count,
                 network,
@@ -1069,20 +1073,43 @@ impl EncodeWideExtra for std::ffi::OsStr {
 fn handle_open_session(
     pipe: HANDLE,
     id: String,
+    protocol_version: u32,
     kernel_path: &str,
     initrd_path: &str,
-    rootfs_dir_str: &str,
-    workspace_path: &str,
+    rootfs: RootfsSpec,
+    shares: Vec<ShareSpec>,
     memory_mb: u64,
     cpu_count: usize,
     network: SvcNetwork,
 ) {
+    if protocol_version != WIRE_PROTOCOL_VERSION {
+        let _ = send_error_raw(
+            pipe,
+            &id,
+            "bad_protocol",
+            &format!("client wire protocol_version={protocol_version}, service expects {WIRE_PROTOCOL_VERSION}"),
+        );
+        return;
+    }
     if network == SvcNetwork::AllowAll {
         let _ = send_error_raw(
             pipe,
             &id,
             "not_implemented",
             "NetworkPolicy::AllowAll is not yet implemented on Windows. Use Blocked.",
+        );
+        return;
+    }
+    if shares.is_empty() {
+        let _ = send_error_raw(pipe, &id, "bad_request", "shares list is empty");
+        return;
+    }
+    if shares.len() > 64 {
+        let _ = send_error_raw(
+            pipe,
+            &id,
+            "bad_request",
+            &format!("too many shares: {} (max 64)", shares.len()),
         );
         return;
     }
@@ -1101,89 +1128,120 @@ fn handle_open_session(
             return;
         }
     };
-    let workspace = match canonicalize_safe(Path::new(workspace_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("workspace: {e}"));
-            return;
-        }
-    };
-    let rootfs_dir = match canonicalize_safe(Path::new(rootfs_dir_str)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("rootfs_dir: {e}"));
-            return;
-        }
-    };
 
-    // Generate a session id and let HCS auto-assign the RuntimeId; we
-    // read it back after start to use as the AF_HYPERV VmId.
+    // Canonicalize every share's host path (TOCTOU-safe; rejects symlinks
+    // and reparse points). Build the canonical list up front so we never
+    // pass an attacker-influenced path into HCS.
+    let mut canonical_shares: Vec<(PathBuf, ShareSpec)> = Vec::with_capacity(shares.len());
+    for (i, s) in shares.iter().enumerate() {
+        match canonicalize_safe(Path::new(&s.host_path)) {
+            Ok(p) => canonical_shares.push((p, s.clone())),
+            Err(e) => {
+                let _ = send_error_raw(
+                    pipe,
+                    &id,
+                    "bad_path",
+                    &format!("shares[{i}].host_path ({}): {e}", s.host_path),
+                );
+                return;
+            }
+        }
+    }
+
     let vm_id = format!("tokimo-sess-{}-{}", std::process::id(), rand_session_suffix());
 
-    // Clone rootfs.vhdx to a per-session writable copy in the workspace
-    // so concurrent sessions don't corrupt each other's filesystem.
-    let session_vhdx = match clone_rootfs_for_session(&rootfs_dir, &workspace, &vm_id) {
-        Ok(p) => p,
+    // Acquire a rootfs lease (ephemeral clones the template; persistent
+    // locks the caller-supplied target path so concurrent sessions for
+    // the same target are rejected with `persistent_busy`).
+    let scratch_dir: PathBuf = {
+        // For ephemeral, drop the clone next to the first share for
+        // workspace-locality. For persistent, the lease's path is the
+        // caller's own path so the scratch_dir doesn't matter.
+        canonical_shares[0].0.clone()
+    };
+    let vhdx_lease = match vhdx_pool::acquire(&rootfs, &scratch_dir, &vm_id) {
+        Ok(l) => l,
+        Err(vhdx_pool::PoolError::Busy(p)) => {
+            let _ = send_error_raw(
+                pipe,
+                &id,
+                "persistent_busy",
+                &format!("rootfs target already in use: {}", p.display()),
+            );
+            return;
+        }
         Err(e) => {
-            let _ = send_error_raw(pipe, &id, "vhdx_clone", &e);
+            let _ = send_error_raw(pipe, &id, "vhdx_pool", &e.to_string());
             return;
         }
     };
 
-    // Allocate a unique AF_VSOCK port for THIS session so the host-side
-    // HvSocket listener uses a distinct service GUID. Hyper-V requires
-    // `(VmId, ServiceId)` to be unique for a host listener, and bind()
-    // with a specific child VmId from the parent partition is rejected
-    // (WSAEACCES) — the only way to support concurrent sessions is one
-    // service GUID per session.
+    // Allocate the init control port + one port per share. We bind a
+    // WILDCARD listener for the init control plane only — Plan9 share
+    // ports are owned by HCS (its internal Plan9 device serves 9p on
+    // each `Plan9.Shares[i].Port`), so we MUST NOT register their
+    // service GUIDs or bind listeners that would race HCS.
     let init_port = vmconfig::alloc_session_init_port();
-    let svc_id_str = vmconfig::hvsock_service_id(init_port);
-    if let Err(e) = ensure_hvsocket_service_registered(&svc_id_str, "Tokimo Sandbox Init") {
+    let init_svc_id = vmconfig::hvsock_service_id(init_port);
+    if let Err(e) = ensure_hvsocket_service_registered(&init_svc_id, "Tokimo Sandbox Init") {
         let _ = send_error_raw(pipe, &id, "hvsock_register", &e);
         return;
     }
-
-    let cfg_json = vmconfig::build_ex(
-        &vm_id,
-        &kernel,
-        &initrd,
-        &session_vhdx,
-        &workspace,
-        "",
-        memory_mb,
-        cpu_count,
-        true,
-        None,
-        init_port,
-    );
-    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
-
-    // COM2 logger: kernel kmsg.
-    spawn_com_logger(
-        &format!(r"\\.\pipe\tokimo-vm-com2-{vm_id}"),
-        r"C:\tokimo-debug\last-vm-com2.log",
-    );
-
-    let svc_guid = match parse_guid(&svc_id_str) {
+    let init_svc_guid = match parse_guid(&init_svc_id) {
         Ok(g) => g,
         Err(e) => {
             let _ = send_error_raw(pipe, &id, "guid", &e);
             return;
         }
     };
-    // Bind listener BEFORE starting the VM (using HV_GUID_WILDCARD which
-    // is the only legal VmId for a parent-partition listener) so the
-    // guest can dial in as soon as init.sh brings up vsock. Per-session
-    // service_ids guarantee distinct (vm_id, service_id) tuples even with
-    // concurrent sessions.
-    let listener = match hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, svc_guid) {
+    let init_listener = match hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid) {
         Ok(l) => l,
         Err(e) => {
             let _ = send_error_raw(pipe, &id, "hvsock_listen", &e.to_string());
             return;
         }
     };
-    eprintln!("[svc] session {vm_id} listening on AF_HYPERV service {svc_id_str}");
+
+    // Allocate per-share vsock ports up front so the V2 schema can list
+    // them all in `Plan9.Shares` and the response can echo `share_ports`
+    // back to the library (which forwards them to the guest in the
+    // `MountManifest` op). HCS provides the host-side endpoint for each.
+    let share_ports: Vec<u32> = (0..canonical_shares.len())
+        .map(|_| vmconfig::alloc_share_port())
+        .collect();
+
+    let v2_shares: Vec<vmconfig::V2Share<'_>> = canonical_shares
+        .iter()
+        .zip(share_ports.iter())
+        .map(|((host_path, spec), port)| vmconfig::V2Share {
+            host_path: host_path.as_path(),
+            name: spec.name.as_str(),
+            port: *port,
+            read_only: spec.read_only,
+        })
+        .collect();
+
+    let cfg_json = vmconfig::build_session_v2(
+        &vm_id,
+        &kernel,
+        &initrd,
+        vhdx_lease.path(),
+        &v2_shares,
+        memory_mb,
+        cpu_count,
+        init_port,
+    );
+    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
+
+    spawn_com_logger(
+        &format!(r"\\.\pipe\tokimo-vm-com2-{vm_id}"),
+        r"C:\tokimo-debug\last-vm-com2.log",
+    );
+
+    eprintln!(
+        "[svc] session {vm_id} listening on AF_HYPERV: init={init_svc_id}, {} share(s)",
+        canonical_shares.len()
+    );
 
     let api = match hcs::HcsApi::init() {
         Ok(a) => a,
@@ -1206,31 +1264,45 @@ fn handle_open_session(
         return;
     }
 
-    // Wait for the guest to connect. The guest's init binary opens an
-    // AF_VSOCK stream to (CID=VMADDR_CID_HOST, PORT_INIT_CONTROL) which
-    // Hyper-V translates to an AF_HYPERV accept on the host's listener.
-    let mut hv = match hvsock::accept_guest(&listener, Duration::from_secs(60)) {
-        Ok(s) => s,
-        Err(e) => {
-            api.terminate_compute_system(cs).ok();
-            api.close_compute_system(cs);
-            let _ = send_error_raw(pipe, &id, "hvsock", &e.to_string());
-            return;
-        }
-    };
-    drop(listener);
-    eprintln!("[svc] session {vm_id} hvsock connected (guest dialed in)");
-
-    if let Err(e) = send_response_raw(pipe, &SvcResponse::SessionOpened { id: id.clone() }) {
+    // Send SessionOpened *before* we start blocking on `accept_guest` —
+    // the host's WinInitClient pumps reads in a background thread so we
+    // can interleave the OpenSession reply and tunnel bytes safely.
+    if let Err(e) = send_response_raw(
+        pipe,
+        &SvcResponse::SessionOpened {
+            id: id.clone(),
+            protocol_version: WIRE_PROTOCOL_VERSION,
+            init_port,
+            share_ports: share_ports.clone(),
+        },
+    ) {
         api.terminate_compute_system(cs).ok();
         api.close_compute_system(cs);
         eprintln!("[svc] failed to send SessionOpened: {e}");
         return;
     }
 
-    // Tunnel: spawn one thread that copies client(pipe)→hvsock and run
-    // hvsock→client(pipe) inline. When either side errors out we tear
-    // down everything.
+    // Wait for the guest to dial the init control port. The share ports
+    // are accepted lazily — one accept thread per share, each one
+    // blocks on its own listener until the guest's MountManifest
+    // handler dials in.
+    let mut hv = match hvsock::accept_guest(&init_listener, Duration::from_secs(60)) {
+        Ok(s) => s,
+        Err(e) => {
+            api.terminate_compute_system(cs).ok();
+            api.close_compute_system(cs);
+            eprintln!("[svc] hvsock(init) accept failed: {e}");
+            return;
+        }
+    };
+    drop(init_listener);
+    eprintln!("[svc] session {vm_id} init hvsock connected");
+
+    // Plan9 share connections are handled entirely by HCS — the guest
+    // dials each share's vsock port (relayed via `MountManifest`) and
+    // HCS's internal Plan9 server takes care of byte-level 9p traffic
+    // backed by the host directory specified in `Plan9.Shares[i].Path`.
+
     let mut hv2 = match hv.try_clone() {
         Ok(h) => h,
         Err(e) => {
@@ -1241,10 +1313,6 @@ fn handle_open_session(
         }
     };
     let client_ptr = pipe.0 as usize;
-    // Duplicate the pipe handle so read and write threads use independent
-    // SYNCHRONOUS handles. The named pipe was created without
-    // FILE_FLAG_OVERLAPPED so each ReadFile/WriteFile blocks the handle
-    // it uses; sharing one handle would serialize read against write.
     let cli_read_h: usize = unsafe {
         use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
         use windows::Win32::System::Threading::GetCurrentProcess;
@@ -1295,7 +1363,6 @@ fn handle_open_session(
         dead_a.store(true, Ordering::Relaxed);
     });
 
-    // hvsock → client.
     {
         tunnel_log("hv→client loop start");
         let cli = HANDLE(client_ptr as *mut _);
@@ -1344,26 +1411,9 @@ fn handle_open_session(
     eprintln!("[svc] session {vm_id} tunnel closed, tearing down VM");
     api.terminate_compute_system(cs).ok();
     api.close_compute_system(cs);
-    let _ = std::fs::remove_file(&session_vhdx);
-}
-
-/// Clone the read-only rootfs VHDX template into a per-session writable
-/// copy living next to the workspace. The copy is named
-/// `.tokimo-rootfs-<vm_id>.vhdx` so it's hidden from typical workspace
-/// listings and easy to identify for cleanup.
-fn clone_rootfs_for_session(template: &Path, workspace: &Path, vm_id: &str) -> Result<PathBuf, String> {
-    if !template.is_file() {
-        return Err(format!(
-            "rootfs template not a file: {} (expected rootfs.vhdx)",
-            template.display()
-        ));
-    }
-    let dst = workspace.join(format!(".tokimo-rootfs-{vm_id}.vhdx"));
-    if dst.exists() {
-        let _ = std::fs::remove_file(&dst);
-    }
-    std::fs::copy(template, &dst).map_err(|e| format!("clone {} -> {}: {e}", template.display(), dst.display()))?;
-    Ok(dst)
+    // vhdx_lease drop releases the per-target mutex and (for ephemeral
+    // leases) deletes the per-session VHDX clone.
+    drop(vhdx_lease);
 }
 
 fn rand_u16() -> u16 {

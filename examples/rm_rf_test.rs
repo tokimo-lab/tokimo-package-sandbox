@@ -18,10 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Inside the sandbox, /tmp is the sandbox's work_dir, NOT the host's /tmp.
     // And $HOME inside is also /tmp, which is sandboxed. So these rm calls
     // should either affect only the ephemeral sandbox or hit tmpfs-hidden dirs.
-    let script = format!(
-        "set -x; echo HELLO > /tmp/inside.txt; ls -la /tmp; rm -rf / 2>/dev/null; rm -rf $HOME 2>/dev/null; \
-         echo DONE"
-    );
+    let script = "set -x; echo HELLO > /tmp/inside.txt; ls -la /tmp; rm -rf / 2>/dev/null; rm -rf $HOME 2>/dev/null; \
+         echo DONE".to_string();
     let out = tokimo_package_sandbox::run(&["/bin/sh", "-c", &script], &cfg)?;
 
     println!(

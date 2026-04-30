@@ -235,12 +235,30 @@ fn find_vm_dir() -> Result<PathBuf> {
         }
     };
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    // Highest priority: explicit override. Lets CI/dev environments
+    // point at a pre-fetched VM artifact directory without polluting
+    // the cwd or the service exe parent.
+    if let Ok(env_dir) = std::env::var("TOKIMO_VM_DIR")
+        && !env_dir.is_empty()
+        && let Some(hit) = probe(PathBuf::from(&env_dir))
+    {
+        return Ok(hit);
+    }
+
+    // Next: a project-local `<cwd>/.data/vm/` directory. Convention used
+    // by `scripts/fetch-vm.ps1` so caller code can stash artifacts under
+    // a single hidden folder per repo without configuration.
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(hit) = probe(cwd.join(".data").join(VM_DIR_NAME))
+    {
+        return Ok(hit);
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             if let Some(hit) = probe(dir.join(VM_DIR_NAME)) {
                 return Ok(hit);
             }
-            // walk up
             let mut cur = Some(dir);
             while let Some(d) = cur {
                 if let Some(hit) = probe(d.join(VM_DIR_NAME)) {
@@ -249,7 +267,6 @@ fn find_vm_dir() -> Result<PathBuf> {
                 cur = d.parent();
             }
         }
-    }
 
     if let Ok(cwd) = std::env::current_dir() {
         let mut cur: Option<&std::path::Path> = Some(&cwd);
@@ -268,7 +285,8 @@ fn find_vm_dir() -> Result<PathBuf> {
         .join("\n  ");
     Err(Error::validation(format!(
         "VM artifacts not found. Expected `{KERNEL_FILE}`, `{INITRD_FILE}`, `{ROOTFS_FILE}` \
-         in a `{VM_DIR_NAME}/` directory. Run `scripts/fetch-vm.ps1` to download them.\n\
+         in a `{VM_DIR_NAME}/` directory. Run `scripts/fetch-vm.ps1` to download them. \
+         Set $TOKIMO_VM_DIR to override.\n\
          Tried:\n  {probed}"
     )))
 }

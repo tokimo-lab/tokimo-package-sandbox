@@ -16,6 +16,9 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("session for that target rootfs is already active")]
+    SessionAlreadyActive,
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

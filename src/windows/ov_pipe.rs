@@ -86,8 +86,7 @@ where
         }
         let w = unsafe { WaitForSingleObject(event, INFINITE) };
         if w != WAIT_OBJECT_0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("WaitForSingleObject = {:?}", w),
             ));
         }
