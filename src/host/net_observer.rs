@@ -535,10 +535,10 @@ fn header_value(text: &str, name: &str) -> Option<String> {
         if line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().to_ascii_lowercase() == name_lower {
-                return Some(v.trim().to_string());
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().to_ascii_lowercase() == name_lower
+        {
+            return Some(v.trim().to_string());
         }
     }
     None

@@ -208,12 +208,11 @@ fn child_setup_pipes(
     // setsid so the child has its own session; setpgid mirrors parent's call.
     let _ = setsid();
     let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
-    if let Some(cwd) = cwd {
-        if let Ok(c) = CString::new(cwd) {
-            if chdir(c.as_c_str()).is_err() {
-                report_errno_and_exit(err_w, Errno::ENOTDIR as i32);
-            }
-        }
+    if let Some(cwd) = cwd
+        && let Ok(c) = CString::new(cwd)
+        && chdir(c.as_c_str()).is_err()
+    {
+        report_errno_and_exit(err_w, Errno::ENOTDIR as i32);
     }
     // Move pipe ends into 0/1/2.
     if dup2(stdin_r, 0).is_err() {
@@ -276,12 +275,11 @@ fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CStr
     unsafe {
         let _ = libc::tcsetpgrp(slave_fd, libc::getpid());
     }
-    if let Some(cwd) = cwd {
-        if let Ok(c) = CString::new(cwd) {
-            if chdir(c.as_c_str()).is_err() {
-                report_errno_and_exit(err_w, Errno::ENOTDIR as i32);
-            }
-        }
+    if let Some(cwd) = cwd
+        && let Ok(c) = CString::new(cwd)
+        && chdir(c.as_c_str()).is_err()
+    {
+        report_errno_and_exit(err_w, Errno::ENOTDIR as i32);
     }
     if dup2(slave_fd, 0).is_err() || dup2(slave_fd, 1).is_err() || dup2(slave_fd, 2).is_err() {
         report_errno_and_exit(err_w, Errno::last_raw());

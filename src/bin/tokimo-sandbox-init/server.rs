@@ -21,7 +21,7 @@ use nix::unistd::{Pid, getpid};
 use tokimo_package_sandbox::protocol::types::{
     ErrorCode, ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, STREAM_CHUNK_BYTES, StdioMode, default_features,
 };
-use tokimo_package_sandbox::protocol::wire::{decode_frame, encode_frame};
+use tokimo_package_sandbox::protocol::wire::encode_frame;
 use tokimo_package_sandbox::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
 
 use crate::child::{ChildKind, ChildRecord};
@@ -205,23 +205,23 @@ pub fn run_loop(
             // Heartbeat: try writing a marker byte to the write fd, and log
             // poll state to kmsg so we can verify whether (a) we're being
             // woken at all and (b) writes actually leave the guest.
-            if transport == Transport::Serial {
-                if let Some(c) = state.clients.values().next() {
-                    let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
-                    let marker = b"HBHBHBHBHB";
-                    let n = unsafe { libc::write(wfd, marker.as_ptr().cast(), marker.len()) };
-                    eprintln!("[init] heartbeat: wrote {n} bytes to fd {wfd}");
-                }
+            if transport == Transport::Serial
+                && let Some(c) = state.clients.values().next()
+            {
+                let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
+                let marker = b"HBHBHBHBHB";
+                let n = unsafe { libc::write(wfd, marker.as_ptr().cast(), marker.len()) };
+                eprintln!("[init] heartbeat: wrote {n} bytes to fd {wfd}");
             }
         }
 
         for ev in events.iter() {
             match ev.token() {
                 TOK_LISTENER => {
-                    if let Some(ref l) = listener_opt {
-                        if let Err(e) = accept_client(l, &mut state, poll.registry()) {
-                            eprintln!("[init] accept_client: {e}");
-                        }
+                    if let Some(ref l) = listener_opt
+                        && let Err(e) = accept_client(l, &mut state, poll.registry())
+                    {
+                        eprintln!("[init] accept_client: {e}");
                     }
                 }
                 TOK_SIGFD => {
@@ -307,10 +307,10 @@ fn disconnect_client(fd: RawFd, state: &mut State, registry: &mio::Registry) {
         .map(|(id, _)| id.clone())
         .collect();
     for cid in &child_ids {
-        if let Some(rec) = state.children.get(cid) {
-            if rec.pgid > 0 {
-                let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
-            }
+        if let Some(rec) = state.children.get(cid)
+            && rec.pgid > 0
+        {
+            let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
         }
     }
     // Remove children AND deregister their pipe fds immediately.
@@ -379,27 +379,27 @@ fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, s
     let owner_fd = state.children.get(&id).map(|c| c.owner_fd);
     if let Some(rec) = state.children.get(&id) {
         // Drain any remaining bytes before emitting Exit.
-        if let Some(fd) = rec.stdout_fd.as_ref() {
-            if let Some(of) = owner_fd {
-                drain_pipe(fd, &id, of, false, state);
-            }
+        if let Some(fd) = rec.stdout_fd.as_ref()
+            && let Some(of) = owner_fd
+        {
+            drain_pipe(fd, &id, of, false, state);
         }
-        if let Some(fd) = rec.stderr_fd.as_ref() {
-            if let Some(of) = owner_fd {
-                drain_pipe(fd, &id, of, true, state);
-            }
+        if let Some(fd) = rec.stderr_fd.as_ref()
+            && let Some(of) = owner_fd
+        {
+            drain_pipe(fd, &id, of, true, state);
         }
     }
     // Send Exit event to the owner client.
-    if let Some(of) = owner_fd {
-        if let Some(client) = state.clients.get(&of) {
-            let frame = Frame::Event(Event::Exit {
-                child_id: id.clone(),
-                code,
-                signal,
-            });
-            state.send_to_client(client.fd.as_raw_fd(), &frame, None);
-        }
+    if let Some(of) = owner_fd
+        && let Some(client) = state.clients.get(&of)
+    {
+        let frame = Frame::Event(Event::Exit {
+            child_id: id.clone(),
+            code,
+            signal,
+        });
+        state.send_to_client(client.fd.as_raw_fd(), &frame, None);
     }
     // Cleanup: deregister fds and remove from client's children set.
     if let Some(rec) = state.children.remove(&id) {
@@ -797,10 +797,10 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 .map(|(cid, _)| cid.clone())
                 .collect();
             for cid in &child_ids {
-                if let Some(rec) = state.children.get(cid) {
-                    if rec.pgid > 0 {
-                        let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
-                    }
+                if let Some(rec) = state.children.get(cid)
+                    && rec.pgid > 0
+                {
+                    let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
                 }
             }
             ack(state, client_fd, id, Ok(()));
@@ -1035,10 +1035,10 @@ fn resolve_child_env(state: &State, child_id: &str) -> Option<Vec<(String, Strin
     // (`export -p > /.tps_env_<pid>`). This captures env vars set via
     // `export` at runtime, which /proc/<pid>/environ (frozen at execve) misses.
     let dump_path = format!("/.tps_env_{}", rec.pid);
-    if let Ok(data) = std::fs::read_to_string(&dump_path) {
-        if let Some(env) = parse_export_p(&data) {
-            return Some(env);
-        }
+    if let Ok(data) = std::fs::read_to_string(&dump_path)
+        && let Some(env) = parse_export_p(&data)
+    {
+        return Some(env);
     }
     // Fall back to /proc/<pid>/environ (snapshot from execve time).
     let path = format!("/proc/{}/environ", rec.pid);
@@ -1081,10 +1081,10 @@ fn parse_proc_environ(data: &[u8]) -> Vec<(String, String)> {
         if chunk.is_empty() {
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(chunk) {
-            if let Some(eq) = s.find('=') {
-                env.push((s[..eq].to_string(), s[eq + 1..].to_string()));
-            }
+        if let Ok(s) = std::str::from_utf8(chunk)
+            && let Some(eq) = s.find('=')
+        {
+            env.push((s[..eq].to_string(), s[eq + 1..].to_string()));
         }
     }
     env

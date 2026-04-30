@@ -51,10 +51,10 @@ impl L4Config {
     pub fn decide(&self, ev: &NetEvent) -> Verdict {
         // Suppress connects that the L7 proxy will handle itself (to avoid
         // duplicate events for the same user action).
-        if let (Some(bridge), Some(addr)) = (self.bridge.as_ref(), ev.remote) {
-            if bridge.is_proxy_target(&addr) {
-                return Verdict::Allow;
-            }
+        if let (Some(bridge), Some(addr)) = (self.bridge.as_ref(), ev.remote)
+            && bridge.is_proxy_target(&addr)
+        {
+            return Verdict::Allow;
         }
         let sink_verdict = self.sink.on_event(ev);
         if !self.enforce_allow {
@@ -171,11 +171,13 @@ pub(crate) enum Pending {
 /// # Safety
 /// Must be called exactly once, in the child, after fork and before exec.
 pub(crate) unsafe fn child_install(ci: ChildInstall) -> std::io::Result<()> {
-    match ci.backend {
-        Backend::SeccompNotify => seccomp_notify::child_install(ci.child_fd),
-        Backend::SeccompTrace => seccomp_trace::child_install(),
-        #[cfg(feature = "ebpf")]
-        Backend::Ebpf => Ok(()),
+    unsafe {
+        match ci.backend {
+            Backend::SeccompNotify => seccomp_notify::child_install(ci.child_fd),
+            Backend::SeccompTrace => seccomp_trace::child_install(),
+            #[cfg(feature = "ebpf")]
+            Backend::Ebpf => Ok(()),
+        }
     }
 }
 

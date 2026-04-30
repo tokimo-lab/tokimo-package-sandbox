@@ -157,10 +157,10 @@ fn find_pid_by_inode(inode: u64) -> Option<u32> {
             continue;
         };
         for fd in fds.flatten() {
-            if let Ok(link) = fs::read_link(fd.path()) {
-                if link.to_string_lossy() == needle {
-                    return Some(pid);
-                }
+            if let Ok(link) = fs::read_link(fd.path())
+                && link.to_string_lossy() == needle
+            {
+                return Some(pid);
             }
         }
     }

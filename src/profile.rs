@@ -73,10 +73,10 @@ pub fn materialise_per_agent_rootfs(base: &Path, agent_root: &Path, overlay: Opt
         copy_dir_recursive(&src, &dst)?;
     }
 
-    if let Some(overlay) = overlay {
-        if overlay.exists() {
-            apply_overlay(overlay, agent_root)?;
-        }
+    if let Some(overlay) = overlay
+        && overlay.exists()
+    {
+        apply_overlay(overlay, agent_root)?;
     }
 
     substitute_uid_gid(agent_root)?;

@@ -435,15 +435,16 @@ impl Session {
                     "session shell exited unexpectedly (read EOF before sentinels)",
                 ));
             }
-            if let Some(slot) = guard.completed.get(&id) {
-                if slot.have_stdout && slot.have_stderr {
-                    let slot = guard.completed.remove(&id).unwrap();
-                    return Ok(ExecOutput {
-                        stdout: String::from_utf8_lossy(&slot.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&slot.stderr).into_owned(),
-                        exit_code: slot.exit_code,
-                    });
-                }
+            if let Some(slot) = guard.completed.get(&id)
+                && slot.have_stdout
+                && slot.have_stderr
+            {
+                let slot = guard.completed.remove(&id).unwrap();
+                return Ok(ExecOutput {
+                    stdout: String::from_utf8_lossy(&slot.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&slot.stderr).into_owned(),
+                    exit_code: slot.exit_code,
+                });
             }
             let now = Instant::now();
             if now >= deadline {

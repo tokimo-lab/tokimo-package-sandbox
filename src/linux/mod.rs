@@ -1,7 +1,5 @@
 //! Linux sandbox: bubblewrap (preferred) or firejail (fallback).
 
-#![cfg(target_os = "linux")]
-
 pub(crate) mod bridge;
 pub(crate) mod init_client;
 pub(crate) mod l4;
@@ -980,18 +978,18 @@ pub fn locate_init_binary() -> Result<PathBuf> {
             return Ok(pb);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let pb = dir.join("tokimo-sandbox-init");
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let pb = dir.join("tokimo-sandbox-init");
+        if pb.exists() {
+            return Ok(pb);
+        }
+        // Workspace target/debug/examples/<name> -> target/debug/tokimo-sandbox-init
+        if let Some(parent) = dir.parent() {
+            let pb = parent.join("tokimo-sandbox-init");
             if pb.exists() {
                 return Ok(pb);
-            }
-            // Workspace target/debug/examples/<name> -> target/debug/tokimo-sandbox-init
-            if let Some(parent) = dir.parent() {
-                let pb = parent.join("tokimo-sandbox-init");
-                if pb.exists() {
-                    return Ok(pb);
-                }
             }
         }
     }

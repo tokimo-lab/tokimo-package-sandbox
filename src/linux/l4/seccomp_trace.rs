@@ -255,38 +255,40 @@ pub(crate) fn probe_supported() -> io::Result<()> {
 }
 
 unsafe fn probe_in_child() -> bool {
-    let pid = libc::fork();
-    if pid < 0 {
-        return false;
-    }
-    if pid == 0 {
-        // Child: install a minimal RET_ALLOW filter without any flags.
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
-            libc::_exit(2);
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return false;
         }
-        let allow = SockFilter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        };
-        let prog = SockFprog { len: 1, filter: &allow };
-        let rc = libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER as libc::c_long,
-            0i64,
-            &prog as *const SockFprog as libc::c_long,
-        );
-        if rc < 0 {
-            libc::_exit(1);
+        if pid == 0 {
+            // Child: install a minimal RET_ALLOW filter without any flags.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
+                libc::_exit(2);
+            }
+            let allow = SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            };
+            let prog = SockFprog { len: 1, filter: &allow };
+            let rc = libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER as libc::c_long,
+                0i64,
+                &prog as *const SockFprog as libc::c_long,
+            );
+            if rc < 0 {
+                libc::_exit(1);
+            }
+            libc::_exit(0);
         }
-        libc::_exit(0);
+        let mut st: libc::c_int = 0;
+        if libc::waitpid(pid, &mut st, 0) < 0 {
+            return false;
+        }
+        libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
     }
-    let mut st: libc::c_int = 0;
-    if libc::waitpid(pid, &mut st, 0) < 0 {
-        return false;
-    }
-    libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
 }
 
 /// Async-signal-safe installer. Called from the bwrap-child's `pre_exec`.
@@ -306,24 +308,26 @@ unsafe fn probe_in_child() -> bool {
 /// # Safety
 /// Must be called post-fork, pre-exec, exactly once.
 pub(crate) unsafe fn child_install() -> io::Result<()> {
-    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
-        return Err(io::Error::last_os_error());
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let prog = build_program();
+        let fprog = SockFprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr(),
+        };
+        let rc = libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER as libc::c_long,
+            0i64,
+            &fprog as *const SockFprog as libc::c_long,
+        );
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    let prog = build_program();
-    let fprog = SockFprog {
-        len: prog.len() as u16,
-        filter: prog.as_ptr(),
-    };
-    let rc = libc::syscall(
-        libc::SYS_seccomp,
-        SECCOMP_SET_MODE_FILTER as libc::c_long,
-        0i64,
-        &fprog as *const SockFprog as libc::c_long,
-    );
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Start the parent-side tracer. Must be called AFTER `Command::spawn`.

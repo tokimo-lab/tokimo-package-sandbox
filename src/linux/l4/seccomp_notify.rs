@@ -322,77 +322,79 @@ fn probe_new_listener_supported() -> io::Result<()> {
 /// allocation, no Rust synchronisation primitives. Returns `Ok` on success;
 /// on failure, returns the errno so `Command::spawn` fails cleanly.
 pub(crate) unsafe fn child_install(sp_child: RawFd) -> io::Result<()> {
-    // 1. Clear CLOEXEC on the child-end socket so sendmsg below works AFTER
-    //    exec-safety — actually we send BEFORE exec, so CLOEXEC is moot.
-    //    Still clear it for belt-and-braces in case bwrap itself forks.
-    let flags = libc::fcntl(sp_child, libc::F_GETFD, 0);
-    if flags >= 0 {
-        libc::fcntl(sp_child, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-    }
+    unsafe {
+        // 1. Clear CLOEXEC on the child-end socket so sendmsg below works AFTER
+        //    exec-safety — actually we send BEFORE exec, so CLOEXEC is moot.
+        //    Still clear it for belt-and-braces in case bwrap itself forks.
+        let flags = libc::fcntl(sp_child, libc::F_GETFD, 0);
+        if flags >= 0 {
+            libc::fcntl(sp_child, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
 
-    // 2. NO_NEW_PRIVS is required for non-root seccomp filters.
-    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
-        return Err(io::Error::last_os_error());
-    }
+        // 2. NO_NEW_PRIVS is required for non-root seccomp filters.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
+            return Err(io::Error::last_os_error());
+        }
 
-    // 3. Install the filter with NEW_LISTENER. Filter program on the stack.
-    let prog = build_program();
-    let fprog = SockFprog {
-        len: PROG_LEN,
-        filter: prog.as_ptr(),
-    };
-    let listener_fd = libc::syscall(
-        libc::SYS_seccomp,
-        SECCOMP_SET_MODE_FILTER,
-        SECCOMP_FILTER_FLAG_NEW_LISTENER,
-        &fprog as *const SockFprog as *const libc::c_void,
-    );
-    if listener_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let listener_fd = listener_fd as RawFd;
+        // 3. Install the filter with NEW_LISTENER. Filter program on the stack.
+        let prog = build_program();
+        let fprog = SockFprog {
+            len: PROG_LEN,
+            filter: prog.as_ptr(),
+        };
+        let listener_fd = libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &fprog as *const SockFprog as *const libc::c_void,
+        );
+        if listener_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let listener_fd = listener_fd as RawFd;
 
-    // 4. sendmsg the listener fd via SCM_RIGHTS over sp_child.
-    //    Layout manually — no CMSG_* macros needed given fixed size.
-    //
-    //    struct cmsghdr { cmsg_len; cmsg_level; cmsg_type; } + [fd]
-    //
-    //    We build:
-    //      iov = single-byte payload '!'
-    //      control = cmsg_len=CMSG_LEN(sizeof(int))
-    //                cmsg_level=SOL_SOCKET cmsg_type=SCM_RIGHTS
-    //                data=listener_fd
-    let payload: u8 = b'!';
-    let mut iov = libc::iovec {
-        iov_base: &payload as *const u8 as *mut libc::c_void,
-        iov_len: 1,
-    };
-    // cmsg buffer: enough for one int fd. Over-size safely.
-    let mut cbuf: [u8; 64] = [0; 64];
-    let cmsg = cbuf.as_mut_ptr() as *mut libc::cmsghdr;
-    (*cmsg).cmsg_len = libc_cmsg_len(mem::size_of::<libc::c_int>()) as _;
-    (*cmsg).cmsg_level = libc::SOL_SOCKET;
-    (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-    let data_ptr = libc_cmsg_data(cmsg) as *mut libc::c_int;
-    *data_ptr = listener_fd as libc::c_int;
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = std::ptr::null_mut();
-    msg.msg_namelen = 0;
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = libc_cmsg_space(mem::size_of::<libc::c_int>()) as _;
-    let sent = libc::sendmsg(sp_child, &msg, 0);
-    if sent < 0 {
-        let e = io::Error::last_os_error();
+        // 4. sendmsg the listener fd via SCM_RIGHTS over sp_child.
+        //    Layout manually — no CMSG_* macros needed given fixed size.
+        //
+        //    struct cmsghdr { cmsg_len; cmsg_level; cmsg_type; } + [fd]
+        //
+        //    We build:
+        //      iov = single-byte payload '!'
+        //      control = cmsg_len=CMSG_LEN(sizeof(int))
+        //                cmsg_level=SOL_SOCKET cmsg_type=SCM_RIGHTS
+        //                data=listener_fd
+        let payload: u8 = b'!';
+        let mut iov = libc::iovec {
+            iov_base: &payload as *const u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        // cmsg buffer: enough for one int fd. Over-size safely.
+        let mut cbuf: [u8; 64] = [0; 64];
+        let cmsg = cbuf.as_mut_ptr() as *mut libc::cmsghdr;
+        (*cmsg).cmsg_len = libc_cmsg_len(mem::size_of::<libc::c_int>()) as _;
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        let data_ptr = libc_cmsg_data(cmsg) as *mut libc::c_int;
+        *data_ptr = listener_fd as libc::c_int;
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = std::ptr::null_mut();
+        msg.msg_namelen = 0;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc_cmsg_space(mem::size_of::<libc::c_int>()) as _;
+        let sent = libc::sendmsg(sp_child, &msg, 0);
+        if sent < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(listener_fd);
+            return Err(e);
+        }
+
+        // 5. Child no longer needs listener or socketpair. Parent owns them.
         libc::close(listener_fd);
-        return Err(e);
+        libc::close(sp_child);
+        Ok(())
     }
-
-    // 5. Child no longer needs listener or socketpair. Parent owns them.
-    libc::close(listener_fd);
-    libc::close(sp_child);
-    Ok(())
 }
 
 // glibc CMSG_* macros recomputed without allocation.
@@ -411,7 +413,7 @@ fn libc_cmsg_space(data_len: usize) -> libc::size_t {
 }
 #[inline]
 unsafe fn libc_cmsg_data(cmsg: *const libc::cmsghdr) -> *const u8 {
-    (cmsg as *const u8).add(libc_cmsg_align(mem::size_of::<libc::cmsghdr>()))
+    unsafe { (cmsg as *const u8).add(libc_cmsg_align(mem::size_of::<libc::cmsghdr>())) }
 }
 
 // ---- parent-side listener -----------------------------------------------

@@ -17,7 +17,7 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};

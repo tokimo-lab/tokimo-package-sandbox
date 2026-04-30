@@ -1,7 +1,5 @@
 //! Shared helpers: process monitoring, rlimit, stdio piping.
 
-#![cfg(unix)]
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -25,10 +23,10 @@ pub(crate) fn get_process_memory(pid: u32) -> Option<u64> {
     for line in status.lines() {
         if line.starts_with("VmRSS:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(kb) = parts[1].parse::<u64>() {
-                    return Some(kb * 1024);
-                }
+            if parts.len() >= 2
+                && let Ok(kb) = parts[1].parse::<u64>()
+            {
+                return Some(kb * 1024);
             }
             break;
         }
@@ -119,21 +117,22 @@ pub(crate) fn wait_with_timeout(
                 let stdout = stdout_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
                 let stderr = stderr_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
-                if let Some(peak) = get_children_peak_rss_bytes() {
-                    if memory_limit_bytes > 0 && peak > memory_limit_bytes {
-                        return Ok((
-                            stdout,
-                            format!(
-                                "{}\nsandbox: peak RSS {} MB exceeded limit {} MB",
-                                stderr,
-                                peak / (1024 * 1024),
-                                memory_limit_bytes / (1024 * 1024),
-                            ),
-                            -1,
-                            false,
-                            true,
-                        ));
-                    }
+                if let Some(peak) = get_children_peak_rss_bytes()
+                    && memory_limit_bytes > 0
+                    && peak > memory_limit_bytes
+                {
+                    return Ok((
+                        stdout,
+                        format!(
+                            "{}\nsandbox: peak RSS {} MB exceeded limit {} MB",
+                            stderr,
+                            peak / (1024 * 1024),
+                            memory_limit_bytes / (1024 * 1024),
+                        ),
+                        -1,
+                        false,
+                        true,
+                    ));
                 }
                 return Ok((stdout, stderr, status.code().unwrap_or(-1), false, false));
             }
@@ -156,26 +155,25 @@ pub(crate) fn wait_with_timeout(
             ));
         }
 
-        if memory_limit_bytes > 0 {
-            if let Some(mem) = get_process_memory(child.id()) {
-                if mem > memory_limit_bytes {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_handle.map(|h| h.join());
-                    let _ = stderr_handle.map(|h| h.join());
-                    return Ok((
-                        String::new(),
-                        format!(
-                            "sandbox: killed, memory {} MB > limit {} MB",
-                            mem / (1024 * 1024),
-                            memory_limit_bytes / (1024 * 1024)
-                        ),
-                        -1,
-                        false,
-                        true,
-                    ));
-                }
-            }
+        if memory_limit_bytes > 0
+            && let Some(mem) = get_process_memory(child.id())
+            && mem > memory_limit_bytes
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_handle.map(|h| h.join());
+            let _ = stderr_handle.map(|h| h.join());
+            return Ok((
+                String::new(),
+                format!(
+                    "sandbox: killed, memory {} MB > limit {} MB",
+                    mem / (1024 * 1024),
+                    memory_limit_bytes / (1024 * 1024)
+                ),
+                -1,
+                false,
+                true,
+            ));
         }
         thread::sleep(check_interval);
     }
@@ -213,29 +211,31 @@ fn kill_progressive(
 /// # Safety
 /// Runs after fork, before exec.
 pub(crate) unsafe fn apply_rlimits(limits: &ResourceLimits) {
-    use nix::libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, rlimit, setrlimit};
-    if limits.has_memory_limit() {
-        let mem = rlimit {
-            rlim_cur: limits.max_memory_bytes(),
-            rlim_max: limits.max_memory_bytes(),
+    unsafe {
+        use nix::libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, rlimit, setrlimit};
+        if limits.has_memory_limit() {
+            let mem = rlimit {
+                rlim_cur: limits.max_memory_bytes(),
+                rlim_max: limits.max_memory_bytes(),
+            };
+            setrlimit(RLIMIT_AS, &mem);
+        }
+        let cpu = rlimit {
+            rlim_cur: limits.timeout_secs.saturating_add(5),
+            rlim_max: limits.timeout_secs.saturating_add(5),
         };
-        setrlimit(RLIMIT_AS, &mem);
+        if limits.has_cpu_time_limit() {
+            setrlimit(RLIMIT_CPU, &cpu);
+        }
+        if limits.has_file_size_limit() {
+            let fs = rlimit {
+                rlim_cur: limits.max_file_size_mb * 1024 * 1024,
+                rlim_max: limits.max_file_size_mb * 1024 * 1024,
+            };
+            setrlimit(RLIMIT_FSIZE, &fs);
+        }
+        let _ = limits.max_processes; // reserved for future per-sandbox cgroup use
     }
-    let cpu = rlimit {
-        rlim_cur: limits.timeout_secs.saturating_add(5),
-        rlim_max: limits.timeout_secs.saturating_add(5),
-    };
-    if limits.has_cpu_time_limit() {
-        setrlimit(RLIMIT_CPU, &cpu);
-    }
-    if limits.has_file_size_limit() {
-        let fs = rlimit {
-            rlim_cur: limits.max_file_size_mb * 1024 * 1024,
-            rlim_max: limits.max_file_size_mb * 1024 * 1024,
-        };
-        setrlimit(RLIMIT_FSIZE, &fs);
-    }
-    let _ = limits.max_processes; // reserved for future per-sandbox cgroup use
 }
 
 /// Spawn + pipe stdin + wait, returning the assembled result.
@@ -271,10 +271,10 @@ pub(crate) fn wait_with_io_ext(
     stream_stderr: bool,
     exit_rx: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>>,
 ) -> Result<crate::ExecutionResult> {
-    if let Some(bytes) = stdin_bytes {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(bytes);
-        }
+    if let Some(bytes) = stdin_bytes
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(bytes);
     }
     if let Some(rx) = exit_rx {
         return wait_via_channel(child, rx, limits.timeout_secs, stream_stderr);

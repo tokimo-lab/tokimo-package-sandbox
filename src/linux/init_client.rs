@@ -406,10 +406,10 @@ impl InitClient {
         let (lock, cv) = &*self.inner.state;
         let mut g = lock.lock().expect("client state");
         loop {
-            if let Some(c) = g.children.get(child_id) {
-                if !c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some() {
-                    return true;
-                }
+            if let Some(c) = g.children.get(child_id)
+                && (!c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some())
+            {
+                return true;
             }
             if g.eof {
                 return true;
