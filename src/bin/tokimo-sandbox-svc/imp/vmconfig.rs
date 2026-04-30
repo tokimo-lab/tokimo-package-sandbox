@@ -46,13 +46,17 @@ pub fn alloc_session_init_port() -> u32 {
     0x4000_0000 | (n & 0x00FF_FFFF)
 }
 
-/// Allocate a unique vsock port for a per-session Plan9 share. Distinct
-/// from the init-control range above so log GUID prefixes stay readable.
+/// Allocate a unique vsock port for a per-session Plan9 share. We stay
+/// in the same low decimal range as `PORT_WORK` (50002) because HCS's
+/// internal Plan9 implementation rejects very high port values during
+/// `HcsCreateComputeSystem` (`0x8037010D` "Construct" failure).
 pub fn alloc_share_port() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    0x4100_0000 | (n & 0x00FF_FFFF)
+    // 50100..=58291 — well clear of PORT_WORK (50002) and PORT_INIT_CONTROL,
+    // small enough for HCS Plan9 to accept.
+    50100 + (n % 8192)
 }
 
 /// Build the HvSocket service GUID for a given vsock port.
@@ -270,12 +274,16 @@ pub fn build_session_v2(
     let plan9_shares: Vec<serde_json::Value> = shares
         .iter()
         .map(|s| {
+            // NOTE: do NOT add a `ReadOnly` field here — HCS schema 2.5
+            // rejects Plan9.Shares entries containing it with `0x8037010D`
+            // ("Construct" failure). RO is enforced guest-side via the
+            // mount manifest's `MS_RDONLY` flag.
+            let _ = s.read_only;
             serde_json::json!({
                 "Name": s.name,
                 "AccessName": s.name,
                 "Path": strip_extended_prefix(s.host_path),
-                "Port": s.port,
-                "ReadOnly": s.read_only
+                "Port": s.port
             })
         })
         .collect();
@@ -458,14 +466,21 @@ mod tests {
             r"C:\persist.vhdx"
         );
 
-        // Plan9 has both shares, in order, with read_only flags.
+        // Plan9 has both shares, in order. RO flag is enforced guest-side
+        // via the mount manifest — HCS schema 2.5 rejects any `ReadOnly`
+        // field on Plan9.Shares with `0x8037010D`.
         let arr = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["Name"], "s0");
-        assert_eq!(arr[0]["ReadOnly"], false);
+        assert!(arr[0].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
         assert_eq!(arr[1]["Name"], "s1");
-        assert_eq!(arr[1]["ReadOnly"], true);
-        assert_eq!(arr[1]["Port"], 0x4100_0002);
+        assert!(arr[1].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
+        // Share port is in the low decimal range so HCS Plan9 accepts it.
+        let port = arr[1]["Port"].as_u64().unwrap();
+        assert!(
+            (50100..58292).contains(&(port as u32)),
+            "share port {port} out of HCS-Plan9 range"
+        );
 
         // HvSocket service table registers ONLY the init port — share
         // ports are owned by HCS's internal Plan9 server.
@@ -494,8 +509,10 @@ mod tests {
         let s2 = alloc_share_port();
         assert_ne!(i1, s1);
         assert_ne!(s1, s2);
-        // Different prefixes for log readability.
+        // Init ports stay in the high 0x4000_0000 range; share ports stay in
+        // a low decimal range that HCS Plan9 accepts.
         assert_eq!(i1 & 0xFF00_0000, 0x4000_0000);
-        assert_eq!(s1 & 0xFF00_0000, 0x4100_0000);
+        assert!((50100..58292).contains(&s1));
+        assert!((50100..58292).contains(&s2));
     }
 }

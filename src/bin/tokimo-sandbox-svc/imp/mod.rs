@@ -1154,12 +1154,14 @@ fn handle_open_session(
     // Acquire a rootfs lease (ephemeral clones the template; persistent
     // locks the caller-supplied target path so concurrent sessions for
     // the same target are rejected with `persistent_busy`).
-    let scratch_dir: PathBuf = {
-        // For ephemeral, drop the clone next to the first share for
-        // workspace-locality. For persistent, the lease's path is the
-        // caller's own path so the scratch_dir doesn't matter.
-        canonical_shares[0].0.clone()
-    };
+    //
+    // The ephemeral clone goes next to the first share. HCS auto-grants
+    // the VM worker's NT VIRTUAL MACHINE SID access to the share path,
+    // and that ACL inheritance covers the VHDX too. Putting the VHDX in
+    // `%TEMP%` (LocalSystem's `C:\WINDOWS\SystemTemp`) instead would
+    // fail VM start with `0x80070005 Access is denied` because the VM
+    // worker's per-VM SID has no ACE on system-restricted directories.
+    let scratch_dir: PathBuf = canonical_shares[0].0.clone();
     let vhdx_lease = match vhdx_pool::acquire(&rootfs, &scratch_dir, &vm_id) {
         Ok(l) => l,
         Err(vhdx_pool::PoolError::Busy(p)) => {
