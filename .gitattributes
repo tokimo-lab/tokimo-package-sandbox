@@ -1,0 +1,2 @@
+*.sh text eol=lf
+packaging/vm-image/init.sh text eol=lf
