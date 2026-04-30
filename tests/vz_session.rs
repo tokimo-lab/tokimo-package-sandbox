@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the persistent VM session path (VSOCK-based init
 //! protocol). They require a VZ-capable Mac with kernel + initrd + rootfs
-//! artifacts from tokimo-package-rootfs.
+//! artifacts from the tokimo-package-sandbox rootfs release.
 
 #![cfg(target_os = "macos")]
 

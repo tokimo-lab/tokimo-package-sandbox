@@ -18,7 +18,7 @@ jobs:
     name: linux (build + test)
     runs-on: ubuntu-latest
     env:
-      ROOTFS_VERSION: v1.3.1
+      ROOTFS_VERSION: v1.3.1  # TODO: bump to rootfs-v1.6.0 after first sandbox release
       ROOTFS_ASSET: rootfs-amd64.tar.zst
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
           set -euxo pipefail
           mkdir -p .test-rootfs
           curl -sSL -o rootfs.tar.zst \
-            "https://github.com/tokimo-lab/tokimo-package-rootfs/releases/download/${ROOTFS_VERSION}/${ROOTFS_ASSET}"
+            "https://github.com/tokimo-lab/tokimo-package-sandbox/releases/download/${ROOTFS_VERSION}/${ROOTFS_ASSET}"
           # Sanity peek at archive layout — must extract to top-level dirs
           # like ./bin, ./usr, etc.
           zstd -d -c rootfs.tar.zst | tar -tf - 2>/dev/null | head -3 || true

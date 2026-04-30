@@ -1,0 +1,136 @@
+name: release-rootfs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rootfs/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rootfs/**'
+  push:
+    tags: ['rootfs-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: rootfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU (arm64 cross-build)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      # ── Level 0: final artifact cache ────────────────────────────────
+      # If no rootfs/ files changed, the zst is restored from GHA cache
+      # and the build step is skipped entirely (<30s total job time).
+
+      - name: Restore cached rootfs
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: rootfs-${{ matrix.arch }}.tar.zst
+          key: rootfs-${{ matrix.arch }}-${{ hashFiles('rootfs/**') }}
+
+      # ── Level 1+2: Docker build with BuildKit gha cache ──────────────
+      # Layer cache: unchanged RUN layers are restored from GHA cache.
+      # Cache mounts: /var/cache/apt & /var/lib/apt persist across builds.
+      # Mode=max exports all intermediate layers for max cache reuse.
+
+      - name: Build rootfs
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          docker buildx build \
+            -f rootfs/Dockerfile \
+            --cache-from type=gha,scope=rootfs-${{ matrix.arch }} \
+            --cache-to type=gha,mode=max,scope=rootfs-${{ matrix.arch }} \
+            --output type=local,dest=rootfs-${{ matrix.arch }} \
+            --platform linux/${{ matrix.arch }} \
+            .
+
+      # ── Verify ──────────────────────────────────────────────────────
+      # Use rootfs's own ld-linux (not host) so we test the actual binaries.
+
+      - name: Verify binaries
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64)
+              LD="rootfs-amd64/lib64/ld-linux-x86-64.so.2"
+              MULTIARCH="x86_64-linux-gnu"
+              ;;
+            arm64)
+              LD="rootfs-arm64/lib/ld-linux-aarch64.so.1"
+              MULTIARCH="aarch64-linux-gnu"
+              ;;
+          esac
+          LD_LIB="rootfs-${{ matrix.arch }}/usr/lib/${MULTIARCH}:rootfs-${{ matrix.arch }}/lib/${MULTIARCH}:rootfs-${{ matrix.arch }}/usr/lib/libreoffice/program"
+          set -x
+          "$LD" --library-path "$LD_LIB" "rootfs-${{ matrix.arch }}/usr/bin/node" --version
+          "$LD" --library-path "$LD_LIB" "rootfs-${{ matrix.arch }}/usr/bin/python3" --version
+          "$LD" --library-path "$LD_LIB" "rootfs-${{ matrix.arch }}/usr/local/bin/lua" -v
+          echo "node bins:" && ls "rootfs-${{ matrix.arch }}/home/tokimo/bin/" | head -15
+          echo "python pkgs:" && ls "rootfs-${{ matrix.arch }}/home/tokimo/python_packages/" | grep -v dist-info | grep -v __pycache__ | head -20
+
+      # ── Compress ────────────────────────────────────────────────────
+
+      - name: Compress
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          tar -cpf - -C "rootfs-${{ matrix.arch }}" . | zstd -10 -T0 -o "rootfs-${{ matrix.arch }}.tar.zst"
+          sha256sum "rootfs-${{ matrix.arch }}.tar.zst" > "sha256sum-${{ matrix.arch }}.txt"
+
+      # ── Upload artifact (always, so PRs can download for testing) ───
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: |
+            rootfs-${{ matrix.arch }}.tar.zst
+            sha256sum-${{ matrix.arch }}.txt
+          retention-days: 7
+
+      # ── GitHub Release (only on rootfs-v* tags) ─────────────────────
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/rootfs-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rootfs-${{ matrix.arch }}.tar.zst
+            sha256sum-${{ matrix.arch }}.txt
+          body: |
+            TokimoOS rootfs ${{ github.ref_name }}
+
+            ## Architectures
+
+            | File | Arch |
+            |------|------|
+            | `rootfs-amd64.tar.zst` | x86_64 |
+            | `rootfs-arm64.tar.zst` | aarch64 |
+
+            ## Usage
+
+            ```bash
+            curl -LO ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/rootfs-amd64.tar.zst
+            zstd -d rootfs-amd64.tar.zst
+            mkdir rootfs && tar -xpf rootfs-amd64.tar -C rootfs
+            ```
+          make_latest: true

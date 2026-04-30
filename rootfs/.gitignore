@@ -1,0 +1,7 @@
+# Build artifacts (too large for git)
+rootfs-amd64/
+rootfs-arm64/
+rootfs.tar
+rootfs-*.tar.zst
+sha256sum*.txt
+*.tar
