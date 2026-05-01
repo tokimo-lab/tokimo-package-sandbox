@@ -1,48 +1,66 @@
 //! Windows-only implementation of the SYSTEM service.
+//!
+//! Persistent JSON-RPC dispatch over a named pipe. See `src/svc_protocol.rs`
+//! for the wire format. Each connection runs in its own thread; per-connection
+//! state holds the active `ConfigureParams`, HCS handle, `WinInitClient`, and
+//! a map of running spawned children.
 
 #![cfg(target_os = "windows")]
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree};
-use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+use serde_json::{Value, json};
+
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_DATA_PROVIDER_FLAGS,
-    WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO,
-    WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
+    WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT,
+    WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
-    ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use tokimo_package_sandbox::canonicalize_safe;
+use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::svc_protocol::{
-    ExecVmResult, RootfsSpec, ShareSpec, SvcError, SvcNetwork, SvcRequest, SvcResponse, WIRE_PROTOCOL_VERSION,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, ExecParams, ExecResultWire, Frame,
+    IdParams, KillParams, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec,
+    RpcError, SpawnResult, WriteStdinParams, encode_frame, method,
 };
+use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
+mod hcn;
 mod hcs;
 mod hvsock;
 mod vhdx_pool;
@@ -52,39 +70,19 @@ mod vmconfig;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Service name used by MSIX-packaged deployment (declared in
-/// `packaging/windows/AppxManifest.xml`'s `desktop6:Service Name=`).
-/// The MSIX subsystem registers this name with SCM, so we keep it as the
-/// well-known dispatcher name for compatibility.
 const SERVICE_NAME: &str = "TokimoSandboxSvc";
-/// Service name used by the CLI `--install` / `--uninstall` flow.
-/// Deliberately *different* from `SERVICE_NAME` (PascalCase) so a developer
-/// install can coexist with an MSIX-packaged install on the same machine
-/// — the two names point at distinct SCM entries.
 const INSTALL_SERVICE_NAME: &str = "tokimo-sandbox-svc";
 const SERVICE_DISPLAY: &str = "Tokimo Sandbox Service";
 const PIPE_NAME: &str = r"\\.\pipe\tokimo-sandbox-svc";
 
-/// SDDL for the named pipe when running as a service (LocalSystem).
-///
-/// `O:SY` owner = LocalSystem
-/// `G:SY` group = LocalSystem
-/// `D:` DACL:
-///   * `(A;;GA;;;SY)` - LocalSystem: GENERIC_ALL
-///   * `(A;;0x12019b;;;IU)` - Interactive Users: read|write|sync without
-///     delete/changeperms (FILE_GENERIC_READ | FILE_GENERIC_WRITE).
 const PIPE_SDDL_SERVICE: &str = "O:SYG:SYD:(A;;GA;;;SY)(A;;0x12019b;;;IU)";
-
-/// SDDL for the named pipe when running in console (dev) mode.
-///
-/// Does not require LocalSystem as owner so it works under a privileged
-/// admin account without `SeRestorePrivilege`. The DACL grants access to
-/// the current interactive user session only.
 const PIPE_SDDL_CONSOLE: &str = "D:(A;;GA;;;IU)";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Service-wide debug-logging toggle (controlled via the `setDebugLogging` RPC).
+static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Entry
@@ -97,12 +95,12 @@ pub fn run() {
             "--install" => return install_service(),
             "--uninstall" => return uninstall_service(),
             "--console" => return run_console(),
-            // MSIX packaged service passes --service; fall through to the
-            // service_dispatcher below.
             "--service" => {}
             "-h" | "--help" => {
                 println!("tokimo-sandbox-svc v{VERSION}");
-                println!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console|--service]");
+                println!(
+                    "Usage: tokimo-sandbox-svc [--install|--uninstall|--console|--service]"
+                );
                 return;
             }
             other => {
@@ -112,7 +110,6 @@ pub fn run() {
         }
     }
 
-    // Default: SCM started us as a service.
     if let Err(e) = windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         eprintln!("service_dispatcher::start failed: {e}");
         eprintln!("If you meant to run interactively, use --console");
@@ -160,7 +157,6 @@ fn run_as_service() -> windows_service::Result<()> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
-
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
@@ -192,7 +188,10 @@ fn run_as_service() -> windows_service::Result<()> {
 
 fn install_service() {
     let exe = std::env::current_exe().expect("current_exe");
-    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE) {
+    let manager = match ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CREATE_SERVICE,
+    ) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("OpenSCManager failed: {e}");
@@ -209,14 +208,12 @@ fn install_service() {
         executable_path: exe,
         launch_arguments: vec![OsString::from("--service")],
         dependencies: vec![],
-        account_name: None, // LocalSystem
+        account_name: None,
         account_password: None,
     };
 
     match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START) {
         Ok(svc) => {
-            // Best-effort: delayed auto-start so we boot only after Hyper-V
-            // host services are up.
             let _ = svc.set_delayed_auto_start(true);
             if let Err(e) = svc.start::<&str>(&[]) {
                 eprintln!(
@@ -227,30 +224,23 @@ fn install_service() {
                 println!("Service installed and started: {INSTALL_SERVICE_NAME}");
             }
         }
-        Err(e) => {
-            // ERROR_SERVICE_EXISTS (1073) and ERROR_DUPLICATE_SERVICE_NAME
-            // (1078) both mean "name is already taken"; treat as no-op.
-            match ws_error_code(&e) {
-                Some(1073) => println!("Service already installed: {INSTALL_SERVICE_NAME}"),
-                Some(1078) => {
-                    eprintln!(
-                        "Cannot create service '{INSTALL_SERVICE_NAME}': another service is using the same display name '{SERVICE_DISPLAY}' (ERROR_DUPLICATE_SERVICE_NAME 1078). \
-This usually means an MSIX package (service '{SERVICE_NAME}') is already installed. Uninstall it via `Get-AppxPackage Tokimo.SandboxSvc | Remove-AppxPackage` and retry."
-                    );
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("CreateService failed: {}", format_ws_error(&e));
-                    std::process::exit(1);
-                }
+        Err(e) => match ws_error_code(&e) {
+            Some(1073) => println!("Service already installed: {INSTALL_SERVICE_NAME}"),
+            Some(1078) => {
+                eprintln!(
+                    "Cannot create service '{INSTALL_SERVICE_NAME}': another service is using \
+                     the same display name '{SERVICE_DISPLAY}' (ERROR_DUPLICATE_SERVICE_NAME 1078)."
+                );
+                std::process::exit(1);
             }
-        }
+            _ => {
+                eprintln!("CreateService failed: {}", format_ws_error(&e));
+                std::process::exit(1);
+            }
+        },
     }
 }
 
-/// Extract the underlying OS error code from a `windows_service::Error`.
-/// The crate's `Display` impl is famously useless ("IO error in winapi call")
-/// and hides the actual code, so we reach through `Error::source()` for it.
 fn ws_error_code(e: &windows_service::Error) -> Option<i32> {
     use std::error::Error;
     e.source()
@@ -258,7 +248,6 @@ fn ws_error_code(e: &windows_service::Error) -> Option<i32> {
         .and_then(|io| io.raw_os_error())
 }
 
-/// Format a `windows_service::Error` with its OS code attached.
 fn format_ws_error(e: &windows_service::Error) -> String {
     match ws_error_code(e) {
         Some(code) => format!("{e} (os error {code})"),
@@ -267,14 +256,14 @@ fn format_ws_error(e: &windows_service::Error) -> String {
 }
 
 fn uninstall_service() {
-    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("OpenSCManager failed: {e}");
             std::process::exit(1);
         }
     };
-
     let svc = match manager.open_service(
         INSTALL_SERVICE_NAME,
         ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
@@ -289,20 +278,20 @@ fn uninstall_service() {
             std::process::exit(1);
         }
     };
-
     if let Ok(status) = svc.query_status()
         && status.current_state != ServiceState::Stopped
     {
         let _ = svc.stop();
-        // Wait briefly.
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(200));
-            if matches!(svc.query_status().map(|s| s.current_state), Ok(ServiceState::Stopped)) {
+            if matches!(
+                svc.query_status().map(|s| s.current_state),
+                Ok(ServiceState::Stopped)
+            ) {
                 break;
             }
         }
     }
-
     if let Err(e) = svc.delete() {
         eprintln!("DeleteService failed: {}", format_ws_error(&e));
         std::process::exit(1);
@@ -314,7 +303,6 @@ fn uninstall_service() {
 // Pipe server
 // ---------------------------------------------------------------------------
 
-/// Holder that frees the security descriptor on drop.
 struct SdGuard(PSECURITY_DESCRIPTOR);
 impl Drop for SdGuard {
     fn drop(&mut self) {
@@ -326,7 +314,9 @@ impl Drop for SdGuard {
     }
 }
 
-fn build_security_attributes(console_mode: bool) -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
+fn build_security_attributes(
+    console_mode: bool,
+) -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
     let sddl_str = if console_mode {
         PIPE_SDDL_CONSOLE
     } else {
@@ -334,9 +324,10 @@ fn build_security_attributes(console_mode: bool) -> std::io::Result<(SECURITY_AT
     };
     let sddl = HSTRING::from(sddl_str);
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None) }
-        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None)
+    }
+    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.0,
@@ -353,17 +344,12 @@ fn pipe_server_loop(console_mode: bool) {
             return;
         }
     };
-
     let pipe_name = HSTRING::from(PIPE_NAME);
-
     eprintln!("[svc] listening on {PIPE_NAME} (v{VERSION})");
     if verify_caller_required() {
         eprintln!("[svc] caller signature verification: ENFORCED");
     } else {
-        eprintln!(
-            "[svc] caller signature verification: log-only \
-             (set TOKIMO_VERIFY_CALLER=1 or HKLM\\SOFTWARE\\Tokimo\\SandboxSvc\\VerifyCaller=1 to enforce)"
-        );
+        eprintln!("[svc] caller signature verification: log-only");
     }
 
     while !SHUTDOWN.load(Ordering::Relaxed) {
@@ -371,7 +357,9 @@ fn pipe_server_loop(console_mode: bool) {
             CreateNamedPipeW(
                 &pipe_name,
                 PIPE_ACCESS_DUPLEX
-                    | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
+                    | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(
+                        FILE_FLAG_OVERLAPPED.0,
+                    ),
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -381,13 +369,13 @@ fn pipe_server_loop(console_mode: bool) {
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
-            eprintln!("[svc] CreateNamedPipeW failed: {:?}", unsafe { GetLastError() });
+            eprintln!("[svc] CreateNamedPipeW failed: {:?}", unsafe {
+                GetLastError()
+            });
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
 
-        // Overlapped ConnectNamedPipe: returns immediately with ERROR_IO_PENDING,
-        // wait on the OVERLAPPED event for actual connection.
         let connect_evt = match create_event() {
             Ok(h) => h,
             Err(e) => {
@@ -400,22 +388,16 @@ fn pipe_server_loop(console_mode: bool) {
         ov.hEvent = connect_evt;
         let connected = unsafe { ConnectNamedPipe(pipe, Some(&mut ov)) };
         let last = unsafe { GetLastError() }.0;
-        if connected.is_err() && last != 535 /* ERROR_PIPE_CONNECTED */ && last != 997
-        /* ERROR_IO_PENDING */
-        {
+        if connected.is_err() && last != 535 && last != 997 {
             let _ = unsafe { CloseHandle(connect_evt) };
             let _ = unsafe { CloseHandle(pipe) };
             continue;
         }
         if last == 997 {
-            // Wait for the connection to actually complete.
             unsafe { WaitForSingleObject(connect_evt, u32::MAX) };
         }
         let _ = unsafe { CloseHandle(connect_evt) };
 
-        // Hand the pipe to a worker thread. We carry the raw pointer as a
-        // `usize` to side-step `HANDLE`'s lack of `Send` — there is exactly
-        // one owner at any time.
         let pipe_ptr = pipe.0 as usize;
         std::thread::spawn(move || {
             handle_client(HANDLE(pipe_ptr as *mut _));
@@ -424,11 +406,84 @@ fn pipe_server_loop(console_mode: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Client handling
+// Client connection state
+// ---------------------------------------------------------------------------
+
+/// Per-spawned-child handle held by the service.
+struct ChildEntry {
+    /// Joiner for the per-child poller thread; dropped on `kill` so the
+    /// thread can exit cleanly.
+    _joiner: thread::JoinHandle<()>,
+    /// Set to `true` once the child's exit has been observed and the
+    /// `EV_EXIT` event sent.
+    finished: Arc<AtomicBool>,
+}
+
+struct SessionState {
+    config: Option<ConfigureParams>,
+    hcs: Option<(Arc<hcs::HcsApi>, hcs::CsHandle, String /* vm_id */)>,
+    init: Option<Arc<tokimo_package_sandbox::init_client::WinInitClient>>,
+    /// Held for the lifetime of a running VM; dropped (deleting the
+    /// per-session VHDX clone for ephemeral leases) on stopVm.
+    vhdx: Option<vhdx_pool::VhdxLease>,
+    children: HashMap<String, ChildEntry>,
+    /// Plan9 shares currently attached to the VM. Keyed by share `name`.
+    /// Includes both boot-time shares (immutable) and dynamically-added
+    /// shares; only the latter are removable.
+    active_shares: HashMap<String, ActiveShare>,
+    /// HCN endpoint owned by this session (None when NetworkPolicy::Blocked).
+    /// Drop deletes the endpoint, releasing the NAT mapping on the host.
+    network_endpoint: Option<hcn::HcnEndpoint>,
+    running: bool,
+    guest_connected: bool,
+}
+
+struct ActiveShare {
+    port: u32,
+    /// True for shares attached at boot-time via `build_session_v2`; the
+    /// dispatcher refuses `removePlan9Share` for these because the HCS
+    /// schema rejects `Remove` on shares declared in the original config.
+    boot_time: bool,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            config: None,
+            hcs: None,
+            init: None,
+            vhdx: None,
+            children: HashMap::new(),
+            active_shares: HashMap::new(),
+            network_endpoint: None,
+            running: false,
+            guest_connected: false,
+        }
+    }
+}
+
+/// Shared per-connection bag — wrap the writer in a Mutex so background
+/// poller threads can emit `EV_STDOUT` / `EV_EXIT` frames without racing
+/// the main dispatch thread.
+struct Connection {
+    pipe: HANDLE,
+    /// Serializes writes so multiple emitter threads can coexist.
+    write_lock: Mutex<()>,
+    state: Mutex<SessionState>,
+    /// Monotonic counter for spawned child IDs.
+    job_counter: AtomicU64,
+}
+
+// HANDLE is `*mut c_void` (not Send); we manually attest single-thread-of-write
+// by way of `write_lock`. The pipe is owned exclusively by this connection.
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
+
+// ---------------------------------------------------------------------------
+// Connection entry point
 // ---------------------------------------------------------------------------
 
 fn handle_client(pipe: HANDLE) {
-    // Caller identity check — log always; reject if enforced.
     let caller = caller_image_path(pipe);
     match &caller {
         Some(p) => eprintln!("[svc] client connected: {}", p.display()),
@@ -439,346 +494,859 @@ fn handle_client(pipe: HANDLE) {
         match caller.as_deref().and_then(safe_canon_or_log) {
             Some(canon) => {
                 if let Err(why) = verify_authenticode(&canon) {
-                    eprintln!("[svc] REJECT unsigned/untrusted caller {}: {why}", canon.display());
-                    let _ = send_error_raw(pipe, "", "unauthorized", "caller not trusted");
+                    eprintln!(
+                        "[svc] REJECT unsigned/untrusted caller {}: {why}",
+                        canon.display()
+                    );
                     disconnect(pipe);
                     return;
                 }
             }
             None => {
                 eprintln!("[svc] REJECT caller: could not resolve image path");
-                let _ = send_error_raw(pipe, "", "unauthorized", "caller image not resolvable");
                 disconnect(pipe);
                 return;
             }
         }
     }
 
-    let request = match read_request(pipe) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = send_error_raw(pipe, "", "bad_request", &format!("read: {e}"));
-            disconnect(pipe);
-            return;
-        }
-    };
+    let conn = Arc::new(Connection {
+        pipe,
+        write_lock: Mutex::new(()),
+        state: Mutex::new(SessionState::default()),
+        job_counter: AtomicU64::new(0),
+    });
 
-    match request {
-        SvcRequest::Ping { id } => {
-            let _ = send_response_raw(
-                pipe,
-                &SvcResponse::Pong {
-                    id,
-                    version: VERSION.to_string(),
+    // Hello handshake.
+    match read_frame(pipe) {
+        Ok(Frame::Hello { version, peer, .. }) => {
+            eprintln!("[svc] hello from {peer} (proto v{version})");
+            if version != PROTOCOL_VERSION {
+                eprintln!(
+                    "[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}"
+                );
+                let _ = send_frame(
+                    &conn,
+                    &Frame::Hello {
+                        version: PROTOCOL_VERSION,
+                        peer: format!("tokimo-sandbox-svc/{VERSION}"),
+                        info: json!({ "error": "protocol_version_mismatch" }),
+                    },
+                );
+                disconnect(pipe);
+                return;
+            }
+            // Reply with our Hello.
+            let _ = send_frame(
+                &conn,
+                &Frame::Hello {
+                    version: PROTOCOL_VERSION,
+                    peer: format!("tokimo-sandbox-svc/{VERSION}"),
+                    info: json!({}),
                 },
             );
         }
-        SvcRequest::ExecVm {
-            id,
-            kernel_path,
-            initrd_path,
-            rootfs_dir,
-            workspace_path,
-            cmd_b64,
-            memory_mb,
-            cpu_count,
-            network,
-        } => {
-            handle_exec_vm(
-                pipe,
-                id,
-                &kernel_path,
-                &initrd_path,
-                &rootfs_dir,
-                &workspace_path,
-                &cmd_b64,
-                memory_mb,
-                cpu_count,
-                network,
-            );
+        Ok(other) => {
+            eprintln!("[svc] expected Hello, got {other:?}");
+            disconnect(pipe);
+            return;
         }
-        SvcRequest::OpenSession {
-            id,
-            protocol_version,
-            kernel_path,
-            initrd_path,
-            rootfs,
-            shares,
-            memory_mb,
-            cpu_count,
-            network,
-        } => {
-            handle_open_session(
-                pipe,
-                id,
-                protocol_version,
-                &kernel_path,
-                &initrd_path,
-                rootfs,
-                shares,
-                memory_mb,
-                cpu_count,
-                network,
-            );
+        Err(e) => {
+            eprintln!("[svc] failed to read Hello: {e}");
+            disconnect(pipe);
+            return;
         }
     }
 
+    // Dispatch loop.
+    loop {
+        let frame = match read_frame(pipe) {
+            Ok(f) => f,
+            Err(e) => {
+                if DEBUG_LOGGING.load(Ordering::Relaxed) {
+                    eprintln!("[svc] connection closed: {e}");
+                }
+                break;
+            }
+        };
+        match frame {
+            Frame::Request { id, method, params } => {
+                let result = dispatch(&conn, &method, params);
+                let resp = match result {
+                    Ok(v) => Frame::Response {
+                        id,
+                        result: Some(v),
+                        error: None,
+                    },
+                    Err(e) => Frame::Response {
+                        id,
+                        result: None,
+                        error: Some(e),
+                    },
+                };
+                if let Err(e) = send_frame(&conn, &resp) {
+                    eprintln!("[svc] write response failed: {e}");
+                    break;
+                }
+            }
+            Frame::Hello { .. } => {
+                // Spurious Hello — ignore.
+            }
+            Frame::Notification { .. } | Frame::Response { .. } | Frame::Event { .. } => {
+                // Client shouldn't send these; ignore.
+            }
+        }
+    }
+
+    // Connection teardown — best-effort tear down VM if still up.
+    {
+        let mut st = conn.state.lock().expect("state lock");
+        teardown_session(&mut st);
+    }
     disconnect(pipe);
 }
 
-fn disconnect(pipe: HANDLE) {
-    unsafe {
-        let _ = FlushFileBuffers(pipe);
-        let _ = DisconnectNamedPipe(pipe);
-        let _ = CloseHandle(pipe);
-    }
-}
-
-fn safe_canon_or_log(p: &Path) -> Option<PathBuf> {
-    match canonicalize_safe(p) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("[svc] path rejected ({}): {e}", p.display());
-            None
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// ExecVm
+// Method dispatch
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn handle_exec_vm(
-    pipe: HANDLE,
-    id: String,
-    kernel_path: &str,
-    initrd_path: &str,
-    rootfs_dir_str: &str,
-    workspace_path: &str,
-    cmd_b64: &str,
-    memory_mb: u64,
-    cpu_count: usize,
-    network: SvcNetwork,
-) {
-    // Validate every path. canonicalize_safe rejects symlinks/junctions
-    // and multi-hardlink files.
-    let kernel = match canonicalize_safe(Path::new(kernel_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("kernel: {e}"));
-            return;
-        }
-    };
-    let initrd = match canonicalize_safe(Path::new(initrd_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("initrd: {e}"));
-            return;
-        }
-    };
-    let workspace = match canonicalize_safe(Path::new(workspace_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("workspace: {e}"));
-            return;
-        }
-    };
-    let rootfs_dir = match canonicalize_safe(Path::new(rootfs_dir_str)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("rootfs_dir: {e}"));
-            return;
-        }
-    };
+fn dispatch(conn: &Arc<Connection>, method_name: &str, params: Value) -> Result<Value, RpcError> {
+    match method_name {
+        method::PING => Ok(json!({ "version": VERSION })),
 
-    if network == SvcNetwork::AllowAll {
-        let _ = send_error_raw(
-            pipe,
-            &id,
+        method::CONFIGURE => handle_configure(conn, params),
+        method::CREATE_VM => handle_create_vm(conn),
+        method::START_VM => handle_start_vm(conn),
+        method::STOP_VM => handle_stop_vm(conn),
+
+        method::IS_RUNNING => Ok(json!(BoolValue {
+            value: conn.state.lock().unwrap().running
+        })),
+        method::IS_GUEST_CONNECTED => Ok(json!(BoolValue {
+            value: conn.state.lock().unwrap().guest_connected
+        })),
+        method::IS_PROCESS_RUNNING => {
+            let p: IdParams = serde_json::from_value(params)
+                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            let st = conn.state.lock().unwrap();
+            let alive = st
+                .children
+                .get(&p.id)
+                .map(|c| !c.finished.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            Ok(json!(BoolValue { value: alive }))
+        }
+
+        method::EXEC => handle_exec(conn, params),
+        method::SPAWN => handle_spawn(conn, params),
+        method::WRITE_STDIN => handle_write_stdin(conn, params),
+        method::KILL => handle_kill(conn, params),
+
+        method::SUBSCRIBE => Ok(json!({})),
+
+        method::CREATE_DISK_IMAGE => {
+            let _p: CreateDiskImageParams = serde_json::from_value(params)
+                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            // TODO: implement via Win32_Storage_Vhd CreateVirtualDiskW.
+            Err(RpcError::new(
+                "not_implemented",
+                "create_disk_image not yet implemented",
+            ))
+        }
+
+        method::SET_DEBUG_LOGGING => {
+            let enabled = params
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            DEBUG_LOGGING.store(enabled, Ordering::Relaxed);
+            Ok(json!({}))
+        }
+        method::IS_DEBUG_LOGGING_ENABLED => Ok(json!(BoolValue {
+            value: DEBUG_LOGGING.load(Ordering::Relaxed)
+        })),
+
+        method::SEND_GUEST_RESPONSE => Err(RpcError::new(
             "not_implemented",
-            "NetworkPolicy::AllowAll is not yet implemented on Windows. \
-             Use NetworkPolicy::Blocked. (Tracking: AllowAll requires HCN endpoint setup.)",
-        );
-        return;
-    }
+            "send_guest_response not yet implemented",
+        )),
 
-    match run_vm(&kernel, &initrd, &rootfs_dir, &workspace, cmd_b64, memory_mb, cpu_count) {
-        Ok(result) => {
-            let _ = send_response_raw(pipe, &SvcResponse::ExecVmResult { id, result });
+        method::ADD_PLAN9_SHARE => {
+            let p: AddPlan9ShareParams = serde_json::from_value(params)
+                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_add_plan9_share(conn, p)
         }
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "hcs_error", &format!("VM failed: {e}"));
+        method::REMOVE_PLAN9_SHARE => {
+            let p: RemovePlan9ShareParams = serde_json::from_value(params)
+                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_remove_plan9_share(conn, p)
         }
+
+        other => Err(RpcError::new(
+            "unknown_method",
+            format!("unknown method: {other}"),
+        )),
     }
 }
 
-fn run_vm(
-    kernel: &Path,
-    initrd: &Path,
-    rootfs_dir: &Path,
-    workspace: &Path,
-    cmd_b64: &str,
-    memory_mb: u64,
-    cpu_count: usize,
-) -> Result<ExecVmResult, String> {
-    // Clean stale guest output files.
-    let _ = std::fs::remove_file(workspace.join(".vz_stdout"));
-    let _ = std::fs::remove_file(workspace.join(".vz_stderr"));
-    let _ = std::fs::remove_file(workspace.join(".vz_exit_code"));
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
-    let vm_id = format!("tokimo-svc-{}", std::process::id());
-    let cfg_json = vmconfig::build(
-        &vm_id, kernel, initrd, rootfs_dir, workspace, cmd_b64, memory_mb, cpu_count,
-    );
+fn handle_configure(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+    let cfg: ConfigureParams = serde_json::from_value(params)
+        .map_err(|e| RpcError::new("bad_params", format!("configure: {e}")))?;
+    let mut st = conn.state.lock().unwrap();
+    if st.running {
+        return Err(RpcError::new(
+            "already_running",
+            "cannot reconfigure while VM is running",
+        ));
+    }
+    st.config = Some(cfg);
+    Ok(json!({}))
+}
 
-    // Debug: dump the HCS config JSON to a known location so failures can
-    // be inspected post-mortem from the test harness.
-    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-config.json", &cfg_json);
+fn handle_create_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
+    // The Windows backend rolls VM creation into `start_vm` since HCS
+    // requires the full configuration up front and we want the guest
+    // available as soon as the call returns. `create_vm` is a no-op
+    // sanity check that configure was called.
+    let st = conn.state.lock().unwrap();
+    if st.config.is_none() {
+        return Err(RpcError::new(
+            "not_configured",
+            "configure() must be called before create_vm()",
+        ));
+    }
+    Ok(json!({}))
+}
 
-    // Spawn a thread that hosts the COM1 named pipe server and tails serial
-    // output into C:\tokimo-debug\last-vm-com1.log. HCS connects to this pipe
-    // when the VM starts; we keep accepting reads until the VM stops.
-    spawn_com1_logger(&vm_id);
+fn handle_start_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
+    // Take a snapshot of config without holding the state lock during
+    // the long-running boot path (we re-acquire to install state).
+    let cfg = {
+        let st = conn.state.lock().unwrap();
+        if st.running {
+            return Err(RpcError::new("already_running", "VM is already running"));
+        }
+        st.config
+            .clone()
+            .ok_or_else(|| RpcError::new("not_configured", "configure() not called"))?
+    };
 
-    let api = hcs::HcsApi::init()?;
-    let handle = match api.create_compute_system(&vm_id, &cfg_json) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-error.txt", &e);
-            return Err(e);
+    // Allocate HCN endpoint when network policy requires guest egress.
+    // Observed/Gated currently fall through to AllowAll (TODO: smoltcp
+    // userspace netstack — see plan/windows-service-upgrade.md Phase 4).
+    let net_endpoint = match cfg.network {
+        NetworkPolicy::Blocked => None,
+        NetworkPolicy::AllowAll => {
+            let net = hcn::HcnNetwork::create_or_open_nat()
+                .map_err(|e| RpcError::new("hcn_network", e))?;
+            let ep = net
+                .create_endpoint()
+                .map_err(|e| RpcError::new("hcn_endpoint", e))?;
+            Some(ep)
         }
     };
-    let _guard = scopeguard_close(api.clone(), handle);
+    let net_endpoint_id_str = net_endpoint.as_ref().map(|e| e.id_string());
+    let net_endpoint_mac = net_endpoint.as_ref().map(|e| e.mac_string().to_string());
 
-    api.start_compute_system(handle)?;
+    let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg)
+        .map_err(|e| RpcError::new("bad_path", e))?;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        std::thread::sleep(Duration::from_millis(200));
-        match api.poll_state(handle) {
-            hcs::HcsState::Stopped => break,
-            hcs::HcsState::Error => {
-                let _ = api.terminate_compute_system(handle);
-                return Err("VM entered error state".into());
-            }
-            hcs::HcsState::Running => {}
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = api.terminate_compute_system(handle);
-            return Ok(ExecVmResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: true,
-            });
-        }
+    if cfg.plan9_shares.is_empty() {
+        return Err(RpcError::new(
+            "validation",
+            "at least one plan9_share is required on Windows",
+        ));
+    }
+    if cfg.plan9_shares.len() > 64 {
+        return Err(RpcError::new(
+            "validation",
+            format!("too many plan9_shares: {} (max 64)", cfg.plan9_shares.len()),
+        ));
     }
 
-    let stdout = std::fs::read_to_string(workspace.join(".vz_stdout")).unwrap_or_default();
-    let stderr = std::fs::read_to_string(workspace.join(".vz_stderr")).unwrap_or_default();
-    let exit_code = std::fs::read_to_string(workspace.join(".vz_exit_code"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(-1);
-
-    let _ = std::fs::remove_file(workspace.join(".vz_stdout"));
-    let _ = std::fs::remove_file(workspace.join(".vz_stderr"));
-    let _ = std::fs::remove_file(workspace.join(".vz_exit_code"));
-
-    Ok(ExecVmResult {
-        stdout,
-        stderr,
-        exit_code,
-        timed_out: false,
-    })
-}
-
-/// Tiny RAII guard that always closes the compute system handle.
-fn scopeguard_close(api: Arc<hcs::HcsApi>, handle: hcs::CsHandle) -> impl Drop {
-    struct G(Arc<hcs::HcsApi>, hcs::CsHandle);
-    impl Drop for G {
-        fn drop(&mut self) {
-            self.0.close_compute_system(self.1);
-        }
+    // Canonicalise share host paths (TOCTOU-safe).
+    let mut canon_shares: Vec<(PathBuf, &tokimo_package_sandbox::Plan9Share)> = Vec::new();
+    for (i, s) in cfg.plan9_shares.iter().enumerate() {
+        let canon = canonicalize_safe(&s.host_path).map_err(|e| {
+            RpcError::new(
+                "bad_path",
+                format!("plan9_shares[{i}].host_path ({}): {e}", s.host_path.display()),
+            )
+        })?;
+        canon_shares.push((canon, s));
     }
-    G(api, handle)
-}
 
-/// Hosts the named pipe server for COM1 and tails everything HCS writes to
-/// it into `C:\tokimo-debug\last-vm-com1.log`. Truncates the log first.
-fn spawn_com1_logger(vm_id: &str) {
-    spawn_com_logger(
-        &format!(r"\\.\pipe\tokimo-vm-com1-{vm_id}"),
-        r"C:\tokimo-debug\last-vm-com1.log",
+    let vm_id = format!(
+        "tokimo-sess-{}-{}",
+        std::process::id(),
+        rand_session_suffix()
     );
+
+    let scratch_dir: PathBuf = canon_shares[0].0.clone();
+    let rootfs_spec = RootfsSpec::Ephemeral {
+        template: rootfs_template.to_string_lossy().into_owned(),
+    };
+    let lease = vhdx_pool::acquire(&rootfs_spec, &scratch_dir, &vm_id).map_err(|e| match e {
+        vhdx_pool::PoolError::Busy(p) => RpcError::new(
+            "persistent_busy",
+            format!("rootfs target busy: {}", p.display()),
+        ),
+        other => RpcError::new("vhdx_pool", other.to_string()),
+    })?;
+
+    let init_port = vmconfig::alloc_session_init_port();
+    let init_svc_id = vmconfig::hvsock_service_id(init_port);
+    ensure_hvsocket_service_registered(&init_svc_id, "Tokimo Sandbox Init")
+        .map_err(|e| RpcError::new("hvsock_register", e))?;
+    let init_svc_guid =
+        parse_guid(&init_svc_id).map_err(|e| RpcError::new("guid", e))?;
+    let init_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid)
+        .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?;
+
+    let share_ports: Vec<u32> = (0..canon_shares.len())
+        .map(|_| vmconfig::alloc_share_port())
+        .collect();
+    let v2_shares: Vec<vmconfig::V2Share<'_>> = canon_shares
+        .iter()
+        .zip(share_ports.iter())
+        .map(|((host_path, spec), port)| vmconfig::V2Share {
+            host_path: host_path.as_path(),
+            name: spec.name.as_str(),
+            port: *port,
+            read_only: spec.read_only,
+        })
+        .collect();
+
+    let cfg_json = vmconfig::build_session_v2_ex(
+        &vm_id,
+        &kernel,
+        &initrd,
+        lease.path(),
+        &v2_shares,
+        cfg.memory_mb,
+        cfg.cpu_count as usize,
+        init_port,
+        net_endpoint_id_str.as_deref(),
+        net_endpoint_mac.as_deref(),
+    );
+    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
+
+    let api = hcs::HcsApi::init().map_err(|e| RpcError::new("hcs_init", e))?;
+    let cs = api
+        .create_compute_system(&vm_id, &cfg_json)
+        .map_err(|e| RpcError::new("hcs_create", e))?;
+    if let Err(e) = api.start_compute_system(cs) {
+        api.close_compute_system(cs);
+        return Err(RpcError::new("hcs_start", e));
+    }
+
+    // Accept the guest's init connection.
+    let hv = match hvsock::accept_guest(&init_listener, Duration::from_secs(60)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = api.terminate_compute_system(cs);
+            api.close_compute_system(cs);
+            return Err(RpcError::new("hvsock_accept", e.to_string()));
+        }
+    };
+    drop(init_listener);
+
+    let hv_writer = match hv.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = api.terminate_compute_system(cs);
+            api.close_compute_system(cs);
+            return Err(RpcError::new("hvsock_clone", e.to_string()));
+        }
+    };
+
+    let init = match tokimo_package_sandbox::init_client::WinInitClient::with_transport(
+        Box::new(hv_writer),
+        Box::new(hv),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = api.terminate_compute_system(cs);
+            api.close_compute_system(cs);
+            return Err(RpcError::new("init_client", e.to_string()));
+        }
+    };
+    init.hello()
+        .map_err(|e| RpcError::new("init_hello", e.to_string()))?;
+
+    // Send mount manifest so guest-side init can mount each Plan9 share.
+    let manifest: Vec<MountEntry> = canon_shares
+        .iter()
+        .zip(share_ports.iter())
+        .map(|((_host, spec), port)| MountEntry {
+            vsock_port: *port,
+            guest_path: spec.guest_path.to_string_lossy().into_owned(),
+            aname: spec.name.clone(),
+            read_only: spec.read_only,
+        })
+        .collect();
+    init.send_mount_manifest(manifest)
+        .map_err(|e| RpcError::new("mount_manifest", e.to_string()))?;
+
+    // Install state.
+    let init_arc = Arc::new(init);
+    {
+        let mut st = conn.state.lock().unwrap();
+        st.hcs = Some((api.clone(), cs, vm_id.clone()));
+        st.init = Some(init_arc);
+        st.vhdx = Some(lease);
+        st.network_endpoint = net_endpoint;
+        st.running = true;
+        st.guest_connected = true;
+        // Record boot-time shares so dynamic add/remove can validate
+        // name uniqueness and reject removal of the immutable ones.
+        st.active_shares.clear();
+        for ((_host, spec), port) in canon_shares.iter().zip(share_ports.iter()) {
+            st.active_shares.insert(
+                spec.name.clone(),
+                ActiveShare {
+                    port: *port,
+                    boot_time: true,
+                },
+            );
+        }
+    }
+
+    // Emit Ready + GuestConnected events.
+    let _ = send_event(conn, method::EV_READY, json!({}));
+    let _ = send_event(
+        conn,
+        method::EV_GUEST_CONNECTED,
+        json!({ "connected": true }),
+    );
+
+    Ok(json!({}))
 }
 
-/// Generic version: any COM port to any log path.
-fn spawn_com_logger(pipe_name: &str, log_path: &'static str) {
-    let _ = std::fs::write(log_path, b"");
-    let pipe_w = HSTRING::from(pipe_name);
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        while std::time::Instant::now() < deadline {
-            let pipe = unsafe {
-                CreateNamedPipeW(
-                    &pipe_w,
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    1,
-                    4096,
-                    4096,
-                    50,
-                    None,
-                )
-            };
-            if pipe == INVALID_HANDLE_VALUE {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+fn handle_stop_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
+    let mut st = conn.state.lock().unwrap();
+    teardown_session(&mut st);
+    Ok(json!({}))
+}
+
+fn teardown_session(st: &mut SessionState) {
+    if let Some(init) = st.init.take() {
+        let _ = init.shutdown();
+    }
+    if let Some((api, cs, _vm_id)) = st.hcs.take() {
+        let _ = api.terminate_compute_system(cs);
+        api.close_compute_system(cs);
+    }
+    st.children.clear();
+    st.active_shares.clear();
+    st.vhdx = None;
+    // Drop endpoint AFTER the VM is terminated so HCS releases the NIC
+    // reference before HCN tries to delete it.
+    st.network_endpoint = None;
+    st.running = false;
+    st.guest_connected = false;
+}
+
+fn handle_exec(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+    let p: ExecParams = serde_json::from_value(params)
+        .map_err(|e| RpcError::new("bad_params", format!("exec: {e}")))?;
+    let init = require_init(conn)?;
+    let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
+    let info = init
+        .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
+        .map_err(|e| RpcError::new("spawn", e.to_string()))?;
+
+    if let Some(stdin) = &p.stdin {
+        let _ = init.write(&info.child_id, stdin);
+    }
+
+    // Drain until exit. Use a reasonable timeout; long-running execs
+    // should use spawn() instead.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        for chunk in init.drain_stdout(&info.child_id) {
+            stdout.extend_from_slice(&chunk);
+        }
+        for chunk in init.drain_stderr(&info.child_id) {
+            stderr.extend_from_slice(&chunk);
+        }
+        if let Some((exit_code, signal)) = init.take_exit(&info.child_id) {
+            // One last drain post-exit.
+            for chunk in init.drain_stdout(&info.child_id) {
+                stdout.extend_from_slice(&chunk);
             }
-            let connected = unsafe { ConnectNamedPipe(pipe, None) };
-            if connected.is_err() {
-                let last = unsafe { GetLastError() }.0;
-                if last != 535 {
-                    let _ = unsafe { CloseHandle(pipe) };
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
+            for chunk in init.drain_stderr(&info.child_id) {
+                stderr.extend_from_slice(&chunk);
             }
-            let mut buf = [0u8; 1024];
-            loop {
-                let mut got: u32 = 0;
-                let r = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut got), None) };
-                if r.is_err() || got == 0 {
-                    break;
-                }
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                    let _ = f.write_all(&buf[..got as usize]);
-                }
+            let _ = init.close_child(&info.child_id);
+            return Ok(serde_json::to_value(ExecResultWire {
+                stdout,
+                stderr,
+                exit_code,
+                signal,
+            })
+            .unwrap());
+        }
+        if Instant::now() >= deadline {
+            let _ = init.signal(&info.child_id, 9, false);
+            return Err(RpcError::new("timeout", "exec deadline exceeded"));
+        }
+        let _ = init.wait_for_event(&info.child_id, Instant::now() + Duration::from_millis(200));
+    }
+}
+
+fn handle_spawn(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+    let p: ExecParams = serde_json::from_value(params)
+        .map_err(|e| RpcError::new("bad_params", format!("spawn: {e}")))?;
+    let init = require_init(conn)?;
+    let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
+    let info = init
+        .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
+        .map_err(|e| RpcError::new("spawn", e.to_string()))?;
+    let child_id = info.child_id.clone();
+
+    if let Some(stdin) = &p.stdin {
+        let _ = init.write(&child_id, stdin);
+    }
+
+    // Spawn a per-child poller thread that drains stdout/stderr/exit and
+    // emits Event frames over the pipe.
+    let conn_w = Arc::clone(conn);
+    let init_w = Arc::clone(&init);
+    let child_id_w = child_id.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_w = Arc::clone(&finished);
+    let joiner = thread::spawn(move || {
+        child_poller(conn_w, init_w, child_id_w, finished_w);
+    });
+
+    // Map our visible JobId to the init's child id (they're the same string here).
+    {
+        let mut st = conn.state.lock().unwrap();
+        st.children.insert(
+            child_id.clone(),
+            ChildEntry {
+                _joiner: joiner,
+                finished,
+            },
+        );
+    }
+
+    // Bump counter for telemetry (not strictly used).
+    conn.job_counter.fetch_add(1, Ordering::Relaxed);
+
+    Ok(serde_json::to_value(SpawnResult { id: child_id }).unwrap())
+}
+
+fn child_poller(
+    conn: Arc<Connection>,
+    init: Arc<tokimo_package_sandbox::init_client::WinInitClient>,
+    child_id: String,
+    finished: Arc<AtomicBool>,
+) {
+    loop {
+        for chunk in init.drain_stdout(&child_id) {
+            let _ = send_event(
+                &conn,
+                method::EV_STDOUT,
+                json!({ "id": child_id, "data": chunk }),
+            );
+        }
+        for chunk in init.drain_stderr(&child_id) {
+            let _ = send_event(
+                &conn,
+                method::EV_STDERR,
+                json!({ "id": child_id, "data": chunk }),
+            );
+        }
+        if let Some((exit_code, signal)) = init.take_exit(&child_id) {
+            // Final drain.
+            for chunk in init.drain_stdout(&child_id) {
+                let _ = send_event(
+                    &conn,
+                    method::EV_STDOUT,
+                    json!({ "id": child_id, "data": chunk }),
+                );
             }
-            let _ = unsafe { CloseHandle(pipe) };
+            for chunk in init.drain_stderr(&child_id) {
+                let _ = send_event(
+                    &conn,
+                    method::EV_STDERR,
+                    json!({ "id": child_id, "data": chunk }),
+                );
+            }
+            let _ = send_event(
+                &conn,
+                method::EV_EXIT,
+                json!({
+                    "id": child_id,
+                    "exit_code": exit_code,
+                    "signal": signal,
+                }),
+            );
+            let _ = init.close_child(&child_id);
+            finished.store(true, Ordering::Relaxed);
             return;
         }
-    });
+        if init.is_dead() {
+            finished.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Cap polling frequency.
+        let _ = init.wait_for_event(&child_id, Instant::now() + Duration::from_millis(250));
+    }
+}
+
+fn handle_write_stdin(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+    let p: WriteStdinParams = serde_json::from_value(params)
+        .map_err(|e| RpcError::new("bad_params", format!("write_stdin: {e}")))?;
+    let init = require_init(conn)?;
+    init.write(&p.id, &p.data)
+        .map_err(|e| RpcError::new("write", e.to_string()))?;
+    Ok(json!({}))
+}
+
+fn handle_kill(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+    let p: KillParams = serde_json::from_value(params)
+        .map_err(|e| RpcError::new("bad_params", format!("kill: {e}")))?;
+    let init = require_init(conn)?;
+    init.signal(&p.id, p.signal, false)
+        .map_err(|e| RpcError::new("kill", e.to_string()))?;
+    Ok(json!({}))
+}
+
+fn handle_add_plan9_share(
+    conn: &Arc<Connection>,
+    p: AddPlan9ShareParams,
+) -> Result<Value, RpcError> {
+    let share: Plan9Share = p.share;
+    if share.name.is_empty() {
+        return Err(RpcError::new("validation", "share name must not be empty"));
+    }
+    // Snapshot what we need under the lock; release before long blocking
+    // calls (HCS modify, init RPC).
+    let (api, cs, init) = {
+        let st = conn.state.lock().unwrap();
+        if !st.running {
+            return Err(RpcError::new(
+                "vm_not_running",
+                "VM is not running; call startVm() first",
+            ));
+        }
+        if st.active_shares.contains_key(&share.name) {
+            return Err(RpcError::new(
+                "duplicate_share",
+                format!("share {:?} already attached", share.name),
+            ));
+        }
+        let (api, cs, _id) = st
+            .hcs
+            .as_ref()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no live HCS handle"))?
+            .clone();
+        let init = st
+            .init
+            .clone()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no init client"))?;
+        (api, cs, init)
+    };
+
+    let canon = canonicalize_safe(&share.host_path).map_err(|e| {
+        RpcError::new(
+            "bad_path",
+            format!("host_path ({}): {e}", share.host_path.display()),
+        )
+    })?;
+
+    let port = vmconfig::alloc_plan9_port();
+    let req_json = vmconfig::plan9_modify_request(&share.name, &canon, port, "Add");
+
+    api.modify_compute_system(cs, &req_json)
+        .map_err(|e| RpcError::new("hcs_modify", e))?;
+
+    // Tell the guest to dial + mount the new share.
+    let entry = MountEntry {
+        vsock_port: port,
+        guest_path: share.guest_path.to_string_lossy().into_owned(),
+        aname: share.name.clone(),
+        read_only: share.read_only,
+    };
+    if let Err(e) = init.add_mount(entry) {
+        // Best-effort rollback: detach the share from the VM so the
+        // host doesn't leak the Plan9 endpoint.
+        let rollback = vmconfig::plan9_modify_request(&share.name, &canon, port, "Remove");
+        let _ = api.modify_compute_system(cs, &rollback);
+        return Err(RpcError::new("guest_mount", e.to_string()));
+    }
+
+    {
+        let mut st = conn.state.lock().unwrap();
+        st.active_shares.insert(
+            share.name.clone(),
+            ActiveShare {
+                port,
+                boot_time: false,
+            },
+        );
+    }
+
+    Ok(json!({}))
+}
+
+fn handle_remove_plan9_share(
+    conn: &Arc<Connection>,
+    p: RemovePlan9ShareParams,
+) -> Result<Value, RpcError> {
+    let name = p.name;
+    if name.is_empty() {
+        return Err(RpcError::new("validation", "share name must not be empty"));
+    }
+
+    let (api, cs, init, port) = {
+        let st = conn.state.lock().unwrap();
+        if !st.running {
+            return Err(RpcError::new(
+                "vm_not_running",
+                "VM is not running; call startVm() first",
+            ));
+        }
+        let entry = st.active_shares.get(&name).ok_or_else(|| {
+            RpcError::new("unknown_share", format!("no share named {name:?}"))
+        })?;
+        if entry.boot_time {
+            return Err(RpcError::new(
+                "immutable_share",
+                format!("share {name:?} was attached at boot and cannot be removed"),
+            ));
+        }
+        let port = entry.port;
+        let (api, cs, _id) = st
+            .hcs
+            .as_ref()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no live HCS handle"))?
+            .clone();
+        let init = st
+            .init
+            .clone()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no init client"))?;
+        (api, cs, init, port)
+    };
+
+    // Unmount guest-side first so the kernel releases the 9p fd before
+    // we tell HCS to tear down the host endpoint.
+    if let Err(e) = init.remove_mount(&name) {
+        return Err(RpcError::new("guest_unmount", e.to_string()));
+    }
+
+    // Path is irrelevant for Remove (HCS keys off Name+Port); pass an
+    // empty placeholder.
+    let req_json = vmconfig::plan9_modify_request(&name, std::path::Path::new(""), port, "Remove");
+    if let Err(e) = api.modify_compute_system(cs, &req_json) {
+        return Err(RpcError::new("hcs_modify", e));
+    }
+
+    {
+        let mut st = conn.state.lock().unwrap();
+        st.active_shares.remove(&name);
+    }
+
+    Ok(json!({}))
+}
+
+fn require_init(
+    conn: &Arc<Connection>,
+) -> Result<Arc<tokimo_package_sandbox::init_client::WinInitClient>, RpcError> {
+    conn.state
+        .lock()
+        .unwrap()
+        .init
+        .clone()
+        .ok_or_else(|| RpcError::new("vm_not_running", "VM is not running"))
 }
 
 // ---------------------------------------------------------------------------
-// Pipe framing
+// VM artifact discovery
 // ---------------------------------------------------------------------------
 
-fn read_request(pipe: HANDLE) -> std::io::Result<SvcRequest> {
+fn resolve_vm_artifacts(cfg: &ConfigureParams) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let kernel = match &cfg.kernel_path {
+        Some(p) => canonicalize_safe(p).map_err(|e| format!("kernel: {e}"))?,
+        None => find_artifact("vmlinuz")?,
+    };
+    let initrd = match &cfg.initrd_path {
+        Some(p) => canonicalize_safe(p).map_err(|e| format!("initrd: {e}"))?,
+        None => find_artifact("initrd.img")?,
+    };
+    let rootfs = match &cfg.vhdx_path {
+        Some(p) => canonicalize_safe(p).map_err(|e| format!("rootfs: {e}"))?,
+        None => find_artifact("rootfs.vhdx")?,
+    };
+    Ok((kernel, initrd, rootfs))
+}
+
+fn find_artifact(name: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut dir = exe.parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        let candidate = d.join("vm").join(name);
+        if candidate.is_file() {
+            return canonicalize_safe(&candidate).map_err(|e| e.to_string());
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut d = Some(cwd);
+        while let Some(p) = d {
+            let candidate = p.join("vm").join(name);
+            if candidate.is_file() {
+                return canonicalize_safe(&candidate).map_err(|e| e.to_string());
+            }
+            d = p.parent().map(Path::to_path_buf);
+        }
+    }
+    Err(format!("could not locate vm/{name} (no env vars consulted)"))
+}
+
+// ---------------------------------------------------------------------------
+// Frame I/O
+// ---------------------------------------------------------------------------
+
+fn read_frame(pipe: HANDLE) -> std::io::Result<Frame> {
     let mut len_buf = [0u8; 4];
     read_exact(pipe, &mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut payload = vec![0u8; len];
     read_exact(pipe, &mut payload)?;
     serde_json::from_slice(&payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("json: {e}")))
+}
+
+fn send_frame(conn: &Arc<Connection>, frame: &Frame) -> std::io::Result<()> {
+    let bytes = encode_frame(frame)?;
+    let _g = conn.write_lock.lock().unwrap();
+    write_all(conn.pipe, &bytes)
+}
+
+fn send_event(conn: &Arc<Connection>, method_name: &str, params: Value) -> std::io::Result<()> {
+    send_frame(
+        conn,
+        &Frame::Event {
+            method: method_name.into(),
+            params,
+        },
+    )
 }
 
 fn create_event() -> std::io::Result<HANDLE> {
@@ -787,8 +1355,6 @@ fn create_event() -> std::io::Result<HANDLE> {
     Ok(h)
 }
 
-/// Synchronous-style ReadFile on an OVERLAPPED handle. Issues an
-/// overlapped read and waits for completion via WaitForSingleObject.
 unsafe fn ov_read(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<u32> {
     let evt = create_event()?;
     let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -796,19 +1362,13 @@ unsafe fn ov_read(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<u32> {
     let mut got: u32 = 0;
     let r = unsafe { ReadFile(pipe, Some(buf), Some(&mut got), Some(&mut ov)) };
     let last = unsafe { GetLastError() }.0;
-    tunnel_log(&format!(
-        "ov_read ReadFile r.is_err={} last={last} got={got}",
-        r.is_err()
-    ));
     if r.is_err() {
-        if last == 997
-        /* ERROR_IO_PENDING */
-        {
-            tunnel_log("ov_read waiting on event");
+        if last == 997 {
             unsafe { WaitForSingleObject(evt, u32::MAX) };
-            tunnel_log("ov_read event signaled");
             let mut transferred: u32 = 0;
-            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
+            let ok = unsafe {
+                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
+            };
             unsafe {
                 let _ = CloseHandle(evt);
             }
@@ -840,7 +1400,9 @@ unsafe fn ov_write(pipe: HANDLE, buf: &[u8]) -> std::io::Result<u32> {
         if last == 997 {
             unsafe { WaitForSingleObject(evt, u32::MAX) };
             let mut transferred: u32 = 0;
-            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
+            let ok = unsafe {
+                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
+            };
             unsafe {
                 let _ = CloseHandle(evt);
             }
@@ -866,7 +1428,10 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<()> {
     while off < buf.len() {
         let got = unsafe { ov_read(pipe, &mut buf[off..])? };
         if got == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pipe closed"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pipe closed",
+            ));
         }
         off += got as usize;
     }
@@ -878,32 +1443,32 @@ fn write_all(pipe: HANDLE, buf: &[u8]) -> std::io::Result<()> {
     while off < buf.len() {
         let written = unsafe { ov_write(pipe, &buf[off..])? };
         if written == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pipe closed"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pipe closed",
+            ));
         }
         off += written as usize;
     }
     Ok(())
 }
 
-fn send_response_raw(pipe: HANDLE, resp: &SvcResponse) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(resp)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ser: {e}")))?;
-    let len = (bytes.len() as u32).to_le_bytes();
-    write_all(pipe, &len)?;
-    write_all(pipe, &bytes)
+fn disconnect(pipe: HANDLE) {
+    unsafe {
+        let _ = FlushFileBuffers(pipe);
+        let _ = DisconnectNamedPipe(pipe);
+        let _ = CloseHandle(pipe);
+    }
 }
 
-fn send_error_raw(pipe: HANDLE, id: &str, code: &str, msg: &str) -> std::io::Result<()> {
-    send_response_raw(
-        pipe,
-        &SvcResponse::Error {
-            id: id.to_string(),
-            error: SvcError {
-                code: code.to_string(),
-                message: msg.to_string(),
-            },
-        },
-    )
+fn safe_canon_or_log(p: &Path) -> Option<PathBuf> {
+    match canonicalize_safe(p) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[svc] path rejected ({}): {e}", p.display());
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -911,12 +1476,15 @@ fn send_error_raw(pipe: HANDLE, id: &str, code: &str, msg: &str) -> std::io::Res
 // ---------------------------------------------------------------------------
 
 fn verify_caller_required() -> bool {
-    if std::env::var("TOKIMO_VERIFY_CALLER").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("TOKIMO_VERIFY_CALLER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return true;
     }
-    // Check HKLM\SOFTWARE\Tokimo\SandboxSvc\VerifyCaller
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW,
     };
     let subkey = HSTRING::from(r"SOFTWARE\Tokimo\SandboxSvc");
     let value = HSTRING::from("VerifyCaller");
@@ -942,16 +1510,12 @@ fn verify_caller_required() -> bool {
     r.is_ok() && data != 0
 }
 
-/// Register an HvSocket service GUID under
-/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\<guid>`.
-/// Idempotent — if the key already exists we just refresh the friendly name.
 fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Result<(), String> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-        RegCreateKeyExW, RegSetValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE,
+        REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
     };
-
     let subkey = HSTRING::from(format!(
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\{svc_guid}"
     ));
@@ -974,17 +1538,19 @@ fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Re
         return Err(format!("RegCreateKeyExW {svc_guid}: {:?}", r));
     }
     let value_name = HSTRING::from("ElementName");
-    let wide: Vec<u16> = friendly_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+    let wide: Vec<u16> = friendly_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
     let r2 = unsafe { RegSetValueExW(hk, &value_name, None, REG_SZ, Some(bytes)) };
 
-    // Set SecurityDescriptor REG_SZ so the guest's hv_sock connect to this
-    // service GUID is granted access. Without this the guest's connect can
-    // be silently dropped (ETIMEDOUT) — Hyper-V doesn't surface a refusal.
     let sd_name = HSTRING::from("SecurityDescriptor");
     let sd_str = "D:(A;;GA;;;WD)";
     let sd_wide: Vec<u16> = sd_str.encode_utf16().chain(std::iter::once(0)).collect();
-    let sd_bytes: &[u8] = unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
+    let sd_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
     let _ = unsafe { RegSetValueExW(hk, &sd_name, None, REG_SZ, Some(sd_bytes)) };
 
     let _ = unsafe { RegCloseKey(hk) };
@@ -997,7 +1563,6 @@ fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Re
 fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
     let mut pid: u32 = 0;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut pid).ok()? };
-
     let proc_h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut buf = [0u16; 32 * 1024];
     let mut sz: u32 = buf.len() as u32;
@@ -1018,15 +1583,18 @@ fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
 }
 
 fn verify_authenticode(path: &Path) -> Result<(), String> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide_extra().chain(std::iter::once(0)).collect();
-
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let file_info = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: PCWSTR(wide.as_ptr()),
         hFile: HANDLE::default(),
         pgKnownSubject: std::ptr::null_mut(),
     };
-
     let mut wd = WINTRUST_DATA {
         cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
         pPolicyCallbackData: std::ptr::null_mut(),
@@ -1037,14 +1605,13 @@ fn verify_authenticode(path: &Path) -> Result<(), String> {
         Anonymous: WINTRUST_DATA_0 {
             pFile: &file_info as *const _ as *mut _,
         },
-        dwStateAction: WINTRUST_DATA_STATE_ACTION(1), // WTD_STATEACTION_VERIFY
+        dwStateAction: WINTRUST_DATA_STATE_ACTION(1),
         hWVTStateData: HANDLE::default(),
         pwszURLReference: PWSTR::null(),
         dwProvFlags: WINTRUST_DATA_PROVIDER_FLAGS(0),
-        dwUIContext: WINTRUST_DATA_UICONTEXT(1), // WTD_UICONTEXT_EXECUTE
+        dwUIContext: WINTRUST_DATA_UICONTEXT(1),
         pSignatureSettings: std::ptr::null_mut(),
     };
-
     let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     let hr = unsafe { WinVerifyTrust(HWND::default(), &mut action, &mut wd as *mut _ as *mut _) };
     if hr == 0 {
@@ -1054,391 +1621,10 @@ fn verify_authenticode(path: &Path) -> Result<(), String> {
     }
 }
 
-// Helper: encode_wide for OsStr (std doesn't expose this on stable as an
-// inherent method; the windows crate has HSTRING but we need a Vec<u16>).
-trait EncodeWideExtra {
-    fn encode_wide_extra(&self) -> std::os::windows::ffi::EncodeWide<'_>;
-}
-impl EncodeWideExtra for std::ffi::OsStr {
-    fn encode_wide_extra(&self) -> std::os::windows::ffi::EncodeWide<'_> {
-        use std::os::windows::ffi::OsStrExt;
-        self.encode_wide()
-    }
-}
-
 // ---------------------------------------------------------------------------
-// OpenSession — long-lived VM, COM1 tunneled to client pipe
+// Misc helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn handle_open_session(
-    pipe: HANDLE,
-    id: String,
-    protocol_version: u32,
-    kernel_path: &str,
-    initrd_path: &str,
-    rootfs: RootfsSpec,
-    shares: Vec<ShareSpec>,
-    memory_mb: u64,
-    cpu_count: usize,
-    network: SvcNetwork,
-) {
-    if protocol_version != WIRE_PROTOCOL_VERSION {
-        let _ = send_error_raw(
-            pipe,
-            &id,
-            "bad_protocol",
-            &format!("client wire protocol_version={protocol_version}, service expects {WIRE_PROTOCOL_VERSION}"),
-        );
-        return;
-    }
-    if network == SvcNetwork::AllowAll {
-        let _ = send_error_raw(
-            pipe,
-            &id,
-            "not_implemented",
-            "NetworkPolicy::AllowAll is not yet implemented on Windows. Use Blocked.",
-        );
-        return;
-    }
-    if shares.is_empty() {
-        let _ = send_error_raw(pipe, &id, "bad_request", "shares list is empty");
-        return;
-    }
-    if shares.len() > 64 {
-        let _ = send_error_raw(
-            pipe,
-            &id,
-            "bad_request",
-            &format!("too many shares: {} (max 64)", shares.len()),
-        );
-        return;
-    }
-
-    let kernel = match canonicalize_safe(Path::new(kernel_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("kernel: {e}"));
-            return;
-        }
-    };
-    let initrd = match canonicalize_safe(Path::new(initrd_path)) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "bad_path", &format!("initrd: {e}"));
-            return;
-        }
-    };
-
-    // Canonicalize every share's host path (TOCTOU-safe; rejects symlinks
-    // and reparse points). Build the canonical list up front so we never
-    // pass an attacker-influenced path into HCS.
-    let mut canonical_shares: Vec<(PathBuf, ShareSpec)> = Vec::with_capacity(shares.len());
-    for (i, s) in shares.iter().enumerate() {
-        match canonicalize_safe(Path::new(&s.host_path)) {
-            Ok(p) => canonical_shares.push((p, s.clone())),
-            Err(e) => {
-                let _ = send_error_raw(
-                    pipe,
-                    &id,
-                    "bad_path",
-                    &format!("shares[{i}].host_path ({}): {e}", s.host_path),
-                );
-                return;
-            }
-        }
-    }
-
-    let vm_id = format!("tokimo-sess-{}-{}", std::process::id(), rand_session_suffix());
-
-    // Acquire a rootfs lease (ephemeral clones the template; persistent
-    // locks the caller-supplied target path so concurrent sessions for
-    // the same target are rejected with `persistent_busy`).
-    //
-    // The ephemeral clone goes next to the first share. HCS auto-grants
-    // the VM worker's NT VIRTUAL MACHINE SID access to the share path,
-    // and that ACL inheritance covers the VHDX too. Putting the VHDX in
-    // `%TEMP%` (LocalSystem's `C:\WINDOWS\SystemTemp`) instead would
-    // fail VM start with `0x80070005 Access is denied` because the VM
-    // worker's per-VM SID has no ACE on system-restricted directories.
-    let scratch_dir: PathBuf = canonical_shares[0].0.clone();
-    let vhdx_lease = match vhdx_pool::acquire(&rootfs, &scratch_dir, &vm_id) {
-        Ok(l) => l,
-        Err(vhdx_pool::PoolError::Busy(p)) => {
-            let _ = send_error_raw(
-                pipe,
-                &id,
-                "persistent_busy",
-                &format!("rootfs target already in use: {}", p.display()),
-            );
-            return;
-        }
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "vhdx_pool", &e.to_string());
-            return;
-        }
-    };
-
-    // Allocate the init control port + one port per share. We bind a
-    // WILDCARD listener for the init control plane only — Plan9 share
-    // ports are owned by HCS (its internal Plan9 device serves 9p on
-    // each `Plan9.Shares[i].Port`), so we MUST NOT register their
-    // service GUIDs or bind listeners that would race HCS.
-    let init_port = vmconfig::alloc_session_init_port();
-    let init_svc_id = vmconfig::hvsock_service_id(init_port);
-    if let Err(e) = ensure_hvsocket_service_registered(&init_svc_id, "Tokimo Sandbox Init") {
-        let _ = send_error_raw(pipe, &id, "hvsock_register", &e);
-        return;
-    }
-    let init_svc_guid = match parse_guid(&init_svc_id) {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "guid", &e);
-            return;
-        }
-    };
-    let init_listener = match hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "hvsock_listen", &e.to_string());
-            return;
-        }
-    };
-
-    // Allocate per-share vsock ports up front so the V2 schema can list
-    // them all in `Plan9.Shares` and the response can echo `share_ports`
-    // back to the library (which forwards them to the guest in the
-    // `MountManifest` op). HCS provides the host-side endpoint for each.
-    let share_ports: Vec<u32> = (0..canonical_shares.len())
-        .map(|_| vmconfig::alloc_share_port())
-        .collect();
-
-    let v2_shares: Vec<vmconfig::V2Share<'_>> = canonical_shares
-        .iter()
-        .zip(share_ports.iter())
-        .map(|((host_path, spec), port)| vmconfig::V2Share {
-            host_path: host_path.as_path(),
-            name: spec.name.as_str(),
-            port: *port,
-            read_only: spec.read_only,
-        })
-        .collect();
-
-    let cfg_json = vmconfig::build_session_v2(
-        &vm_id,
-        &kernel,
-        &initrd,
-        vhdx_lease.path(),
-        &v2_shares,
-        memory_mb,
-        cpu_count,
-        init_port,
-    );
-    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
-
-    spawn_com_logger(
-        &format!(r"\\.\pipe\tokimo-vm-com2-{vm_id}"),
-        r"C:\tokimo-debug\last-vm-com2.log",
-    );
-
-    eprintln!(
-        "[svc] session {vm_id} listening on AF_HYPERV: init={init_svc_id}, {} share(s)",
-        canonical_shares.len()
-    );
-
-    let api = match hcs::HcsApi::init() {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = send_error_raw(pipe, &id, "hcs_init", &e);
-            return;
-        }
-    };
-    let cs = match api.create_compute_system(&vm_id, &cfg_json) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-error.txt", &e);
-            let _ = send_error_raw(pipe, &id, "hcs_create", &e);
-            return;
-        }
-    };
-    if let Err(e) = api.start_compute_system(cs) {
-        api.close_compute_system(cs);
-        let _ = send_error_raw(pipe, &id, "hcs_start", &e);
-        return;
-    }
-
-    // Send SessionOpened *before* we start blocking on `accept_guest` —
-    // the host's WinInitClient pumps reads in a background thread so we
-    // can interleave the OpenSession reply and tunnel bytes safely.
-    if let Err(e) = send_response_raw(
-        pipe,
-        &SvcResponse::SessionOpened {
-            id: id.clone(),
-            protocol_version: WIRE_PROTOCOL_VERSION,
-            init_port,
-            share_ports: share_ports.clone(),
-        },
-    ) {
-        api.terminate_compute_system(cs).ok();
-        api.close_compute_system(cs);
-        eprintln!("[svc] failed to send SessionOpened: {e}");
-        return;
-    }
-
-    // Wait for the guest to dial the init control port. The share ports
-    // are accepted lazily — one accept thread per share, each one
-    // blocks on its own listener until the guest's MountManifest
-    // handler dials in.
-    let mut hv = match hvsock::accept_guest(&init_listener, Duration::from_secs(60)) {
-        Ok(s) => s,
-        Err(e) => {
-            api.terminate_compute_system(cs).ok();
-            api.close_compute_system(cs);
-            eprintln!("[svc] hvsock(init) accept failed: {e}");
-            return;
-        }
-    };
-    drop(init_listener);
-    eprintln!("[svc] session {vm_id} init hvsock connected");
-
-    // Plan9 share connections are handled entirely by HCS — the guest
-    // dials each share's vsock port (relayed via `MountManifest`) and
-    // HCS's internal Plan9 server takes care of byte-level 9p traffic
-    // backed by the host directory specified in `Plan9.Shares[i].Path`.
-
-    let mut hv2 = match hv.try_clone() {
-        Ok(h) => h,
-        Err(e) => {
-            api.terminate_compute_system(cs).ok();
-            api.close_compute_system(cs);
-            eprintln!("[svc] hvsock clone failed: {e}");
-            return;
-        }
-    };
-    let client_ptr = pipe.0 as usize;
-    let cli_read_h: usize = unsafe {
-        use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
-        use windows::Win32::System::Threading::GetCurrentProcess;
-        let mut dup = HANDLE(std::ptr::null_mut());
-        let proc = GetCurrentProcess();
-        let _ = windows::Win32::Foundation::DuplicateHandle(
-            proc,
-            HANDLE(client_ptr as *mut _),
-            proc,
-            &mut dup,
-            0,
-            false,
-            DUPLICATE_SAME_ACCESS,
-        );
-        dup.0 as usize
-    };
-    let dead = Arc::new(AtomicBool::new(false));
-
-    let dead_a = dead.clone();
-    let _t = std::thread::spawn(move || {
-        tunnel_log("client→hv thread started");
-        let cli = HANDLE(cli_read_h as *mut _);
-        let mut buf = [0u8; 8192];
-        let mut total = 0u64;
-        loop {
-            if dead_a.load(Ordering::Relaxed) {
-                break;
-            }
-            let got = match unsafe { ov_read(cli, &mut buf) } {
-                Ok(g) => g,
-                Err(e) => {
-                    tunnel_log(&format!("client→hv read failed: {e}"));
-                    break;
-                }
-            };
-            if got == 0 {
-                tunnel_log(&format!("client→hv EOF total={total}"));
-                break;
-            }
-            total += got as u64;
-            tunnel_log(&format!("client→hv +{got}B (total {total})"));
-            use std::io::Write;
-            if let Err(e) = hv2.write_all(&buf[..got as usize]) {
-                tunnel_log(&format!("client→hv write failed: {e}"));
-                break;
-            }
-        }
-        dead_a.store(true, Ordering::Relaxed);
-    });
-
-    {
-        tunnel_log("hv→client loop start");
-        let cli = HANDLE(client_ptr as *mut _);
-        let mut buf = [0u8; 8192];
-        let mut total = 0u64;
-        use std::io::Read;
-        loop {
-            if dead.load(Ordering::Relaxed) {
-                break;
-            }
-            let n = match hv.read(&mut buf) {
-                Ok(0) => {
-                    tunnel_log(&format!("hv→client EOF total={total}"));
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    tunnel_log(&format!("hv→client read failed: {e}"));
-                    break;
-                }
-            };
-            total += n as u64;
-            tunnel_log(&format!("hv→client +{n}B (total {total})"));
-            let mut off = 0usize;
-            while off < n {
-                tunnel_log(&format!("hv→client about to ov_write {}B", n - off));
-                let wrote = match unsafe { ov_write(cli, &buf[off..n]) } {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tunnel_log(&format!("hv→client ov_write failed: {e}"));
-                        break;
-                    }
-                };
-                if wrote == 0 {
-                    tunnel_log("hv→client ov_write zero");
-                    break;
-                }
-                tunnel_log(&format!("hv→client wrote {wrote}B"));
-                off += wrote as usize;
-            }
-            let _ = unsafe { FlushFileBuffers(cli) };
-        }
-        dead.store(true, Ordering::Relaxed);
-    }
-
-    eprintln!("[svc] session {vm_id} tunnel closed, tearing down VM");
-    api.terminate_compute_system(cs).ok();
-    api.close_compute_system(cs);
-    // vhdx_lease drop releases the per-target mutex and (for ephemeral
-    // leases) deletes the per-session VHDX clone.
-    drop(vhdx_lease);
-}
-
-fn rand_u16() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (n & 0xFFFF) as u16 ^ ((n >> 16) as u16)
-}
-
-fn rand_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-    n.wrapping_mul(0x9E3779B97F4A7C15)
-}
-
-/// Parse a string GUID `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` into a
-/// `windows::core::GUID`.
 fn parse_guid(s: &str) -> Result<windows::core::GUID, String> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 5 {
@@ -1452,10 +1638,12 @@ fn parse_guid(s: &str) -> Result<windows::core::GUID, String> {
     }
     let mut data4 = [0u8; 8];
     for i in 0..2 {
-        data4[i] = u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[i] =
+            u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     for i in 0..6 {
-        data4[2 + i] = u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[2 + i] =
+            u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     Ok(windows::core::GUID {
         data1,
@@ -1474,17 +1662,6 @@ fn rand_session_suffix() -> String {
     format!("{:08x}", nanos)
 }
 
-fn tunnel_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(r"C:\tokimo-debug\last-vm-tunnel.log")
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{now}] {msg}");
-    }
-}
+// Suppress unused warnings for items kept around for future use.
+#[allow(dead_code)]
+fn _unused_compat() {}

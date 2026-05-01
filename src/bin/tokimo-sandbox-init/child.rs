@@ -103,8 +103,12 @@ pub fn spawn_pipes(argv: &[String], env: &[(String, String)], cwd: Option<&str>)
             let _ = setpgid(child, child);
 
             // Read errno from the pre-exec pipe; if any bytes arrive, exec failed.
-            // err_r is CLOEXEC + blocking — set non-blocking briefly.
-            let _ = fcntl(err_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
+            // err_r is CLOEXEC + blocking. On successful execve, the kernel
+            // closes err_w (CLOEXEC) and our blocking read here gets EOF (n=0).
+            // On exec failure, the child writes 4 bytes of errno then _exit(127),
+            // so we get n=4. We MUST keep this blocking — making it non-blocking
+            // races the child's write and lets exec failures slip through as
+            // "successful spawn" with a child that immediately exits 127.
             let mut buf = [0u8; 4];
             let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n == 4 {
@@ -166,7 +170,9 @@ pub fn spawn_pty(
             // subsequent setsid() fail with EPERM, leaving the shell with
             // no controlling tty ("cannot set terminal process group").
 
-            let _ = fcntl(err_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK));
+            // See spawn_pipes: keep err_r blocking. Reading 0 bytes (EOF
+            // when CLOEXEC closes err_w on successful execve) means success;
+            // 4 bytes means execve reported errno before _exit(127).
             let mut buf = [0u8; 4];
             let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n == 4 {
@@ -242,7 +248,11 @@ fn child_setup_pipes(
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    let _ = unsafe { libc::execve(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
+    // execvpe: like execve but consults PATH from the supplied envp when
+    // argv[0] does not contain a slash. This is a glibc extension; the
+    // Debian rootfs we boot uses glibc so this is fine. Without PATH lookup
+    // commands like "uname" or "sh" fail with ENOENT.
+    let _ = unsafe { libc::execvpe(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
     report_errno_and_exit(err_w, Errno::last_raw());
 }
 
@@ -303,7 +313,7 @@ fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CStr
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
-    let _ = unsafe { libc::execve(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
+    let _ = unsafe { libc::execvpe(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
     report_errno_and_exit(err_w, Errno::last_raw());
 }
 

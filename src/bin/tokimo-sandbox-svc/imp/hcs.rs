@@ -27,6 +27,7 @@ type PfnTerminateCs = unsafe extern "system" fn(CsHandle, Op, *const u16) -> Hre
 type PfnCloseCs = unsafe extern "system" fn(CsHandle);
 type PfnWaitOp = unsafe extern "system" fn(Op, u32, *mut *mut u16) -> Hres;
 type PfnGetProps = unsafe extern "system" fn(CsHandle, Op, *const u16) -> Hres;
+type PfnModifyCs = unsafe extern "system" fn(CsHandle, Op, *const u16, *mut c_void) -> Hres;
 
 pub struct HcsApi {
     module: HMODULE,
@@ -38,6 +39,7 @@ pub struct HcsApi {
     close_cs: PfnCloseCs,
     wait_op: PfnWaitOp,
     get_props: PfnGetProps,
+    modify_cs: PfnModifyCs,
 }
 
 unsafe impl Send for HcsApi {}
@@ -93,6 +95,7 @@ impl HcsApi {
             close_cs: resolve!("HcsCloseComputeSystem", PfnCloseCs),
             wait_op: resolve!("HcsWaitForOperationResult", PfnWaitOp),
             get_props: resolve!("HcsGetComputeSystemProperties", PfnGetProps),
+            modify_cs: resolve!("HcsModifyComputeSystem", PfnModifyCs),
         })
     }
 
@@ -140,6 +143,24 @@ impl HcsApi {
         if !handle.is_null() {
             unsafe { (self.close_cs)(handle) };
         }
+    }
+
+    /// Apply a runtime modification to a live compute system.
+    /// `settings_json` must be a full Schema 2.x ModifySettingRequest:
+    ///   `{"ResourceUri":"...", "Settings":{...}, "RequestType":"Add"|"Update"|"Remove"}`
+    pub fn modify_compute_system(&self, handle: CsHandle, settings_json: &str) -> Result<(), String> {
+        let cfg_w = wide_z(settings_json);
+        let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
+        if op.is_null() {
+            return Err("HcsCreateOperation returned null".into());
+        }
+        let hr = unsafe { (self.modify_cs)(handle, op, cfg_w.as_ptr(), ptr::null_mut()) };
+        if hr < 0 {
+            unsafe { (self.close_op)(op) };
+            return Err(format!("HcsModifyComputeSystem: 0x{:08X}", hr as u32));
+        }
+        self.wait_and_close(op, 30_000)
+            .map_err(|e| format!("HcsModifyComputeSystem wait: {e}"))
     }
 
     fn wait_and_close(&self, op: Op, timeout_ms: u32) -> Result<(), String> {

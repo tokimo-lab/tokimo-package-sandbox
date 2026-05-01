@@ -92,9 +92,18 @@ pub struct State {
     /// If true the listener is VSOCK (stream framing); else Unix SEQPACKET.
     pub transport: Transport,
     /// 9p-over-vsock fds kept alive for the lifetime of the session;
-    /// dropping them would tear down the share.
+    /// dropping them would tear down the share. The tuple is
+    /// `(aname, guest_path, fd)` so dynamic `RemoveMount` can locate
+    /// and umount a previously-attached share.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub mount_fds: Vec<OwnedFd>,
+    pub mount_fds: Vec<MountedShare>,
+}
+
+#[allow(dead_code)]
+pub struct MountedShare {
+    pub name: String,
+    pub target: String,
+    pub fd: OwnedFd,
 }
 
 impl State {
@@ -863,6 +872,12 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::MountManifest { id, entries } => {
             handle_mount_manifest(state, client_fd, id, entries);
         }
+        Op::AddMount { id, entry } => {
+            handle_add_mount(state, client_fd, id, entry);
+        }
+        Op::RemoveMount { id, name } => {
+            handle_remove_mount(state, client_fd, id, name);
+        }
     }
 }
 
@@ -897,7 +912,11 @@ fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, entrie
     for (i, entry) in entries.iter().enumerate() {
         match mount_one(entry) {
             Ok(fd) => {
-                state.mount_fds.push(fd);
+                state.mount_fds.push(MountedShare {
+                    name: entry.aname.clone(),
+                    target: entry.guest_path.clone(),
+                    fd,
+                });
             }
             Err(msg) => {
                 failing_index = Some(i as u32);
@@ -926,6 +945,78 @@ fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, _entri
         error: Some(ErrorReply::new(ErrorCode::Internal, "MountManifest is Linux-only")),
     };
     state.send_to_client(client_fd, &Frame::Reply(reply), None);
+}
+
+#[cfg(target_os = "linux")]
+fn handle_add_mount(state: &mut State, client_fd: RawFd, id: String, entry: MountEntry) {
+    if state.mount_fds.iter().any(|m| m.name == entry.aname) {
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::BadRequest,
+            format!("share {:?} already mounted", entry.aname),
+        )));
+        return;
+    }
+    match mount_one(&entry) {
+        Ok(fd) => {
+            state.mount_fds.push(MountedShare {
+                name: entry.aname.clone(),
+                target: entry.guest_path.clone(),
+                fd,
+            });
+            ack(state, client_fd, id, Ok(()));
+        }
+        Err(msg) => {
+            ack(state, client_fd, id, Err(ErrorReply::new(ErrorCode::Internal, msg)));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, name: String) {
+    let idx = match state.mount_fds.iter().position(|m| m.name == name) {
+        Some(i) => i,
+        None => {
+            ack(state, client_fd, id, Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("no such share: {name:?}"),
+            )));
+            return;
+        }
+    };
+    let entry = state.mount_fds.remove(idx);
+    let target_str = entry.target.clone();
+    let target_c = std::ffi::CString::new(target_str.as_str()).unwrap_or_default();
+    // MNT_DETACH = lazy unmount; the kernel finalises once all refs go away.
+    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+    drop(entry); // closes fd
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("umount2({target_str}): {err}"),
+        )));
+        return;
+    }
+    // Best-effort: remove the now-empty mountpoint so a subsequent
+    // `ls <guest_path>` returns ENOENT.
+    let _ = std::fs::remove_dir(&target_str);
+    ack(state, client_fd, id, Ok(()));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_add_mount(state: &mut State, client_fd: RawFd, id: String, _entry: MountEntry) {
+    ack(state, client_fd, id, Err(ErrorReply::new(
+        ErrorCode::Internal,
+        "AddMount is Linux-only",
+    )));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, _name: String) {
+    ack(state, client_fd, id, Err(ErrorReply::new(
+        ErrorCode::Internal,
+        "RemoveMount is Linux-only",
+    )));
 }
 
 #[cfg(target_os = "linux")]
@@ -1246,5 +1337,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::BindMount { .. } => "BindMount",
         Op::Unmount { .. } => "Unmount",
         Op::MountManifest { .. } => "MountManifest",
+        Op::AddMount { .. } => "AddMount",
+        Op::RemoveMount { .. } => "RemoveMount",
     }
 }

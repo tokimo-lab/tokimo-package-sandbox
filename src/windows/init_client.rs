@@ -68,7 +68,7 @@ impl Clone for WinInitClient {
 }
 
 struct Inner {
-    write: Mutex<OvPipe>,
+    write: Mutex<Box<dyn Write + Send>>,
     state: Arc<(Mutex<Shared>, Condvar)>,
     counter: AtomicU64,
     _reader: Mutex<Option<JoinHandle<()>>>,
@@ -87,17 +87,28 @@ impl WinInitClient {
         let read = pipe
             .try_clone()
             .map_err(|e| Error::exec(format!("try_clone session pipe: {e}")))?;
+        Self::with_transport(Box::new(pipe), Box::new(read))
+    }
+
+    /// Build a client from arbitrary transport halves. Each half must implement
+    /// the relevant byte-oriented trait. Used by the Windows service to drive
+    /// the in-VM init protocol over an `HvSock` pair without going through a
+    /// named-pipe tunnel.
+    pub fn with_transport(
+        write_half: Box<dyn Write + Send>,
+        read_half: Box<dyn Read + Send>,
+    ) -> Result<Self> {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
 
         let reader = thread::Builder::new()
             .name("tokimo-win-init-reader".into())
-            .spawn(move || reader_loop(read, reader_state))
+            .spawn(move || reader_loop(read_half, reader_state))
             .map_err(|e| Error::exec(format!("spawn reader thread: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                write: Mutex::new(pipe),
+                write: Mutex::new(write_half),
                 state,
                 counter: AtomicU64::new(0),
                 _reader: Mutex::new(Some(reader)),
@@ -277,6 +288,55 @@ impl WinInitClient {
                 }
             }
             other => Err(Error::exec(format!("expected MountManifest reply, got {other:?}"))),
+        }
+    }
+
+    /// Dynamically add one Plan9-over-vsock share at runtime. The host
+    /// must have already attached the share to the live VM via
+    /// `HcsModifyComputeSystem` so the guest's vsock dial succeeds.
+    pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddMount {
+            id: id.clone(),
+            entry,
+        };
+        // mount(2) inside the guest can take a moment for slow boots.
+        let reply = self.send_op_sync(&id, op, Duration::from_secs(30))?;
+        match reply {
+            Reply::Ack { ok, error, .. } => {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(Error::exec(format!(
+                        "AddMount failed: {:?}",
+                        error.map(|e| e.message)
+                    )))
+                }
+            }
+            other => Err(Error::exec(format!("expected Ack reply, got {other:?}"))),
+        }
+    }
+
+    /// Dynamically remove a Plan9 share by 9p tag (`aname`).
+    pub fn remove_mount(&self, name: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveMount {
+            id: id.clone(),
+            name: name.to_string(),
+        };
+        let reply = self.send_op_sync(&id, op, Duration::from_secs(30))?;
+        match reply {
+            Reply::Ack { ok, error, .. } => {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(Error::exec(format!(
+                        "RemoveMount failed: {:?}",
+                        error.map(|e| e.message)
+                    )))
+                }
+            }
+            other => Err(Error::exec(format!("expected Ack reply, got {other:?}"))),
         }
     }
 

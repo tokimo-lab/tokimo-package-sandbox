@@ -142,6 +142,16 @@ pub enum Op {
     /// (currently Windows only). On platforms whose backend mounts the
     /// workspace itself (Linux bwrap, macOS VZ) hosts simply omit this op.
     MountManifest { id: String, entries: Vec<MountEntry> },
+    /// Add a single Plan9-over-vsock share at runtime (after `MountManifest`).
+    /// The host has already attached the share to the live VM via
+    /// `HcsModifyComputeSystem`; init dials the new vsock port, performs
+    /// `mount(2)` and stashes the fd in `state.mount_fds`. Init replies
+    /// with a generic `Reply::Ack`.
+    AddMount { id: String, entry: MountEntry },
+    /// Remove a previously-added Plan9 share by 9p tag (`aname`). Init
+    /// `umount2(target, MNT_DETACH)`s the share and drops the held fd.
+    /// Replies with `Reply::Ack`.
+    RemoveMount { id: String, name: String },
 }
 
 /// One Plan9-over-vsock mount the guest must perform during `MountManifest`.
@@ -280,5 +290,6 @@ pub fn default_features() -> Vec<String> {
         "bindmount".into(),
         "unmount".into(),
         "mount_manifest".into(),
+        "dynamic_mount".into(),
     ]
 }

@@ -79,6 +79,13 @@ if [ -d /modules ]; then
     load_mod 9pnet
     load_mod 9pnet_fd
     load_mod 9p
+    # Hyper-V network virtual service client (synthetic NIC).
+    # Optional: only present when the initrd was rebaked with networking
+    # support. failover/net_failover are pulled in by netvsc when SR-IOV
+    # is configured but are harmless to load eagerly.
+    load_mod failover
+    load_mod net_failover
+    load_mod hv_netvsc
     # ext4 filesystem (for SCSI rootfs). Needs crc16 + crc32c + libcrc32c
     # + jbd2 + mbcache.
     load_mod crc16
@@ -179,6 +186,33 @@ fi
 
 if [ "$SESSION_MODE" = 1 ]; then
     echo "tokimo-init: SESSION mode — exec'ing tokimo-sandbox-init under chroot" >/dev/kmsg 2>/dev/null || true
+
+    # ---------------------------------------------------------------------------
+    # Network bring-up.
+    #
+    # When NetworkPolicy::AllowAll is configured, the host adds a Hyper-V
+    # NetworkAdapter to the VM bound to an HCN NAT endpoint with subnet
+    # 192.168.127.0/24 (gateway .1). We assign a static IP within that
+    # subnet because no DHCP client is bundled in the initrd. The gateway
+    # itself does the NAT.
+    #
+    # When NetworkPolicy::Blocked, no NIC is attached → /sys/class/net/eth0
+    # does not exist and this block becomes a no-op.
+    # ---------------------------------------------------------------------------
+    /bin/busybox ip link set lo up 2>/dev/null || true
+    if [ -d /sys/class/net/eth0 ]; then
+        echo "tokimo-init: configuring eth0 (static 192.168.127.2/24)" >/dev/kmsg 2>/dev/null || true
+        /bin/busybox ip link set eth0 up 2>/dev/null || true
+        /bin/busybox ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
+        /bin/busybox ip route add default via 192.168.127.1 2>/dev/null || true
+        # Resolver — propagate into the chrooted rootfs too. The Hyper-V
+        # NAT gateway forwards DNS to the host resolver, but pointing
+        # directly at public resolvers avoids depending on that path.
+        echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
+        echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
+    else
+        echo "tokimo-init: no eth0 (NetworkPolicy::Blocked or NIC driver missing)" >/dev/kmsg 2>/dev/null || true
+    fi
 
     # Always copy a fresh tokimo-sandbox-init from initramfs into the rootfs
     # so a stale binary doesn't get reused across builds.

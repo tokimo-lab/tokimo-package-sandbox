@@ -1,32 +1,10 @@
-//! macOS sandbox: Virtualization.framework backend.
+//! macOS backend: Linux VM via Apple Virtualization.framework (arcbox-vz).
 //!
-//! Boots a lightweight Linux VM for Linux-grade isolation on macOS.
-//! Requires a Linux kernel + initrd produced by the in-repo
-//! `.github/workflows/vm-image.yml` (tag prefix `vm-v*`).
+//! Boots a Linux micro-VM running `tokimo-sandbox-init`, communicates over
+//! virtio-vsock with the guest's init binary.
 
-#![cfg(target_os = "macos")]
+pub(crate) mod sandbox;
+pub(crate) mod vm;
+pub(crate) mod vsock_init_client;
 
-mod vz;
-pub(crate) mod vz_session;
-pub(crate) mod vz_vsock;
-
-use crate::config::SandboxConfig;
-use crate::{Error, ExecutionResult, Result};
-
-pub(crate) fn run<S: AsRef<str>>(cmd: &[S], cfg: &SandboxConfig) -> Result<ExecutionResult> {
-    if !vz::is_available() {
-        return Err(Error::validation(
-            "Virtualization.framework not available (requires macOS 11+ on Apple Silicon or Intel VT-x)",
-        ));
-    }
-    vz::run(cmd, cfg)
-}
-
-pub(crate) fn spawn_session_shell(cfg: &SandboxConfig) -> Result<crate::session::ShellHandle> {
-    if !vz::is_available() {
-        return Err(Error::validation(
-            "Virtualization.framework not available (requires macOS 11+)",
-        ));
-    }
-    vz_session::spawn_session_shell(cfg)
-}
+pub use sandbox::MacosBackend;

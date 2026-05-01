@@ -255,6 +255,28 @@ pub fn build_session_v2(
     cpu_count: usize,
     init_port: u32,
 ) -> String {
+    build_session_v2_ex(
+        vm_id, kernel, initrd, rootfs_vhdx, shares, memory_mb, cpu_count, init_port, None, None,
+    )
+}
+
+/// Variant with optional network endpoint (Hyper-V NAT). When
+/// `network_endpoint_id` is `Some(guid_bare_string)` an HCS NetworkAdapter
+/// device referencing that endpoint is added to the schema; otherwise no
+/// NIC is exposed to the guest.
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_v2_ex(
+    vm_id: &str,
+    kernel: &Path,
+    initrd: &Path,
+    rootfs_vhdx: &Path,
+    shares: &[V2Share<'_>],
+    memory_mb: u64,
+    cpu_count: usize,
+    init_port: u32,
+    network_endpoint_id: Option<&str>,
+    network_mac: Option<&str>,
+) -> String {
     let kernel_s = strip_extended_prefix(kernel);
     let initrd_s = strip_extended_prefix(initrd);
     let rootfs_s = strip_extended_prefix(rootfs_vhdx);
@@ -326,6 +348,26 @@ pub fn build_session_v2(
         }),
     );
 
+    // ----- network adapter (network agent) -----
+    // When a HCN endpoint GUID is supplied, attach it to the VM as a single
+    // NIC. The map key MUST be the endpoint GUID (bare, hyphenated form).
+    if let Some(ep_id) = network_endpoint_id {
+        let mut nics = serde_json::Map::new();
+        let mut nic = serde_json::Map::new();
+        nic.insert("EndpointId".into(), serde_json::Value::String(ep_id.to_string()));
+        if let Some(mac) = network_mac {
+            if !mac.is_empty() {
+                nic.insert("MacAddress".into(), serde_json::Value::String(mac.to_string()));
+            }
+        }
+        nics.insert(ep_id.to_string(), serde_json::Value::Object(nic));
+        devices.insert(
+            "NetworkAdapters".into(),
+            serde_json::Value::Object(nics),
+        );
+    }
+    // ----- end network adapter -----
+
     let kernel_cmdline = format!(
         "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
          tokimo.session=1 tokimo.init_port={init_port}"
@@ -353,6 +395,45 @@ pub fn build_session_v2(
     });
     top.to_string()
 }
+
+/// Build a ModifySettingRequest JSON for adding/removing a single
+/// Plan9 share at runtime via `HcsModifyComputeSystem`.
+///
+/// Schema 2.x format:
+/// `{"ResourceUri":"VirtualMachine/Devices/Plan9/Shares",
+///   "Settings":{"Name":..,"AccessName":..,"Path":..,"Port":..},
+///   "RequestType":"Add"|"Remove"}`
+///
+/// As with [`build_session_v2`], no `ReadOnly` field is emitted —
+/// HCS Plan9 rejects it; read-only is enforced guest-side via the
+/// 9p mount flags carried over the AddMount op.
+pub fn plan9_modify_request(
+    name: &str,
+    host_path: &Path,
+    port: u32,
+    request_type: &str,
+) -> String {
+    let settings = serde_json::json!({
+        "Name": name,
+        "AccessName": name,
+        "Path": strip_extended_prefix(host_path),
+        "Port": port,
+    });
+    serde_json::json!({
+        "ResourcePath": "VirtualMachine/Devices/Plan9/Shares",
+        "Settings": settings,
+        "RequestType": request_type,
+    })
+    .to_string()
+}
+
+/// Allocate a Plan9 share port for a runtime-added share. Currently a
+/// thin alias of [`alloc_share_port`] so the boot-time and runtime
+/// allocators stay in lock-step.
+pub fn alloc_plan9_port() -> u32 {
+    alloc_share_port()
+}
+
 
 #[cfg(test)]
 mod tests {
