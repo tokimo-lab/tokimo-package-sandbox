@@ -184,6 +184,35 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // bwrap mode: the host stages /dev as tmpfs + bind-mounts a small set of
+    // device nodes (null/zero/full/random/urandom/tty), but devpts and ptmx
+    // are not provided. Mount a private devpts instance so PTY-mode shells
+    // (`spawn_shell` with `pty: Some(..)`) can call posix_openpt → open
+    // /dev/ptmx → /dev/pts/N. We have CAP_SYS_ADMIN inside the bwrap
+    // user_ns (granted by `--cap-add CAP_SYS_ADMIN` on the host side).
+    if bwrap_mode {
+        let _ = std::fs::create_dir_all("/dev/pts");
+        match mount_fs(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            0,
+            "ptmxmode=666,mode=620",
+        ) {
+            Ok(()) => {
+                // posix_openpt opens "/dev/ptmx"; with newinstance the real
+                // ptmx for this devpts instance is /dev/pts/ptmx. Symlink
+                // /dev/ptmx → pts/ptmx so libc's posix_openpt finds it.
+                let _ = std::fs::remove_file("/dev/ptmx");
+                if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx") {
+                    eprintln!("[tokimo-sandbox-init] WARN: symlink /dev/ptmx -> pts/ptmx: {e}");
+                }
+            }
+            Err(e) if e.contains("Resource busy") || e.contains("16") => {}
+            Err(e) => eprintln!("[tokimo-sandbox-init] WARN: mount devpts: {e}"),
+        }
+    }
+
     let mut mask = SigSet::empty();
     for s in [
         Signal::SIGCHLD,
