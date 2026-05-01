@@ -33,6 +33,7 @@ use crossbeam_channel as chan;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
+use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, Icmpv4Packet, Icmpv4Repr,
@@ -150,13 +151,6 @@ struct TcpKey {
     dst_port: u16,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct UdpKey {
-    src_ip: IpAddress,
-    src_port: u16,
-    dst_ip: IpAddress,
-    dst_port: u16,
-}
 
 /// State for one upstream TCP proxy connection.
 struct TcpFlow {
@@ -173,15 +167,23 @@ struct TcpFlow {
     closed: bool,
 }
 
-/// State for one upstream UDP "flow" (per src+dst tuple, NAT-style).
-#[allow(dead_code)] // upstream + dst held for lifetime; recv loop owns its own clones.
+/// State for one upstream UDP flow (per destination port).
+///
+/// Each destination port gets a smoltcp `udp::Socket` that intercepts guest
+/// traffic and a real `UdpSocket` for upstream communication. Reply frames
+/// are built manually (bypassing smoltcp Ethernet framing) to avoid the
+/// ARP resolution issue.
 struct UdpFlow {
-    upstream: Arc<UdpSocket>,
-    dst: SocketAddr,
+    /// smoltcp UDP socket handle (bound to `dst_port`).
+    sock_handle: SocketHandle,
+    /// Real upstream UDP socket.
+    upstream: UdpSocket,
+    /// Last guest endpoint that sent to this port (for routing replies back).
+    remote: smoltcp::wire::IpEndpoint,
+    /// Destination IP the guest was talking to (for reply frame src IP).
+    dst_ip: IpAddress,
+    /// Last time we saw activity (for idle GC).
     last_activity: Instant,
-    /// Set when the recv thread should stop.
-    shutdown: Arc<AtomicBool>,
-    _join: thread::JoinHandle<()>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -279,7 +281,7 @@ fn run(
 
     let mut sockets = SocketSet::new(Vec::new());
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
-    let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
+    let mut udp_flows: HashMap<u16, UdpFlow> = HashMap::new();
 
     eprintln!(
         "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready",
@@ -383,22 +385,78 @@ fn run(
             }
         }
 
-        // 3. Service UDP flows: drain inbound (guest → upstream) by
-        //    iterating sockets we registered.
-        let mut udp_to_remove: Vec<UdpKey> = Vec::new();
-        for (key, flow) in udp_flows.iter_mut() {
-            // Find the udp::Socket bound to (key.dst_ip, key.dst_port).
-            // We stored handle inside flow via UdpFlow, but for simplicity
-            // we keep a single shared udp::Socket per key — looked up
-            // through the registry below.
+        // 3. Service UDP flows: forward guest ↔ upstream via smoltcp sockets.
+        let mut udp_to_remove: Vec<u16> = Vec::new();
+        for (&port, flow) in udp_flows.iter_mut() {
+            let sock = sockets.get_mut::<udp::Socket>(flow.sock_handle);
+
+            // Guest → upstream: drain smoltcp recv buffer, forward to real server.
+            if sock.can_recv() {
+                while let Ok((data, meta)) = sock.recv() {
+                    let dst_ip = meta.local_address.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
+                    let dst = SocketAddr::new(ipaddr_to_std(dst_ip), port);
+                    let _ = flow.upstream.send_to(data, dst);
+                    flow.remote = meta.endpoint;
+                    flow.last_activity = now;
+                }
+            }
+
+            // Upstream → guest: non-blocking recv, build Ethernet frame
+            // manually (bypasses smoltcp ARP resolution, same as ICMP).
+            let mut buf = vec![0u8; 2048];
+            loop {
+                match flow.upstream.recv_from(&mut buf) {
+                    Ok((n, _from)) => {
+                        // Reply: from upstream (dst_ip, e.g. 1.1.1.1:53) → guest (remote, e.g. 192.168.127.2:12345)
+                        let (reply_src_ip, reply_dst_ip) = match (dst_ip_for_flow(flow), flow.remote.addr) {
+                            (IpAddress::Ipv4(s), IpAddress::Ipv4(d)) => (s, d),
+                            _ => break,
+                        };
+                        let frame = build_udp_reply_ethernet_frame(
+                            &reply_src_ip.octets(), // src = upstream (1.1.1.1)
+                            &reply_dst_ip.octets(), // dst = guest (192.168.127.2)
+                            port,            // src_port (upstream side, e.g. 53)
+                            flow.remote.port, // dst_port (guest side)
+                            &buf[..n],
+                            &HOST_MAC,
+                            &GUEST_MAC,
+                        );
+                        let _ = tx_out_tx.send(frame);
+                        flow.last_activity = now;
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => {
+                        udp_to_remove.push(port);
+                        break;
+                    }
+                }
+            }
+
             // Idle GC.
             if now.duration_since(flow.last_activity) > idle_timeout {
-                udp_to_remove.push(*key);
+                udp_to_remove.push(port);
             }
         }
-        for key in udp_to_remove {
-            if let Some(flow) = udp_flows.remove(&key) {
-                flow.shutdown.store(true, Ordering::Relaxed);
+        for port in udp_to_remove {
+            if let Some(flow) = udp_flows.remove(&port) {
+                sockets.remove(flow.sock_handle);
+            }
+        }
+
+        // 3c. Flush: poll again to transmit any frames queued by the
+        //     servicing above (e.g. UDP replies).
+        {
+            use smoltcp::iface::PollResult;
+            loop {
+                match iface.poll(smol_now(), &mut device, &mut sockets) {
+                    PollResult::SocketStateChanged => continue,
+                    PollResult::None => break,
+                }
             }
         }
 
@@ -421,7 +479,7 @@ fn inspect_and_register(
     frame: &[u8],
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    udp_flows: &mut HashMap<u16, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
 ) {
     let eth = match EthernetFrame::new_checked(frame) {
@@ -477,7 +535,7 @@ fn dispatch_l4(
     dst_ip: IpAddress,
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    udp_flows: &mut HashMap<u16, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
 ) {
     match proto {
@@ -505,16 +563,20 @@ fn dispatch_l4(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let key = UdpKey {
-                src_ip,
-                src_port: udp.src_port(),
-                dst_ip,
-                dst_port: udp.dst_port(),
-            };
-            if udp_flows.contains_key(&key) {
+            let dst_port = udp.dst_port();
+            if udp_flows.contains_key(&dst_port) {
+                // Flow exists — forward the payload to the existing upstream.
+                if let Some(flow) = udp_flows.get_mut(&dst_port) {
+                    let dst = SocketAddr::new(ipaddr_to_std(dst_ip), dst_port);
+                    let _ = flow.upstream.send_to(udp.payload(), dst);
+                    flow.remote = smoltcp::wire::IpEndpoint {
+                        addr: src_ip,
+                        port: udp.src_port(),
+                    };
+                }
                 return;
             }
-            register_udp_flow(key, sockets, udp_flows, tx_out_tx);
+            register_udp_flow(dst_port, dst_ip, src_ip, udp.src_port(), sockets, udp_flows, udp.payload());
         }
         IpProtocol::Icmp => {
             handle_icmpv4_echo(payload, src_ip, dst_ip, tx_out_tx);
@@ -637,156 +699,60 @@ fn tcp_proxy(
 }
 
 fn register_udp_flow(
-    key: UdpKey,
-    _sockets: &mut SocketSet<'_>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
-    tx_out_tx: &chan::Sender<Vec<u8>>,
+    dst_port: u16,
+    dst_ip: IpAddress,
+    src_ip: IpAddress,
+    src_port: u16,
+    sockets: &mut SocketSet<'_>,
+    udp_flows: &mut HashMap<u16, UdpFlow>,
+    initial_payload: &[u8],
 ) {
-    // Bind a host UdpSocket and spawn a recv thread that wraps replies into
-    // outbound IPv4/UDP/Ethernet frames and pushes them via tx_out_tx
-    // (bypassing smoltcp — we craft frames manually because smoltcp's
-    // udp::Socket would need any_ip + listen on dst which is awkward).
-    let bind_addr = match key.dst_ip {
+    // Create a smoltcp UDP socket bound to the destination port.
+    // With any_ip=true, this intercepts all UDP to this port.
+    let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
+    let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
+    let mut sock = udp::Socket::new(rx_buf, tx_buf);
+    if let Err(e) = sock.bind(dst_port) {
+        eprintln!("[netstack] udp bind port {}: {e}", dst_port);
+        return;
+    }
+    let sock_handle = sockets.add(sock);
+
+    // Create real upstream UDP socket.
+    let bind_addr = match dst_ip {
         IpAddress::Ipv4(_) => "0.0.0.0:0",
         IpAddress::Ipv6(_) => "[::]:0",
     };
     let upstream = match UdpSocket::bind(bind_addr) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[netstack] udp bind: {}", e);
+            eprintln!("[netstack] upstream udp bind: {e}");
+            sockets.remove(sock_handle);
             return;
         }
     };
-    let _ = upstream.set_read_timeout(Some(Duration::from_millis(500)));
-    let upstream = Arc::new(upstream);
-    let dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
+    let _ = upstream.set_read_timeout(Some(Duration::from_millis(100)));
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_t = Arc::clone(&shutdown);
-    let upstream_t = Arc::clone(&upstream);
-    let tx_out = tx_out_tx.clone();
-
-    let join = thread::Builder::new()
-        .name(format!("net-udp-{}-{}", key.dst_ip, key.dst_port))
-        .spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
-            while !shutdown_t.load(Ordering::Relaxed) {
-                match upstream_t.recv_from(&mut buf) {
-                    Ok((n, _from)) => {
-                        let frame = build_udp_reply(&buf[..n], &key);
-                        let _ = tx_out.send(frame);
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
-                    Err(_) => break,
-                }
-            }
-        })
-        .expect("spawn udp recv thread");
+    // Forward the initial packet to the real upstream server.
+    let upstream_dst = SocketAddr::new(ipaddr_to_std(dst_ip), dst_port);
+    if let Err(e) = upstream.send_to(initial_payload, upstream_dst) {
+        eprintln!("[netstack] udp send_to {upstream_dst}: {e}");
+    }
 
     udp_flows.insert(
-        key,
+        dst_port,
         UdpFlow {
+            sock_handle,
             upstream,
-            dst,
+            remote: smoltcp::wire::IpEndpoint {
+                addr: src_ip,
+                port: src_port,
+            },
+            dst_ip,
             last_activity: Instant::now(),
-            shutdown,
-            _join: join,
         },
     );
-
-    eprintln!("[netstack] udp flow opened {}:{} → {}", key.src_ip, key.src_port, dst);
-}
-
-/// Build a complete Ethernet/IP/UDP frame carrying `payload` from the
-/// gateway back to the guest, swapping the original 5-tuple. Dispatches
-/// on key.dst_ip to v4 or v6.
-fn build_udp_reply(payload: &[u8], key: &UdpKey) -> Vec<u8> {
-    match (key.dst_ip, key.src_ip) {
-        (IpAddress::Ipv4(dst), IpAddress::Ipv4(src)) => build_udp_reply_v4(payload, dst, src, key),
-        (IpAddress::Ipv6(dst), IpAddress::Ipv6(src)) => build_udp_reply_v6(payload, dst, src, key),
-        _ => Vec::new(),
-    }
-}
-
-fn build_udp_reply_v4(payload: &[u8], orig_dst: Ipv4Address, orig_src: Ipv4Address, key: &UdpKey) -> Vec<u8> {
-    use smoltcp::wire::{EthernetFrame as EF, Ipv4Packet as IP, UdpPacket as UP};
-    let udp_total = 8 + payload.len();
-    let ip_total = 20 + udp_total;
-    let eth_total = 14 + ip_total;
-    let mut buf = vec![0u8; eth_total];
-
-    {
-        let mut eth = EF::new_unchecked(&mut buf);
-        eth.set_dst_addr(EthernetAddress(GUEST_MAC));
-        eth.set_src_addr(EthernetAddress(HOST_MAC));
-        eth.set_ethertype(EthernetProtocol::Ipv4);
-    }
-    {
-        let mut ip = IP::new_unchecked(&mut buf[14..]);
-        ip.set_version(4);
-        ip.set_header_len(20);
-        ip.set_dscp(0);
-        ip.set_ecn(0);
-        ip.set_total_len(ip_total as u16);
-        ip.set_ident(rand_u16());
-        ip.clear_flags();
-        ip.set_dont_frag(true);
-        ip.set_frag_offset(0);
-        ip.set_hop_limit(64);
-        ip.set_next_header(IpProtocol::Udp);
-        ip.set_src_addr(orig_dst);
-        ip.set_dst_addr(orig_src);
-        ip.fill_checksum();
-    }
-    {
-        let mut udp = UP::new_unchecked(&mut buf[14 + 20..]);
-        udp.set_src_port(key.dst_port);
-        udp.set_dst_port(key.src_port);
-        udp.set_len(udp_total as u16);
-        udp.payload_mut().copy_from_slice(payload);
-        udp.fill_checksum(&IpAddress::Ipv4(orig_dst), &IpAddress::Ipv4(orig_src));
-    }
-    buf
-}
-
-fn build_udp_reply_v6(payload: &[u8], orig_dst: Ipv6Address, orig_src: Ipv6Address, key: &UdpKey) -> Vec<u8> {
-    use smoltcp::wire::{EthernetFrame as EF, Ipv6Packet as IP, UdpPacket as UP};
-    let udp_total = 8 + payload.len();
-    let ip_total = 40 + udp_total;
-    let eth_total = 14 + ip_total;
-    let mut buf = vec![0u8; eth_total];
-
-    {
-        let mut eth = EF::new_unchecked(&mut buf);
-        eth.set_dst_addr(EthernetAddress(GUEST_MAC));
-        eth.set_src_addr(EthernetAddress(HOST_MAC));
-        eth.set_ethertype(EthernetProtocol::Ipv6);
-    }
-    {
-        let mut ip = IP::new_unchecked(&mut buf[14..]);
-        ip.set_version(6);
-        ip.set_traffic_class(0);
-        ip.set_flow_label(0);
-        ip.set_payload_len(udp_total as u16);
-        ip.set_next_header(IpProtocol::Udp);
-        ip.set_hop_limit(64);
-        ip.set_src_addr(orig_dst);
-        ip.set_dst_addr(orig_src);
-    }
-    {
-        let mut udp = UP::new_unchecked(&mut buf[14 + 40..]);
-        udp.set_src_port(key.dst_port);
-        udp.set_dst_port(key.src_port);
-        udp.set_len(udp_total as u16);
-        udp.payload_mut().copy_from_slice(payload);
-        udp.fill_checksum(&IpAddress::Ipv6(orig_dst), &IpAddress::Ipv6(orig_src));
-    }
-    buf
+    eprintln!("[netstack] udp flow opened port {dst_port} → {upstream_dst}");
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -806,6 +772,10 @@ fn rand_seed() -> u64 {
 
 fn rand_u16() -> u16 {
     rand_seed() as u16
+}
+
+fn dst_ip_for_flow(flow: &UdpFlow) -> IpAddress {
+    flow.dst_ip
 }
 
 fn ipv4_to_std(a: Ipv4Address) -> Ipv4Addr {
@@ -1018,6 +988,105 @@ fn build_icmpv4_echo_reply(
         repr.emit(&mut icmp, &smoltcp::phy::ChecksumCapabilities::default());
     }
     buf
+}
+
+// ─── UDP reply frame builder ────────────────────────────────────────────────
+//
+// Builds a complete Ethernet + IPv4 + UDP frame manually, bypassing smoltcp's
+// ARP resolution (which fails because the neighbor cache has no entry for the
+// guest IP — TCP populates it via the SYN/SYN-ACK exchange, but UDP has no
+// such handshake).
+
+fn build_udp_reply_ethernet_frame(
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+) -> Vec<u8> {
+    let ip_hdr_len = 20usize;
+    let udp_hdr_len = 8usize;
+    let udp_total = udp_hdr_len + payload.len();
+    let ip_total = ip_hdr_len + udp_total;
+    let eth_total = 14 + ip_total;
+    let mut buf = vec![0u8; eth_total];
+
+    // Ethernet header
+    buf[0..6].copy_from_slice(dst_mac);
+    buf[6..12].copy_from_slice(src_mac);
+    buf[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
+
+    // IPv4 header
+    buf[14] = 0x45; // version=4, IHL=5
+    buf[15] = 0x00; // DSCP/ECN
+    buf[16..18].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    buf[18..20].copy_from_slice(&0u16.to_be_bytes()); // identification
+    buf[20..22].copy_from_slice(&[0x40, 0x00]); // flags=DF, frag_offset=0
+    buf[22] = 64; // TTL
+    buf[23] = 17; // protocol = UDP
+    buf[24..26].copy_from_slice(&[0x00, 0x00]); // checksum placeholder
+    buf[26..30].copy_from_slice(src_ip);
+    buf[30..34].copy_from_slice(dst_ip);
+    let ip_cksum = checksum(&buf[14..14 + ip_hdr_len]);
+    buf[24..26].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // UDP header
+    let udp_start = 14 + ip_hdr_len;
+    buf[udp_start..udp_start + 2].copy_from_slice(&src_port.to_be_bytes());
+    buf[udp_start + 2..udp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[udp_start + 4..udp_start + 6].copy_from_slice(&(udp_total as u16).to_be_bytes());
+    buf[udp_start + 6..udp_start + 8].copy_from_slice(&[0x00, 0x00]); // checksum placeholder
+    buf[udp_start + udp_hdr_len..udp_start + udp_hdr_len + payload.len()]
+        .copy_from_slice(payload);
+
+    // UDP checksum (with pseudo-header)
+    let udp_cksum = udp_checksum(src_ip, dst_ip, &buf[udp_start..udp_start + udp_total]);
+    buf[udp_start + 6..udp_start + 8].copy_from_slice(&udp_cksum.to_be_bytes());
+
+    buf
+}
+
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_segment: &[u8]) -> u16 {
+    let udp_len = udp_segment.len() as u16;
+    let mut sum: u32 = 0;
+    // Pseudo-header
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += 17u32;
+    sum += udp_len as u32;
+    // UDP segment
+    let mut i = 0;
+    while i + 1 < udp_segment.len() {
+        sum += u16::from_be_bytes([udp_segment[i], udp_segment[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < udp_segment.len() {
+        sum += (udp_segment[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn build_icmpv6_echo_reply(
