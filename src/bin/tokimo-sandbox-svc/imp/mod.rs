@@ -53,6 +53,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
+use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
     AddPlan9ShareParams, BoolValue, CreateDiskImageParams, ExecParams, ExecResultWire, Frame,
     IdParams, KillParams, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec,
@@ -337,6 +338,7 @@ fn build_security_attributes(
 }
 
 fn pipe_server_loop(console_mode: bool) {
+    let sessions = WindowsRegistry::new();
     let (mut sa, _sd_guard) = match build_security_attributes(console_mode) {
         Ok(v) => v,
         Err(e) => {
@@ -399,8 +401,9 @@ fn pipe_server_loop(console_mode: bool) {
         let _ = unsafe { CloseHandle(connect_evt) };
 
         let pipe_ptr = pipe.0 as usize;
+        let sessions_clone = sessions.clone();
         std::thread::spawn(move || {
-            handle_client(HANDLE(pipe_ptr as *mut _));
+            handle_client(HANDLE(pipe_ptr as *mut _), sessions_clone);
         });
     }
 }
@@ -462,6 +465,23 @@ impl Default for SessionState {
     }
 }
 
+// SAFETY: The HANDLE (CsHandle) inside SessionState is owned exclusively by
+// the session and never accessed from multiple threads simultaneously — all
+// mutations go through the Mutex<SessionState> lock.
+unsafe impl Send for SessionState {}
+
+impl tokimo_package_sandbox::session_registry::SessionState for SessionState {
+    fn is_running(&self) -> bool {
+        self.running
+    }
+    fn teardown(&mut self) {
+        teardown_session(self);
+    }
+}
+
+/// Windows session registry type alias.
+type WindowsRegistry = SessionRegistry<SessionState>;
+
 /// Shared per-connection bag — wrap the writer in a Mutex so background
 /// poller threads can emit `EV_STDOUT` / `EV_EXIT` frames without racing
 /// the main dispatch thread.
@@ -469,7 +489,8 @@ struct Connection {
     pipe: HANDLE,
     /// Serializes writes so multiple emitter threads can coexist.
     write_lock: Mutex<()>,
-    state: Mutex<SessionState>,
+    /// Key into the global [`WindowsRegistry`]. Set by `handle_configure`.
+    session_id: Mutex<Option<String>>,
     /// Monotonic counter for spawned child IDs.
     job_counter: AtomicU64,
 }
@@ -483,7 +504,21 @@ unsafe impl Sync for Connection {}
 // Connection entry point
 // ---------------------------------------------------------------------------
 
-fn handle_client(pipe: HANDLE) {
+/// Look up the [`SharedSession`] bound to this connection.
+fn get_session<'a>(
+    conn: &Connection,
+    sessions: &'a WindowsRegistry,
+) -> Result<Arc<SharedSession<SessionState>>, RpcError> {
+    let key = conn.session_id.lock().unwrap();
+    let key = key
+        .as_ref()
+        .ok_or_else(|| RpcError::new("not_configured", "call configure first"))?;
+    sessions
+        .get(key)
+        .ok_or_else(|| RpcError::new("session_lost", "session no longer exists"))
+}
+
+fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
     let caller = caller_image_path(pipe);
     match &caller {
         Some(p) => eprintln!("[svc] client connected: {}", p.display()),
@@ -513,7 +548,7 @@ fn handle_client(pipe: HANDLE) {
     let conn = Arc::new(Connection {
         pipe,
         write_lock: Mutex::new(()),
-        state: Mutex::new(SessionState::default()),
+        session_id: Mutex::new(None),
         job_counter: AtomicU64::new(0),
     });
 
@@ -571,7 +606,7 @@ fn handle_client(pipe: HANDLE) {
         };
         match frame {
             Frame::Request { id, method, params } => {
-                let result = dispatch(&conn, &method, params);
+                let result = dispatch(&conn, &method, params, &sessions);
                 let resp = match result {
                     Ok(v) => Frame::Response {
                         id,
@@ -598,11 +633,9 @@ fn handle_client(pipe: HANDLE) {
         }
     }
 
-    // Connection teardown — best-effort tear down VM if still up.
-    {
-        let mut st = conn.state.lock().expect("state lock");
-        teardown_session(&mut st);
-    }
+    // Connection teardown — do NOT destroy the VM.  The session lives in
+    // the global registry and survives reconnection.  Only the pipe is
+    // released here.
     disconnect(pipe);
 }
 
@@ -610,25 +643,37 @@ fn handle_client(pipe: HANDLE) {
 // Method dispatch
 // ---------------------------------------------------------------------------
 
-fn dispatch(conn: &Arc<Connection>, method_name: &str, params: Value) -> Result<Value, RpcError> {
+fn dispatch(
+    conn: &Arc<Connection>,
+    method_name: &str,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     match method_name {
         method::PING => Ok(json!({ "version": VERSION })),
 
-        method::CONFIGURE => handle_configure(conn, params),
-        method::CREATE_VM => handle_create_vm(conn),
-        method::START_VM => handle_start_vm(conn),
-        method::STOP_VM => handle_stop_vm(conn),
+        method::CONFIGURE => handle_configure(conn, params, sessions),
+        method::CREATE_VM => handle_create_vm(conn, sessions),
+        method::START_VM => handle_start_vm(conn, sessions),
+        method::STOP_VM => handle_stop_vm(conn, sessions),
 
-        method::IS_RUNNING => Ok(json!(BoolValue {
-            value: conn.state.lock().unwrap().running
-        })),
-        method::IS_GUEST_CONNECTED => Ok(json!(BoolValue {
-            value: conn.state.lock().unwrap().guest_connected
-        })),
+        method::IS_RUNNING => {
+            let shared = get_session(conn, sessions)?;
+            Ok(json!(BoolValue {
+                value: shared.state.lock().unwrap().running
+            }))
+        }
+        method::IS_GUEST_CONNECTED => {
+            let shared = get_session(conn, sessions)?;
+            Ok(json!(BoolValue {
+                value: shared.state.lock().unwrap().guest_connected
+            }))
+        }
         method::IS_PROCESS_RUNNING => {
             let p: IdParams = serde_json::from_value(params)
                 .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            let st = conn.state.lock().unwrap();
+            let shared = get_session(conn, sessions)?;
+            let st = shared.state.lock().unwrap();
             let alive = st
                 .children
                 .get(&p.id)
@@ -637,10 +682,10 @@ fn dispatch(conn: &Arc<Connection>, method_name: &str, params: Value) -> Result<
             Ok(json!(BoolValue { value: alive }))
         }
 
-        method::EXEC => handle_exec(conn, params),
-        method::SPAWN => handle_spawn(conn, params),
-        method::WRITE_STDIN => handle_write_stdin(conn, params),
-        method::KILL => handle_kill(conn, params),
+        method::EXEC => handle_exec(conn, params, sessions),
+        method::SPAWN => handle_spawn(conn, params, sessions),
+        method::WRITE_STDIN => handle_write_stdin(conn, params, sessions),
+        method::KILL => handle_kill(conn, params, sessions),
 
         method::SUBSCRIBE => Ok(json!({})),
 
@@ -674,12 +719,12 @@ fn dispatch(conn: &Arc<Connection>, method_name: &str, params: Value) -> Result<
         method::ADD_PLAN9_SHARE => {
             let p: AddPlan9ShareParams = serde_json::from_value(params)
                 .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_add_plan9_share(conn, p)
+            handle_add_plan9_share(conn, p, sessions)
         }
         method::REMOVE_PLAN9_SHARE => {
             let p: RemovePlan9ShareParams = serde_json::from_value(params)
                 .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_remove_plan9_share(conn, p)
+            handle_remove_plan9_share(conn, p, sessions)
         }
 
         other => Err(RpcError::new(
@@ -693,26 +738,50 @@ fn dispatch(conn: &Arc<Connection>, method_name: &str, params: Value) -> Result<
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_configure(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+fn handle_configure(
+    conn: &Arc<Connection>,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     let cfg: ConfigureParams = serde_json::from_value(params)
         .map_err(|e| RpcError::new("bad_params", format!("configure: {e}")))?;
-    let mut st = conn.state.lock().unwrap();
-    if st.running {
-        return Err(RpcError::new(
-            "already_running",
-            "cannot reconfigure while VM is running",
-        ));
+
+    // Session key: caller-supplied UUID or auto-generate.
+    let key = if cfg.session_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        cfg.session_id.clone()
+    };
+
+    let shared = sessions.get_or_create(&key);
+
+    // If the VM is already running for this session, just bind and return.
+    {
+        let st = shared.state.lock().unwrap();
+        if st.running {
+            eprintln!("[svc] reusing existing session {key}");
+            *conn.session_id.lock().unwrap() = Some(key);
+            return Ok(json!({}));
+        }
     }
-    st.config = Some(cfg);
+
+    // Not running — store config.
+    {
+        let mut st = shared.state.lock().unwrap();
+        st.config = Some(cfg);
+    }
+
+    // Bind this connection to the session.
+    *conn.session_id.lock().unwrap() = Some(key);
     Ok(json!({}))
 }
 
-fn handle_create_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
-    // The Windows backend rolls VM creation into `start_vm` since HCS
-    // requires the full configuration up front and we want the guest
-    // available as soon as the call returns. `create_vm` is a no-op
-    // sanity check that configure was called.
-    let st = conn.state.lock().unwrap();
+fn handle_create_vm(
+    conn: &Arc<Connection>,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
+    let st = shared.state.lock().unwrap();
     if st.config.is_none() {
         return Err(RpcError::new(
             "not_configured",
@@ -722,11 +791,15 @@ fn handle_create_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
     Ok(json!({}))
 }
 
-fn handle_start_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
+fn handle_start_vm(
+    conn: &Arc<Connection>,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
     // Take a snapshot of config without holding the state lock during
     // the long-running boot path (we re-acquire to install state).
     let cfg = {
-        let st = conn.state.lock().unwrap();
+        let st = shared.state.lock().unwrap();
         if st.running {
             return Err(RpcError::new("already_running", "VM is already running"));
         }
@@ -895,7 +968,7 @@ fn handle_start_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
     // Install state.
     let init_arc = Arc::new(init);
     {
-        let mut st = conn.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
         st.hcs = Some((api.clone(), cs, vm_id.clone()));
         st.init = Some(init_arc);
         st.vhdx = Some(lease);
@@ -927,8 +1000,12 @@ fn handle_start_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
     Ok(json!({}))
 }
 
-fn handle_stop_vm(conn: &Arc<Connection>) -> Result<Value, RpcError> {
-    let mut st = conn.state.lock().unwrap();
+fn handle_stop_vm(
+    conn: &Arc<Connection>,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
+    let mut st = shared.state.lock().unwrap();
     teardown_session(&mut st);
     Ok(json!({}))
 }
@@ -951,10 +1028,14 @@ fn teardown_session(st: &mut SessionState) {
     st.guest_connected = false;
 }
 
-fn handle_exec(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+fn handle_exec(
+    conn: &Arc<Connection>,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     let p: ExecParams = serde_json::from_value(params)
         .map_err(|e| RpcError::new("bad_params", format!("exec: {e}")))?;
-    let init = require_init(conn)?;
+    let init = require_init(conn, sessions)?;
     let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
     let info = init
         .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
@@ -1001,10 +1082,14 @@ fn handle_exec(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError>
     }
 }
 
-fn handle_spawn(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+fn handle_spawn(
+    conn: &Arc<Connection>,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     let p: ExecParams = serde_json::from_value(params)
         .map_err(|e| RpcError::new("bad_params", format!("spawn: {e}")))?;
-    let init = require_init(conn)?;
+    let init = require_init(conn, sessions)?;
     let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
     let info = init
         .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
@@ -1028,7 +1113,8 @@ fn handle_spawn(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError
 
     // Map our visible JobId to the init's child id (they're the same string here).
     {
-        let mut st = conn.state.lock().unwrap();
+        let shared = get_session(conn, sessions)?;
+        let mut st = shared.state.lock().unwrap();
         st.children.insert(
             child_id.clone(),
             ChildEntry {
@@ -1103,19 +1189,27 @@ fn child_poller(
     }
 }
 
-fn handle_write_stdin(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+fn handle_write_stdin(
+    conn: &Arc<Connection>,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     let p: WriteStdinParams = serde_json::from_value(params)
         .map_err(|e| RpcError::new("bad_params", format!("write_stdin: {e}")))?;
-    let init = require_init(conn)?;
+    let init = require_init(conn, sessions)?;
     init.write(&p.id, &p.data)
         .map_err(|e| RpcError::new("write", e.to_string()))?;
     Ok(json!({}))
 }
 
-fn handle_kill(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError> {
+fn handle_kill(
+    conn: &Arc<Connection>,
+    params: Value,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
     let p: KillParams = serde_json::from_value(params)
         .map_err(|e| RpcError::new("bad_params", format!("kill: {e}")))?;
-    let init = require_init(conn)?;
+    let init = require_init(conn, sessions)?;
     init.signal(&p.id, p.signal, false)
         .map_err(|e| RpcError::new("kill", e.to_string()))?;
     Ok(json!({}))
@@ -1124,6 +1218,7 @@ fn handle_kill(conn: &Arc<Connection>, params: Value) -> Result<Value, RpcError>
 fn handle_add_plan9_share(
     conn: &Arc<Connection>,
     p: AddPlan9ShareParams,
+    sessions: &WindowsRegistry,
 ) -> Result<Value, RpcError> {
     let share: Plan9Share = p.share;
     if share.name.is_empty() {
@@ -1131,8 +1226,9 @@ fn handle_add_plan9_share(
     }
     // Snapshot what we need under the lock; release before long blocking
     // calls (HCS modify, init RPC).
+    let shared = get_session(conn, sessions)?;
     let (api, cs, init) = {
-        let st = conn.state.lock().unwrap();
+        let st = shared.state.lock().unwrap();
         if !st.running {
             return Err(RpcError::new(
                 "vm_not_running",
@@ -1186,7 +1282,7 @@ fn handle_add_plan9_share(
     }
 
     {
-        let mut st = conn.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
         st.active_shares.insert(
             share.name.clone(),
             ActiveShare {
@@ -1202,14 +1298,16 @@ fn handle_add_plan9_share(
 fn handle_remove_plan9_share(
     conn: &Arc<Connection>,
     p: RemovePlan9ShareParams,
+    sessions: &WindowsRegistry,
 ) -> Result<Value, RpcError> {
     let name = p.name;
     if name.is_empty() {
         return Err(RpcError::new("validation", "share name must not be empty"));
     }
 
+    let shared = get_session(conn, sessions)?;
     let (api, cs, init, port) = {
-        let st = conn.state.lock().unwrap();
+        let st = shared.state.lock().unwrap();
         if !st.running {
             return Err(RpcError::new(
                 "vm_not_running",
@@ -1252,7 +1350,7 @@ fn handle_remove_plan9_share(
     }
 
     {
-        let mut st = conn.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
         st.active_shares.remove(&name);
     }
 
@@ -1261,8 +1359,11 @@ fn handle_remove_plan9_share(
 
 fn require_init(
     conn: &Arc<Connection>,
+    sessions: &WindowsRegistry,
 ) -> Result<Arc<tokimo_package_sandbox::init_client::WinInitClient>, RpcError> {
-    conn.state
+    let shared = get_session(conn, sessions)?;
+    shared
+        .state
         .lock()
         .unwrap()
         .init
@@ -1665,3 +1766,255 @@ fn rand_session_suffix() -> String {
 // Suppress unused warnings for items kept around for future use.
 #[allow(dead_code)]
 fn _unused_compat() {}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokimo_package_sandbox::session_registry::SessionState as SessionStateTrait;
+
+    /// Build a Connection with a dummy pipe handle (never used for I/O in tests).
+    fn dummy_conn() -> Arc<Connection> {
+        Arc::new(Connection {
+            pipe: HANDLE(std::ptr::null_mut()),
+            write_lock: Mutex::new(()),
+            session_id: Mutex::new(None),
+            job_counter: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn configure_creates_session_and_binds() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Before configure: no session bound.
+        assert!(conn.session_id.lock().unwrap().is_none());
+
+        // Configure with a specific session_id.
+        let params = json!({ "session_id": "test-001", "user_data_name": "test", "memory_mb": 1024, "cpu_count": 2 });
+        handle_configure(&conn, params, &sessions).unwrap();
+
+        // Now a session is bound.
+        let key = conn.session_id.lock().unwrap();
+        assert_eq!(key.as_deref(), Some("test-001"));
+        drop(key);
+
+        // The session exists in the registry.
+        let shared = sessions.get("test-001").unwrap();
+        let st = shared.state.lock().unwrap();
+        assert!(st.config.is_some());
+        assert!(!st.running); // not started yet
+    }
+
+    #[test]
+    fn configure_same_id_reuses_session() {
+        let sessions = WindowsRegistry::new();
+        let conn_a = dummy_conn();
+        let conn_b = dummy_conn();
+
+        let params = json!({ "session_id": "reuse-001", "user_data_name": "test" });
+
+        // Connection A configures.
+        handle_configure(&conn_a, params.clone(), &sessions).unwrap();
+
+        // Simulate "running" state so connection B hits the reuse path.
+        {
+            let shared = sessions.get("reuse-001").unwrap();
+            shared.state.lock().unwrap().running = true;
+        }
+
+        // Connection B configures with same session_id.
+        handle_configure(&conn_b, params, &sessions).unwrap();
+
+        // Both point to the same session.
+        assert_eq!(
+            conn_a.session_id.lock().unwrap().as_deref(),
+            conn_b.session_id.lock().unwrap().as_deref()
+        );
+
+        // Only one session in the registry.
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn configure_auto_generates_session_id_when_empty() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Empty session_id → auto-generated UUID.
+        let params = json!({ "session_id": "", "user_data_name": "test" });
+        handle_configure(&conn, params, &sessions).unwrap();
+
+        let key = conn.session_id.lock().unwrap();
+        let id = key.as_ref().unwrap();
+        assert!(!id.is_empty());
+        // Should be a valid UUID.
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+    }
+
+    #[test]
+    fn session_state_default() {
+        let st = SessionState::default();
+        assert!(!SessionStateTrait::is_running(&st));
+        assert!(st.config.is_none());
+        assert!(st.hcs.is_none());
+        assert!(st.init.is_none());
+        assert!(st.children.is_empty());
+        assert!(st.active_shares.is_empty());
+    }
+
+    #[test]
+    fn session_state_trait_impl() {
+        let mut st = SessionState::default();
+        st.running = true;
+        assert!(SessionStateTrait::is_running(&st));
+
+        SessionStateTrait::teardown(&mut st);
+        assert!(!SessionStateTrait::is_running(&st));
+    }
+
+    #[test]
+    fn get_session_fails_without_configure() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // No configure called → session_id is None.
+        let result = get_session(&conn, &sessions);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.code, "not_configured");
+    }
+
+    #[test]
+    fn get_session_fails_for_missing_session() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Manually set a session_id that doesn't exist in the registry.
+        *conn.session_id.lock().unwrap() = Some("ghost".to_string());
+
+        let result = get_session(&conn, &sessions);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.code, "session_lost");
+    }
+
+    #[test]
+    fn dispatch_not_configured_returns_error() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Any command before configure should fail.
+        let result = dispatch(&conn, method::IS_RUNNING, json!({}), &sessions);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.code, "not_configured");
+    }
+
+    #[test]
+    fn dispatch_ping_works_without_session() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // PING doesn't require a session.
+        let result = dispatch(&conn, method::PING, json!({}), &sessions).unwrap();
+        assert!(result.get("version").is_some());
+    }
+
+    #[test]
+    fn dispatch_is_running_reflects_state() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Configure first.
+        let params = json!({ "session_id": "run-check", "user_data_name": "test" });
+        handle_configure(&conn, params, &sessions).unwrap();
+
+        // Not running yet.
+        let result = dispatch(&conn, method::IS_RUNNING, json!({}), &sessions).unwrap();
+        assert!(!result.get("value").unwrap().as_bool().unwrap());
+
+        // Mark as running.
+        {
+            let shared = sessions.get("run-check").unwrap();
+            shared.state.lock().unwrap().running = true;
+        }
+
+        // Now is_running should return true.
+        let result = dispatch(&conn, method::IS_RUNNING, json!({}), &sessions).unwrap();
+        assert!(result.get("value").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn stop_vm_tears_down_session_state() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Configure and mark as running.
+        handle_configure(&conn, json!({ "session_id": "stop-test", "user_data_name": "test" }), &sessions).unwrap();
+        {
+            let shared = sessions.get("stop-test").unwrap();
+            let mut st = shared.state.lock().unwrap();
+            st.running = true;
+        }
+
+        // Stop the VM.
+        dispatch(&conn, method::STOP_VM, json!({}), &sessions).unwrap();
+
+        // Session still exists in registry (not removed), but is no longer running.
+        let shared = sessions.get("stop-test").unwrap();
+        let st = shared.state.lock().unwrap();
+        assert!(!st.running);
+    }
+
+    #[test]
+    fn connection_disconnect_does_not_destroy_session() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Configure and mark running.
+        handle_configure(&conn, json!({ "session_id": "persist", "user_data_name": "test" }), &sessions).unwrap();
+        {
+            let shared = sessions.get("persist").unwrap();
+            shared.state.lock().unwrap().running = true;
+        }
+
+        // Simulate connection drop by just dropping the Arc<Connection>.
+        drop(conn);
+
+        // Session survives in the registry.
+        let shared = sessions.get("persist").unwrap();
+        assert!(shared.state.lock().unwrap().running);
+    }
+
+    #[test]
+    fn multiple_connections_share_same_vm() {
+        let sessions = WindowsRegistry::new();
+        let conn1 = dummy_conn();
+        let conn2 = dummy_conn();
+
+        let params = json!({ "session_id": "shared-vm", "user_data_name": "test" });
+
+        // Both connections configure with the same session_id.
+        handle_configure(&conn1, params.clone(), &sessions).unwrap();
+        // Simulate the VM is running before conn2 connects.
+        {
+            let shared = sessions.get("shared-vm").unwrap();
+            shared.state.lock().unwrap().running = true;
+        }
+        handle_configure(&conn2, params, &sessions).unwrap();
+
+        // Both see the VM as running.
+        let r1 = dispatch(&conn1, method::IS_RUNNING, json!({}), &sessions).unwrap();
+        let r2 = dispatch(&conn2, method::IS_RUNNING, json!({}), &sessions).unwrap();
+        assert!(r1.get("value").unwrap().as_bool().unwrap());
+        assert!(r2.get("value").unwrap().as_bool().unwrap());
+
+        // Only 1 session in registry.
+        assert_eq!(sessions.len(), 1);
+    }
+}

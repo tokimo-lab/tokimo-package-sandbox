@@ -111,6 +111,17 @@ pub struct ConfigureParams {
     /// [`Event::ApiReachability`] events.
     #[serde(default)]
     pub api_probe_url: Option<String>,
+
+    /// Session identifier (UUID).  External caller controls this.
+    ///
+    /// Connections that supply the same `session_id` share a single VM
+    /// instance — the second `configure()` returns immediately and the
+    /// caller can issue `exec` / `spawn` against the already-running VM.
+    ///
+    /// When empty the service generates a random UUID (effectively
+    /// one-shot — no reconnect possible).
+    #[serde(default)]
+    pub session_id: String,
 }
 
 fn default_memory_mb() -> u64 {

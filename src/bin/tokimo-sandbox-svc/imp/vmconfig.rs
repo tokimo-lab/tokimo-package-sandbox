@@ -519,13 +519,13 @@ mod tests {
             V2Share {
                 host_path: &work,
                 name: "s0",
-                port: 0x4100_0001,
+                port: alloc_share_port(),
                 read_only: false,
             },
             V2Share {
                 host_path: &ro,
                 name: "s1",
-                port: 0x4100_0002,
+                port: alloc_share_port(),
                 read_only: true,
             },
         ];
@@ -569,8 +569,11 @@ mod tests {
             .as_object()
             .unwrap();
         assert!(table.contains_key(&hvsock_service_id(0x4000_0001)));
-        assert!(!table.contains_key(&hvsock_service_id(0x4100_0001)));
-        assert!(!table.contains_key(&hvsock_service_id(0x4100_0002)));
+        // Share ports must NOT be in the service table.
+        let sp0 = arr[0]["Port"].as_u64().unwrap() as u32;
+        let sp1 = arr[1]["Port"].as_u64().unwrap() as u32;
+        assert!(!table.contains_key(&hvsock_service_id(sp0)));
+        assert!(!table.contains_key(&hvsock_service_id(sp1)));
 
         let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
             .as_str()

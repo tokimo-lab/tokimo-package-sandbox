@@ -8,6 +8,7 @@
 //! let sb = Sandbox::connect().unwrap();
 //! sb.configure(ConfigureParams {
 //!     user_data_name: "demo".into(),
+//!     session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
 //!     memory_mb: 4096,
 //!     cpu_count: 4,
 //!     ..Default::default()
@@ -23,6 +24,7 @@ mod api;
 mod backend;
 mod error;
 mod platform;
+pub mod session_registry;
 
 pub mod protocol;
 pub mod svc_protocol;
