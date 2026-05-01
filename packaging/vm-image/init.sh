@@ -258,6 +258,17 @@ if [ "$SESSION_MODE" = 1 ]; then
             /bin/busybox ip addr add 192.168.127.2/24 dev tk0 2>/dev/null || true
             /bin/busybox ip link set tk0 up 2>/dev/null || true
             /bin/busybox ip route add default via 192.168.127.1 dev tk0 2>/dev/null || true
+            # IPv6: enable on tk0, assign ULA, default route via host gateway.
+            # Disable DAD/RA BEFORE assigning the address — DAD would otherwise
+            # delay the address ~1 s in "tentative" state and the first packet
+            # from a freshly-started VM would silently fail. We are the only
+            # node on this synthetic L2 so DAD has nothing to detect.
+            echo 0 > /proc/sys/net/ipv6/conf/tk0/disable_ipv6 2>/dev/null || true
+            echo 0 > /proc/sys/net/ipv6/conf/tk0/accept_dad 2>/dev/null || true
+            echo 0 > /proc/sys/net/ipv6/conf/tk0/dad_transmits 2>/dev/null || true
+            echo 0 > /proc/sys/net/ipv6/conf/tk0/accept_ra 2>/dev/null || true
+            /bin/busybox ip -6 addr add fd00:7f::2/64 dev tk0 2>/dev/null || true
+            /bin/busybox ip -6 route add default via fd00:7f::1 dev tk0 2>/dev/null || true
             echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
             echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
         else

@@ -472,6 +472,144 @@ fn network_allow_all_has_nic() {
 }
 
 // ---------------------------------------------------------------------------
+// 8.b ICMPv4 PING — verify the userspace netstack proxies ping echo replies.
+// ---------------------------------------------------------------------------
+#[test]
+fn network_allow_all_icmpv4_ping() {
+    let mut cfg = config("net-ping4");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let shell = sb.shell_id().expect("shell_id");
+
+    sb.write_stdin(
+        &shell,
+        b"timeout 8 ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1 && echo PING4_OK || echo PING4_FAIL; echo PING4_DONE\n",
+    )
+    .unwrap();
+    let probe = drain_until(&rx, &shell, "PING4_DONE", Duration::from_secs(15));
+    sb.stop_vm().ok();
+    assert!(
+        probe.contains("PING4_OK"),
+        "AllowAll: ICMPv4 ping to 1.1.1.1 should succeed. probe={probe:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.c IPv6 TCP — verify the netstack carries v6 SYN/ACK to a real endpoint.
+// ---------------------------------------------------------------------------
+#[test]
+fn network_allow_all_ipv6_tcp() {
+    let mut cfg = config("net-tcp6");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let shell = sb.shell_id().expect("shell_id");
+
+    // Cloudflare v6 DNS over TCP.
+    sb.write_stdin(
+        &shell,
+        b"timeout 8 bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/53 && echo TCP6_OK || echo TCP6_FAIL'; echo TCP6_DONE\n",
+    )
+    .unwrap();
+    let probe = drain_until(&rx, &shell, "TCP6_DONE", Duration::from_secs(20));
+    sb.stop_vm().ok();
+    // Host must have IPv6 connectivity for this to pass; tolerate skip if
+    // the host machine lacks v6 by allowing the host probe to confirm first.
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping assertion (probe={probe:?})");
+        return;
+    }
+    assert!(
+        probe.contains("TCP6_OK"),
+        "AllowAll: IPv6 TCP egress should succeed. probe={probe:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.d ICMPv6 PING — verify the netstack proxies v6 echo replies.
+// ---------------------------------------------------------------------------
+#[test]
+fn network_allow_all_icmpv6_ping() {
+    let mut cfg = config("net-ping6");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let shell = sb.shell_id().expect("shell_id");
+
+    sb.write_stdin(
+        &shell,
+        b"timeout 8 ping -6 -c 1 -W 5 2606:4700:4700::1111 >/dev/null 2>&1 && echo PING6_OK || echo PING6_FAIL; echo PING6_DONE\n",
+    )
+    .unwrap();
+    let probe = drain_until(&rx, &shell, "PING6_DONE", Duration::from_secs(15));
+    sb.stop_vm().ok();
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping assertion (probe={probe:?})");
+        return;
+    }
+    assert!(
+        probe.contains("PING6_OK"),
+        "AllowAll: ICMPv6 ping should succeed. probe={probe:?}"
+    );
+}
+
+/// Check whether the host has working IPv6 connectivity by attempting to
+/// open a short-lived TCP connection to a known dual-stack endpoint.
+fn host_has_ipv6() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr: SocketAddr = "[2606:4700:4700::1111]:53".parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// 8.e IPv6 DIAGNOSTIC — `cargo test ... network_allow_all_ipv6_diag -- --ignored --nocapture`
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn network_allow_all_ipv6_diag() {
+    let mut cfg = config("net-v6-diag");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let shell = sb.shell_id().expect("shell_id");
+
+    let cmds = b"echo === V6-ADDR ===\n\
+ip -6 addr\n\
+echo === V6-ROUTE ===\n\
+ip -6 route\n\
+echo === V6-NEIGH-BEFORE ===\n\
+ip -6 neigh\n\
+echo === DISABLE-IPV6 ===\n\
+cat /proc/sys/net/ipv6/conf/tk0/disable_ipv6 2>&1 || echo MISSING\n\
+echo === PING-V6-GW ===\n\
+timeout 3 ping -6 -c 2 -W 1 fd00:7f::1 2>&1 || echo PING_GW6_FAIL\n\
+echo === PING-V6-EXT ===\n\
+timeout 3 ping -6 -c 2 -W 1 2606:4700:4700::1111 2>&1 || echo PING_EXT6_FAIL\n\
+echo === V6-NEIGH-AFTER ===\n\
+ip -6 neigh\n\
+echo === TCP6 ===\n\
+timeout 5 bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/53 && echo TCP6_OK || echo TCP6_FAIL'\n\
+echo V6_DIAG_DONE\n";
+    sb.write_stdin(&shell, cmds).unwrap();
+    let out = drain_until(&rx, &shell, "V6_DIAG_DONE", Duration::from_secs(30));
+    sb.stop_vm().ok();
+    eprintln!("=== V6 DIAG ===\n{out}\n=== END ===");
+}
+
+// ---------------------------------------------------------------------------
 // 8.x DIAGNOSTIC — run with: cargo test --test sandbox_integration network_allow_all_diag -- --ignored --test-threads=1 --nocapture
 // ---------------------------------------------------------------------------
 #[test]

@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,8 +35,9 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpListenEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, Icmpv4Packet, Icmpv4Repr,
+    Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Ipv4Address,
+    Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
 };
 
 // ─── Topology constants ──────────────────────────────────────────────────────
@@ -54,6 +55,14 @@ pub const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 /// MTU advertised on the gateway interface. 1400 leaves headroom for any
 /// future encapsulation; matches cowork.
 pub const MTU: usize = 1400;
+
+// IPv6 topology — ULA addresses; guest gets v6 default route via HOST_IP6.
+pub const HOST_IP6: Ipv6Address =
+    Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0001);
+#[allow(dead_code)]
+pub const GUEST_IP6: Ipv6Address =
+    Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0002);
+pub const SUBNET6_PREFIX: u8 = 64;
 
 // ─── Hvsock-backed Device ────────────────────────────────────────────────────
 
@@ -135,17 +144,17 @@ fn write_frame<W: Write>(w: &mut W, frame: &[u8]) -> std::io::Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TcpKey {
-    src_ip: Ipv4Address,
+    src_ip: IpAddress,
     src_port: u16,
-    dst_ip: Ipv4Address,
+    dst_ip: IpAddress,
     dst_port: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpKey {
-    src_ip: Ipv4Address,
+    src_ip: IpAddress,
     src_port: u16,
-    dst_ip: Ipv4Address,
+    dst_ip: IpAddress,
     dst_port: u16,
 }
 
@@ -165,6 +174,7 @@ struct TcpFlow {
 }
 
 /// State for one upstream UDP "flow" (per src+dst tuple, NAT-style).
+#[allow(dead_code)] // upstream + dst held for lifetime; recv loop owns its own clones.
 struct UdpFlow {
     upstream: Arc<UdpSocket>,
     dst: SocketAddr,
@@ -260,6 +270,9 @@ fn run(
         addrs
             .push(IpCidr::new(IpAddress::Ipv4(HOST_IP), SUBNET_PREFIX))
             .ok();
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv6(HOST_IP6), SUBNET6_PREFIX))
+            .ok();
     });
     // Accept packets to ANY destination IP (transparent proxy mode).
     iface.set_any_ip(true);
@@ -269,8 +282,8 @@ fn run(
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
 
     eprintln!(
-        "[netstack] gateway {}/{} ↔ guest {}/{} ready",
-        HOST_IP, SUBNET_PREFIX, GUEST_IP, SUBNET_PREFIX
+        "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready",
+        HOST_IP, SUBNET_PREFIX, HOST_IP6, SUBNET6_PREFIX, GUEST_IP, SUBNET_PREFIX
     );
 
     let idle_timeout = Duration::from_secs(120);
@@ -403,6 +416,7 @@ fn run(
 /// Inspect an inbound Ethernet frame; if it's a TCP SYN to a (dst_ip, dst_port)
 /// for which we have no listener, allocate a smoltcp socket in Listen state
 /// and spawn the upstream proxy thread. UDP datagrams behave similarly.
+/// ICMPv4/ICMPv6 EchoRequests are short-circuited via Win32 IcmpSendEcho.
 fn inspect_and_register(
     frame: &[u8],
     sockets: &mut SocketSet<'_>,
@@ -414,19 +428,61 @@ fn inspect_and_register(
         Ok(e) => e,
         Err(_) => return,
     };
-    if eth.ethertype() != EthernetProtocol::Ipv4 {
-        return;
+    match eth.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ipv4 = match Ipv4Packet::new_checked(eth.payload()) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let src_ip = IpAddress::Ipv4(ipv4.src_addr());
+            let dst_ip = IpAddress::Ipv4(ipv4.dst_addr());
+            dispatch_l4(
+                ipv4.next_header(),
+                ipv4.payload(),
+                src_ip,
+                dst_ip,
+                sockets,
+                tcp_flows,
+                udp_flows,
+                tx_out_tx,
+            );
+        }
+        EthernetProtocol::Ipv6 => {
+            let ipv6 = match Ipv6Packet::new_checked(eth.payload()) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let src_ip = IpAddress::Ipv6(ipv6.src_addr());
+            let dst_ip = IpAddress::Ipv6(ipv6.dst_addr());
+            dispatch_l4(
+                ipv6.next_header(),
+                ipv6.payload(),
+                src_ip,
+                dst_ip,
+                sockets,
+                tcp_flows,
+                udp_flows,
+                tx_out_tx,
+            );
+        }
+        _ => {}
     }
-    let ipv4 = match Ipv4Packet::new_checked(eth.payload()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let src_ip = ipv4.src_addr();
-    let dst_ip = ipv4.dst_addr();
+}
 
-    match ipv4.next_header() {
+#[allow(clippy::too_many_arguments)]
+fn dispatch_l4(
+    proto: IpProtocol,
+    payload: &[u8],
+    src_ip: IpAddress,
+    dst_ip: IpAddress,
+    sockets: &mut SocketSet<'_>,
+    tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
+    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    tx_out_tx: &chan::Sender<Vec<u8>>,
+) {
+    match proto {
         IpProtocol::Tcp => {
-            let tcp = match TcpPacket::new_checked(ipv4.payload()) {
+            let tcp = match TcpPacket::new_checked(payload) {
                 Ok(p) => p,
                 Err(_) => return,
             };
@@ -437,7 +493,7 @@ fn inspect_and_register(
                 dst_port: tcp.dst_port(),
             };
             if !tcp.syn() || tcp.ack() {
-                return; // only act on bare SYNs
+                return;
             }
             if tcp_flows.contains_key(&key) {
                 return;
@@ -445,7 +501,7 @@ fn inspect_and_register(
             register_tcp_flow(key, sockets, tcp_flows);
         }
         IpProtocol::Udp => {
-            let udp = match UdpPacket::new_checked(ipv4.payload()) {
+            let udp = match UdpPacket::new_checked(payload) {
                 Ok(p) => p,
                 Err(_) => return,
             };
@@ -460,6 +516,12 @@ fn inspect_and_register(
             }
             register_udp_flow(key, sockets, udp_flows, tx_out_tx);
         }
+        IpProtocol::Icmp => {
+            handle_icmpv4_echo(payload, src_ip, dst_ip, tx_out_tx);
+        }
+        IpProtocol::Icmpv6 => {
+            handle_icmpv6_echo(payload, src_ip, dst_ip, tx_out_tx);
+        }
         _ => {}
     }
 }
@@ -473,7 +535,7 @@ fn register_tcp_flow(
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
     let listen_ep = IpListenEndpoint {
-        addr: Some(IpAddress::Ipv4(key.dst_ip)),
+        addr: Some(key.dst_ip),
         port: key.dst_port,
     };
     if let Err(e) = sock.listen(listen_ep) {
@@ -490,7 +552,7 @@ fn register_tcp_flow(
     let upstream_closed2 = Arc::clone(&upstream_closed);
 
     // Spawn upstream proxy. It blocks on connect, then bridges bytes.
-    let dst = SocketAddr::new(IpAddr::V4(ipv4_to_std(key.dst_ip)), key.dst_port);
+    let dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
     thread::Builder::new()
         .name(format!("net-tcp-{}-{}", key.dst_ip, key.dst_port))
         .spawn(move || tcp_proxy(dst, u2g_tx, g2u_rx, upstream_closed2))
@@ -584,7 +646,11 @@ fn register_udp_flow(
     // outbound IPv4/UDP/Ethernet frames and pushes them via tx_out_tx
     // (bypassing smoltcp — we craft frames manually because smoltcp's
     // udp::Socket would need any_ip + listen on dst which is awkward).
-    let upstream = match UdpSocket::bind("0.0.0.0:0") {
+    let bind_addr = match key.dst_ip {
+        IpAddress::Ipv4(_) => "0.0.0.0:0",
+        IpAddress::Ipv6(_) => "[::]:0",
+    };
+    let upstream = match UdpSocket::bind(bind_addr) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[netstack] udp bind: {}", e);
@@ -593,7 +659,7 @@ fn register_udp_flow(
     };
     let _ = upstream.set_read_timeout(Some(Duration::from_millis(500)));
     let upstream = Arc::new(upstream);
-    let dst = SocketAddr::new(IpAddr::V4(ipv4_to_std(key.dst_ip)), key.dst_port);
+    let dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_t = Arc::clone(&shutdown);
@@ -636,23 +702,30 @@ fn register_udp_flow(
     eprintln!("[netstack] udp flow opened {}:{} → {}", key.src_ip, key.src_port, dst);
 }
 
-/// Build a complete Ethernet/IPv4/UDP frame carrying `payload` from the
-/// gateway back to the guest, swapping the original 5-tuple.
+/// Build a complete Ethernet/IP/UDP frame carrying `payload` from the
+/// gateway back to the guest, swapping the original 5-tuple. Dispatches
+/// on key.dst_ip to v4 or v6.
 fn build_udp_reply(payload: &[u8], key: &UdpKey) -> Vec<u8> {
+    match (key.dst_ip, key.src_ip) {
+        (IpAddress::Ipv4(dst), IpAddress::Ipv4(src)) => build_udp_reply_v4(payload, dst, src, key),
+        (IpAddress::Ipv6(dst), IpAddress::Ipv6(src)) => build_udp_reply_v6(payload, dst, src, key),
+        _ => Vec::new(),
+    }
+}
+
+fn build_udp_reply_v4(payload: &[u8], orig_dst: Ipv4Address, orig_src: Ipv4Address, key: &UdpKey) -> Vec<u8> {
     use smoltcp::wire::{EthernetFrame as EF, Ipv4Packet as IP, UdpPacket as UP};
     let udp_total = 8 + payload.len();
     let ip_total = 20 + udp_total;
     let eth_total = 14 + ip_total;
     let mut buf = vec![0u8; eth_total];
 
-    // Ethernet
     {
         let mut eth = EF::new_unchecked(&mut buf);
         eth.set_dst_addr(EthernetAddress(GUEST_MAC));
         eth.set_src_addr(EthernetAddress(HOST_MAC));
         eth.set_ethertype(EthernetProtocol::Ipv4);
     }
-    // IPv4
     {
         let mut ip = IP::new_unchecked(&mut buf[14..]);
         ip.set_version(4);
@@ -666,18 +739,52 @@ fn build_udp_reply(payload: &[u8], key: &UdpKey) -> Vec<u8> {
         ip.set_frag_offset(0);
         ip.set_hop_limit(64);
         ip.set_next_header(IpProtocol::Udp);
-        ip.set_src_addr(key.dst_ip);
-        ip.set_dst_addr(key.src_ip);
+        ip.set_src_addr(orig_dst);
+        ip.set_dst_addr(orig_src);
         ip.fill_checksum();
     }
-    // UDP
     {
         let mut udp = UP::new_unchecked(&mut buf[14 + 20..]);
         udp.set_src_port(key.dst_port);
         udp.set_dst_port(key.src_port);
         udp.set_len(udp_total as u16);
         udp.payload_mut().copy_from_slice(payload);
-        udp.fill_checksum(&IpAddress::Ipv4(key.dst_ip), &IpAddress::Ipv4(key.src_ip));
+        udp.fill_checksum(&IpAddress::Ipv4(orig_dst), &IpAddress::Ipv4(orig_src));
+    }
+    buf
+}
+
+fn build_udp_reply_v6(payload: &[u8], orig_dst: Ipv6Address, orig_src: Ipv6Address, key: &UdpKey) -> Vec<u8> {
+    use smoltcp::wire::{EthernetFrame as EF, Ipv6Packet as IP, UdpPacket as UP};
+    let udp_total = 8 + payload.len();
+    let ip_total = 40 + udp_total;
+    let eth_total = 14 + ip_total;
+    let mut buf = vec![0u8; eth_total];
+
+    {
+        let mut eth = EF::new_unchecked(&mut buf);
+        eth.set_dst_addr(EthernetAddress(GUEST_MAC));
+        eth.set_src_addr(EthernetAddress(HOST_MAC));
+        eth.set_ethertype(EthernetProtocol::Ipv6);
+    }
+    {
+        let mut ip = IP::new_unchecked(&mut buf[14..]);
+        ip.set_version(6);
+        ip.set_traffic_class(0);
+        ip.set_flow_label(0);
+        ip.set_payload_len(udp_total as u16);
+        ip.set_next_header(IpProtocol::Udp);
+        ip.set_hop_limit(64);
+        ip.set_src_addr(orig_dst);
+        ip.set_dst_addr(orig_src);
+    }
+    {
+        let mut udp = UP::new_unchecked(&mut buf[14 + 40..]);
+        udp.set_src_port(key.dst_port);
+        udp.set_dst_port(key.src_port);
+        udp.set_len(udp_total as u16);
+        udp.payload_mut().copy_from_slice(payload);
+        udp.fill_checksum(&IpAddress::Ipv6(orig_dst), &IpAddress::Ipv6(orig_src));
     }
     buf
 }
@@ -704,4 +811,258 @@ fn rand_u16() -> u16 {
 fn ipv4_to_std(a: Ipv4Address) -> Ipv4Addr {
     let o = a.octets();
     Ipv4Addr::new(o[0], o[1], o[2], o[3])
+}
+
+fn ipv6_to_std(a: Ipv6Address) -> Ipv6Addr {
+    Ipv6Addr::from(a.octets())
+}
+
+fn ipaddr_to_std(a: IpAddress) -> IpAddr {
+    match a {
+        IpAddress::Ipv4(v4) => IpAddr::V4(ipv4_to_std(v4)),
+        IpAddress::Ipv6(v6) => IpAddr::V6(ipv6_to_std(v6)),
+    }
+}
+
+// ─── ICMP echo proxy (ICMPv4 + ICMPv6) ──────────────────────────────────────
+//
+// Strategy: parse guest EchoRequest, spawn a worker that uses Win32
+// IcmpSendEcho (v4) / Icmp6SendEcho2 (v6) to actually ping upstream, then
+// fabricate a corresponding EchoReply ICMP packet preserving the original
+// identifier+sequence+payload and push it back to the guest as a complete
+// Ethernet frame.
+
+fn handle_icmpv4_echo(payload: &[u8], src_ip: IpAddress, dst_ip: IpAddress, tx_out_tx: &chan::Sender<Vec<u8>>) {
+    let icmp = match Icmpv4Packet::new_checked(payload) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let repr = match Icmpv4Repr::parse(&icmp, &smoltcp::phy::ChecksumCapabilities::default()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let (ident, seq, data) = match repr {
+        Icmpv4Repr::EchoRequest { ident, seq_no, data } => (ident, seq_no, data.to_vec()),
+        _ => return,
+    };
+    let (src, dst) = match (src_ip, dst_ip) {
+        (IpAddress::Ipv4(s), IpAddress::Ipv4(d)) => (s, d),
+        _ => return,
+    };
+    let tx = tx_out_tx.clone();
+    thread::Builder::new()
+        .name(format!("net-icmp4-{}", dst))
+        .spawn(move || {
+            let ok = icmp4_send_echo(ipv4_to_std(dst), &data, Duration::from_secs(4));
+            if ok {
+                let frame = build_icmpv4_echo_reply(dst, src, ident, seq, &data);
+                let _ = tx.send(frame);
+            }
+        })
+        .ok();
+}
+
+fn handle_icmpv6_echo(payload: &[u8], src_ip: IpAddress, dst_ip: IpAddress, tx_out_tx: &chan::Sender<Vec<u8>>) {
+    let icmp = match Icmpv6Packet::new_checked(payload) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let (src, dst) = match (src_ip, dst_ip) {
+        (IpAddress::Ipv6(s), IpAddress::Ipv6(d)) => (s, d),
+        _ => return,
+    };
+    let repr = match Icmpv6Repr::parse(
+        &src,
+        &dst,
+        &icmp,
+        &smoltcp::phy::ChecksumCapabilities::default(),
+    ) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let (ident, seq, data) = match repr {
+        Icmpv6Repr::EchoRequest { ident, seq_no, data } => (ident, seq_no, data.to_vec()),
+        _ => return, // smoltcp Interface handles NDP NS/NA itself.
+    };
+    let tx = tx_out_tx.clone();
+    thread::Builder::new()
+        .name(format!("net-icmp6-{}", dst))
+        .spawn(move || {
+            let ok = icmp6_send_echo(ipv6_to_std(dst), &data, Duration::from_secs(4));
+            if ok {
+                let frame = build_icmpv6_echo_reply(dst, src, ident, seq, &data);
+                let _ = tx.send(frame);
+            }
+        })
+        .ok();
+}
+
+// ─── Win32 ICMP bindings ────────────────────────────────────────────────────
+
+fn icmp4_send_echo(target: Ipv4Addr, payload: &[u8], timeout: Duration) -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    };
+
+    unsafe {
+        let h: HANDLE = match IcmpCreateFile() {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return false,
+        };
+        // ICMP_ECHO_REPLY (28 bytes) + payload + 8 byte slack.
+        let mut reply_buf = vec![0u8; 64 + payload.len()];
+        let dst_be = u32::from_le_bytes(target.octets()); // API expects in_addr (network byte order in struct, but Win32 IcmpSendEcho takes IPAddr which is u32 in network order = native LE bytes of IPv4 octets reversed... actually IPAddr is just the 4 bytes packed; on x86 LE that's octets[0]|octets[1]<<8|octets[2]<<16|octets[3]<<24)
+        let n = IcmpSendEcho(
+            h,
+            dst_be,
+            payload.as_ptr() as *const _,
+            payload.len() as u16,
+            None,
+            reply_buf.as_mut_ptr() as *mut _,
+            reply_buf.len() as u32,
+            timeout.as_millis() as u32,
+        );
+        let _ = IcmpCloseHandle(h);
+        n > 0
+    }
+}
+
+fn icmp6_send_echo(target: Ipv6Addr, payload: &[u8], timeout: Duration) -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        Icmp6CreateFile, Icmp6SendEcho2, IcmpCloseHandle,
+    };
+    use windows::Win32::Networking::WinSock::{AF_INET6, SOCKADDR_IN6, IN6_ADDR, IN6_ADDR_0};
+
+    unsafe {
+        let h: HANDLE = match Icmp6CreateFile() {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return false,
+        };
+
+        let mut src: SOCKADDR_IN6 = std::mem::zeroed();
+        src.sin6_family = AF_INET6;
+        // src addr left as ::
+
+        let mut dst: SOCKADDR_IN6 = std::mem::zeroed();
+        dst.sin6_family = AF_INET6;
+        dst.sin6_addr = IN6_ADDR { u: IN6_ADDR_0 { Byte: target.octets() } };
+
+        let mut reply_buf = vec![0u8; 256 + payload.len()];
+
+        let n = Icmp6SendEcho2(
+            h,
+            None,
+            None,
+            Some(std::ptr::null()),
+            &src,
+            &dst,
+            payload.as_ptr() as *const _,
+            payload.len() as u16,
+            None,
+            reply_buf.as_mut_ptr() as *mut _,
+            reply_buf.len() as u32,
+            timeout.as_millis() as u32,
+        );
+        let _ = IcmpCloseHandle(h);
+        n > 0
+    }
+}
+
+// ─── ICMP reply frame builders ──────────────────────────────────────────────
+
+fn build_icmpv4_echo_reply(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    ident: u16,
+    seq: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    use smoltcp::wire::{EthernetFrame as EF, Ipv4Packet as IP};
+    let icmp_total = 8 + data.len();
+    let ip_total = 20 + icmp_total;
+    let eth_total = 14 + ip_total;
+    let mut buf = vec![0u8; eth_total];
+
+    {
+        let mut eth = EF::new_unchecked(&mut buf);
+        eth.set_dst_addr(EthernetAddress(GUEST_MAC));
+        eth.set_src_addr(EthernetAddress(HOST_MAC));
+        eth.set_ethertype(EthernetProtocol::Ipv4);
+    }
+    {
+        let mut ip = IP::new_unchecked(&mut buf[14..]);
+        ip.set_version(4);
+        ip.set_header_len(20);
+        ip.set_dscp(0);
+        ip.set_ecn(0);
+        ip.set_total_len(ip_total as u16);
+        ip.set_ident(rand_u16());
+        ip.clear_flags();
+        ip.set_dont_frag(true);
+        ip.set_frag_offset(0);
+        ip.set_hop_limit(64);
+        ip.set_next_header(IpProtocol::Icmp);
+        ip.set_src_addr(src);
+        ip.set_dst_addr(dst);
+        ip.fill_checksum();
+    }
+    {
+        let mut icmp = Icmpv4Packet::new_unchecked(&mut buf[14 + 20..]);
+        let repr = Icmpv4Repr::EchoReply {
+            ident,
+            seq_no: seq,
+            data,
+        };
+        repr.emit(&mut icmp, &smoltcp::phy::ChecksumCapabilities::default());
+    }
+    buf
+}
+
+fn build_icmpv6_echo_reply(
+    src: Ipv6Address,
+    dst: Ipv6Address,
+    ident: u16,
+    seq: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    use smoltcp::wire::{EthernetFrame as EF, Ipv6Packet as IP};
+    let icmp_total = 8 + data.len();
+    let ip_total = 40 + icmp_total;
+    let eth_total = 14 + ip_total;
+    let mut buf = vec![0u8; eth_total];
+
+    {
+        let mut eth = EF::new_unchecked(&mut buf);
+        eth.set_dst_addr(EthernetAddress(GUEST_MAC));
+        eth.set_src_addr(EthernetAddress(HOST_MAC));
+        eth.set_ethertype(EthernetProtocol::Ipv6);
+    }
+    {
+        let mut ip = IP::new_unchecked(&mut buf[14..]);
+        ip.set_version(6);
+        ip.set_traffic_class(0);
+        ip.set_flow_label(0);
+        ip.set_payload_len(icmp_total as u16);
+        ip.set_next_header(IpProtocol::Icmpv6);
+        ip.set_hop_limit(64);
+        ip.set_src_addr(src);
+        ip.set_dst_addr(dst);
+    }
+    {
+        let mut icmp = Icmpv6Packet::new_unchecked(&mut buf[14 + 40..]);
+        let repr = Icmpv6Repr::EchoReply {
+            ident,
+            seq_no: seq,
+            data,
+        };
+        repr.emit(
+            &src,
+            &dst,
+            &mut icmp,
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        );
+    }
+    buf
 }
