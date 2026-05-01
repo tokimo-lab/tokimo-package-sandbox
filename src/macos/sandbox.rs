@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,12 +25,14 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
 use super::vm::{BootedVm, DYN_SHARE_GUEST_PATH, DYN_SHARE_TAG, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// macOS backend: boots a Linux VM with `tokimo-sandbox-init`, communicates
 /// over virtio-vsock.
@@ -47,12 +50,13 @@ enum State {
 }
 
 struct RunningState {
-    params: ConfigureParams,
     vm: VirtualMachine,
     init: Arc<VsockInitClient>,
-    /// Long-lived shell child id (mirrors Windows backend).
-    #[allow(dead_code)]
+    /// Long-lived boot-time shell child id.
     shell_id: String,
+    /// All shells active in this session: the boot shell + any returned
+    /// from `spawn_shell`. `close_shell` removes from the set.
+    shells: HashSet<String>,
     /// Tokio runtime that drove `vm.start()` and the VSOCK connect; **must**
     /// outlive the VM, otherwise the underlying Objective-C completion
     /// handlers and dispatch queues are released and the VSOCK fd dies.
@@ -165,16 +169,24 @@ impl SandboxBackend for MacosBackend {
         };
 
         // ---- Per-session host directory --------------------------------
-        let session_id = format!(
-            "{}-{}",
-            params
-                .user_data_name
-                .chars()
+        // session_dir must be unique per Sandbox handle even within the
+        // same process: tests run multiple `Sandbox::connect()` instances
+        // simultaneously with the same `user_data_name`, so we mix in the
+        // caller-supplied `session_id` and a monotonic counter as a fallback.
+        let sanitize = |s: &str| -> String {
+            s.chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                 .take(32)
-                .collect::<String>(),
-            std::process::id()
-        );
+                .collect()
+        };
+        let label = sanitize(&params.user_data_name);
+        let sid = sanitize(&params.session_id);
+        let counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session_id = if sid.is_empty() {
+            format!("{label}-{}-{counter}", std::process::id())
+        } else {
+            format!("{label}-{sid}-{}-{counter}", std::process::id())
+        };
         let session_dir = session_root().join(&session_id);
         let dyn_root = session_dir.join("dyn-root");
         std::fs::create_dir_all(&dyn_root)
@@ -206,9 +218,6 @@ impl SandboxBackend for MacosBackend {
             let _ = std::fs::remove_dir_all(&session_dir);
             return Err(e);
         }
-
-        // Empty MountManifest — we do not use 9p-over-vsock on macOS.
-        let _ = init.mount_manifest(&[]);
 
         // ---- Mount the dynamic-share pool -------------------------------
         if let Err(e) = guest_mount_virtiofs(&init, DYN_SHARE_TAG, DYN_SHARE_GUEST_PATH, false) {
@@ -243,6 +252,8 @@ impl SandboxBackend for MacosBackend {
             }
         };
         let shell_id = shell_info.child_id.clone();
+        let mut shells = HashSet::new();
+        shells.insert(shell_id.clone());
 
         self.emit_event(Event::Ready);
         self.emit_event(Event::GuestConnected { connected: true });
@@ -250,17 +261,16 @@ impl SandboxBackend for MacosBackend {
         // ---- Event pump thread ------------------------------------------
         let init_for_pump = init.clone();
         let event_senders = self.event_senders.clone();
-        let shell_id_for_pump = shell_id.clone();
         thread::Builder::new()
             .name("tokimo-macos-event-pump".into())
-            .spawn(move || event_pump_loop(init_for_pump, event_senders, shell_id_for_pump))
+            .spawn(move || event_pump_loop(init_for_pump, event_senders))
             .map_err(|e| Error::other(format!("spawn event pump thread: {e}")))?;
 
         *state = State::Running(Box::new(RunningState {
-            params,
             vm,
             init,
             shell_id,
+            shells,
             runtime,
             session_dir,
             boot_share_names,
@@ -339,43 +349,39 @@ impl SandboxBackend for MacosBackend {
     }
 
     fn spawn_shell(&self) -> Result<JobId> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
+        let mut state = self.state.lock().unwrap();
+        let rs = match &mut *state {
+            State::Running(rs) => rs,
+            _ => return Err(Error::VmNotRunning),
         };
-        // Match the boot-shell argv from start_vm.
-        let shell_info = init
-            .open_shell(&["/bin/bash"], &[], None)
+        let shell_info = rs
+            .init
+            .open_shell(&["/bin/sh".to_string()], &[], None)
             .map_err(|e| Error::other(format!("open_shell: {e}")))?;
+        rs.shells.insert(shell_info.child_id.clone());
         Ok(JobId(shell_info.child_id))
     }
 
     fn close_shell(&self, id: &JobId) -> Result<()> {
         let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
+            let mut state = self.state.lock().unwrap();
+            let rs = match &mut *state {
+                State::Running(rs) => rs,
                 _ => return Err(Error::VmNotRunning),
-            }
+            };
+            rs.shells.remove(id.as_str());
+            rs.init.clone()
         };
         // SIGTERM the shell's process group; the event pump emits Exit.
         init.signal(id.as_str(), 15, true)
     }
 
     fn list_shells(&self) -> Result<Vec<JobId>> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-        // child_ids() returns every live child the init tracks; in this
-        // backend they're all shells (we don't currently expose `Op::Exec`).
-        Ok(init.child_ids().into_iter().map(JobId).collect())
+        let state = self.state.lock().unwrap();
+        match &*state {
+            State::Running(rs) => Ok(rs.shells.iter().cloned().map(JobId).collect()),
+            _ => Err(Error::VmNotRunning),
+        }
     }
 
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
@@ -518,7 +524,7 @@ impl SandboxBackend for MacosBackend {
 /// child the guest tells us about. We don't pre-register children; the
 /// reader thread populates the per-child entry the first time it sees an
 /// event, so we just iterate over the keys present in the shared map.
-fn event_pump_loop(init: Arc<VsockInitClient>, event_senders: Arc<Mutex<Vec<Sender<Event>>>>, _shell_id: String) {
+fn event_pump_loop(init: Arc<VsockInitClient>, event_senders: Arc<Mutex<Vec<Sender<Event>>>>) {
     let mut seen_exit: HashSet<String> = HashSet::new();
 
     loop {

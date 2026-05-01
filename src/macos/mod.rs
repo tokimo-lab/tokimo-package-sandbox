@@ -6,5 +6,3 @@
 pub(crate) mod sandbox;
 pub(crate) mod vm;
 pub(crate) mod vsock_init_client;
-
-pub use sandbox::MacosBackend;

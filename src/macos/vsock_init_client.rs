@@ -17,9 +17,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::error::{Error, Result};
-use crate::protocol::types::{
-    ErrorReply, Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features,
-};
+use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
 
 /// Outbound op id sequence.
@@ -132,35 +130,6 @@ impl VsockInitClient {
         }
     }
 
-    /// Send MountManifest (used by Windows to tell guest to 9p-mount host shares).
-    /// On macOS/Linux, typically not needed if the backend mounts shares itself.
-    pub fn mount_manifest(&self, entries: &[MountEntry]) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::MountManifest {
-            id: id.clone(),
-            entries: entries.to_vec(),
-        };
-        self.ack_op(&id, op)
-    }
-
-    /// Dynamically attach a single Plan9 share at runtime. Mirrors
-    /// `WinInitClient::add_mount`.
-    pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::AddMount { id: id.clone(), entry };
-        self.ack_op(&id, op)
-    }
-
-    /// Dynamically detach a single Plan9 share by `aname`.
-    pub fn remove_mount(&self, name: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::RemoveMount {
-            id: id.clone(),
-            name: name.to_string(),
-        };
-        self.ack_op(&id, op)
-    }
-
     /// OpenShell → returns child_id of the long-lived shell.
     pub fn open_shell(
         &self,
@@ -197,35 +166,17 @@ impl VsockInitClient {
         self.spawn_ack(&id, op)
     }
 
-    /// Spawn (PTY mode). Returns NotImplemented on macOS (no SCM_RIGHTS over VSOCK).
-    #[allow(unused_variables)]
-    pub fn spawn_pty(
-        &self,
-        argv: &[String],
-        env_overlay: &[(String, String)],
-        cwd: Option<&str>,
-        rows: u16,
-        cols: u16,
-    ) -> Result<(SpawnInfo, OwnedFd)> {
-        Err(Error::not_implemented("PTY mode over VSOCK (no fd passing)"))
-    }
-
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
         let reply = self.send_op_sync(id, op, Duration::from_secs(10))?;
         match reply {
             Reply::Spawn {
-                ok,
-                child_id,
-                pid,
-                error,
-                ..
+                ok, child_id, error, ..
             } => {
                 if !ok {
                     return Err(Error::other(format!("spawn failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
-                    pid: pid.unwrap_or(0),
                 })
             }
             other => Err(Error::other(format!("unexpected reply: {other:?}"))),
@@ -249,17 +200,6 @@ impl VsockInitClient {
             child_id: child_id.into(),
             sig,
             to_pgrp,
-        };
-        self.ack_op(&id, op)
-    }
-
-    pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::Resize {
-            id: id.clone(),
-            child_id: child_id.into(),
-            rows,
-            cols,
         };
         self.ack_op(&id, op)
     }
@@ -290,16 +230,6 @@ impl VsockInitClient {
                     Ok(())
                 } else {
                     Err(Error::other(format!("init op failed: {:?}", error.map(|e| e.message))))
-                }
-            }
-            Reply::MountManifest { ok, error, .. } => {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(Error::other(format!(
-                        "mount manifest failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
                 }
             }
             other => Err(Error::other(format!("expected Ack, got {other:?}"))),
@@ -468,7 +398,6 @@ impl VsockInitClient {
 #[derive(Debug, Clone)]
 pub struct SpawnInfo {
     pub child_id: String,
-    pub pid: i32,
 }
 
 fn reader_loop(mut sock: OwnedFd, state: Arc<(Mutex<Shared>, Condvar)>) {

@@ -8,7 +8,8 @@
 use std::env;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arcbox_vz::{
@@ -33,9 +34,6 @@ const ROOTFS_TAG: &str = "work";
 pub(crate) const DYN_SHARE_TAG: &str = "tokimo_dyn";
 /// Mount point inside the guest for the dynamic share pool.
 pub(crate) const DYN_SHARE_GUEST_PATH: &str = "/__tokimo_dyn";
-
-/// Default amount of memory the VM is allotted, in MiB.
-pub(crate) const DEFAULT_MEMORY_MB: u64 = 2048;
 
 /// Result of `boot_vm`: a started `VirtualMachine`, the connected vsock fd
 /// to the guest's init listener, and the tokio runtime that ran (and must
@@ -128,6 +126,16 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
             "Virtualization.framework not available (requires macOS 11+)",
         ));
     }
+
+    // Apple's Virtualization.framework dispatches VM lifecycle calls onto a
+    // shared internal queue; building+starting two VMs in parallel inside
+    // one process surfaces as "Start operation cancelled". Serialize the
+    // build+start path so the dispatch queue sees one VM-start at a time.
+    static BOOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = BOOT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let vm_dir = find_vm_dir()?;
     let kernel = vm_dir.join("vmlinuz");
