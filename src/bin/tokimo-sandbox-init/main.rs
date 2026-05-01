@@ -114,7 +114,8 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), String> {
     let pid = getpid();
-    if pid.as_raw() != 1 {
+    let bwrap_mode = std::env::var_os("TOKIMO_SANDBOX_CONTROL_FD").is_some();
+    if pid.as_raw() != 1 && !bwrap_mode {
         return Err(format!("init must be PID 1 (got {}); host forgot --as-pid-1", pid));
     }
 
@@ -192,8 +193,48 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("signalfd: {e}"))?;
 
     // Choose transport.
-    // macOS VZ: guest listens (bind_vsock), host connects to guest.
-    // Windows HCS: guest connects (connect_vsock), host listens.
+    // Priority order:
+    //   1. Linux bwrap mode: TOKIMO_SANDBOX_CONTROL_FD points at an
+    //      already-connected SEQPACKET socket inherited from the host
+    //      via socketpair + pre_exec(clear CLOEXEC).
+    //   2. Serial mode (legacy Windows HCS).
+    //   3. Vsock (modern Windows HCS / macOS VZ).
+    //   4. Default: bind a SEQPACKET listener at the well-known path.
+    if let Ok(raw_str) = env::var("TOKIMO_SANDBOX_CONTROL_FD") {
+        let raw: i32 = raw_str
+            .parse()
+            .map_err(|e| format!("bad TOKIMO_SANDBOX_CONTROL_FD={raw_str}: {e}"))?;
+        // Set non-blocking — mio + recv_frame_seqpacket expect EAGAIN on no-data.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags == -1 {
+            return Err(format!(
+                "fcntl(F_GETFL) on inherited fd {raw}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+            return Err(format!(
+                "fcntl(F_SETFL O_NONBLOCK) on inherited fd {raw}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let client = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // bwrap-side bringup: optional loopback up.
+        if env::var("TOKIMO_SANDBOX_BRINGUP_LO").as_deref() == Ok("1") {
+            if let Err(e) = bringup_lo() {
+                eprintln!("[tokimo-sandbox-init] WARN bringup_lo: {e}");
+            }
+        }
+
+        let base_env = server::snapshot_base_env();
+        let sigfd_owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(sigfd.as_raw_fd()) };
+        std::mem::forget(sigfd);
+        eprintln!("[tokimo-sandbox-init] READY (bwrap, inherited fd {raw})");
+        return server::run_loop_preconnected(client, sigfd_owned, base_env)
+            .map_err(|e| format!("event loop: {e}"));
+    }
+
     let (listener, write_fd, transport) = if env::var(ENV_SERIAL_MODE).is_ok() {
         let (r, w) = bind_serial()?;
         (r, w, server::Transport::Serial)
@@ -512,4 +553,37 @@ fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn bringup_lo() -> Result<(), String> {
+    // Open a generic AF_INET DGRAM socket — used solely as the ioctl
+    // delivery vehicle for SIOCSIFFLAGS.
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(format!(
+            "socket(AF_INET, DGRAM): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // libc::ifreq layout: char ifr_name[IFNAMSIZ]; union { short ifru_flags; ... }
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name = b"lo\0";
+    for (i, &b) in name.iter().enumerate() {
+        ifr.ifr_name[i] = b as libc::c_char;
+    }
+    unsafe {
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    }
+    let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
+    let res = if rc != 0 {
+        Err(format!(
+            "ioctl(SIOCSIFFLAGS, lo): {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    };
+    unsafe { libc::close(sock) };
+    res
 }

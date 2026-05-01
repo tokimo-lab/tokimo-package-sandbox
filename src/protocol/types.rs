@@ -152,6 +152,22 @@ pub enum Op {
     /// `umount2(target, MNT_DETACH)`s the share and drops the held fd.
     /// Replies with `Reply::Ack`.
     RemoveMount { id: String, name: String },
+    /// Bwrap-backend dynamic mount: init opens `host_path` relative to
+    /// its long-lived `/.tps_host` fd (no SCM_RIGHTS required), then
+    /// bind-mounts the result at `target`. If `read_only`, init follows
+    /// up with a remount-RDONLY. `name` is the logical id used by the
+    /// host to drive `Op::RemoveMountByName` later.
+    AddMountFd {
+        id: String,
+        name: String,
+        host_path: String,
+        target: String,
+        read_only: bool,
+    },
+    /// Counterpart for AddMountFd: umount2(target, MNT_DETACH) and rmdir
+    /// the empty mountpoint. Looked up by `name` against an init-side
+    /// registry of dynamic mounts.
+    RemoveMountByName { id: String, name: String },
 }
 
 /// One Plan9-over-vsock mount the guest must perform during `MountManifest`.

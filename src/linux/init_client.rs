@@ -75,7 +75,13 @@ impl InitClient {
             .map_err(|e| Error::exec(format!("socket(SEQPACKET): {e}")))?;
         let addr = UnixAddr::new(path).map_err(|e| Error::exec(format!("UnixAddr {path:?}: {e}")))?;
         connect(fd.as_raw_fd(), &addr).map_err(|e| Error::exec(format!("connect {path:?}: {e}")))?;
+        Self::from_fd(fd)
+    }
 
+    /// Wrap an already-connected SEQPACKET socket (e.g. one half of a
+    /// `socketpair(2)` whose other end was inherited by the bwrap+init
+    /// child via `Command::pre_exec`). Spawns the reader thread.
+    pub fn from_fd(fd: OwnedFd) -> Result<Self> {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
         let reader_fd_raw = fd.as_raw_fd();
@@ -124,7 +130,12 @@ impl InitClient {
                         "init protocol mismatch: client={PROTOCOL_VERSION} init={protocol}"
                     )));
                 }
-                if init_pid != 1 {
+                // bwrap-mode init runs as PID 2 (bwrap is PID 1). The
+                // strict PID-1 check is meaningful only for the VM
+                // backends where init is the literal first userspace
+                // process.
+                let allow_non_pid1 = std::env::var_os("TOKIMO_SANDBOX_ALLOW_NON_PID1").is_some();
+                if init_pid != 1 && !allow_non_pid1 {
                     return Err(Error::exec(format!(
                         "init not PID 1 (got {init_pid}); host forgot --as-pid-1"
                     )));
@@ -190,6 +201,39 @@ impl InitClient {
         let op = Op::Unmount {
             id: id.clone(),
             target: target.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Add a runtime bind mount in the bwrap container. Init opens
+    /// `host_path` (absolute) relative to its long-lived staging fd and
+    /// bind-mounts it at `target`. No SCM_RIGHTS needed — init resolves
+    /// the path entirely on its own side.
+    pub fn add_mount_fd(
+        &self,
+        name: &str,
+        host_path: &str,
+        target: &str,
+        read_only: bool,
+    ) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddMountFd {
+            id: id.clone(),
+            name: name.into(),
+            host_path: host_path.into(),
+            target: target.into(),
+            read_only,
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Counterpart to [`add_mount_fd`]: ask init to umount + rmdir a
+    /// previously-added dynamic mount, looked up by `name`.
+    pub fn remove_mount_by_name(&self, name: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveMountByName {
+            id: id.clone(),
+            name: name.into(),
         };
         self.ack_op(&id, op)
     }
@@ -423,7 +467,92 @@ impl InitClient {
         }
     }
 
-    /// Take the exit status if known.
+    /// Block until any child has data (stdout/stderr/exit), or the reader
+    /// observed EOF, or `deadline` is reached. Returns `true` if there is
+    /// pending data or EOF; `false` on timeout.
+    pub fn wait_any_event_or_eof(&self, deadline: Instant) -> bool {
+        let (lock, cv) = &*self.inner.state;
+        let mut g = lock.lock().expect("client state");
+        loop {
+            if g.eof {
+                return true;
+            }
+            let any = g.children.values().any(|c| {
+                !c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some()
+            });
+            if any {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g2, _) = cv.wait_timeout(g, deadline - now).expect("wait");
+            g = g2;
+        }
+    }
+
+    /// Drain pending events ONLY for the given set of `child_id`s. Used
+    /// by the event pump so it doesn't steal events from synchronous
+    /// `run_oneshot` callers (which look up child events directly).
+    pub fn drain_pending_events_for(&self, ids: &std::collections::HashSet<String>) -> Vec<DrainedEvent> {
+        let mut out = Vec::new();
+        let mut g = self.inner.state.0.lock().expect("client state");
+        for cid in ids {
+            let Some(c) = g.children.get_mut(cid) else { continue };
+            for chunk in std::mem::take(&mut c.stdout) {
+                out.push(DrainedEvent::Stdout {
+                    child_id: cid.clone(),
+                    data: chunk,
+                });
+            }
+            for chunk in std::mem::take(&mut c.stderr) {
+                out.push(DrainedEvent::Stderr {
+                    child_id: cid.clone(),
+                    data: chunk,
+                });
+            }
+            if let Some((code, sig)) = c.exit.take() {
+                out.push(DrainedEvent::Exit {
+                    child_id: cid.clone(),
+                    code,
+                    signal: sig,
+                });
+            }
+        }
+        out
+    }
+
+    /// Drain all pending events across every child. Returns a flat list of
+    /// (child_id, kind) tuples. Exit is removed (one-shot); stdout/stderr
+    /// chunks are taken (cleared from the buffer).
+    pub fn drain_all_pending_events(&self) -> Vec<DrainedEvent> {
+        let mut out = Vec::new();
+        let mut g = self.inner.state.0.lock().expect("client state");
+        for (cid, c) in g.children.iter_mut() {
+            for chunk in std::mem::take(&mut c.stdout) {
+                out.push(DrainedEvent::Stdout {
+                    child_id: cid.clone(),
+                    data: chunk,
+                });
+            }
+            for chunk in std::mem::take(&mut c.stderr) {
+                out.push(DrainedEvent::Stderr {
+                    child_id: cid.clone(),
+                    data: chunk,
+                });
+            }
+            if let Some((code, sig)) = c.exit.take() {
+                out.push(DrainedEvent::Exit {
+                    child_id: cid.clone(),
+                    code,
+                    signal: sig,
+                });
+            }
+        }
+        out
+    }
+
     pub fn take_exit(&self, child_id: &str) -> Option<(i32, Option<i32>)> {
         let mut g = self.inner.state.0.lock().expect("client state");
         g.children.get_mut(child_id).and_then(|c| c.exit.take())
@@ -511,6 +640,25 @@ pub struct SpawnInfo {
     pub child_id: String,
     pub pid: i32,
 }
+
+/// Event handed to the event pump by [`InitClient::drain_all_pending_events`].
+#[derive(Debug, Clone)]
+pub enum DrainedEvent {
+    Stdout {
+        child_id: String,
+        data: Vec<u8>,
+    },
+    Stderr {
+        child_id: String,
+        data: Vec<u8>,
+    },
+    Exit {
+        child_id: String,
+        code: i32,
+        signal: Option<i32>,
+    },
+}
+
 
 /// Handle to a running child spawned via `spawn_pipes_async` or
 /// `spawn_pipes_inherit_async`. Call `wait_with_timeout` to block
