@@ -7,21 +7,20 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 
+use crate::error::{Error, Result};
 use crate::protocol::types::{
-    default_features, ErrorReply, Event, Frame, MountEntry, Op, Reply, StdioMode,
-    PROTOCOL_VERSION,
+    ErrorReply, Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features,
 };
 use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
-use crate::error::{Error, Result};
 
 /// Outbound op id sequence.
 fn next_id(counter: &AtomicU64) -> String {
@@ -54,10 +53,9 @@ pub struct VsockInitClient {
 }
 
 struct Inner {
-    /// VSOCK stream socket (AF_VSOCK SOCK_STREAM). Wrapped in Arc<Mutex> so
-    /// the reader thread and sender can share it. Unlike SEQPACKET, stream
-    /// sockets require external locking to prevent read/write interleaving.
-    sock: Arc<Mutex<OwnedFd>>,
+    /// Write half of the VSOCK socket. The reader thread holds an
+    /// independent `dup`'d fd, so the writer Mutex never blocks the reader.
+    write_fd: Mutex<OwnedFd>,
     state: Arc<(Mutex<Shared>, Condvar)>,
     counter: AtomicU64,
     /// JoinHandle for the reader thread; held to keep it alive.
@@ -66,21 +64,29 @@ struct Inner {
 
 impl VsockInitClient {
     /// Wrap an already-connected VSOCK stream socket and spawn the background
-    /// reader thread.
+    /// reader thread. Internally `dup`s the fd so reader and writer can
+    /// operate on independent file descriptors.
     pub fn new(sock: OwnedFd) -> Result<Self> {
-        let sock = Arc::new(Mutex::new(sock));
+        let raw = sock.as_raw_fd();
+        let dup_raw = unsafe { libc::dup(raw) };
+        if dup_raw < 0 {
+            return Err(Error::other(format!(
+                "dup VSOCK fd: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
 
         let reader_state = state.clone();
-        let reader_sock = sock.clone();
         let reader = thread::Builder::new()
             .name("tokimo-vsock-init-reader".into())
-            .spawn(move || reader_loop(reader_sock, reader_state))
+            .spawn(move || reader_loop(read_fd, reader_state))
             .map_err(|e| Error::other(format!("spawn reader thread: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                sock,
+                write_fd: Mutex::new(sock),
                 state,
                 counter: AtomicU64::new(0),
                 _reader: Mutex::new(Some(reader)),
@@ -118,15 +124,11 @@ impl VsockInitClient {
                     )));
                 }
                 if init_pid != 1 {
-                    return Err(Error::other(format!(
-                        "init not PID 1 (got {init_pid})"
-                    )));
+                    return Err(Error::other(format!("init not PID 1 (got {init_pid})")));
                 }
                 Ok(init_pid)
             }
-            other => Err(Error::other(format!(
-                "expected Hello reply, got {other:?}"
-            ))),
+            other => Err(Error::other(format!("expected Hello reply, got {other:?}"))),
         }
     }
 
@@ -145,10 +147,7 @@ impl VsockInitClient {
     /// `WinInitClient::add_mount`.
     pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::AddMount {
-            id: id.clone(),
-            entry,
-        };
+        let op = Op::AddMount { id: id.clone(), entry };
         self.ack_op(&id, op)
     }
 
@@ -208,9 +207,7 @@ impl VsockInitClient {
         rows: u16,
         cols: u16,
     ) -> Result<(SpawnInfo, OwnedFd)> {
-        Err(Error::not_implemented(
-            "PTY mode over VSOCK (no fd passing)",
-        ))
+        Err(Error::not_implemented("PTY mode over VSOCK (no fd passing)"))
     }
 
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
@@ -224,10 +221,7 @@ impl VsockInitClient {
                 ..
             } => {
                 if !ok {
-                    return Err(Error::other(format!(
-                        "spawn failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::other(format!("spawn failed: {:?}", error.map(|e| e.message))));
                 }
                 Ok(SpawnInfo {
                     child_id: child_id.unwrap_or_default(),
@@ -295,10 +289,7 @@ impl VsockInitClient {
                 if ok {
                     Ok(())
                 } else {
-                    Err(Error::other(format!(
-                        "init op failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
+                    Err(Error::other(format!("init op failed: {:?}", error.map(|e| e.message))))
                 }
             }
             Reply::MountManifest { ok, error, .. } => {
@@ -316,15 +307,15 @@ impl VsockInitClient {
     }
 
     fn send_op_sync(&self, id: &str, op: Op, timeout: Duration) -> Result<Reply> {
-        // Send the op while holding sock lock (stream socket requires exclusive
-        // access for both read and write to avoid interleaving).
+        // Send the op while holding the write lock (multiple writer threads
+        // might race; the reader uses an independent dup'd fd so it is not
+        // blocked here).
         {
             let mut sock_guard = self
                 .inner
-                .sock
+                .write_fd
                 .lock()
                 .map_err(|_| Error::other("sock lock poisoned"))?;
-            // Wrap OwnedFd in a Write adapter.
             let mut writer = FdWriter(&mut *sock_guard);
             send_frame_stream(&mut writer, &Frame::Op(op))?;
         }
@@ -332,9 +323,7 @@ impl VsockInitClient {
         // Wait for matching reply.
         let deadline = Instant::now() + timeout;
         let (lock, cv) = &*self.inner.state;
-        let mut g = lock
-            .lock()
-            .map_err(|_| Error::other("client state poisoned"))?;
+        let mut g = lock.lock().map_err(|_| Error::other("client state poisoned"))?;
         loop {
             if let Some(r) = g.replies.remove(id) {
                 return Ok(r);
@@ -344,9 +333,7 @@ impl VsockInitClient {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(Error::other(format!(
-                    "init op {id} timed out after {timeout:?}"
-                )));
+                return Err(Error::other(format!("init op {id} timed out after {timeout:?}")));
             }
             let (g2, _) = cv
                 .wait_timeout(g, deadline - now)
@@ -397,6 +384,13 @@ impl VsockInitClient {
     pub fn take_exit(&self, child_id: &str) -> Option<(i32, Option<i32>)> {
         let mut g = self.inner.state.0.lock().expect("client state");
         g.children.get_mut(child_id).and_then(|c| c.exit.take())
+    }
+
+    /// Snapshot of all child ids currently tracked by the reader thread.
+    /// Useful for an event-pump loop that doesn't pre-register children.
+    pub fn child_ids(&self) -> Vec<String> {
+        let g = self.inner.state.0.lock().expect("client state");
+        g.children.keys().cloned().collect()
     }
 
     /// Has the reader thread observed EOF / fatal error?
@@ -465,11 +459,7 @@ impl VsockInitClient {
         }
 
         let _ = self.close_child(&child_id);
-        let code = if timed_out {
-            124
-        } else {
-            exit_code.unwrap_or(-1)
-        };
+        let code = if timed_out { 124 } else { exit_code.unwrap_or(-1) };
         Ok((stdout_buf, stderr_buf, code))
     }
 }
@@ -481,14 +471,10 @@ pub struct SpawnInfo {
     pub pid: i32,
 }
 
-fn reader_loop(sock: Arc<Mutex<OwnedFd>>, state: Arc<(Mutex<Shared>, Condvar)>) {
+fn reader_loop(mut sock: OwnedFd, state: Arc<(Mutex<Shared>, Condvar)>) {
     loop {
         let frame_opt = {
-            let mut sock_guard = match sock.lock() {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            let mut reader = FdReader(&mut *sock_guard);
+            let mut reader = FdReader(&mut sock);
             match recv_frame_stream(&mut reader) {
                 Ok(f) => f,
                 Err(_) => break,
@@ -509,35 +495,17 @@ fn reader_loop(sock: Arc<Mutex<OwnedFd>>, state: Arc<(Mutex<Shared>, Condvar)>) 
                         g.replies.insert(id, r);
                     }
                     Frame::Event(e) => match e {
-                        Event::Stdout {
-                            child_id,
-                            data_b64,
-                        } => {
+                        Event::Stdout { child_id, data_b64 } => {
                             if let Ok(bytes) = B64.decode(&data_b64) {
-                                g.children
-                                    .entry(child_id)
-                                    .or_default()
-                                    .stdout
-                                    .push(bytes);
+                                g.children.entry(child_id).or_default().stdout.push(bytes);
                             }
                         }
-                        Event::Stderr {
-                            child_id,
-                            data_b64,
-                        } => {
+                        Event::Stderr { child_id, data_b64 } => {
                             if let Ok(bytes) = B64.decode(&data_b64) {
-                                g.children
-                                    .entry(child_id)
-                                    .or_default()
-                                    .stderr
-                                    .push(bytes);
+                                g.children.entry(child_id).or_default().stderr.push(bytes);
                             }
                         }
-                        Event::Exit {
-                            child_id,
-                            code,
-                            signal,
-                        } => {
+                        Event::Exit { child_id, code, signal } => {
                             g.children.entry(child_id).or_default().exit = Some((code, signal));
                         }
                     },
@@ -556,10 +524,9 @@ fn reader_loop(sock: Arc<Mutex<OwnedFd>>, state: Arc<(Mutex<Shared>, Condvar)>) 
 
 fn reply_id(r: &Reply) -> String {
     match r {
-        Reply::Hello { id, .. }
-        | Reply::Spawn { id, .. }
-        | Reply::Ack { id, .. }
-        | Reply::MountManifest { id, .. } => id.clone(),
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } | Reply::MountManifest { id, .. } => {
+            id.clone()
+        }
     }
 }
 
@@ -577,7 +544,7 @@ struct FdWriter<'a>(&'a mut OwnedFd);
 
 impl<'a> Write for FdWriter<'a> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        nix::unistd::write(self.0.as_raw_fd(), buf).map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        nix::unistd::write(&*self.0, buf).map_err(|e| std::io::Error::from_raw_os_error(e as i32))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

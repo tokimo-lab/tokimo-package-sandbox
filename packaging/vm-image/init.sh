@@ -28,6 +28,8 @@ ROOTSHARE_PORT=""
 WORK_PORT=""
 SESSION_MODE=0
 INIT_PORT=50003
+GUEST_LISTENS=0
+NET_MODE=static
 for arg in $CMDLINE; do
     case "$arg" in
         run=*)                       CMD_B64="${arg#run=}" ;;
@@ -35,6 +37,8 @@ for arg in $CMDLINE; do
         tokimo.work_port=*)          WORK_PORT="${arg#tokimo.work_port=}" ;;
         tokimo.session=1)            SESSION_MODE=1 ;;
         tokimo.init_port=*)          INIT_PORT="${arg#tokimo.init_port=}" ;;
+        tokimo.guest_listens=1)      GUEST_LISTENS=1 ;;
+        tokimo.net=*)                NET_MODE="${arg#tokimo.net=}" ;;
     esac
 done
 
@@ -66,6 +70,10 @@ if [ -d /modules ]; then
     # vsock core then hv_sock transport.
     load_mod vsock
     load_mod hv_sock
+    # macOS VZ vsock transport — virtio-vsock. No-op on Windows where the
+    # .ko isn't present in /modules.
+    load_mod vmw_vsock_virtio_transport_common
+    load_mod vmw_vsock_virtio_transport
     # SCSI stack (for VHDX boot disk). scsi_common provides helper symbols
     # split out of scsi_mod in modern kernels — must load before scsi_mod.
     # scsi_transport_fc is pulled in by hv_storvsc.
@@ -86,6 +94,9 @@ if [ -d /modules ]; then
     load_mod failover
     load_mod net_failover
     load_mod hv_netvsc
+    # macOS VZ NAT NIC (virtio-net). No-op on Windows where the .ko isn't
+    # present in /modules.
+    load_mod virtio_net
     # ext4 filesystem (for SCSI rootfs). Needs crc16 + crc32c + libcrc32c
     # + jbd2 + mbcache.
     load_mod crc16
@@ -201,13 +212,17 @@ if [ "$SESSION_MODE" = 1 ]; then
     # ---------------------------------------------------------------------------
     /bin/busybox ip link set lo up 2>/dev/null || true
     if [ -d /sys/class/net/eth0 ]; then
-        echo "tokimo-init: configuring eth0 (static 192.168.127.2/24)" >/dev/kmsg 2>/dev/null || true
         /bin/busybox ip link set eth0 up 2>/dev/null || true
-        /bin/busybox ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-        /bin/busybox ip route add default via 192.168.127.1 2>/dev/null || true
-        # Resolver — propagate into the chrooted rootfs too. The Hyper-V
-        # NAT gateway forwards DNS to the host resolver, but pointing
-        # directly at public resolvers avoids depending on that path.
+        if [ "$NET_MODE" = "dhcp" ]; then
+            echo "tokimo-init: configuring eth0 via DHCP (udhcpc)" >/dev/kmsg 2>/dev/null || true
+            /bin/busybox udhcpc -i eth0 -t 8 -T 1 -A 1 -n -q -s /etc/udhcpc/default.script >/dev/kmsg 2>&1 || \
+                echo "tokimo-init: udhcpc failed" >/dev/kmsg 2>/dev/null || true
+        else
+            echo "tokimo-init: configuring eth0 (static 192.168.127.2/24)" >/dev/kmsg 2>/dev/null || true
+            /bin/busybox ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
+            /bin/busybox ip route add default via 192.168.127.1 2>/dev/null || true
+        fi
+        # Resolver — propagate into the chrooted rootfs too.
         echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
         echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
     else
@@ -232,7 +247,12 @@ if [ "$SESSION_MODE" = 1 ]; then
     # binary. The init binary expects to be PID 1 (it checks getpid()==1),
     # which works because chroot is the same PID via exec chain.
     export TOKIMO_SANDBOX_VSOCK_PORT="$INIT_PORT"
+    # init.sh always pre-chroots; init binary should skip its own mount/chroot.
     export TOKIMO_SANDBOX_PRE_CHROOTED=1
+    if [ "$GUEST_LISTENS" = 1 ]; then
+        # macOS VZ: guest listens for host connect on AF_VSOCK.
+        export TOKIMO_SANDBOX_GUEST_LISTENS=1
+    fi
     exec /bin/busybox chroot /newroot /bin/tokimo-sandbox-init </dev/null >/dev/null 2>/dev/kmsg
     # If exec returns, something went wrong.
     echo "tokimo-init: chroot exec failed" >/dev/kmsg 2>/dev/null || true

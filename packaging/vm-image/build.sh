@@ -30,7 +30,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$PROJECT_DIR/tokimo-os-${ARCH}"
 ROOTFS_DIR="$OUTPUT_DIR/rootfs"
 ROOTFS_TAR="$PROJECT_DIR/rootfs.tar"
-BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod"
+BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod udhcpc ip"
 
 # Optional: path to a prebuilt static `tokimo-sandbox-init` (musl) that
 # will be baked into the initrd at /bin/tokimo-sandbox-init. The init.sh
@@ -248,10 +248,12 @@ find /usr/share/zoneinfo -type d -empty -delete 2>/dev/null || true
 # The module-bundle step on the host does `docker cp /var/cache/tokimo-kmods/.` out.
 KVER_INNER=$(ls /lib/modules | head -1)
 KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover'
-# macOS VZ uses virtio-vsock (not Hyper-V). Add the virtio transport modules
-# for arm64 so the init binary can load them in the guest VM.
+# macOS VZ uses virtio-vsock + virtio-net (not Hyper-V). Add the virtio
+# transport modules for arm64 so the init binary can load them in the
+# guest VM. virtio_net requires net_failover (already listed) for SR-IOV
+# fallback handling.
 if [ "$ARCH" = "arm64" ]; then
-    KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport"
+    KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
 fi
 resolve_deps() {
     local mod="$1" seen="$2"
@@ -351,6 +353,43 @@ for applet in $BUSYBOX_APPLETS; do
 done
 ln -sf /bin/busybox "$INITRD_DIR/sbin/poweroff"
 ln -sf /bin/busybox "$INITRD_DIR/sbin/init"
+ln -sf /bin/busybox "$INITRD_DIR/sbin/udhcpc"
+
+# udhcpc default script (busybox style).
+mkdir -p "$INITRD_DIR/etc/udhcpc"
+cat > "$INITRD_DIR/etc/udhcpc/default.script" <<'UDHCPC_SCRIPT'
+#!/bin/busybox sh
+RESOLV_CONF=/etc/resolv.conf
+[ -n "$1" ] || { echo "Error: should be called from udhcpc" >&2; exit 1; }
+case "$1" in
+    deconfig)
+        /bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        /bin/busybox ip link set "$interface" up
+        ;;
+    bound|renew)
+        /bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        if [ -n "$subnet" ]; then
+            mask=$(/bin/busybox ipcalc -p 0.0.0.0 "$subnet" 2>/dev/null | /bin/busybox cut -d= -f2)
+            [ -z "$mask" ] && mask=24
+            /bin/busybox ip addr add "$ip/$mask" dev "$interface"
+        else
+            /bin/busybox ip addr add "$ip/24" dev "$interface"
+        fi
+        if [ -n "$router" ]; then
+            for r in $router; do
+                /bin/busybox ip route add default via "$r" dev "$interface" 2>/dev/null
+            done
+        fi
+        : > "$RESOLV_CONF"
+        [ -n "$domain" ] && echo "search $domain" >> "$RESOLV_CONF"
+        for dns in $dns; do
+            echo "nameserver $dns" >> "$RESOLV_CONF"
+        done
+        ;;
+esac
+exit 0
+UDHCPC_SCRIPT
+chmod +x "$INITRD_DIR/etc/udhcpc/default.script"
 
 cp "$PROJECT_DIR/init.sh" "$INITRD_DIR/init"
 chmod +x "$INITRD_DIR/init"
