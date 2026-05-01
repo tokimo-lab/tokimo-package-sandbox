@@ -156,7 +156,18 @@ impl State {
 }
 
 pub fn snapshot_base_env() -> Vec<(String, String)> {
-    env::vars().collect()
+    // Filter out init's private control vars (TOKIMO_SANDBOX_CONTROL_FD,
+    // TOKIMO_SANDBOX_BRINGUP_LO, TOKIMO_SANDBOX_MOUNT_SYSFS,
+    // TOKIMO_SANDBOX_SECCOMP_B64, TOKIMO_SANDBOX_PRE_CHROOTED,
+    // TOKIMO_SANDBOX_ALLOW_NON_PID1, TOKIMO_SANDBOX_VSOCK_PORT,
+    // TOKIMO_SANDBOX_SERIAL_MODE, TOKIMO_SANDBOX_CONTROL_SOCK,
+    // TOKIMO_SANDBOX_GUEST_LISTENS, ...) so they don't leak into every
+    // child spawned inside the sandbox. Anything legitimate the user wants
+    // visible inside the guest must come through `ConfigureParams::env`
+    // and `ShellOpts::env`/`ExecOpts::env`, not the host process env.
+    env::vars()
+        .filter(|(k, _)| !k.starts_with("TOKIMO_SANDBOX_"))
+        .collect()
 }
 
 pub fn run_loop(
