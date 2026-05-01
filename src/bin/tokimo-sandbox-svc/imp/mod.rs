@@ -890,8 +890,6 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
 
     let init_port = vmconfig::alloc_session_init_port();
     let init_svc_id = vmconfig::hvsock_service_id(init_port);
-    ensure_hvsocket_service_registered(&init_svc_id, "Tokimo Sandbox Init")
-        .map_err(|e| RpcError::new("hvsock_register", e))?;
     let init_svc_guid = parse_guid(&init_svc_id).map_err(|e| RpcError::new("guid", e))?;
     let init_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid)
         .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?;
@@ -900,8 +898,6 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // bound BEFORE HCS starts so the guest can connect immediately at boot.
     let netstack_listener = if let Some(p) = netstack_port {
         let svc_id = vmconfig::hvsock_service_id(p);
-        ensure_hvsocket_service_registered(&svc_id, "Tokimo Sandbox Netstack")
-            .map_err(|e| RpcError::new("hvsock_register", e))?;
         let svc_guid = parse_guid(&svc_id).map_err(|e| RpcError::new("guid", e))?;
         Some(
             hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, svc_guid)
@@ -1659,50 +1655,6 @@ fn verify_caller_required() -> bool {
     r.is_ok() && data != 0
 }
 
-fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Result<(), String> {
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-        RegCreateKeyExW, RegSetValueExW,
-    };
-    let subkey = HSTRING::from(format!(
-        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\{svc_guid}"
-    ));
-    let mut hk = HKEY::default();
-    let mut disp = REG_CREATE_KEY_DISPOSITION(0);
-    let r = unsafe {
-        RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            &subkey,
-            None,
-            windows::core::PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
-            None,
-            &mut hk,
-            Some(&mut disp),
-        )
-    };
-    if r != ERROR_SUCCESS {
-        return Err(format!("RegCreateKeyExW {svc_guid}: {:?}", r));
-    }
-    let value_name = HSTRING::from("ElementName");
-    let wide: Vec<u16> = friendly_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
-    let r2 = unsafe { RegSetValueExW(hk, &value_name, None, REG_SZ, Some(bytes)) };
-
-    let sd_name = HSTRING::from("SecurityDescriptor");
-    let sd_str = "D:(A;;GA;;;WD)";
-    let sd_wide: Vec<u16> = sd_str.encode_utf16().chain(std::iter::once(0)).collect();
-    let sd_bytes: &[u8] = unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
-    let _ = unsafe { RegSetValueExW(hk, &sd_name, None, REG_SZ, Some(sd_bytes)) };
-
-    let _ = unsafe { RegCloseKey(hk) };
-    if r2 != ERROR_SUCCESS {
-        return Err(format!("RegSetValueExW: {:?}", r2));
-    }
-    Ok(())
-}
 
 fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
     let mut pid: u32 = 0;

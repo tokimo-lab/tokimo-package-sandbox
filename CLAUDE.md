@@ -341,4 +341,4 @@ Each session allocates a **unique vsock port** via `vmconfig::alloc_session_init
 2. The parent partition **must** use `HV_GUID_WILDCARD` as the listener VmId — binding a specific child's RuntimeId returns `WSAEACCES (10013)`.
 3. Two wildcard listeners on the same ServiceId → `WSAEADDRINUSE (10048)`.
 
-Therefore, the **only** way to run concurrent sessions is one `ServiceId` per session. Each service GUID is also registered in `HKLM\...\GuestCommunicationServices\<guid>` and the vsock port is passed to the guest kernel as `tokimo.init_port=<port>` on the cmdline.
+Therefore, the **only** way to run concurrent sessions is one `ServiceId` per session. Service GUIDs are registered via the HCS `ServiceTable` in the VM config JSON (no `HKLM` registry writes needed — cowork uses the same approach). The vsock port is passed to the guest kernel as `tokimo.init_port=<port>` on the cmdline.
