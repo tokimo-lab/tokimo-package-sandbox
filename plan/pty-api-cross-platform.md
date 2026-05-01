@@ -1,200 +1,346 @@
-# PTY API -- Cross-Platform Interactive Terminal
+# PTY Support — Shell-Mode Approach (Revised)
+
+> **Why this rewrite.** The previous draft (archived as
+> `pty-api-cross-platform.OLD.md`) assumed a generic `spawn()` /
+> `exec()` foundation in `SandboxBackend`. There is none — the public
+> API is, and after auditing the integration tests should remain,
+> **shell-centric**. This plan therefore models PTY as a *mode of an
+> existing shell* rather than a separate `PtyHandle` type, reusing 100%
+> of the per-`JobId` event/signal/lifecycle plumbing already exercised
+> by `tests/sandbox_integration.rs`.
 
 ## Context
 
-The user needs SSH-like interactive terminal access to sandbox VMs (for xterm.js + WebSocket frontend). This requires PTY (pseudo-terminal) support, which provides: combined stdin/stdout over a single channel, terminal escape codes (colors, cursor), signal handling (Ctrl-C), terminal resize, and job control.
+Need SSH-like interactive terminal access (xterm.js + WebSocket
+frontend) on all three platforms (Linux, macOS, Windows).
 
-Current state: Linux PTY works via SCM_RIGHTS (host gets master fd). macOS returns `not_implemented`. Windows has PTY fields in the protocol but no host-side implementation. The init-side PTY relay for stream transports (macOS/Windows) is already fully implemented in `server.rs:1362-1398`.
+PTY semantics required by xterm.js:
+- combined byte stream (stdin / stdout merged on the slave side)
+- terminal escape codes (colours, cursor)
+- terminal resize (`TIOCSWINSZ` + `SIGWINCH`)
+- Ctrl-C / job-control via the slave's controlling TTY
 
-Goal: Add `PtyHandle` type and `Sandbox::open_pty()` method that works on all 3 platforms. WebSocket server is out of scope -- the user will wire that up themselves using `PtyHandle`'s `Read + Write + resize()` interface.
+## What the tests already prove is in place
+
+[tests/sandbox_integration.rs](../tests/sandbox_integration.rs) covers
+`JobId`-keyed isolation end-to-end on all three platforms:
+
+| Capability | Test | File |
+|---|---|---|
+| Per-shell stdout stream tagged by `JobId` | `multi_shell_isolated_streams` | [tests/sandbox_integration.rs](../tests/sandbox_integration.rs#L518) |
+| Per-shell signal scoping | `multi_shell_independent_signals` | [tests/sandbox_integration.rs](../tests/sandbox_integration.rs#L562) |
+| `spawn_shell` / `close_shell` / `list_shells` lifecycle | `list_shells_tracks_lifecycle` | [tests/sandbox_integration.rs](../tests/sandbox_integration.rs#L607) |
+| `write_stdin(&id, ...)` per-shell | `shell_runs_multiple_commands` | [tests/sandbox_integration.rs](../tests/sandbox_integration.rs#L123) |
+| Wire path: host → svc → init → `killpg(SIG)` | `signal_shell_delivers_sigint` | [tests/sandbox_integration.rs](../tests/sandbox_integration.rs#L317) |
+
+The only missing semantics are: **(a)** "spawn this shell with a
+controlling TTY of size (rows, cols)" and **(b)** "resize an existing
+PTY shell". Everything else (stdin write, stdout events, signal, close)
+is reused unchanged.
+
+## Design — PTY as a shell *mode*
+
+Replace the current zero-arg `spawn_shell()` with an options-taking
+version. No backward-compat shim.
+
+```rust
+// src/api.rs
+#[derive(Debug, Clone, Default)]
+pub struct ShellOpts {
+    /// `Some((rows, cols))` → allocate a PTY pair, dup slave to
+    /// stdin/stdout/stderr, set the slave as the child's controlling
+    /// terminal. `None` → pipes mode (separate stdin/stdout/stderr).
+    pub pty: Option<(u16, u16)>,
+    /// Optional argv override. `None` → default login shell.
+    pub argv: Option<Vec<String>>,
+    /// Optional env overlay applied on top of the session-wide env.
+    pub env: Vec<(String, String)>,
+    /// Optional initial cwd; defaults to `/work`.
+    pub cwd: Option<String>,
+}
+
+impl Sandbox {
+    /// Spawn a shell. The boot shell created by `start_vm()` always uses
+    /// `ShellOpts::default()` (pipes mode) and is exposed via `shell_id()`.
+    pub fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> { ... }
+    pub fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> { ... }
+}
+```
+
+All existing callers update from `spawn_shell()` →
+`spawn_shell(ShellOpts::default())`. Tests in
+`tests/sandbox_integration.rs` need the same one-line change in
+~3 places (`multi_shell_*`, `list_shells_tracks_lifecycle`).
+
+### Cross-platform user code (identical on all three)
+
+```rust
+let id = sb.spawn_shell_with(ShellOpts {
+    pty: Some((24, 80)),
+    ..Default::default()
+})?;
+sb.write_stdin(&id, b"vim README.md\n")?;     // existing API
+// Stdout (with escape codes) arrives via the existing subscribe() stream.
+sb.resize_shell(&id, 50, 120)?;                // new
+sb.write_stdin(&id, b"\x03")?;                 // Ctrl-C as a slave-side byte
+sb.close_shell(&id)?;                          // existing API
+```
+
+### Critical architectural decision: Linux also routes through events
+
+Linux's `init_client::spawn_pty` returns `(SpawnInfo, OwnedFd)` — the
+master fd via `SCM_RIGHTS`. There are two ways to expose it:
+
+1. Hand the master fd to the user (the abandoned draft's approach).
+2. **Host-side reader thread** that drains the master fd and emits
+   `Event::Stdout { id, data }`, mirroring the `init`-side relay used
+   by macOS/Windows stream transports.
+
+**Pick (2).** It makes the user-visible behaviour identical on all
+three platforms: every byte from the slave shows up as `Event::Stdout`
+events keyed by the shell's `JobId`, and `write_stdin` writes to the
+master fd. The xterm.js / WebSocket bridge becomes a single
+platform-agnostic loop — no `cfg(target_os = "linux")` branches in
+user code.
+
+`stderr` is not produced separately in PTY mode (slave merges them);
+`Event::Stderr` simply never fires for PTY shells.
 
 ---
 
-## Step 1: New type `PtyHandle` in `src/api.rs`
+## Per-platform increments
 
-```rust
-/// Interactive PTY session handle. Implements Read (stdout) + Write (stdin).
-/// Platform-agnostic: on Linux wraps the raw master fd; on macOS/Windows
-/// bridges through the init protocol.
-pub struct PtyHandle {
-    child_id: String,
-    job_id: JobId,
-    // Writer declared before reader -- drops first (closes stdin -> child exits
-    // -> reader drains remaining output -> EOF).
-    writer: Box<dyn std::io::Write + Send>,
-    reader: Box<dyn std::io::Read + Send>,
-    resize_fn: Box<dyn Fn(u16, u16) -> Result<()> + Send>,
-}
+```mermaid
+flowchart TB
+    subgraph Common
+      A1[api.rs: ShellOpts + spawn_shell_with + resize_shell]
+      A2[backend.rs: trait additions]
+      A3[Sandbox::spawn_shell becomes wrapper]
+    end
+    subgraph Linux
+      L1[linux/sandbox.rs: spawn_shell_with branches on opts.pty<br/>PTY branch calls init_client.spawn_pty<br/>spawn reader thread fd to Event::Stdout]
+      L2[linux: write_stdin branches on JobSpawnInfo.pty_fd<br/>writes to master fd directly when present]
+      L3[linux/sandbox.rs: resize_shell calls init_client.resize]
+    end
+    subgraph macOS
+      M1[macos/vsock_init_client.rs: spawn_pty<br/>change return from Result tuple to Result SpawnInfo<br/>send Op::Spawn StdioMode::Pty]
+      M2[macos/sandbox.rs: spawn_shell_with branches; PTY uses spawn_pty<br/>event_pump unchanged - init streams Reply::Stdout]
+      M3[macos/sandbox.rs: resize_shell calls init.resize]
+    end
+    subgraph Windows
+      W1[windows/init_client.rs: add spawn_pipes / spawn_pty / resize<br/>currently only write/signal exist]
+      W2[svc_protocol: SpawnShellParams gains pty_rows/pty_cols<br/>add RESIZE_SHELL method + ResizeShellParams]
+      W3[svc dispatcher: spawn handler branches Pipes vs Pty<br/>add resize handler]
+      W4[windows/sandbox.rs: spawn_shell_with -> SPAWN_SHELL with pty fields<br/>resize_shell -> RESIZE_SHELL]
+    end
+    Common --> Linux
+    Common --> macOS
+    Common --> Windows
 ```
 
-Methods:
-- `pub fn child_id(&self) -> &str`
-- `pub fn job_id(&self) -> &JobId`
-- `pub fn resize(&self, rows: u16, cols: u16) -> Result<()>`
-- `impl Read for PtyHandle` (delegates to reader)
-- `impl Write for PtyHandle` (delegates to writer)
+### Linux (`src/linux/`)
 
-Re-export `PtyHandle` from `src/lib.rs`.
+1. **`sandbox.rs`** — `JobSpawnInfo.pty_fd` field already exists
+   ([linux/sandbox.rs](../src/linux/sandbox.rs#L61)). In
+   `spawn_shell_with`:
+   - `None` → existing path: `init_client.spawn_shell(...)`.
+   - `Some((rows, cols))` →
+     `init_client.spawn_pty(argv, env, cwd, rows, cols)` returns
+     `(SpawnInfo, OwnedFd)`. Store fd in `pty_fd`. Spawn a dedicated
+     reader thread:
+     ```rust
+     let fd_clone = nix::unistd::dup(&master_fd)?;
+     let job = job_id.clone();
+     let senders = event_senders.clone();
+     thread::spawn(move || {
+         let mut f = std::fs::File::from(fd_clone);
+         let mut buf = [0u8; 8192];
+         loop {
+             match f.read(&mut buf) {
+                 Ok(0) | Err(_) => break,
+                 Ok(n) => broadcast(
+                     &senders,
+                     Event::Stdout { id: job.clone(), data: buf[..n].to_vec() },
+                 ),
+             }
+         }
+     });
+     ```
+   - `write_stdin(&id, ...)` checks `pty_fd`: if `Some`, writes to the
+     master fd; else uses the existing pipe path.
+   - `close_shell(&id)`: if `pty_fd` present, drop the fd before signal
+     (closes master, slave gets EOF, child exits naturally).
 
-## Step 2: Backend trait (`src/backend.rs`)
+2. **`init_client.rs`** — `spawn_pty` and `resize` already exist
+   ([init_client.rs](../src/linux/init_client.rs#L270),
+   [resize](../src/linux/init_client.rs#L355)). No changes.
 
-Add:
+3. **`backend.rs`** — implement `resize_shell` calling
+   `init_client.resize(child_id, rows, cols)`.
+
+### macOS (`src/macos/`)
+
+1. **`vsock_init_client.rs`** — replace `spawn_pty`'s
+   `Err(not_implemented)`
+   ([line 202](../src/macos/vsock_init_client.rs#L202)) with the same
+   `spawn_ack` flow as `spawn_pipes`, just sending
+   `StdioMode::Pty { rows, cols }`. Return type changes to
+   `Result<SpawnInfo>` (no fd over VSOCK). The init-side PTY relay in
+   `tokimo-sandbox-init` already converts master-fd reads into
+   `Reply::Stdout { child_id, data }` over the stream.
+
+2. **`sandbox.rs`** — `spawn_shell_with` branches on `opts.pty`. PTY
+   children's stdout flows through the existing `event_pump_loop`
+   ([macos/sandbox.rs](../src/macos/sandbox.rs#L521)) → `Event::Stdout`.
+   No `pty_children` exclusion set is needed (everything is uniform).
+
+3. **`resize_shell`** — call existing
+   `init.resize(child_id, rows, cols)`
+   ([vsock_init_client.rs](../src/macos/vsock_init_client.rs#L256)).
+
+### Windows (largest gap)
+
+1. **`windows/init_client.rs`** — currently only `write` and `signal`
+   exist. Add:
+   ```rust
+   pub fn spawn_pipes(
+       &self,
+       argv: &[String],
+       env: &[(String, String)],
+       cwd: Option<&str>,
+   ) -> Result<SpawnInfo>;
+
+   pub fn spawn_pty(
+       &self,
+       argv: &[String],
+       env: &[(String, String)],
+       cwd: Option<&str>,
+       rows: u16,
+       cols: u16,
+   ) -> Result<SpawnInfo>;
+
+   pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()>;
+   ```
+   Mirror the Linux/macOS init-client pattern — send `Op::Spawn` /
+   `Op::Resize` over the existing pipe tunnel and await ack/reply.
+
+2. **`svc_protocol.rs`** — extend, do **not** add parallel methods:
+   ```rust
+   #[derive(Serialize, Deserialize)]
+   pub struct SpawnShellParams {
+       #[serde(default)] pub pty_rows: Option<u16>,
+       #[serde(default)] pub pty_cols: Option<u16>,
+       #[serde(default)] pub argv: Option<Vec<String>>,
+       #[serde(default)] pub env: Vec<(String, String)>,
+       #[serde(default)] pub cwd: Option<String>,
+   }
+
+   pub mod method {
+       pub const RESIZE_SHELL: &str = "resizeShell";   // new
+   }
+
+   #[derive(Serialize, Deserialize)]
+   pub struct ResizeShellParams {
+       pub id: String,            // JobId of the shell
+       pub rows: u16,
+       pub cols: u16,
+   }
+   ```
+   Bump `PROTOCOL_VERSION` to 4 (additive — `pty_rows/cols` default to
+   `None`, old clients keep working).
+
+3. **Service dispatcher**
+   (`src/bin/tokimo-sandbox-svc/imp/mod.rs`) — extend the `SPAWN_SHELL`
+   handler: if both `pty_rows` and `pty_cols` are `Some`, call
+   `WinInitClient::spawn_pty` (else `spawn_pipes`). Add `RESIZE_SHELL`
+   handler dispatching to `WinInitClient::resize`.
+
+4. **`windows/sandbox.rs`** — `spawn_shell_with` sends `SPAWN_SHELL`
+   with the new fields populated; `resize_shell` sends `RESIZE_SHELL`.
+
+---
+
+## Backend trait changes (`src/backend.rs`)
+
+Replace the old signature outright:
+
 ```rust
-fn open_pty(&self, argv: &[String], opts: ExecOpts) -> Result<PtyHandle>;
+// before:
+// fn spawn_shell(&self) -> Result<JobId>;
+
+// after:
+fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId>;
+fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()>;
 ```
 
-## Step 3: Linux backend (`src/linux/sandbox.rs`)
-
-`InitClient::spawn_pty()` already returns `(SpawnInfo, OwnedFd)` via SCM_RIGHTS.
-
-1. Clone `init_client` Arc, allocate job ID (same pattern as existing `spawn()`)
-2. `client.spawn_pty(&argv_refs, &opts.env, cwd, opts.pty_rows, opts.pty_cols)`
-3. Store `JobSpawnInfo { child_id, pty_fd: Some(fd) }` in jobs map + child_to_job
-4. Build PtyHandle:
-   - `writer`: `File::from(master_fd)` (takes ownership)
-   - `reader`: `File::from(nix::unistd::dup(&master_fd)?)` (dup for independent read end)
-   - `resize_fn`: closure calling `client.resize(&child_id, rows, cols)`
-
-No event pump changes -- Linux PTY children don't emit Stdout/Stderr events (host owns master fd).
-
-## Step 4: macOS init client (`src/macos/vsock_init_client.rs`)
-
-### 4a. Fix `spawn_pty` (line 200-211)
-
-Change from returning `not_implemented` to sending `Op::Spawn { stdio: StdioMode::Pty { rows, cols } }` via existing `spawn_ack()`. Return `Result<SpawnInfo>` (no fd -- VSOCK can't pass fds). Init-side stream-bridged PTY relay already handles the rest.
-
-### 4b. Add `InitStdin` adapter
-
-Port pattern from `src/windows/init_client.rs:595-614`:
-```rust
-pub(crate) struct InitStdin {
-    client: Arc<VsockInitClient>,
-    child_id: String,
-}
-impl Write for InitStdin { ... }  // calls client.write()
-```
-
-### 4c. Add `InitReader` adapter
-
-Port pattern from `src/windows/init_client.rs:630-725`:
-```rust
-pub(crate) struct InitReader {
-    client: Arc<VsockInitClient>,
-    child_id: String,
-    leftover: Vec<u8>,
-}
-impl Read for InitReader { ... }  // blocks on Condvar, drains per-child stdout chunks
-```
-
-Both adapters need access to `VsockInitClient.inner.state`. Add `pub(crate)` accessor:
-```rust
-impl VsockInitClient {
-    pub(crate) fn shared_state(&self) -> &Arc<(Mutex<Shared>, Condvar)> {
-        &self.inner.state
-    }
-}
-```
-
-## Step 5: macOS event pump fix (`src/macos/sandbox.rs`)
-
-Problem: `event_pump_loop` (line 517) drains ALL children's stdout/stderr. For PTY children, `InitReader` must consume those events instead.
-
-1. Add `pty_children: Arc<Mutex<HashSet<String>>>` to `RunningState`
-2. Pass to `event_pump_loop` as parameter
-3. In the loop, skip stdout/stderr drain for child_ids in `pty_children` (still process Exit events)
-4. In `open_pty`, insert child_id into `pty_children` BEFORE calling `spawn_pty` to prevent race
-
-## Step 6: macOS backend (`src/macos/sandbox.rs`)
-
-Implement `MacosBackend::open_pty`:
-
-1. Get `init: Arc<VsockInitClient>` from state
-2. Insert child_id into `pty_children` exclusion set
-3. `init.spawn_pty(argv, env, cwd, rows, cols)` -> `SpawnInfo`
-4. Register in `child_to_job` map
-5. Build PtyHandle with `InitReader`/`InitStdin` + resize closure calling `init.resize()`
-
-## Step 7: Windows service protocol (`src/svc_protocol.rs`)
-
-### 7a. Add resize method
-```rust
-// in method module:
-pub const RESIZE: &str = "resize";
-
-// params struct:
-#[derive(Serialize, Deserialize)]
-pub struct ResizeParams {
-    pub id: String,
-    pub child_id: String,
-    pub rows: u16,
-    pub cols: u16,
-}
-```
-
-### 7b. Service handler (`src/bin/tokimo-sandbox-svc/`)
-
-Handle `method::RESIZE`: deserialize `ResizeParams`, call `WinInitClient::resize(&params.child_id, params.rows, params.cols)`, return ack.
-
-Also verify PTY spawn path: `ExecParams` already has `pty`/`pty_rows`/`pty_cols` fields. Ensure the service's spawn handler forwards these as `StdioMode::Pty` to `WinInitClient`. If it currently only calls `spawn_pipes`, add a `spawn_pty` branch.
-
-## Step 8: Windows backend (`src/windows/sandbox.rs`)
-
-Implement `WindowsBackend::open_pty`:
-
-1. Call SPAWN JSON-RPC with `pty: true, pty_rows, pty_cols` -> `SpawnResult { id: child_id }`
-2. Build PtyHandle:
-   - `reader`: custom `Read` impl using `subscribe()` -> `mpsc::Receiver<Event>`. Filter for `Event::Stdout` matching child_id. Return EOF on matching `Event::Exit`. Each subscribe() gets its own channel copy -- no stealing from other subscribers.
-   - `writer`: custom `Write` impl calling `self.call(method::WRITE_STDIN, WriteStdinParams { id, child_id, data_b64 })`
-   - `resize_fn`: closure calling `self.call(method::RESIZE, ResizeParams { id, child_id, rows, cols })`
-
-## Step 9: Public API (`src/api.rs`)
-
-```rust
-pub fn open_pty<S: AsRef<str>>(&self, cmd: &[S], opts: ExecOpts) -> Result<PtyHandle> {
-    let argv: Vec<String> = cmd.iter().map(|s| s.as_ref().to_owned()).collect();
-    if argv.is_empty() {
-        return Err(Error::validation("empty argv"));
-    }
-    self.inner.open_pty(&argv, opts)
-}
-```
+All three backend impls (`linux/sandbox.rs`, `macos/sandbox.rs`,
+`windows/sandbox.rs`) update accordingly. The boot shell branch
+(`start_vm` auto-spawn) calls `spawn_shell(ShellOpts::default())`
+internally.
 
 ---
 
 ## Implementation order
 
-1. `src/api.rs` -- PtyHandle type
-2. `src/backend.rs` -- open_pty trait method
-3. `src/linux/sandbox.rs` -- Linux open_pty
-4. `src/macos/vsock_init_client.rs` -- fix spawn_pty + add InitReader/InitStdin
-5. `src/macos/sandbox.rs` -- event pump fix + open_pty
-6. `src/svc_protocol.rs` -- resize method
-7. `src/bin/tokimo-sandbox-svc/` -- resize handler + PTY spawn forwarding
-8. `src/windows/sandbox.rs` -- Windows open_pty
-9. `src/api.rs` -- Sandbox::open_pty public method
-10. `src/lib.rs` -- re-export PtyHandle
+1. `src/api.rs` — `ShellOpts`, replace `Sandbox::spawn_shell` signature, add `resize_shell`
+2. `src/backend.rs` — replace trait `spawn_shell` signature, add `resize_shell`
+3. `src/linux/sandbox.rs` — branch on `opts.pty`, reader thread,
+   master-fd write path, `resize_shell`
+4. `src/macos/vsock_init_client.rs` — wire up `spawn_pty`
+   (drop `not_implemented`)
+5. `src/macos/sandbox.rs` — branch on `opts.pty`, hook `resize_shell`
+6. `src/svc_protocol.rs` — extend `SpawnShellParams`, add
+   `RESIZE_SHELL` + params, bump version
+7. `src/windows/init_client.rs` — `spawn_pipes` / `spawn_pty` / `resize`
+8. `src/bin/tokimo-sandbox-svc/imp/mod.rs` — branch in spawn handler,
+   add resize handler
+9. `src/windows/sandbox.rs` — populate new fields, add `resize_shell`
+10. New tests in `tests/sandbox_integration.rs` (see below)
+
+---
 
 ## Verification
 
-1. `cargo build` compiles on all targets
-2. `cargo test --lib` -- existing tests pass
-3. Linux: `open_pty(&["bash"], opts)` -> interactive shell via Read/Write
-4. `pty_handle.resize(50, 120)` -> `stty size` inside guest shows `50 120`
-5. xterm.js integration: user builds WS bridge using `PtyHandle` as the I/O layer
+`cargo build` + `cargo test` on all three targets, plus new integration tests:
 
-## Usage example (what the user will build on top)
+### `pty_shell_reports_correct_size`
+Spawn shell with `pty: Some((40, 132))`. `write_stdin "stty size\n"`.
+Drain stdout. Assert it contains `"40 132"`.
 
-```rust
-let sb = Sandbox::connect().unwrap();
-sb.configure(ConfigureParams { ... }).unwrap();
-sb.start_vm().unwrap();
+### `pty_shell_resize_propagates`
+Spawn `pty: Some((24, 80))`. Send `stty size`, expect `24 80`.
+Call `resize_shell(50, 120)`. Send `stty size` again, expect `50 120`.
 
-let mut pty = sb.open_pty(&["bash"], ExecOpts {
-    pty_rows: 24,
-    pty_cols: 80,
-    ..Default::default()
-}).unwrap();
+### `pty_shell_ctrl_c_does_not_kill_shell`
+Spawn `pty: Some((24, 80))`. Park bash in `sleep 60`. After ≥500ms
+send `write_stdin b"\x03"` (raw Ctrl-C byte to the slave). Then send
+`echo ALIVE\n`. Drain — must see `ALIVE`. **Key contrast** with the
+existing `signal_shell_delivers_sigint` (which kills the pipe-mode
+shell entirely).
 
-// In WS handler: read from pty -> send to WS, receive from WS -> write to pty
-// On terminal resize: pty.resize(rows, cols)
-```
+### `pty_shell_color_escape_codes_pass_through`
+Spawn `pty: Some((24, 80))`. Send `printf '\e[31mRED\e[0m\n'`.
+Drain — assert `\x1b[31mRED\x1b[0m` is present byte-exact.
+
+### Existing tests
+Update ~3 call sites of `spawn_shell()` →
+`spawn_shell(ShellOpts::default())` in
+`multi_shell_isolated_streams`, `multi_shell_independent_signals`,
+`list_shells_tracks_lifecycle`. Behaviour assertions stay identical.
+
+---
+
+## Out of scope
+
+- WebSocket bridge / xterm.js framing — user wires this on top using
+  `subscribe()` + `write_stdin` + `resize_shell`.
+- Heredoc / multi-line paste throttling — xterm.js client-side concern.
+- Terminfo selection inside the guest — guest already has
+  `xterm-256color` in the rootfs.
+- Per-PTY-shell PTY-vs-pipe runtime switch — once a shell is spawned in
+  one mode, it stays in that mode until `close_shell`.
+
+## 用户交互记录
+
+- 决策：选择 ShellOpts + resize_shell 方案（三平台事件流统一），不引入 PtyHandle 第二种返回类型。
+- 决策：不保留向后兼容。直接替换 `spawn_shell()` 签名为 `spawn_shell(ShellOpts)`，旧调用点更新为传 `ShellOpts::default()`。
