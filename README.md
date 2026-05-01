@@ -412,45 +412,47 @@ cargo run --example hv_smoke            # Windows Hyper-V SYSTEM service
 
 ## Tests
 
-```bash
-cargo test --lib --bins                  # unit tests, all platforms
-cargo test --tests                       # + integration tests
-
-# Windows session integration tests (14 cases, concurrent)
-cargo test --test session -- --test-threads=4    # ~16s
-cargo test --test session -- --test-threads=1    # ~60s sequential
-```
-
-Linux integration tests need a real rootfs to bind-mount inside bwrap.
-Point `TOKIMO_TEST_ROOTFS` at a populated directory (any standard Linux
-filesystem tree with `/bin /sbin /lib /lib64 /usr /etc /var`) — without
-it, gated tests no-op and report skipped:
+### Unit tests (all platforms)
 
 ```bash
-# One-time: extract any minimal Linux rootfs (Alpine / Debian / etc.)
-mkdir -p .test-rootfs && (cd .test-rootfs && \
-  curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.0-x86_64.tar.gz | tar -xz)
-
-TOKIMO_TEST_ROOTFS=$PWD/.test-rootfs cargo test --tests
+cargo test --lib                           # 13 lib tests (Sandbox API + session_registry)
+cargo test --bin tokimo-sandbox-svc --lib  # 34 svc tests (vmconfig, vhdx_pool, inflight, …)
 ```
 
-`tests/agent_sandbox_replica.rs` mirrors the real consumer
-(`rust-server::AgentSandbox`) end-to-end: peer mount stacks, skill
-layer isolation, concurrent oneshots over a long-running main session,
-spawn timeout + kill semantics, high-throughput stdout capture, PTY IO
-+ resize, NetworkPolicy::Observed L7 event sink, profile-style env
-combined with mounts.
+### Windows integration tests
 
-The `network_observed_sink_records_events` test is skipped on hosted
-GitHub runners (set `TOKIMO_SKIP_NETWORK_OBSERVED=1` to opt out) — see
-[issue #1](https://github.com/tokimo-lab/tokimo-package-sandbox/issues/1)
-for the seccomp-notify + loopback-proxy interaction we hit there. It
-runs fine locally and on self-hosted runners.
+End-to-end tests (15 cases, ~42 s) live in [`tests/sandbox_integration.rs`](tests/sandbox_integration.rs) and exercise the **real** HCS-backed VM through `\\.\pipe\tokimo-sandbox-svc` — no mocks. Coverage: lifecycle, shell I/O, multi-shell streams + signals, plan9 share dynamics, network policy, multi-session concurrency.
 
-macOS-only integration tests (`vz_session`, `vz_workspace`) are
-`#[cfg(target_os = "macos")]` and only build on a Mac.
+**Hard requirements:**
 
-Windows integration tests live in `tests/session.rs` — 14 session tests covering exec, spawn, concurrency, timeout, kill, PTY setup, and cleanup. They require the service running (`--console` or installed) and VM artifacts in `vm/`. See [`docs/windows-architecture.md`](docs/windows-architecture.md) for setup.
+| | |
+|---|---|
+| Administrator + Hyper-V enabled | HCS / HCN APIs are SYSTEM-only |
+| **PowerShell 7** (`pwsh.exe`) | PS 5.1 mishandles `cargo`'s stderr-on-success |
+| `vm/{vmlinuz,initrd.img,rootfs.vhdx}` | `pwsh scripts/fetch-vm.ps1` |
+
+**Run:**
+
+```powershell
+# From an elevated pwsh 7 prompt — handles build + svc launch + test + cleanup.
+pwsh scripts\test-integration.ps1
+```
+
+The wrapper builds, launches `tokimo-sandbox-svc.exe --console` in the background (logs → `target\integration\svc.log`), runs `cargo test --test sandbox_integration` (logs → `target\integration\test.log`), then kills the svc process.
+
+If you already have the service running and an elevated terminal:
+
+```powershell
+cargo test --test sandbox_integration -- --nocapture
+# Single test:
+cargo test --test sandbox_integration multi_shell_isolated_streams -- --nocapture
+```
+
+See [`tests/README.md`](tests/README.md) for the full test inventory and debug-artefact paths.
+
+### Linux & macOS integration
+
+Linux (bwrap) and macOS (VZ) integration runners are not yet ported — see the TODO sections in [`tests/README.md`](tests/README.md). Only the Sandbox `--lib` / `--bin --lib` unit suites run cross-platform today.
 
 ## Init control protocol (v1, Linux)
 

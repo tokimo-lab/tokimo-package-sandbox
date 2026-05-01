@@ -64,7 +64,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 
 ### Test inventory
 
-13 tests, all currently green (~36 s wall):
+15 tests, all currently green (~42 s wall):
 
 | # | Name | What it asserts |
 |---|------|-----------------|
@@ -77,10 +77,12 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 | 7 | `status_rpcs_during_blocking_shell` | `status()` returns under load (5 calls in <2 s while shell is busy) |
 | 8 | `multi_session_concurrent` | Two parallel sessions each run a marker — no cross-talk |
 | 9 | `plan9_dynamic_add_remove` | `add_plan9_share` after start exposes content; `remove_plan9_share` retracts it |
-| 10 | `signal_shell_delivers_sigint` | `signal_shell(2)` produces `Event::Exit { signal: Some(2) }` |
+| 10 | `signal_shell_delivers_sigint` | `signal_shell(boot, 2)` produces `Event::Exit { signal: Some(2) }` for the boot shell |
 | 11 | `network_blocked_only_loopback` | `NetworkPolicy::Blocked` → `/sys/class/net/` only `lo`; bash `/dev/tcp/1.1.1.1/53` times out |
-| 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → `eth0` enumerated; bash `/dev/tcp/1.1.1.1/53` succeeds (real egress) |
+| 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC has HCN-assigned IPv4 in `192.168.127.0/24` (link + IP-layer invariants only; public-internet egress not asserted — env-dependent) |
 | 13 | `concurrent_commands_in_single_shell` | `(sleep 2; echo A) & (sleep 5; echo B) & wait` finishes in <7 s wall (parallel, not sequential) and both stdout markers appear |
+| 14 | `multi_shell_isolated_streams` | `spawn_shell()` yields a fresh `JobId`; `write_stdin` to two shells produces stdout events tagged correctly — neither stream leaks the other's marker |
+| 15 | `multi_shell_independent_signals` | `signal_shell(A, SIGINT)` kills only A; B remains responsive (`echo` round-trip) until `close_shell(B)` |
 
 ### Cross-platform portability of the test source
 
