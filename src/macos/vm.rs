@@ -1,39 +1,68 @@
-//! VM bootstrap using arcbox-vz.
+//! macOS VM bootstrap via `arcbox-vz` (Apple Virtualization.framework).
 //!
-//! Boots a Linux VM with kernel/initrd/rootfs from `<repo>/vm/`, configures
-//! virtio-vsock, and returns a connected socket to the guest's init.
+//! Boots a Linux micro-VM whose PID 1 is `tokimo-sandbox-init`, mounts the
+//! rootfs as a virtiofs share with tag `work` (the init binary picks this up
+//! and `chroot`s into it), and connects to the guest's vsock listener on
+//! port 1.
 
 use std::env;
-use std::fs;
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader,
-    SocketDeviceConfiguration, VirtualMachine, VirtualMachineConfiguration,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration, SerialPortConfiguration,
+    SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    VirtualMachine, VirtualMachineConfiguration, VirtualMachineState, is_supported,
 };
-use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+use tokio::runtime::Runtime;
 
-use crate::api::Plan9Share;
+use crate::api::{NetworkPolicy, Plan9Share};
 use crate::error::{Error, Result};
 
-/// Default vsock port for init protocol connection.
-pub(crate) const INIT_VSOCK_PORT: u32 = 1234;
+/// Vsock port the guest's `tokimo-sandbox-init` listens on.
+pub(crate) const INIT_VSOCK_PORT: u32 = 2222;
 
-/// VM configuration parameters.
+/// Tag used for the rootfs virtiofs share. Must match the hard-coded value
+/// in `tokimo-sandbox-init/main.rs` which mounts `work` at `/mnt/work`.
+const ROOTFS_TAG: &str = "work";
+
+/// Tag used for the per-session "dynamic share" pool — a single empty
+/// directory that we APFS-clone into to add Plan9 shares at runtime.
+pub(crate) const DYN_SHARE_TAG: &str = "tokimo_dyn";
+/// Mount point inside the guest for the dynamic share pool.
+pub(crate) const DYN_SHARE_GUEST_PATH: &str = "/__tokimo_dyn";
+
+/// Default amount of memory the VM is allotted, in MiB.
+pub(crate) const DEFAULT_MEMORY_MB: u64 = 2048;
+
+/// Result of `boot_vm`: a started `VirtualMachine`, the connected vsock fd
+/// to the guest's init listener, and the tokio runtime that ran (and must
+/// continue to drive) the async VZ APIs.
+pub struct BootedVm {
+    pub vm: VirtualMachine,
+    pub vsock: OwnedFd,
+    pub runtime: Arc<Runtime>,
+}
+
+/// VM bootstrap parameters derived from `ConfigureParams`.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     pub memory_mb: u64,
     pub cpu_count: u32,
     pub plan9_shares: Vec<Plan9Share>,
-    pub user_data_name: String,
+    pub network: NetworkPolicy,
+    /// Host-side directory mounted as the dynamic-share pool.
+    pub dyn_root: PathBuf,
 }
 
-/// Find VM artifacts (kernel/initrd/rootfs) by walking up from current_exe()
-/// and current_dir(), looking for a `vm/` directory containing all three files.
-/// Honours `TOKIMO_VM_DIR` env override.
+/// Locate the VM artifacts: vmlinuz (file), initrd.img (file), rootfs/ (dir).
+///
+/// Priority:
+/// 1. `TOKIMO_VM_DIR` env var.
+/// 2. `<repo>/vm/` walking up from `current_exe()` and `current_dir()`.
+/// 3. `~/.tokimo/`.
 pub fn find_vm_dir() -> Result<PathBuf> {
     if let Ok(dir) = env::var("TOKIMO_VM_DIR") {
         let p = PathBuf::from(dir);
@@ -41,14 +70,13 @@ pub fn find_vm_dir() -> Result<PathBuf> {
             return Ok(p);
         }
         return Err(Error::other(format!(
-            "TOKIMO_VM_DIR={} does not contain vmlinuz, initrd.img, rootfs.ext4",
+            "TOKIMO_VM_DIR={} does not contain vmlinuz, initrd.img and a rootfs/ directory",
             p.display()
         )));
     }
 
-    // Try current_exe() parent chain.
     if let Ok(exe) = env::current_exe() {
-        let mut cur = exe.as_path();
+        let mut cur: &Path = exe.as_path();
         for _ in 0..8 {
             if let Some(parent) = cur.parent() {
                 let vm_dir = parent.join("vm");
@@ -62,9 +90,8 @@ pub fn find_vm_dir() -> Result<PathBuf> {
         }
     }
 
-    // Try current_dir() parent chain.
     if let Ok(cwd) = env::current_dir() {
-        let mut cur = cwd.as_path();
+        let mut cur: &Path = cwd.as_path();
         for _ in 0..8 {
             let vm_dir = cur.join("vm");
             if validate_vm_dir(&vm_dir) {
@@ -78,156 +105,211 @@ pub fn find_vm_dir() -> Result<PathBuf> {
         }
     }
 
+    if let Some(home) = env::var_os("HOME") {
+        let p = PathBuf::from(home).join(".tokimo");
+        if validate_vm_dir(&p) {
+            return Ok(p);
+        }
+    }
+
     Err(Error::other(
-        "VM artifacts not found. Set TOKIMO_VM_DIR or ensure <repo>/vm/ exists with vmlinuz, initrd.img, rootfs.ext4.",
+        "VM artifacts not found. Set TOKIMO_VM_DIR, or place vmlinuz + initrd.img + rootfs/ in <repo>/vm/ or ~/.tokimo/.",
     ))
 }
 
 fn validate_vm_dir(dir: &Path) -> bool {
-    dir.join("vmlinuz").is_file()
-        && dir.join("initrd.img").is_file()
-        && (dir.join("rootfs.ext4").is_file() || dir.join("rootfs.img").is_file())
+    dir.join("vmlinuz").is_file() && dir.join("initrd.img").is_file() && dir.join("rootfs").is_dir()
 }
 
-/// Boot a Linux VM and return (VirtualMachine handle, vsock OwnedFd connected to guest init).
-///
-/// ## Implementation notes
-///
-/// This is a structural placeholder using `arcbox-vz` symbols. The actual
-/// arcbox-vz API on macOS may differ. Key integration points marked TODO:
-///
-/// - VirtualMachineConfiguration builder pattern
-/// - VsockListener / connect logic (may require `tokio` runtime or blocking)
-/// - Rootfs mounting: arcbox-vz may require a disk image; if so, use
-///   `VirtioBlockDeviceConfiguration` instead of virtiofs
-///
-/// If you're filling in real arcbox-vz wiring, consult:
-/// - https://docs.rs/arcbox-vz
-/// - `src/macos/vz.rs` (existing helper code, if still useful)
-pub fn boot_vm(config: &VmConfig) -> Result<(Arc<VirtualMachine>, OwnedFd)> {
-    let vm_dir = find_vm_dir()?;
-    let kernel_path = vm_dir.join("vmlinuz");
-    let initrd_path = vm_dir.join("initrd.img");
-    let rootfs_path = if vm_dir.join("rootfs.ext4").exists() {
-        vm_dir.join("rootfs.ext4")
-    } else {
-        vm_dir.join("rootfs.img")
-    };
-
-    let kernel_str = kernel_path.to_string_lossy().into_owned();
-    let initrd_str = initrd_path.to_string_lossy().into_owned();
-
-    // Build kernel cmdline: console, init, vsock port.
-    let cmdline = format!(
-        "console=hvc0 quiet loglevel=3 init=/tokimo-sandbox-init tokimo.init_port={}",
-        INIT_VSOCK_PORT
-    );
-
-    // TODO: adapt to real arcbox-vz API. The following is a structural sketch.
-    let mut boot_loader = LinuxBootLoader::new(&kernel_str)
-        .map_err(|e| Error::other(format!("LinuxBootLoader::new: {e}")))?;
-    boot_loader
-        .set_initial_ramdisk(&initrd_str)
-        .set_command_line(&cmdline);
-
-    let mut vm_config = VirtualMachineConfiguration::new()
-        .map_err(|e| Error::other(format!("VirtualMachineConfiguration::new: {e}")))?;
-    vm_config
-        .set_cpu_count(config.cpu_count as usize)
-        .set_memory_size(config.memory_mb * 1024 * 1024)
-        .set_platform(
-            GenericPlatform::new()
-                .map_err(|e| Error::other(format!("GenericPlatform::new: {e}")))?,
-        )
-        .set_boot_loader(boot_loader)
-        .add_entropy_device(
-            EntropyDeviceConfiguration::new()
-                .map_err(|e| Error::other(format!("EntropyDeviceConfiguration::new: {e}")))?,
-        )
-        .add_socket_device(
-            SocketDeviceConfiguration::new()
-                .map_err(|e| Error::other(format!("SocketDeviceConfiguration::new: {e}")))?,
-        );
-
-    // TODO: Mount rootfs. Options:
-    // 1. VirtioBlockDeviceConfiguration (disk image)
-    // 2. VirtioFileSystemDeviceConfiguration (virtiofs) — if arcbox-vz supports
-    //
-    // For now, return NotImplemented if rootfs is required.
-    // The user will fill in the real mounting code later.
-    if !rootfs_path.exists() {
-        return Err(Error::not_implemented(
-            "rootfs mounting in macOS VM bootstrap",
+/// Boot the VM and connect to the guest's vsock listener.
+pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
+    if !is_supported() {
+        return Err(Error::other(
+            "Virtualization.framework not available (requires macOS 11+)",
         ));
     }
 
-    // Validate configuration.
-    vm_config
-        .validate()
-        .map_err(|e| Error::other(format!("VM config validation: {e}")))?;
+    let vm_dir = find_vm_dir()?;
+    let kernel = vm_dir.join("vmlinuz");
+    let initrd = vm_dir.join("initrd.img");
+    let rootfs = vm_dir.join("rootfs");
 
-    // Start the VM.
-    let vm = VirtualMachine::new(vm_config, None)
-        .map_err(|e| Error::other(format!("VirtualMachine::new: {e}")))?;
-    let vm = Arc::new(vm);
+    let kernel_s = kernel.to_string_lossy().into_owned();
+    let initrd_s = initrd.to_string_lossy().into_owned();
+    let rootfs_s = rootfs.to_string_lossy().into_owned();
+    let dyn_root_s = config.dyn_root.to_string_lossy().into_owned();
 
-    // TODO: arcbox-vz API for starting the VM. May be `vm.start()` or similar.
-    // For now, assume `vm` is already running or auto-starts.
-    // Real code might need:
-    //   vm.start().map_err(...)?;
+    let memory_mb = config.memory_mb.max(256);
+    let cpu_count = config.cpu_count.max(1) as usize;
 
-    // TODO: Connect to guest vsock. This requires a vsock listener or connect
-    // call. The exact API depends on arcbox-vz's vsock support. Structural
-    // placeholder:
-    //
-    // Option A: Host-side listener (AF_VSOCK bind to wildcard CID + port 1234)
-    // Option B: Host connects to guest CID + port (if arcbox-vz provides guest CID)
-    //
-    // For now, return NotImplemented.
-    let vsock_fd = connect_to_guest_vsock(&vm, INIT_VSOCK_PORT)?;
+    let plan9 = config.plan9_shares.clone();
+    let network = config.network;
 
-    Ok((vm, vsock_fd))
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .map_err(|e| Error::other(format!("tokio runtime: {e}")))?,
+    );
+
+    let rt_for_block = runtime.clone();
+    let (vm, vsock_fd) = rt_for_block.block_on(async move {
+        // ---- Boot loader -----------------------------------------------
+        let mut boot_loader = LinuxBootLoader::new(&kernel_s)
+            .map_err(|e| Error::other(format!("LinuxBootLoader: {e}")))?;
+        boot_loader.set_initial_ramdisk(&initrd_s).set_command_line(
+            "console=hvc0 earlyprintk=hvc0 \
+             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
+             tokimo.net=dhcp \
+             net.ifnames=0 biosdevname=0 \
+             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+             HOME=/root TERM=xterm-256color LANG=C.UTF-8",
+        );
+
+        // ---- VM config -------------------------------------------------
+        let mut vm_cfg = VirtualMachineConfiguration::new()
+            .map_err(|e| Error::other(format!("VirtualMachineConfiguration: {e}")))?;
+        let platform =
+            GenericPlatform::new().map_err(|e| Error::other(format!("GenericPlatform: {e}")))?;
+        vm_cfg
+            .set_cpu_count(cpu_count)
+            .set_memory_size(memory_mb * 1024 * 1024)
+            .set_platform(platform)
+            .set_boot_loader(boot_loader)
+            .add_entropy_device(
+                EntropyDeviceConfiguration::new()
+                    .map_err(|e| Error::other(format!("EntropyDevice: {e}")))?,
+            )
+            .add_socket_device(
+                SocketDeviceConfiguration::new()
+                    .map_err(|e| Error::other(format!("SocketDevice: {e}")))?,
+            );
+
+        let serial = SerialPortConfiguration::virtio_console()
+            .map_err(|e| Error::other(format!("SerialPort: {e}")))?;
+        let serial_read_fd = serial.read_fd();
+        vm_cfg.add_serial_port(serial);
+
+        match network {
+            NetworkPolicy::AllowAll => {
+                let nic = NetworkDeviceConfiguration::nat()
+                    .map_err(|e| Error::other(format!("NetworkDevice::nat: {e}")))?;
+                vm_cfg.add_network_device(nic);
+            }
+            NetworkPolicy::Blocked => {}
+        }
+
+        // Rootfs (tag "work").
+        let rootfs_dir = SharedDirectory::new(&rootfs_s, false)
+            .map_err(|e| Error::other(format!("rootfs SharedDirectory: {e}")))?;
+        let rootfs_share = SingleDirectoryShare::new(rootfs_dir)
+            .map_err(|e| Error::other(format!("rootfs SingleDirectoryShare: {e}")))?;
+        let mut rootfs_fs = VirtioFileSystemDeviceConfiguration::new(ROOTFS_TAG)
+            .map_err(|e| Error::other(format!("rootfs VirtioFs: {e}")))?;
+        rootfs_fs.set_share(rootfs_share);
+        vm_cfg.add_directory_share(rootfs_fs);
+
+        // Boot-time Plan9 shares — one virtiofs device per share.
+        for share in &plan9 {
+            let host_path = share.host_path.to_string_lossy().into_owned();
+            let dir = SharedDirectory::new(&host_path, share.read_only)
+                .map_err(|e| Error::other(format!("share {} SharedDirectory: {e}", share.name)))?;
+            let single = SingleDirectoryShare::new(dir).map_err(|e| {
+                Error::other(format!("share {} SingleDirectoryShare: {e}", share.name))
+            })?;
+            let mut fs = VirtioFileSystemDeviceConfiguration::new(&share.name)
+                .map_err(|e| Error::other(format!("share {} VirtioFs: {e}", share.name)))?;
+            fs.set_share(single);
+            vm_cfg.add_directory_share(fs);
+        }
+
+        // Dynamic-share pool (always present, even with no shares yet).
+        let dyn_dir = SharedDirectory::new(&dyn_root_s, false)
+            .map_err(|e| Error::other(format!("dyn-root SharedDirectory: {e}")))?;
+        let dyn_share = SingleDirectoryShare::new(dyn_dir)
+            .map_err(|e| Error::other(format!("dyn-root SingleDirectoryShare: {e}")))?;
+        let mut dyn_fs = VirtioFileSystemDeviceConfiguration::new(DYN_SHARE_TAG)
+            .map_err(|e| Error::other(format!("dyn-root VirtioFs: {e}")))?;
+        dyn_fs.set_share(dyn_share);
+        vm_cfg.add_directory_share(dyn_fs);
+
+        vm_cfg
+            .validate()
+            .map_err(|e| Error::other(format!("VM config validation: {e}")))?;
+
+        let vm = vm_cfg
+            .build()
+            .map_err(|e| Error::other(format!("VM build: {e}")))?;
+
+        tracing::info!(
+            kernel = %kernel_s,
+            initrd = %initrd_s,
+            rootfs = %rootfs_s,
+            "starting macOS VZ VM"
+        );
+        vm.start()
+            .await
+            .map_err(|e| Error::other(format!("VM start: {e}")))?;
+
+        if vm.state() != VirtualMachineState::Running {
+            return Err(Error::other(format!("VM not running: {:?}", vm.state())));
+        }
+
+        let socket_devs = vm.socket_devices();
+        let socket_dev = socket_devs
+            .first()
+            .ok_or_else(|| Error::other("no virtio-socket device on running VM"))?;
+
+        let connect_timeout = Duration::from_secs(30);
+        let deadline = Instant::now() + connect_timeout;
+        let mut conn = None;
+        let mut console_log = String::new();
+        while Instant::now() < deadline {
+            match socket_dev.connect(INIT_VSOCK_PORT).await {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(_) => {
+                    if let Some(fd) = serial_read_fd {
+                        drain_serial_into(fd, &mut console_log);
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+
+        let conn = conn.ok_or_else(|| {
+            Error::other(format!(
+                "VSOCK connect to guest port {INIT_VSOCK_PORT} timed out after {connect_timeout:?}\nKernel console:\n{console_log}"
+            ))
+        })?;
+
+        let vsock_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
+        Ok::<_, Error>((vm, vsock_fd))
+    })?;
+
+    Ok(BootedVm {
+        vm,
+        vsock: vsock_fd,
+        runtime,
+    })
 }
 
-/// Connect to the guest's vsock port. This is a structural placeholder.
-///
-/// ## Real implementation notes (TODO by user)
-///
-/// macOS AF_VSOCK support via Virtualization.framework is exposed through:
-/// - `VZVirtioSocketDeviceConfiguration` (already added via `add_socket_device`)
-/// - Host-side API to get guest CID and connect
-///
-/// Typical flow:
-/// 1. After `vm.start()`, get guest CID (may be dynamic or fixed to 3)
-/// 2. Use nix::sys::socket or libc to create AF_VSOCK socket
-/// 3. Connect to (guest_cid, INIT_VSOCK_PORT)
-///
-/// Alternatively, if arcbox-vz provides a `VsockListener` or similar:
-/// 4. Bind to (VMADDR_CID_HOST=2, port=1234) and accept guest connection
-///
-/// For now, return NotImplemented.
-fn connect_to_guest_vsock(vm: &VirtualMachine, port: u32) -> Result<OwnedFd> {
-    // Placeholder: create a dummy STREAM socket to satisfy type requirements.
-    // Real code replaces this with AF_VSOCK connect.
-    let _vm = vm; // suppress unused warning
-    let _port = port;
-
-    // Uncomment and adapt once arcbox-vz API is known:
-    // let sock = socket(
-    //     AddressFamily::Vsock,
-    //     SockType::Stream,
-    //     SockFlag::SOCK_CLOEXEC,
-    //     None,
-    // )
-    // .map_err(|e| Error::other(format!("socket(AF_VSOCK): {e}")))?;
-    //
-    // let guest_cid = 3; // or vm.guest_cid()
-    // let addr = VsockAddr::new(guest_cid, port);
-    // connect(sock.as_raw_fd(), &addr)
-    //     .map_err(|e| Error::other(format!("connect vsock: {e}")))?;
-    // Ok(sock)
-
-    Err(Error::not_implemented(
-        "vsock connection to guest (arcbox-vz API TBD)",
-    ))
+fn drain_serial_into(fd: std::os::fd::RawFd, out: &mut String) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            out.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+        }
+    }
 }

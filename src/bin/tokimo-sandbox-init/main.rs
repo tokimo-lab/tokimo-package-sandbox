@@ -242,12 +242,13 @@ fn run() -> Result<(), String> {
         let port: u32 = port_str
             .parse()
             .map_err(|e| format!("{ENV_VSOCK_PORT}={port_str}: {e}"))?;
-        if pre_chrooted {
+        let guest_listens = env::var("TOKIMO_SANDBOX_GUEST_LISTENS").as_deref() == Ok("1");
+        if guest_listens {
+            // macOS VZ: guest listens, host connects.
+            (bind_vsock(port)?, None, server::Transport::Vsock)
+        } else {
             // Windows HCS: host listens, guest connects.
             (connect_vsock(port)?, None, server::Transport::Vsock)
-        } else {
-            // macOS VZ / Linux: guest listens, host connects.
-            (bind_vsock(port)?, None, server::Transport::Vsock)
         }
     } else {
         (bind_unix()?, None, server::Transport::SeqPacket)
