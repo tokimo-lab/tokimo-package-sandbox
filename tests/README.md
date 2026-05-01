@@ -91,17 +91,20 @@ The file uses only public API types. Caveats per backend:
 
 - **`Plan9Share`**: on Windows this maps to plan9-over-vsock (real shared
   filesystem). Linux (bwrap) uses `--bind host_path guest_path` (or a
-  runtime `AddMountFd` for dynamic shares); macOS (virtio-fs) is similar
-  in spirit. All three backends honor the same `Plan9Share { name,
-  host_path, guest_path }` contract — tests 6 and 9 are written against
-  observable behavior, not a specific transport.
+  runtime `AddMountFd` for dynamic shares). macOS uses two virtio-fs
+  share devices (a static `work` tag and a dynamic `tokimo_dyn` pool
+  bind-mounted inside the guest). All three backends honor the same
+  `Plan9Share { name, host_path, guest_path }` contract — tests 6 and
+  9 are written against observable behavior, not a specific transport.
 - **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
   path (Windows HCN NAT, Linux shared host netns, macOS bridged NAT
   via vmnet). Test 12 only asserts capability — link enumeration plus
   outbound TCP to `1.1.1.1:53`.
 - **`NetworkPolicy::Blocked`**: Windows simply omits the `NetworkAdapter`
-  device from the HCS schema — kernel sees no NIC. Linux (bwrap with
-  `--unshare-net`) and macOS will need their own enforcement.
+  device from the HCS schema — kernel sees no NIC. macOS does the same
+  (omits `VZNetworkDeviceConfiguration` from the VM config). Linux
+  (bwrap with `--unshare-net`) achieves the same observable result via
+  a fresh netns.
 - **`signal_shell` / `interrupt_shell`**: relies on init delivering SIGINT
   via `killpg`. The wire path is shared across backends — should port
   directly.
@@ -169,12 +172,108 @@ knowing when porting tests or debugging:
 
 ## macOS
 
-_TODO: add `scripts/test-integration-macos.sh` (VZ virtual machine). When written, document here:_
+### Hard requirements
 
-- VZ entitlement requirements (`com.apple.security.virtualization` — see `vz.entitlements`)
-- Codesign step before running tests (`scripts/macos-codesign-examples.sh`)
-- How to invoke
-- Test inventory subset (network policy enforcement story differs — VZ doesn't have HCN; uses NAT through vmnet)
+| Requirement | Why |
+|---|---|
+| **Apple Silicon (arm64) host** | The bundled prebuilt rootfs / kernel under `packaging/vm-image/tokimo-os-arm64/` is arm64-only. |
+| **macOS 13+** | Apple Virtualization.framework's modern `VZVirtioFileSystemDevice` + virtio-vsock support. |
+| **Code-signed binary with `vz.entitlements`** | Without `com.apple.security.virtualization`, `start_vm()` fails with: *"The process doesn't have the com.apple.security.virtualization entitlement."* |
+| **VM artifacts at `<repo>/vm/`** | The backend walks up from cwd looking for `vm/{vmlinuz,initrd.img,rootfs}` (override with `TOKIMO_VM_DIR`). |
+| **No service / no admin** | Like Linux, the macOS backend is library-only — `Sandbox::connect()` is a no-op. The host process directly drives `arcbox-vz` → Virtualization.framework. |
+
+### One-time setup
+
+```sh
+# 1. Symlink prebuilt artifacts into vm/
+mkdir -p vm
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+
+# 2. Wire up the codesign cargo runner in your local .cargo/config.toml
+#    (gitignored). It ad-hoc-signs every test/example binary with
+#    vz.entitlements before exec.
+cat > .cargo/config.toml <<'EOF'
+[target.aarch64-apple-darwin]
+runner = "scripts/codesign-and-run.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/codesign-and-run.sh"
+EOF
+```
+
+See [`docs/macos-testing.md`](../docs/macos-testing.md) for full details.
+
+### Run
+
+```sh
+cargo test --test sandbox_integration -- --test-threads=1
+```
+
+`--test-threads=1` is required: the VZ dispatch queue does not tolerate
+parallel `vm.start()` calls from a single process. The macOS backend
+also takes a process-wide `BOOT_LOCK` mutex around `vm.build()` /
+`vm.start()`, but the integration suite shares one host process, so
+parallel test threads would still serialize on it and time out.
+
+To run a single test:
+
+```sh
+cargo test --test sandbox_integration <test_name> -- --test-threads=1 --nocapture
+```
+
+### Backend implementation notes
+
+The macOS backend lives in `src/macos/`. Cross-cutting decisions worth
+knowing when porting tests or debugging:
+
+- **Mount story.** `Plan9Share { host_path, guest_path }` is **not**
+  implemented over Plan9. macOS uses two virtio-fs share devices:
+  - `tag="work"` — read-only host workspace tree (the per-Sandbox
+    `session_dir` lives under `~/.tokimo/sessions/...`).
+  - `tag="tokimo_dyn"` — a per-session dynamic pool mounted at
+    `/__tokimo_dyn` inside the guest. `add_plan9_share` /
+    `remove_plan9_share` create/destroy bind mounts inside this pool
+    via init RPCs, exposing the same `host_path → guest_path` contract
+    as the Windows Plan9-over-vsock backend. The transport differs
+    (virtio-fs vs Plan9), but tests 6 and 9 pass because they target
+    observable behavior.
+- **Network policy.**
+  * `AllowAll` → `VZNetworkDeviceConfiguration::nat()` (vmnet-backed).
+    vmnet hands out a runtime-chosen subnet (typically
+    `192.168.64.0/24`), which does **not** match the
+    `192.168.127.0/24` that `init.sh` hard-codes for Hyper-V. After the
+    init handshake, the backend therefore runs busybox `udhcpc` inside
+    the guest (with an inline `/tmp/udhcpc.sh` lease-apply script) to
+    pick up the actual lease + default route. Only then does test 12's
+    egress to `1.1.1.1:53` succeed.
+  * `Blocked` → no `NetworkDeviceConfiguration` is added to the VM
+    config. The guest sees no NIC at all (analogous to Windows
+    omitting the HCS NetworkAdapter device).
+- **Init transport.** macOS uses `VZVirtioSocketDevice` (virtio-vsock)
+  on port `2222`. Same wire protocol as Windows / Linux init.
+- **Process-wide `BOOT_LOCK`.** A `OnceLock<Mutex<()>>` in
+  `src/macos/vm.rs` serializes `vm_cfg.build()` + `vm.start().await`
+  across all `Sandbox` handles in the same host process. Without it,
+  concurrent VM creation produces sporadic *"Start operation
+  cancelled"* errors from the VZ dispatch queue.
+- **Per-Sandbox `session_dir`.** Each handle sanitizes
+  `user_data_name`, mixes in `session_id`, the host pid, and an atomic
+  counter. This makes `multi_session_concurrent` collision-free even
+  when callers reuse the same `user_data_name`.
+- **PID-1 quirk.** Like Linux, the guest is fully chrooted by
+  `init.sh` before `tokimo-sandbox-init` runs, and init hits the same
+  `TOKIMO_SANDBOX_PRE_CHROOTED=1` shortcut to skip its own
+  mount/chroot setup. The strict PID-1 handshake check is satisfied
+  natively because init really is PID 1 inside the guest.
+
+### Test inventory
+
+All 16 tests pass (~25 s wall on M-series, single-threaded). The
+inventory is identical to the Windows table above; behavioral
+differences are limited to the mount mechanism (virtio-fs not Plan9)
+and the egress path (vmnet NAT not HCN NAT).
 
 ## Editing tests
 

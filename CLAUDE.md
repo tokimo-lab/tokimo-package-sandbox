@@ -3,7 +3,7 @@
 Cross-platform native sandbox for running arbitrary commands in isolated environments.
 
 - **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer
-- **macOS**: Apple Seatbelt (VZVirtualMachine / `arcbox-vz`)
+- **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, virtio-fs work share, virtio-vsock control plane
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 
 ## Public API
@@ -78,6 +78,45 @@ differs.
 - **Blocked**  → empty `/sys` mount point + init mounts a fresh `sysfs`
   inside the new netns. A bind mount cannot replace this because sysfs
   filtering of `/sys/class/net` is per-mount, not per-task.
+
+## Architecture (macOS)
+
+```
+Sandbox client (library, in-process)
+        │
+        ├─ arcbox-vz → Apple Virtualization.framework (VZVirtualMachine)
+        │       │
+        │       ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
+        │       ├─ VZVirtioFileSystemDevice  tag="work"      ← rootfs (read-only host-shared)
+        │       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn" ← dynamic Plan9Share pool
+        │       ├─ VZVirtioSocketDevice (vsock CID/port 2222) ← init control plane
+        │       ├─ VZNetworkDeviceConfiguration::nat()        ← AllowAll: vmnet NAT
+        │       └─ VZSerialPortConfiguration                  ← guest console (debug)
+        │
+        └─ in-guest:
+              tokimo-sandbox-init (PID 1) over virtio-vsock port 2222
+                ├─ Hello / handshake
+                ├─ mount the dynamic pool at /__tokimo_dyn
+                ├─ AllowAll → run busybox udhcpc inside guest to apply
+                │   the actual VZ NAT lease (vmnet picks ~192.168.64.x at
+                │   runtime, NOT the Hyper-V 192.168.127.x baked into init.sh)
+                ├─ OpenShell / Spawn / Exec
+                └─ Plan9Share add/remove → bind dyn-pool subdirs at runtime
+```
+
+**Process-wide invariants:**
+- `BOOT_LOCK` (a `Mutex`) serializes `vm.build()` + `vm.start()` — the VZ
+  dispatch queue rejects parallel starts with "Start operation cancelled".
+- Each `Sandbox` handle owns a unique `session_dir` under
+  `~/.tokimo/sessions/<sanitized_name>-<session_id>-<pid>-<counter>` so
+  concurrent sessions never collide.
+- The host binary must be code-signed with `vz.entitlements` (the
+  `com.apple.security.virtualization` entitlement). `cargo test` does this
+  automatically via `scripts/codesign-and-run.sh` registered as a cargo
+  runner; see `docs/macos-testing.md`.
+- `tests/sandbox_integration.rs` (16/16 green) must run with
+  `--test-threads=1` because the suite shares one host process and `BOOT_LOCK`
+  enforces serial VM start anyway.
 
 ## Deployment modes (Windows)
 
@@ -256,6 +295,30 @@ cargo build --bin tokimo-sandbox-init
 PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
 ```
 
+```bash
+# --- macOS (Apple Silicon) ---
+
+# 1. Provide VM artifacts under <repo>/vm/ (symlinks are fine):
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+
+# 2. Register the codesign cargo runner once (in your gitignored
+#    .cargo/config.toml; the runner ad-hoc-signs each test binary with
+#    vz.entitlements before exec'ing):
+#       [target.aarch64-apple-darwin]
+#       runner = "scripts/codesign-and-run.sh"
+#       [target.x86_64-apple-darwin]
+#       runner = "scripts/codesign-and-run.sh"
+
+# 3. Run. --test-threads=1 is required (the VZ dispatch queue cannot
+#    handle parallel vm.start() calls from one process; BOOT_LOCK
+#    enforces it inside the backend too).
+cargo test --test sandbox_integration -- --test-threads=1
+```
+
+See `docs/macos-testing.md` for the full setup walkthrough.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -267,6 +330,7 @@ PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-t
 | `TOKIMO_SANDBOX_BRINGUP_LO=1` | Linux/bwrap Blocked policy: have init bring up `lo` after entering the new netns |
 | `TOKIMO_SANDBOX_MOUNT_SYSFS=1` | Linux/bwrap Blocked policy: have init mount a fresh `sysfs` at `/sys` so `/sys/class/net` is filtered by the new netns |
 | `TOKIMO_SANDBOX_PRE_CHROOTED=1` | VM modes: skip init's mount/chroot setup because `init.sh` already did it |
+| `TOKIMO_VM_DIR=<path>` | macOS / Windows: override VM artifact discovery (default walks up from cwd looking for `vm/`) |
 
 ## Windows VM artifacts
 

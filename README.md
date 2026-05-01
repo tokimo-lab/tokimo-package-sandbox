@@ -68,28 +68,31 @@ under tags with prefix `vm-v*`. The same release feeds both macOS and Windows.
 
 ## macOS setup
 
-The macOS backend boots a lightweight Linux VM via Virtualization.framework (macOS 11+).
+The macOS backend boots a Linux micro-VM via Apple Virtualization.framework
+(macOS 13+, Apple Silicon). Each `Sandbox` handle owns one VM; the host
+talks to a guest-side `tokimo-sandbox-init` over virtio-vsock and shares
+the workspace via virtio-fs (no Plan9 on macOS).
 
-```bash
-# 1. Download artifacts (replace x86_64 with arm64 on Apple Silicon? — both are
-#    built; pick whichever matches the host arch you'll boot the guest under)
-BASE=https://github.com/tokimo-lab/tokimo-package-sandbox/releases/latest/download
-curl -LO $BASE/tokimo-linux-kernel-arm64.tar.zst
-curl -LO $BASE/tokimo-linux-rootfs-arm64.tar.zst
+### 1. Provide VM artifacts under `<repo>/vm/`
 
-# 2. Extract to ~/.tokimo/
-zstd -d tokimo-linux-kernel-arm64.tar.zst && tar -xpf tokimo-linux-kernel-arm64.tar -C ~/.tokimo/
-mkdir -p ~/.tokimo/rootfs
-zstd -d tokimo-linux-rootfs-arm64.tar.zst && tar -xpf tokimo-linux-rootfs-arm64.tar -C ~/.tokimo/rootfs/
+The backend walks up from cwd looking for a `vm/` directory containing
+`vmlinuz`, `initrd.img`, and `rootfs/` (override with
+`TOKIMO_VM_DIR=/path/to/dir`). For local development, symlink the
+prebuilt arm64 artifacts in this repo:
 
-# 3. Sign the binary with virtualization entitlement
-codesign --entitlements vz.entitlements --force -s - target/debug/your-app
-
-# 4. Run
-./your-app
+```sh
+mkdir -p vm
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
-Entitlement (`vz.entitlements`):
+### 2. Code-sign with the virtualization entitlement
+
+Apple's Virtualization.framework requires the
+`com.apple.security.virtualization` entitlement. Without it, `start_vm()`
+fails at runtime. The repo ships `vz.entitlements`:
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -99,7 +102,40 @@ Entitlement (`vz.entitlements`):
 </dict></plist>
 ```
 
-Env vars: `TOKIMO_VZ_KERNEL`, `TOKIMO_VZ_INITRD`, `TOKIMO_VZ_ROOTFS`, `TOKIMO_VZ_MEMORY`, `TOKIMO_VZ_CPUS`.
+Sign before running:
+
+```sh
+codesign --force --sign - --entitlements vz.entitlements target/debug/your-binary
+```
+
+For `cargo test` / `cargo run`, register the cargo runner in your
+**local, gitignored** `.cargo/config.toml` so every target binary is
+auto-signed:
+
+```toml
+[target.aarch64-apple-darwin]
+runner = "scripts/codesign-and-run.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/codesign-and-run.sh"
+```
+
+### 3. Run
+
+```sh
+# Integration suite (16 tests, ~25 s on M-series; --test-threads=1 is
+# required: VZ's dispatch queue cannot start two VMs concurrently, and
+# the backend's process-wide BOOT_LOCK enforces this even if you forget).
+cargo test --test sandbox_integration -- --test-threads=1
+```
+
+Override knobs: `TOKIMO_VM_DIR=<path>` to relocate VM artifacts; per-VM
+memory and CPU come from `ConfigureParams` (no env vars consulted by
+the macOS backend).
+
+See [`docs/macos-testing.md`](docs/macos-testing.md) for the detailed
+walkthrough and [`tests/README.md`](tests/README.md) for backend
+implementation notes.
 
 ## Windows setup
 
@@ -194,11 +230,11 @@ src/
 │   ├── init_client.rs      ──   host-side InitClient (SOCK_SEQPACKET)
 │   └── l4/                 ──   seccomp-notify + seccomp-trace + scaffold eBPF observer
 │
-├── macos/                  ── macOS backend (Virtualization.framework)
-│   ├── mod.rs              ──   run() / spawn_session_shell()
-│   ├── vz.rs               ──   one-shot VM (kernel + initrd + virtiofs)
-│   ├── vz_session.rs       ──   persistent VM runner
-│   └── vz_vsock.rs         ──   InitClient over VSOCK
+├── macos/                  ── macOS backend (Virtualization.framework, persistent VM)
+│   ├── mod.rs              ──   module declarations
+│   ├── sandbox.rs          ──   MacosBackend: SandboxBackend
+│   ├── vm.rs               ──   VM lifecycle (boot_vm / BOOT_LOCK / VmConfig)
+│   └── vsock_init_client.rs ──  host-side init client over virtio-vsock
 │
 ├── windows/                ── Windows backend (HCS via SYSTEM service)
 │   ├── mod.rs              ──   run() → client::exec_vm()
@@ -258,28 +294,36 @@ host process
 ```
 macOS host
   │
-  ├─ run() → VzSandbox::boot(cfg)
+  ├─ Sandbox::connect() (no-op handshake, library-only — no service)
   │     │
-  │     ├─ VirtualMachineConfiguration
-  │     │     ├─ LinuxBootLoader(kernel, initrd)  ← cmd_b64 via kernel cmdline
-  │     │     ├─ VirtioFileSystem("work")          ← rootfs shared via virtiofs
-  │     │     ├─ VirtioSocket                       ← VSOCK for persistent Session
-  │     │     └─ VirtioConsole (serial)             ← boot diagnostics
-  │     │
-  │     ├─ vm.start()
-  │     │
-  │     │  ┌─────── Linux VM (arm64) ────────┐
-  │     │  │  initrd init                    │
-  │     │  │    ├─ mount virtiofs → /mnt/work│
-  │     │  │    ├─ chroot /mnt/work          │
-  │     │  │    └─ bash -c "<cmd>"           │
-  │     │  │                                 │
-  │     │  │  Result → .vz_stdout/.vz_stderr │
-  │     │  └─────────────────────────────────┘
-  │     │
-  │     └─ Read result files → ExecutionResult
+  │     └─ start_vm() → boot_vm() under process-wide BOOT_LOCK (Mutex)
+  │            │
+  │            ├─ arcbox-vz → Apple Virtualization.framework
+  │            │     ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
+  │            │     ├─ VZVirtioFileSystemDevice  tag="work"        ← rootfs share
+  │            │     ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn"  ← dynamic Plan9Share pool
+  │            │     ├─ VZVirtioSocketDevice (port 2222)            ← init control plane
+  │            │     ├─ VZNetworkDeviceConfiguration::nat()         ← AllowAll only (vmnet)
+  │            │     └─ VZSerialPortConfiguration                   ← guest console (debug)
+  │            │
+  │            │  ┌─────── Linux micro-VM (arm64) ─────────────────┐
+  │            │  │  init.sh (initrd)                              │
+  │            │  │    ├─ mounts virtiofs "work" (rootfs)          │
+  │            │  │    └─ chroot → exec tokimo-sandbox-init        │
+  │            │  │                                                │
+  │            │  │  tokimo-sandbox-init (PID 1)                   │
+  │            │  │    ├─ AF_VSOCK accept(host=2, port=2222)       │
+  │            │  │    ├─ mounts "tokimo_dyn" pool at /__tokimo_dyn│
+  │            │  │    ├─ AllowAll → busybox udhcpc to apply the   │
+  │            │  │    │   actual vmnet NAT lease (~192.168.64.x)  │
+  │            │  │    └─ Op::OpenShell / Spawn / AddMount / …     │
+  │            │  └────────────────────────────────────────────────┘
+  │            │
+  │            └─ host-side VsockInitClient drives the protocol
   │
-  └─ ~840ms cold boot-to-result
+  └─ Each Sandbox owns a unique session_dir under
+     ~/.tokimo/sessions/<sanitized_name>-<session_id>-<pid>-<counter>
+     so concurrent sessions never collide.
 ```
 
 ### Windows
@@ -469,7 +513,39 @@ Notable Linux-specific behaviors documented in [`tests/README.md`](tests/README.
 
 ### macOS integration
 
-macOS (VZ) integration runner is not yet ported — see the TODO section in [`tests/README.md`](tests/README.md). Only the Sandbox `--lib` / `--bin --lib` unit suites run on macOS today.
+The same 16-test suite passes on macOS (Apple Silicon) against the
+Virtualization.framework backend. No service, no admin — just the VM
+artifacts under `<repo>/vm/` and a code-signing cargo runner.
+
+```sh
+# One-time: symlink prebuilt artifacts
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+
+# One-time: register the codesign runner in your local .cargo/config.toml
+# (gitignored). See docs/macos-testing.md for the snippet.
+
+# Run
+cargo test --test sandbox_integration -- --test-threads=1
+```
+
+`--test-threads=1` is mandatory: VZ's dispatch queue cannot start two
+VMs concurrently. Notable macOS-specific behaviors documented in
+[`tests/README.md`](tests/README.md):
+
+- `Plan9Share` is implemented over **virtio-fs**, not Plan9. Static
+  shares attach via the `work` tag; dynamic ones go into a per-session
+  `tokimo_dyn` pool that init bind-mounts inside the guest. Same
+  `host_path → guest_path` contract as the Windows / Linux backends.
+- `NetworkPolicy::AllowAll` uses `VZNetworkDeviceConfiguration::nat()`
+  (vmnet-backed). The runtime-chosen subnet does not match the
+  Hyper-V `192.168.127.0/24` baked into the shared `init.sh`, so the
+  backend runs busybox `udhcpc` after the init handshake to apply the
+  actual lease + default route. Test 12's egress probe to `1.1.1.1:53`
+  succeeds only after this.
+- `NetworkPolicy::Blocked` simply omits the network device from the
+  VM config; the guest sees no NIC.
 
 ## Init control protocol (v1, Linux)
 
@@ -499,7 +575,7 @@ init   → client { "event": "Exit",   "child_id": "c2", "code": 0 }
 | | tokimo-package-sandbox | Docker |
 |---|---|---|
 | **Daemon** | library call (or SYSTEM service on Windows) | dockerd required |
-| **Startup** | ~50ms (Linux) / ~840ms (macOS VZ) / ~600ms (Windows HCS) | ~1–3s |
+| **Startup** | ~50ms (Linux bwrap) / ~2-3s cold VM boot (macOS VZ, Windows HCS) | ~1–3s |
 | **Images** | none (reuses Debian rootfs) | required |
 | **API** | Rust native | subprocess `docker run` |
 | **Use case** | "run this one untrusted command" | "deploy this service stack" |
