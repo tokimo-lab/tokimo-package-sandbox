@@ -258,33 +258,48 @@ impl Sandbox {
 
     // ---- Process control ------------------------------------------------
 
-    /// Return the [`JobId`] of the shell auto-started by [`Sandbox::start_vm`].
-    /// Use with [`Sandbox::write_stdin`] to send commands and
-    /// [`Sandbox::subscribe`] to receive output.
+    /// Return the [`JobId`] of the boot-time shell auto-started by
+    /// [`Sandbox::start_vm`]. Use with [`Sandbox::write_stdin`] to send
+    /// commands and [`Sandbox::subscribe`] to receive output.
     pub fn shell_id(&self) -> Result<JobId> {
         self.inner.shell_id()
     }
 
-    /// Write bytes to the stdin of a child process (typically the shell).
+    /// Spawn an additional shell inside the running VM and return its
+    /// [`JobId`]. Each shell has independent stdin/stdout/stderr streams
+    /// (events from this shell are tagged with the returned id). Allows
+    /// API-level concurrency: multiple shells can run in parallel and be
+    /// individually written to / signalled / closed.
+    pub fn spawn_shell(&self) -> Result<JobId> {
+        self.inner.spawn_shell()
+    }
+
+    /// Terminate a shell (sends SIGTERM and drops bookkeeping). Works on
+    /// the boot shell or any shell returned by [`Sandbox::spawn_shell`].
+    pub fn close_shell(&self, id: &JobId) -> Result<()> {
+        self.inner.close_shell(id)
+    }
+
+    /// Write bytes to the stdin of a child process (typically a shell).
     /// Send `\x03` (Ctrl+C) to interrupt, `\x04` (Ctrl+D) for EOF.
     pub fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.inner.write_stdin(id, data)
     }
 
-    /// Deliver a POSIX signal to the active shell's foreground process
-    /// group. Returns an error if no shell is bound. The signal value is
-    /// the raw Linux number (`2` for SIGINT, `15` for SIGTERM, etc.).
+    /// Deliver a POSIX signal to a specific shell's foreground process
+    /// group. The signal value is the raw Linux number (`2` for SIGINT,
+    /// `15` for SIGTERM, etc.).
     ///
     /// Sending Ctrl+C bytes to stdin via [`Sandbox::write_stdin`] does
-    /// **not** raise SIGINT in pipe mode — only a PTY would, and the
-    /// current shell is in pipe mode. Use this method instead.
-    pub fn signal_shell(&self, sig: i32) -> Result<()> {
-        self.inner.signal_shell(sig)
+    /// **not** raise SIGINT in pipe mode — only a PTY would, and shells
+    /// are in pipe mode. Use this method instead.
+    pub fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
+        self.inner.signal_shell(id, sig)
     }
 
-    /// Convenience wrapper for `signal_shell(SIGINT)` (signal 2).
-    pub fn interrupt_shell(&self) -> Result<()> {
-        self.inner.signal_shell(2)
+    /// Convenience wrapper for `signal_shell(id, 2)` (SIGINT).
+    pub fn interrupt_shell(&self, id: &JobId) -> Result<()> {
+        self.inner.signal_shell(id, 2)
     }
 
     // ---- Events ---------------------------------------------------------

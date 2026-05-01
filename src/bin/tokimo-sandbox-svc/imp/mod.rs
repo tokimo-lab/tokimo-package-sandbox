@@ -728,6 +728,8 @@ fn dispatch(
 
         method::WRITE_STDIN => handle_write_stdin(conn, params, sessions),
         method::SHELL_ID => handle_shell_id(conn, sessions),
+        method::SPAWN_SHELL => handle_spawn_shell(conn, sessions),
+        method::CLOSE_SHELL => handle_close_shell(conn, params, sessions),
         method::SIGNAL_SHELL => handle_signal_shell(conn, params, sessions),
 
         method::SUBSCRIBE => Ok(json!({})),
@@ -1083,15 +1085,72 @@ fn handle_signal_shell(conn: &Arc<Connection>, params: Value, sessions: &Windows
     let p: SignalShellParams =
         serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("signal_shell: {e}")))?;
     let init = require_init(conn, sessions)?;
-    let child_id = {
+    {
+        // Validate that the JobId refers to a registered child.
         let shared = get_session(conn, sessions)?;
         let st = shared.state.lock().unwrap();
-        st.shell_child_id
-            .clone()
-            .ok_or_else(|| RpcError::new("not_running", "VM not started or shell not available"))?
-    };
-    init.signal(&child_id, p.sig, true)
+        if !st.children.contains_key(&p.id) {
+            return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
+        }
+    }
+    init.signal(&p.id, p.sig, true)
         .map_err(|e| RpcError::new("signal", e.to_string()))?;
+    Ok(json!({}))
+}
+
+fn handle_spawn_shell(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    let shell_info = init
+        .open_shell(&["/bin/bash"], &[], None)
+        .map_err(|e| RpcError::new("open_shell", e.to_string()))?;
+    let child_id = shell_info.child_id;
+
+    // Spawn the per-child poller so stdout/stderr/exit flow back to subscribers.
+    let finished = Arc::new(AtomicBool::new(false));
+    let joiner = {
+        let conn_w = Arc::clone(conn);
+        let init_w = Arc::clone(&init);
+        let id_w = child_id.clone();
+        let fin_w = Arc::clone(&finished);
+        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
+    };
+
+    {
+        let shared = get_session(conn, sessions)?;
+        let mut st = shared.state.lock().unwrap();
+        st.children.insert(
+            child_id.clone(),
+            ChildEntry {
+                _joiner: joiner,
+                finished,
+            },
+        );
+    }
+    Ok(serde_json::to_value(JobIdResult { id: child_id }).unwrap())
+}
+
+fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let p: IdParams =
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("close_shell: {e}")))?;
+    let init = require_init(conn, sessions)?;
+    {
+        let shared = get_session(conn, sessions)?;
+        let st = shared.state.lock().unwrap();
+        if !st.children.contains_key(&p.id) {
+            return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
+        }
+    }
+    // SIGTERM the shell's process group; the poller will see the exit
+    // event and emit Event::Exit.
+    let _ = init.signal(&p.id, 15, true);
+    {
+        let shared = get_session(conn, sessions)?;
+        let mut st = shared.state.lock().unwrap();
+        st.children.remove(&p.id);
+        if st.shell_child_id.as_deref() == Some(p.id.as_str()) {
+            st.shell_child_id = None;
+        }
+    }
     Ok(json!({}))
 }
 

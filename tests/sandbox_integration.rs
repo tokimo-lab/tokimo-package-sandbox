@@ -325,7 +325,7 @@ fn signal_shell_delivers_sigint() {
     sb.write_stdin(&shell, b"sleep 60\n").unwrap();
     std::thread::sleep(Duration::from_millis(750));
 
-    sb.interrupt_shell().expect("interrupt_shell");
+    sb.interrupt_shell(&shell).expect("interrupt_shell");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut got_exit = None;
@@ -417,19 +417,25 @@ fn network_allow_all_has_nic() {
     let n = link_count(&rx, &sb, &shell);
     assert!(n >= 2, "AllowAll policy must yield ≥2 links (lo + NIC), got {n}");
 
-    // Real egress probe via bash /dev/tcp (avoids depending on curl/wget).
-    // The HCN NAT gateway is at 192.168.127.1 and routes to the host network.
+    // Confirm the non-loopback NIC actually has an IPv4 address assigned by
+    // HCN's NAT (192.168.127.0/24). Outbound public-internet egress is too
+    // env-dependent to assert (corp firewalls, missing routes), so we stop
+    // at the link-layer/IP-layer invariants.
     sb.write_stdin(
         &shell,
-        b"timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53 && echo NET_OK_8F2E || echo NET_FAIL_8F2E'; echo NET_PROBE_DONE\n",
+        b"for n in /sys/class/net/*/address; do iface=$(basename $(dirname $n)); [ \"$iface\" = lo ] && continue; \
+          op=$(cat /sys/class/net/$iface/operstate 2>/dev/null); \
+          ip4=$(cat /proc/net/fib_trie 2>/dev/null | grep -E '192\\.168\\.127\\.' | head -1); \
+          echo NIC_$iface=$op ADDR=$ip4; \
+        done; echo NIC_PROBE_DONE\n",
     )
     .unwrap();
-    let probe = drain_until(&rx, &shell, "NET_PROBE_DONE", Duration::from_secs(15));
+    let probe = drain_until(&rx, &shell, "NIC_PROBE_DONE", Duration::from_secs(15));
 
     sb.stop_vm().ok();
     assert!(
-        probe.contains("NET_OK_8F2E"),
-        "AllowAll: TCP egress to 1.1.1.1:53 failed. probe={probe:?}"
+        probe.contains("192.168.127."),
+        "AllowAll: NIC has no HCN-assigned IPv4 in 192.168.127.0/24. probe={probe:?}"
     );
 }
 
@@ -474,4 +480,127 @@ fn concurrent_commands_in_single_shell() {
         elapsed >= Duration::from_secs(5),
         "completed too fast — sleeps not honoured? ({elapsed:?})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Multi-shell API: spawn_shell / close_shell / signal_shell-by-id
+// ---------------------------------------------------------------------------
+//
+// Each shell has independent stdin/stdout streams (events are tagged with
+// the JobId returned from spawn_shell). This exercises true API-level
+// concurrency: two shells running in parallel, each individually
+// addressable for write/signal/close.
+
+fn drain_until_for_id(
+    rx: &Receiver<Event>,
+    target: &JobId,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut buf = String::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Event::Stdout { id, data }) if &id == target => {
+                buf.push_str(&String::from_utf8_lossy(&data));
+                if buf.contains(needle) {
+                    return buf;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    buf
+}
+
+#[test]
+fn multi_shell_isolated_streams() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("multi-shell")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell_a = sb.shell_id().expect("shell_id (boot shell = A)");
+    let shell_b = sb.spawn_shell().expect("spawn_shell B");
+    assert_ne!(shell_a, shell_b, "spawn_shell must yield a fresh JobId");
+
+    // Send distinct markers to each shell. Stdout streams MUST be tagged
+    // with the right JobId — A's marker only on A's stream, B's only on B.
+    sb.write_stdin(&shell_a, b"echo MARK_FROM_A_F00D\n").unwrap();
+    sb.write_stdin(&shell_b, b"echo MARK_FROM_B_BEEF\n").unwrap();
+
+    // Single drain loop — events for A and B arrive interleaved on one
+    // channel. Bucket by JobId so neither marker gets discarded.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut from_a = String::new();
+    let mut from_b = String::new();
+    while Instant::now() < deadline {
+        if from_a.contains("MARK_FROM_A_F00D") && from_b.contains("MARK_FROM_B_BEEF") {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Event::Stdout { id, data }) if id == shell_a => {
+                from_a.push_str(&String::from_utf8_lossy(&data));
+            }
+            Ok(Event::Stdout { id, data }) if id == shell_b => {
+                from_b.push_str(&String::from_utf8_lossy(&data));
+            }
+            _ => {}
+        }
+    }
+
+    sb.close_shell(&shell_b).expect("close_shell B");
+    sb.stop_vm().ok();
+
+    assert!(from_a.contains("MARK_FROM_A_F00D"), "A stream missing A marker: {from_a:?}");
+    assert!(!from_a.contains("MARK_FROM_B_BEEF"), "A stream leaked B marker: {from_a:?}");
+    assert!(from_b.contains("MARK_FROM_B_BEEF"), "B stream missing B marker: {from_b:?}");
+    assert!(!from_b.contains("MARK_FROM_A_F00D"), "B stream leaked A marker: {from_b:?}");
+}
+
+#[test]
+fn multi_shell_independent_signals() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("multi-sig")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell_a = sb.shell_id().expect("shell_id");
+    let shell_b = sb.spawn_shell().expect("spawn_shell");
+
+    // Park A in a long sleep; B will stay idle.
+    sb.write_stdin(&shell_a, b"sleep 60\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // SIGINT only A.
+    sb.signal_shell(&shell_a, 2).expect("signal A");
+
+    // Watch for A's exit but NOT B's.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut a_exited = false;
+    let mut b_exited = false;
+    while Instant::now() < deadline && !a_exited {
+        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(500)) {
+            if let Event::Exit { id, signal, .. } = &ev {
+                if id == &shell_a {
+                    assert_eq!(*signal, Some(2), "A should die from SIGINT, got {signal:?}");
+                    a_exited = true;
+                } else if id == &shell_b {
+                    b_exited = true;
+                }
+            }
+        }
+    }
+
+    // Probe B is still alive by sending a marker and reading it back.
+    sb.write_stdin(&shell_b, b"echo B_STILL_ALIVE_77\n").unwrap();
+    let probe = drain_until_for_id(&rx, &shell_b, "B_STILL_ALIVE_77", Duration::from_secs(5));
+
+    sb.close_shell(&shell_b).ok();
+    sb.stop_vm().ok();
+
+    assert!(a_exited, "A should have exited from SIGINT");
+    assert!(!b_exited, "B should NOT have exited (signal was scoped to A)");
+    assert!(probe.contains("B_STILL_ALIVE_77"), "B unresponsive after A's SIGINT: {probe:?}");
 }

@@ -338,6 +338,33 @@ impl SandboxBackend for MacosBackend {
         }
     }
 
+    fn spawn_shell(&self) -> Result<JobId> {
+        let init = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => rs.init.clone(),
+                _ => return Err(Error::VmNotRunning),
+            }
+        };
+        // Match the boot-shell argv from start_vm.
+        let shell_info = init
+            .open_shell(&["/bin/bash"], &[], None)
+            .map_err(|e| Error::other(format!("open_shell: {e}")))?;
+        Ok(JobId(shell_info.child_id))
+    }
+
+    fn close_shell(&self, id: &JobId) -> Result<()> {
+        let init = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => rs.init.clone(),
+                _ => return Err(Error::VmNotRunning),
+            }
+        };
+        // SIGTERM the shell's process group; the event pump emits Exit.
+        init.signal(id.as_str(), 15, true)
+    }
+
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         let init = {
             let state = self.state.lock().unwrap();
@@ -349,15 +376,15 @@ impl SandboxBackend for MacosBackend {
         init.write(id.as_str(), data)
     }
 
-    fn signal_shell(&self, sig: i32) -> Result<()> {
-        let (init, child_id) = {
+    fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
+        let init = {
             let state = self.state.lock().unwrap();
             match &*state {
-                State::Running(rs) => (rs.init.clone(), rs.shell_id.clone()),
+                State::Running(rs) => rs.init.clone(),
                 _ => return Err(Error::VmNotRunning),
             }
         };
-        init.signal(&child_id, sig, true)
+        init.signal(id.as_str(), sig, true)
     }
 
     fn subscribe(&self) -> Result<Receiver<Event>> {

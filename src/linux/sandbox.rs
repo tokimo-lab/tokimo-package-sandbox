@@ -498,6 +498,48 @@ impl SandboxBackend for LinuxBackend {
         g.shell_job_id.clone().ok_or_else(|| Error::VmNotRunning)
     }
 
+    fn spawn_shell(&self) -> Result<JobId> {
+        self.ensure_running()?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let client = Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?);
+        let shell_info = client
+            .open_shell(&["/bin/bash"], &[], None)
+            .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
+        let job_id = JobId(format!("j{}", g.next_job_id));
+        g.next_job_id += 1;
+        g.jobs.insert(
+            job_id.0.clone(),
+            JobSpawnInfo {
+                child_id: shell_info.child_id.clone(),
+                pty_fd: None,
+            },
+        );
+        g.child_to_job.insert(shell_info.child_id, job_id.clone());
+        Ok(job_id)
+    }
+
+    fn close_shell(&self, id: &JobId) -> Result<()> {
+        self.ensure_running()?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let client = Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?);
+        let job = g
+            .jobs
+            .get(id.as_str())
+            .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
+        let child_id = job.child_id.clone();
+        // Send SIGTERM to the shell's process group.
+        let _ = client.signal(&child_id, 15, true);
+        // Remove bookkeeping. The pump will still drain any final stdout
+        // and emit Event::Exit when init reports it.
+        g.jobs.remove(id.as_str());
+        g.child_to_job.remove(&child_id);
+        if g.shell_job_id.as_ref() == Some(id) {
+            g.shell_job_id = None;
+            g.shell_child_id = None;
+        }
+        Ok(())
+    }
+
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
@@ -528,13 +570,16 @@ impl SandboxBackend for LinuxBackend {
         Ok(())
     }
 
-    fn signal_shell(&self, sig: i32) -> Result<()> {
+    fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let child_id = g.shell_child_id.clone().ok_or(Error::VmNotRunning)?;
         let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?;
+        let job = g
+            .jobs
+            .get(id.as_str())
+            .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
         client
-            .signal(&child_id, sig, true)
+            .signal(&job.child_id, sig, true)
             .map_err(|e| Error::other(format!("signal_shell: {e}")))
     }
 

@@ -94,6 +94,8 @@ pub mod method {
     pub const IS_PROCESS_RUNNING: &str = "isProcessRunning";
     pub const WRITE_STDIN: &str = "writeStdin";
     pub const SHELL_ID: &str = "shellId";
+    pub const SPAWN_SHELL: &str = "spawnShell";
+    pub const CLOSE_SHELL: &str = "closeShell";
     pub const SIGNAL_SHELL: &str = "signalShell";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const CREATE_DISK_IMAGE: &str = "createDiskImage";
@@ -154,10 +156,12 @@ pub struct WriteStdinParams {
     pub data: Vec<u8>,
 }
 
-/// Parameters for `signalShell` — deliver a POSIX signal to the active
-/// shell's foreground process group.
+/// Parameters for `signalShell` — deliver a POSIX signal to a specific
+/// shell's foreground process group, identified by the JobId returned
+/// from `shellId` or `spawnShell`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalShellParams {
+    pub id: String,
     pub sig: i32,
 }
 

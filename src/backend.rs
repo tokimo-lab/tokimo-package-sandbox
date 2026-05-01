@@ -22,12 +22,19 @@ pub trait SandboxBackend: Send + Sync + 'static {
     fn is_process_running(&self, id: &JobId) -> Result<bool>;
 
     fn shell_id(&self) -> Result<JobId>;
+    /// Spawn an additional shell in the running VM, returning a fresh
+    /// JobId. Each shell has independent stdin/stdout/stderr streams
+    /// (events are tagged with this JobId). Errors if the VM isn't
+    /// running.
+    fn spawn_shell(&self) -> Result<JobId>;
+    /// Terminate a shell previously returned by `shell_id()` or
+    /// `spawn_shell()`. Sends SIGTERM and removes the bookkeeping.
+    fn close_shell(&self, id: &JobId) -> Result<()>;
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()>;
-    /// Deliver a POSIX signal to the active shell's foreground process
-    /// group. Errors if no shell is currently bound (VM not started or
-    /// already stopped). The signal number is the raw Linux value
+    /// Deliver a POSIX signal to a specific shell's foreground process
+    /// group. The signal number is the raw Linux value
     /// (`SIGINT = 2`, `SIGTERM = 15`, …).
-    fn signal_shell(&self, sig: i32) -> Result<()>;
+    fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()>;
 
     fn subscribe(&self) -> Result<Receiver<Event>>;
 

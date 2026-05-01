@@ -99,6 +99,18 @@ impl SandboxBackend for WindowsBackend {
         Ok(JobId(r.id))
     }
 
+    fn spawn_shell(&self) -> Result<JobId> {
+        let v = self.call(method::SPAWN_SHELL, json!({}), SHORT_CALL_TIMEOUT)?;
+        let r: JobIdResult = serde_json::from_value(v)?;
+        Ok(JobId(r.id))
+    }
+
+    fn close_shell(&self, id: &JobId) -> Result<()> {
+        let p = IdParams { id: id.0.clone() };
+        self.call(method::CLOSE_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         let p = WriteStdinParams {
             id: id.0.clone(),
@@ -108,8 +120,8 @@ impl SandboxBackend for WindowsBackend {
         Ok(())
     }
 
-    fn signal_shell(&self, sig: i32) -> Result<()> {
-        let p = SignalShellParams { sig };
+    fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
+        let p = SignalShellParams { id: id.0.clone(), sig };
         self.call(method::SIGNAL_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         Ok(())
     }
