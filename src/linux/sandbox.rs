@@ -13,21 +13,22 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{env, thread};
 
-use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, listen, socket};
+use nix::sys::socket::{SockFlag, socketpair};
 
 use crate::api::{ConfigureParams, Event, ExecOpts, ExecResult, JobId, NetworkPolicy, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
-use crate::linux::init_client::{InitClient, SpawnInfo};
+use crate::linux::init_client::{DrainedEvent, InitClient};
 
 /// Shared mutable state for the Linux backend.
 struct BackendState {
@@ -38,10 +39,14 @@ struct BackendState {
     shell_child_id: Option<String>,
     /// PID of the bwrap process.
     bwrap_pid: Option<u32>,
-    /// SEQPACKET socket path used to connect to init (host side).
-    ctrl_sock_path: Option<PathBuf>,
     /// Per-JobId spawn info.
     jobs: HashMap<String, JobSpawnInfo>,
+    /// Reverse map: init child_id → JobId, for the event pump.
+    child_to_job: HashMap<String, JobId>,
+    /// Names of dynamically added shares (via `add_plan9_share` after
+    /// start_vm). Boot-time shares are NOT in this set so they cannot be
+    /// removed via `remove_plan9_share`.
+    dynamic_shares: HashSet<String>,
     /// Event subscribers (each gets a clone of incoming events).
     subscribers: Vec<std::sync::mpsc::Sender<Event>>,
     /// Next job id sequence.
@@ -63,8 +68,9 @@ impl Default for BackendState {
             init_client: None,
             shell_child_id: None,
             bwrap_pid: None,
-            ctrl_sock_path: None,
             jobs: HashMap::new(),
+            child_to_job: HashMap::new(),
+            dynamic_shares: HashSet::new(),
             subscribers: Vec::new(),
             next_job_id: 0,
             debug_logging: false,
@@ -77,8 +83,10 @@ pub struct LinuxBackend {
     state: Mutex<BackendState>,
     /// Flag set to true when start_vm completes successfully (handshake done).
     running: AtomicBool,
+    /// Signals the event pump to exit.
+    pump_stop: Arc<AtomicBool>,
     /// Event pump thread handle (spawned by start_vm).
-    _event_pump: Mutex<Option<thread::JoinHandle<()>>>,
+    event_pump: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl LinuxBackend {
@@ -86,7 +94,8 @@ impl LinuxBackend {
         Ok(Self {
             state: Mutex::new(BackendState::default()),
             running: AtomicBool::new(false),
-            _event_pump: Mutex::new(None),
+            pump_stop: Arc::new(AtomicBool::new(false)),
+            event_pump: Mutex::new(None),
         })
     }
 
@@ -141,173 +150,218 @@ impl SandboxBackend for LinuxBackend {
             .ok_or_else(|| Error::NotConfigured)?
             .clone();
 
-        // 1. Create a SEQPACKET socket pair for the init control channel.
-        let temp_dir = env::temp_dir().join(format!("tokimo-sb-{}", std::process::id()));
-        fs::create_dir_all(&temp_dir).map_err(|e| {
-            Error::other(format!("create temp dir {}: {}", temp_dir.display(), e))
-        })?;
-        let ctrl_sock_path = temp_dir.join("ctrl.sock");
-        let ctrl_fd = socket(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            SockFlag::SOCK_CLOEXEC,
+        // 1. socketpair(SEQPACKET) for the init control channel. The host
+        //    side stays CLOEXEC; the child side has CLOEXEC cleared in
+        //    pre_exec so it survives execve into bwrap → init.
+        let (host_end, child_end) = socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
             None,
+            SockFlag::SOCK_CLOEXEC,
         )
-        .map_err(|e| Error::other(format!("socket(SEQPACKET): {e}")))?;
-        let addr = UnixAddr::new(&ctrl_sock_path)
-            .map_err(|e| Error::other(format!("UnixAddr {ctrl_sock_path:?}: {e}")))?;
-        bind(ctrl_fd.as_raw_fd(), &addr)
-            .map_err(|e| Error::other(format!("bind {ctrl_sock_path:?}: {e}")))?;
-        listen(&ctrl_fd, nix::sys::socket::Backlog::new(1).unwrap())
-            .map_err(|e| Error::other(format!("listen {ctrl_sock_path:?}: {e}")))?;
+        .map_err(|e| Error::other(format!("socketpair(SEQPACKET): {e}")))?;
+        let child_fd_raw = child_end.as_raw_fd();
 
-        // 2. Find the init binary (tokimo-sandbox-init).
+        // 2. Find the init binary.
         let init_path = find_init_binary()?;
+        let bwrap_path = find_bwrap()?;
 
-        // 3. Build bwrap args:
-        //    * Bind workspace + Plan9Shares
-        //    * Pass ctrl socket via --ro-bind on the socket file (init will connect)
-        //    * Spawn tokimo-sandbox-init with the socket path as arg.
-        let mut args = vec![
-            "--ro-bind".to_string(),
-            "/usr".to_string(),
-            "/usr".to_string(),
-            "--ro-bind".to_string(),
-            "/lib".to_string(),
-            "/lib".to_string(),
-            "--ro-bind".to_string(),
-            "/bin".to_string(),
-            "/bin".to_string(),
-            "--ro-bind".to_string(),
-            "/sbin".to_string(),
-            "/sbin".to_string(),
-            "--proc".to_string(),
-            "/proc".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-            "--tmpfs".to_string(),
-            "/tmp".to_string(),
-            "--unshare-pid".to_string(),
-            "--unshare-ipc".to_string(),
-            "--unshare-uts".to_string(),
-            "--die-with-parent".to_string(),
-            "--as-pid-1".to_string(),
-        ];
-
-        // Check if /lib64 exists (some distros have it, some don't).
+        // 3. Build bwrap args.
+        let mut args: Vec<String> = vec![
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/bin", "/bin",
+            "--ro-bind", "/sbin", "/sbin",
+            "--ro-bind", "/lib", "/lib",
+        ]
+        .into_iter().map(String::from).collect();
         if Path::new("/lib64").is_dir() {
-            args.push("--ro-bind".to_string());
-            args.push("/lib64".to_string());
-            args.push("/lib64".to_string());
+            args.extend(["--ro-bind", "/lib64", "/lib64"].iter().map(|s| s.to_string()));
         }
+        if Path::new("/etc/alternatives").is_dir() {
+            args.extend(["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
+                .iter().map(|s| s.to_string()));
+        }
+        // Network/DNS files (only if present on host).
+        for p in [
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/ssl",
+            "/etc/ca-certificates",
+            "/etc/pki",
+        ] {
+            if Path::new(p).exists() {
+                args.extend(["--ro-bind".to_string(), p.into(), p.into()]);
+            }
+        }
+        args.extend([
+            "--proc", "/proc",
+            // NOTE: Avoid `--dev /dev` — bwrap's devtmpfs setup forces a
+            // nested user_ns (uid_map "1000 0 1") in which init no longer
+            // has CAP_SYS_ADMIN over outer-userns mounts, breaking
+            // dynamic AddMountFd binds. Stage /dev as tmpfs + bind the
+            // standard device nodes individually.
+            "--tmpfs", "/dev",
+            "--dev-bind", "/dev/null", "/dev/null",
+            "--dev-bind", "/dev/zero", "/dev/zero",
+            "--dev-bind", "/dev/full", "/dev/full",
+            "--dev-bind", "/dev/random", "/dev/random",
+            "--dev-bind", "/dev/urandom", "/dev/urandom",
+            "--dev-bind", "/dev/tty", "/dev/tty",
+            "--symlink", "/proc/self/fd", "/dev/fd",
+            "--symlink", "/proc/self/fd/0", "/dev/stdin",
+            "--symlink", "/proc/self/fd/1", "/dev/stdout",
+            "--symlink", "/proc/self/fd/2", "/dev/stderr",
+            "--tmpfs", "/tmp",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--die-with-parent",
+            // (Intentionally NOT using --as-pid-1: it creates a nested
+            // user_ns where init no longer has CAP_SYS_ADMIN over the
+            // mounts created by the outer bwrap user_ns, which breaks
+            // dynamic AddMountFd binds. bwrap will sit at PID 1 and
+            // init will be PID 2 inside the new pid_ns; that's fine.)
+            // Required for AddMountFd dynamic mounts: bwrap drops all
+            // caps by default in unprivileged user_ns mode; we need
+            // CAP_SYS_ADMIN inside the user_ns to call mount(MS_BIND)
+            // for runtime-added Plan9 shares.
+            "--cap-add", "CAP_SYS_ADMIN",
+        ].iter().map(|s| s.to_string()));
 
-        // Workspace is mounted at /work (if any share named "work" or default).
-        // For Plan9Share bindings: bind at guest_path.
+        // Boot-time Plan9-style binds.
         for share in &config.plan9_shares {
             let flag = if share.read_only { "--ro-bind" } else { "--bind" };
-            args.push(flag.to_string());
+            args.push(flag.into());
             args.push(share.host_path.display().to_string());
             args.push(share.guest_path.display().to_string());
         }
 
-        // Bind the control socket path so init can see it.
-        args.push("--ro-bind".to_string());
-        args.push(ctrl_sock_path.display().to_string());
-        args.push(ctrl_sock_path.display().to_string());
+        // Dynamic-mount staging: pre-bind host root **rw** at a hidden
+        // path so init can open arbitrary host paths via openat() into
+        // a mount that lives in our user_ns (kernel mount-source
+        // requirement). We use `--bind` (not `--ro-bind`) so the
+        // resulting dynamic mounts can be writable; bwrap does not
+        // expose a way to remount the staging path RO afterwards, so
+        // `/.tps_host` remains a writable view of the host fs from
+        // inside the sandbox. This is a known leak for the bwrap
+        // backend; the dot-prefix hides it from default `ls /` listings.
+        args.extend([
+            "--bind".to_string(),
+            "/".to_string(),
+            "/.tps_host".to_string(),
+        ]);
 
         // Network policy.
-        //   * AllowAll → bwrap inherits the host network namespace
-        //     (default: no `--unshare-net` flag) → guest sees host NICs.
-        //   * Blocked  → not yet implemented on Linux. Returning an
-        //     error rather than silently allowing traffic is safer.
-        //
-        // Real Blocked support requires either `--unshare-net` plus a
-        // loopback-only setup, or iptables/nftables egress rules.
         match config.network {
             NetworkPolicy::AllowAll => {}
             NetworkPolicy::Blocked => {
-                return Err(Error::other(
-                    "NetworkPolicy::Blocked is not yet implemented on the Linux backend",
-                ));
+                args.push("--unshare-net".to_string());
+                args.extend([
+                    "--setenv".to_string(),
+                    "TOKIMO_SANDBOX_BRINGUP_LO".to_string(),
+                    "1".to_string(),
+                ]);
             }
         }
 
+        // Tell init how to find the inherited control fd.
+        args.extend([
+            "--setenv".to_string(),
+            "TOKIMO_SANDBOX_CONTROL_FD".to_string(),
+            child_fd_raw.to_string(),
+        ]);
+
         args.push("--".to_string());
         args.push(init_path.display().to_string());
-        args.push("--ctrl-sock".to_string());
-        args.push(ctrl_sock_path.display().to_string());
 
-        // 4. Spawn bwrap.
-        let bwrap_path = find_bwrap()?;
-        let child = Command::new(bwrap_path)
-            .args(&args)
+        // Make the init binary visible inside the container at the exact
+        // same path we just substituted into argv. bwrap re-execs into
+        // the container's mount namespace before running the init, so
+        // the path must resolve there.
+        let init_dir = init_path.parent().unwrap_or(Path::new("/"));
+        // Insert this BEFORE the `--` separator. We'll splice it in.
+        // Easier: just push another --ro-bind earlier — but at this point
+        // we've already pushed `--`. Recover by inserting before tail.
+        let tail_len = 2; // [--, init_path]
+        let insert_at = args.len() - tail_len;
+        args.insert(insert_at, "--ro-bind".to_string());
+        args.insert(insert_at + 1, init_dir.display().to_string());
+        args.insert(insert_at + 2, init_dir.display().to_string());
+
+        // 4. Spawn bwrap. In pre_exec, clear CLOEXEC on the child end so
+        //    bwrap → init inherits it.
+        let mut cmd = Command::new(bwrap_path);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit());
+        unsafe {
+            cmd.pre_exec(move || {
+                let r = libc::fcntl(child_fd_raw, libc::F_SETFD, 0);
+                if r == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
+
+        // 5. Drop our copy of the child end. host_end is the active control fd.
+        drop(child_end);
 
         let bwrap_pid = child.id();
         g.bwrap_child = Some(child);
         g.bwrap_pid = Some(bwrap_pid);
-        g.ctrl_sock_path = Some(ctrl_sock_path.clone());
-
         drop(g);
 
-        // 5. Wait for init to connect (with timeout).
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let init_client = loop {
-            if Instant::now() >= deadline {
-                return Err(Error::other("timeout waiting for init to connect"));
-            }
-            match InitClient::connect(&ctrl_sock_path) {
-                Ok(client) => break client,
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        };
-
-        // 6. Send Hello.
+        // 6. Wrap host_end as InitClient and handshake.
+        // bwrap mode: init runs as PID 2 (bwrap is PID 1) — we
+        // intentionally avoid `--as-pid-1` because the nested user_ns
+        // it creates strips CAP_SYS_ADMIN over our outer mounts.
+        // Tell InitClient to allow the non-PID-1 hello.
+        // SAFETY: env-var writes are not thread-safe in general; we
+        // accept that this is set before any concurrent threads run.
+        unsafe { std::env::set_var("TOKIMO_SANDBOX_ALLOW_NON_PID1", "1"); }
+        let init_client = InitClient::from_fd(host_end)
+            .map_err(|e| Error::other(format!("InitClient::from_fd: {e}")))?;
         init_client
             .hello()
             .map_err(|e| Error::other(format!("init hello failed: {e}")))?;
-
-        // 7. OpenShell (sentinel process to keep init alive).
         let shell_info = init_client
             .open_shell(&["/bin/bash"], &[], None)
             .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
 
         let init_client = Arc::new(init_client);
 
-        // 8. Update state first (before starting event pump).
+        // 7. Update state.
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         g.init_client = Some(Arc::clone(&init_client));
         g.shell_child_id = Some(shell_info.child_id);
         drop(g);
 
-        // 9. Start event pump thread.
-        // Cannot directly pass `self` to thread, so we'll poll in a detached way.
-        // The event pump will be stopped when stop_vm is called (init_client.is_dead()).
-        // For now, we skip the event pump thread to avoid architecture issues.
-        // The events will be polled on-demand during exec/spawn operations.
-        //
-        // TODO: implement proper event pump with shared state.
-        let event_pump = thread::Builder::new()
-            .name("tokimo-linux-event-pump-stub".into())
+        // 8. Start event pump.
+        self.pump_stop.store(false, Ordering::Relaxed);
+        let pump_stop = Arc::clone(&self.pump_stop);
+        let pump_state: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let _ = pump_state;
+        // We need to share `&self.state` with the pump; do so via an Arc
+        // wrapper that points back at the `Mutex<BackendState>`. Since
+        // `self` is borrowed for the lifetime of the LinuxBackend, we
+        // hand the pump a raw pointer wrapped in a SyncSendPtr — this is
+        // safe because `LinuxBackend` outlives the pump (we join in
+        // stop_vm before dropping).
+        let backend_state_ptr = SyncStatePtr(&self.state as *const Mutex<BackendState>);
+        let pump_client = Arc::clone(&init_client);
+        let pump = thread::Builder::new()
+            .name("tokimo-linux-event-pump".into())
             .spawn(move || {
-                // Stub event pump — just sleeps. Real implementation would
-                // need access to the backend state to broadcast events.
-                loop {
-                    thread::sleep(Duration::from_secs(1));
-                    if init_client.is_dead() {
-                        break;
-                    }
-                }
+                event_pump_loop(pump_client, pump_stop, backend_state_ptr);
             })
-            .map_err(|e| Error::other(format!("spawn event pump thread: {e}")))?;
-
-        *self._event_pump.lock().unwrap() = Some(event_pump);
+            .map_err(|e| Error::other(format!("spawn event pump: {e}")))?;
+        *self.event_pump.lock().unwrap() = Some(pump);
 
         self.running.store(true, Ordering::Relaxed);
 
@@ -322,9 +376,9 @@ impl SandboxBackend for LinuxBackend {
     fn stop_vm(&self) -> Result<()> {
         self.ensure_running()?;
 
+        // 1. Signal pump to stop and shutdown init.
+        self.pump_stop.store(true, Ordering::Relaxed);
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-
-        // 1. Shutdown init.
         if let Some(ref client) = g.init_client {
             let _ = client.shutdown();
         }
@@ -355,18 +409,16 @@ impl SandboxBackend for LinuxBackend {
         g.shell_child_id = None;
         g.bwrap_pid = None;
         g.jobs.clear();
-
-        // Clean up temp dir with socket.
-        if let Some(ref path) = g.ctrl_sock_path {
-            let temp_dir = path.parent();
-            if let Some(dir) = temp_dir {
-                let _ = fs::remove_dir_all(dir);
-            }
-        }
-        g.ctrl_sock_path = None;
+        g.child_to_job.clear();
+        g.dynamic_shares.clear();
 
         drop(g);
         self.running.store(false, Ordering::Relaxed);
+
+        // 4. Join the pump thread.
+        if let Some(handle) = self.event_pump.lock().unwrap().take() {
+            let _ = handle.join();
+        }
 
         Ok(())
     }
@@ -460,6 +512,7 @@ impl SandboxBackend for LinuxBackend {
                 pty_fd,
             },
         );
+        g.child_to_job.insert(spawn_info.child_id.clone(), job_id.clone());
 
         // If initial stdin is provided, write it.
         if let Some(ref data) = opts.stdin {
@@ -487,10 +540,19 @@ impl SandboxBackend for LinuxBackend {
             Error::other(format!("unknown job: {}", id.as_str()))
         })?;
 
-        if job.pty_fd.is_some() {
-            // PTY mode: write to the master fd directly.
-            // TODO: implement PTY master writes.
-            return Err(Error::not_implemented("write_stdin for PTY jobs"));
+        if let Some(ref pty_fd) = job.pty_fd {
+            // PTY mode: write directly to the master fd in the host process.
+            let bf = unsafe { BorrowedFd::borrow_raw(pty_fd.as_raw_fd()) };
+            let mut written = 0usize;
+            while written < data.len() {
+                match nix::unistd::write(bf, &data[written..]) {
+                    Ok(n) if n == 0 => return Err(Error::other("write_stdin: pty write returned 0")),
+                    Ok(n) => written += n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => return Err(Error::other(format!("write_stdin pty: {e}"))),
+                }
+            }
+            return Ok(());
         }
 
         client
@@ -546,20 +608,50 @@ impl SandboxBackend for LinuxBackend {
         Err(Error::not_implemented(format!("passthrough: {}", method)))
     }
 
-    fn add_plan9_share(&self, _share: Plan9Share) -> Result<()> {
-        // bwrap finalizes the mount namespace at process start; runtime
-        // mount additions would require entering the child's mount ns
-        // (`setns(CLONE_NEWNS)`) and calling mount(2) from there.
-        // TODO: implement via VM-mode backend (see plan/architecture-alignment.md).
-        Err(Error::not_supported(
-            "add_plan9_share on Linux bwrap backend (requires VM-mode)",
-        ))
+    fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
+        self.ensure_running()?;
+        let host_path = share.host_path.canonicalize()
+            .map_err(|e| Error::other(format!("canonicalize {:?}: {e}", share.host_path)))?;
+        if !host_path.is_dir() {
+            return Err(Error::other(format!("{host_path:?} is not a directory")));
+        }
+        let host_path_str = host_path.to_str()
+            .ok_or_else(|| Error::other(format!("non-UTF-8 host path: {host_path:?}")))?
+            .to_string();
+
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        if g.dynamic_shares.contains(&share.name) {
+            return Err(Error::other(format!("share {:?} already exists", share.name)));
+        }
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?.clone();
+        drop(g);
+
+        let target = share.guest_path.display().to_string();
+        client
+            .add_mount_fd(&share.name, &host_path_str, &target, share.read_only)
+            .map_err(|e| Error::other(format!("add_mount_fd: {e}")))?;
+
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.dynamic_shares.insert(share.name);
+        Ok(())
     }
 
-    fn remove_plan9_share(&self, _name: &str) -> Result<()> {
-        Err(Error::not_supported(
-            "remove_plan9_share on Linux bwrap backend (requires VM-mode)",
-        ))
+    fn remove_plan9_share(&self, name: &str) -> Result<()> {
+        self.ensure_running()?;
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        if !g.dynamic_shares.contains(name) {
+            return Err(Error::other(format!(
+                "no such dynamic share: {name:?} (boot-time shares cannot be removed)"
+            )));
+        }
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?.clone();
+        drop(g);
+        client
+            .remove_mount_by_name(name)
+            .map_err(|e| Error::other(format!("remove_mount_by_name: {e}")))?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.dynamic_shares.remove(name);
+        Ok(())
     }
 }
 
@@ -578,6 +670,73 @@ impl SandboxBackend for LinuxBackend {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// `*const Mutex<BackendState>` wrapped to be Send so the event pump can
+/// hold it. Safety contract: the pointed-at LinuxBackend outlives the pump
+/// thread (we join on stop_vm before dropping).
+struct SyncStatePtr(*const Mutex<BackendState>);
+unsafe impl Send for SyncStatePtr {}
+
+fn event_pump_loop(
+    client: Arc<InitClient>,
+    stop: Arc<AtomicBool>,
+    state_ptr: SyncStatePtr,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) || client.is_dead() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(200);
+        client.wait_any_event_or_eof(deadline);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: see SyncStatePtr.
+        let state = unsafe { &*state_ptr.0 };
+        let ids: std::collections::HashSet<String> = match state.lock() {
+            Ok(g) => g.child_to_job.keys().cloned().collect(),
+            Err(_) => return,
+        };
+        if ids.is_empty() {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let drained = client.drain_pending_events_for(&ids);
+        if drained.is_empty() {
+            // Either there's no data at all (timeout) or the pending data
+            // belongs to a non-tracked transient child (e.g. an in-flight
+            // `exec()`). Sleep briefly to avoid spinning.
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let mut g = match state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for ev in drained {
+            match ev {
+                DrainedEvent::Stdout { child_id, data } => {
+                    if let Some(jid) = g.child_to_job.get(&child_id).cloned() {
+                        LinuxBackend::broadcast_event(&mut g, Event::Stdout { id: jid, data });
+                    }
+                }
+                DrainedEvent::Stderr { child_id, data } => {
+                    if let Some(jid) = g.child_to_job.get(&child_id).cloned() {
+                        LinuxBackend::broadcast_event(&mut g, Event::Stderr { id: jid, data });
+                    }
+                }
+                DrainedEvent::Exit { child_id, code, signal } => {
+                    if let Some(jid) = g.child_to_job.get(&child_id).cloned() {
+                        LinuxBackend::broadcast_event(
+                            &mut g,
+                            Event::Exit { id: jid, exit_code: code, signal },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
 fn find_bwrap() -> Result<PathBuf> {
     // Try PATH lookup.

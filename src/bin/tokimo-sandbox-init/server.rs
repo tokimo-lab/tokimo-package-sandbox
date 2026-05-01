@@ -97,6 +97,19 @@ pub struct State {
     /// and umount a previously-attached share.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub mount_fds: Vec<MountedShare>,
+    /// Bwrap-mode dynamic mounts (added via `Op::AddMountFd`). Keyed by
+    /// the host-supplied logical name. Tracks the mount target so
+    /// `Op::RemoveMountByName` can `umount2(target, MNT_DETACH)` + rmdir.
+    pub dynamic_mounts: HashMap<String, String>,
+    /// Long-lived O_PATH/O_DIRECTORY fd into the bwrap-staged
+    /// `/.tps_host` (host root). Opened during init startup, before
+    /// `/.tps_host` is umounted+rmdir'd. Used as the dirfd for
+    /// `openat()` when handling `Op::AddMountFd` so that the fd we then
+    /// bind-mount belongs to a mount inside our user_ns (kernel
+    /// requirement; an init_user_ns fd passed via SCM_RIGHTS would
+    /// otherwise EPERM in `mount(MS_BIND)`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub host_root_fd: Option<OwnedFd>,
 }
 
 #[allow(dead_code)]
@@ -153,9 +166,29 @@ pub fn run_loop(
     base_env: Vec<(String, String)>,
     transport: Transport,
 ) -> Result<(), String> {
-    eprintln!("[init] run_loop ENTER transport={transport:?}");
+    run_loop_inner(listener, write_fd, sigfd, base_env, transport, false)
+}
+
+/// Linux bwrap entry point: the `client` fd is a pre-connected SEQPACKET
+/// socket (one half of a `socketpair(2)` whose other end the host kept).
+/// Skips listener `accept(2)` — there is no listener.
+pub fn run_loop_preconnected(
+    client: OwnedFd,
+    sigfd: OwnedFd,
+    base_env: Vec<(String, String)>,
+) -> Result<(), String> {
+    run_loop_inner(client, None, sigfd, base_env, Transport::SeqPacket, true)
+}
+
+fn run_loop_inner(
+    listener: OwnedFd,
+    write_fd: Option<OwnedFd>,
+    sigfd: OwnedFd,
+    base_env: Vec<(String, String)>,
+    transport: Transport,
+    preconnected_seqpacket: bool,
+) -> Result<(), String> {
     let mut poll = Poll::new().map_err(|e| format!("Poll::new: {e}"))?;
-    eprintln!("[init] run_loop after Poll::new");
     let mut events = Events::with_capacity(64);
 
     let mut state = State {
@@ -166,7 +199,37 @@ pub fn run_loop(
         client_slots: Vec::new(),
         transport,
         mount_fds: Vec::new(),
+        dynamic_mounts: HashMap::new(),
+        host_root_fd: None,
     };
+
+    // Bwrap mode: open a long-lived O_PATH fd on `/.tps_host` (the
+    // pre-bound host root) so we can later openat() arbitrary host
+    // paths whose resulting fd lives in our user_ns mount. Then
+    // umount2 + rmdir `/.tps_host` so it leaves no observable trace
+    // for sandboxed processes.
+    #[cfg(target_os = "linux")]
+    if preconnected_seqpacket {
+        let cstr = std::ffi::CString::new("/.tps_host").unwrap();
+        let raw = unsafe {
+            libc::open(cstr.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if raw < 0 {
+            eprintln!(
+                "[init] open(/.tps_host) failed: {} (dynamic mounts will not work)",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            state.host_root_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            // We cannot umount /.tps_host here: locked-rec mounts inherited
+            // from bwrap's `--ro-bind /` cannot be released without
+            // CAP_SYS_ADMIN over the parent user_ns. The staging path
+            // remains visible at `/.tps_host` (dot-prefix hides it from
+            // default `ls`); the held O_PATH fd is what matters for
+            // future `openat()` resolutions.
+        }
+    }
+
     let mut shutdown = false;
 
     // Serial / Vsock-client mode: register the "listener" as a pre-connected
@@ -174,7 +237,7 @@ pub fn run_loop(
     // guest dial in, so by the time we reach run_loop the vsock socket is
     // already a single connected stream — same shape as Serial.
     let mut listener_opt = Some(listener);
-    if transport == Transport::Serial || transport == Transport::Vsock {
+    if transport == Transport::Serial || transport == Transport::Vsock || preconnected_seqpacket {
         let l = listener_opt.take().unwrap();
         let raw = l.as_raw_fd();
         let slot = state.client_slots.len();
@@ -205,8 +268,6 @@ pub fn run_loop(
         .register(&mut SourceFd(&sigfd.as_raw_fd()), TOK_SIGFD, Interest::READABLE)
         .map_err(|e| format!("register sigfd: {e}"))?;
 
-    eprintln!("[init] entering poll loop, transport={transport:?}");
-
     while !shutdown {
         if let Err(e) = poll.poll(&mut events, Some(std::time::Duration::from_millis(2000))) {
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -225,7 +286,7 @@ pub fn run_loop(
                 let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
                 let marker = b"HBHBHBHBHB";
                 let n = unsafe { libc::write(wfd, marker.as_ptr().cast(), marker.len()) };
-                eprintln!("[init] heartbeat: wrote {n} bytes to fd {wfd}");
+                let _ = n;
             }
         }
 
@@ -495,8 +556,8 @@ fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::R
         let res = recv_frame_seqpacket(bf);
         match res {
             Ok(None) => return Ok(false),
-            Ok(Some((Frame::Op(op), _fd))) => {
-                handle_op(op, client_fd, state, registry);
+            Ok(Some((Frame::Op(op), fd))) => {
+                handle_op(op, client_fd, state, registry, fd);
             }
             Ok(Some((other, _))) => {
                 eprintln!("[init] client sent non-Op frame: {other:?}");
@@ -528,7 +589,6 @@ fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &
             }
             return Err(err.to_string());
         }
-        eprintln!("[init] read {n}B from fd {client_fd}");
         if let Some(c) = state.clients.get_mut(&client_fd) {
             c.read_buf.extend_from_slice(&tmp[..n as usize]);
         } else {
@@ -563,14 +623,14 @@ fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &
         };
         let frame: Frame = serde_json::from_slice(&payload).map_err(|e| format!("parse wire frame: {e}"))?;
         match frame {
-            Frame::Op(op) => handle_op(op, client_fd, state, registry),
+            Frame::Op(op) => handle_op(op, client_fd, state, registry, None),
             other => eprintln!("[init] client sent non-Op frame: {other:?}"),
         }
     }
     Ok(true)
 }
 
-fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Registry) {
+fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Registry, attached_fd: Option<OwnedFd>) {
     match op {
         Op::Hello { id, protocol, .. } => {
             let ok = protocol == PROTOCOL_VERSION;
@@ -878,6 +938,13 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::RemoveMount { id, name } => {
             handle_remove_mount(state, client_fd, id, name);
         }
+        Op::AddMountFd { id, name, host_path, target, read_only } => {
+            handle_add_mount_fd(state, client_fd, id, name, host_path, target, read_only);
+            let _ = attached_fd;
+        }
+        Op::RemoveMountByName { id, name } => {
+            handle_remove_mount_by_name(state, client_fd, id, name);
+        }
     }
 }
 
@@ -1016,6 +1083,158 @@ fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, _name: S
     ack(state, client_fd, id, Err(ErrorReply::new(
         ErrorCode::Internal,
         "RemoveMount is Linux-only",
+    )));
+}
+
+#[cfg(target_os = "linux")]
+fn handle_add_mount_fd(
+    state: &mut State,
+    client_fd: RawFd,
+    id: String,
+    name: String,
+    host_path: String,
+    target: String,
+    read_only: bool,
+) {
+    if state.dynamic_mounts.contains_key(&name) {
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::BadRequest,
+            format!("dynamic mount {name:?} already exists"),
+        )));
+        return;
+    }
+    let host_root = match state.host_root_fd.as_ref() {
+        Some(f) => f.as_raw_fd(),
+        None => {
+            ack(state, client_fd, id, Err(ErrorReply::new(
+                ErrorCode::Internal,
+                "host_root_fd unavailable (init started without /.tps_host)",
+            )));
+            return;
+        }
+    };
+    // Strip leading '/'s so openat() treats the path as relative.
+    let rel = host_path.trim_start_matches('/');
+    let rel_for_open: &str = if rel.is_empty() { "." } else { rel };
+    let rel_c = match std::ffi::CString::new(rel_for_open) {
+        Ok(c) => c,
+        Err(e) => {
+            ack(state, client_fd, id, Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("host_path NUL: {e}"),
+            )));
+            return;
+        }
+    };
+    let src_fd = unsafe {
+        libc::openat(
+            host_root,
+            rel_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if src_fd < 0 {
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("openat(host_root, {rel_for_open:?}): {}", std::io::Error::last_os_error()),
+        )));
+        return;
+    }
+    let src_owned = unsafe { OwnedFd::from_raw_fd(src_fd) };
+
+    if let Err(e) = std::fs::create_dir_all(&target) {
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("create_dir_all {target}: {e}"),
+        )));
+        return;
+    }
+    let src_proc = format!("/proc/self/fd/{}", src_owned.as_raw_fd());
+    let src_c = std::ffi::CString::new(src_proc.as_str()).unwrap();
+    let tgt_c = std::ffi::CString::new(target.as_str()).unwrap();
+    let none_c = std::ffi::CString::new("").unwrap();
+    // Source mount is the bwrap-staged `--bind /` (rw). Locked flags
+    // inherited from the user_ns staging are MS_NOSUID|MS_NODEV (bwrap
+    // applies these to all binds), so we must include them. The bind
+    // itself is rw; we remount-RO afterward if the caller asked for it.
+    let base_flags = libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV;
+    let flags = base_flags as libc::c_ulong;
+    let rc = unsafe {
+        libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), std::ptr::null(), flags, std::ptr::null())
+    };
+    if rc != 0 {
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("mount(bind) {src_proc}->{target}: {}", std::io::Error::last_os_error()),
+        )));
+        return;
+    }
+    drop(src_owned);
+    if read_only {
+        let remount_flags = (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RDONLY) as libc::c_ulong;
+        let rc = unsafe {
+            libc::mount(none_c.as_ptr(), tgt_c.as_ptr(), std::ptr::null(), remount_flags, std::ptr::null())
+        };
+        if rc != 0 {
+            let _ = unsafe { libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH) };
+            ack(state, client_fd, id, Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("remount-ro {target}: {}", std::io::Error::last_os_error()),
+            )));
+            return;
+        }
+    }
+    state.dynamic_mounts.insert(name, target);
+    ack(state, client_fd, id, Ok(()));
+}
+
+#[cfg(target_os = "linux")]
+fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, name: String) {
+    let target = match state.dynamic_mounts.remove(&name) {
+        Some(t) => t,
+        None => {
+            ack(state, client_fd, id, Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("no such dynamic mount: {name:?}"),
+            )));
+            return;
+        }
+    };
+    let target_c = std::ffi::CString::new(target.as_str()).unwrap_or_default();
+    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        ack(state, client_fd, id, Err(ErrorReply::new(
+            ErrorCode::Internal,
+            format!("umount2({target}): {err}"),
+        )));
+        return;
+    }
+    let _ = std::fs::remove_dir(&target);
+    ack(state, client_fd, id, Ok(()));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_add_mount_fd(
+    state: &mut State,
+    client_fd: RawFd,
+    id: String,
+    _name: String,
+    _host_path: String,
+    _target: String,
+    _read_only: bool,
+) {
+    ack(state, client_fd, id, Err(ErrorReply::new(
+        ErrorCode::Internal,
+        "AddMountFd is Linux-only",
+    )));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, _name: String) {
+    ack(state, client_fd, id, Err(ErrorReply::new(
+        ErrorCode::Internal,
+        "RemoveMountByName is Linux-only",
     )));
 }
 
@@ -1339,5 +1558,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::MountManifest { .. } => "MountManifest",
         Op::AddMount { .. } => "AddMount",
         Op::RemoveMount { .. } => "RemoveMount",
+        Op::AddMountFd { .. } => "AddMountFd",
+        Op::RemoveMountByName { .. } => "RemoveMountByName",
     }
 }
