@@ -417,25 +417,23 @@ fn network_allow_all_has_nic() {
     let n = link_count(&rx, &sb, &shell);
     assert!(n >= 2, "AllowAll policy must yield ≥2 links (lo + NIC), got {n}");
 
-    // Confirm the non-loopback NIC actually has an IPv4 address assigned by
-    // HCN's NAT (192.168.127.0/24). Outbound public-internet egress is too
-    // env-dependent to assert (corp firewalls, missing routes), so we stop
-    // at the link-layer/IP-layer invariants.
+    // Egress probe — AllowAll should let the guest open an outbound TCP
+    // connection. We use 1.1.1.1:53 (Cloudflare DNS) as a stable target
+    // that is reachable from virtually any internet-connected host.
+    // The exact NIC IP / subnet depends on the backend (Windows: HCN NAT
+    // 192.168.127.0/24; Linux bwrap: shared host netns; macOS VZ: bridged
+    // NAT) — what we assert is the *capability*, not the implementation.
     sb.write_stdin(
         &shell,
-        b"for n in /sys/class/net/*/address; do iface=$(basename $(dirname $n)); [ \"$iface\" = lo ] && continue; \
-          op=$(cat /sys/class/net/$iface/operstate 2>/dev/null); \
-          ip4=$(cat /proc/net/fib_trie 2>/dev/null | grep -E '192\\.168\\.127\\.' | head -1); \
-          echo NIC_$iface=$op ADDR=$ip4; \
-        done; echo NIC_PROBE_DONE\n",
+        b"timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53 && echo NET_OK_ALLOW || echo NET_FAIL_ALLOW'; echo NET_PROBE_DONE\n",
     )
     .unwrap();
-    let probe = drain_until(&rx, &shell, "NIC_PROBE_DONE", Duration::from_secs(15));
+    let probe = drain_until(&rx, &shell, "NET_PROBE_DONE", Duration::from_secs(15));
 
     sb.stop_vm().ok();
     assert!(
-        probe.contains("192.168.127."),
-        "AllowAll: NIC has no HCN-assigned IPv4 in 192.168.127.0/24. probe={probe:?}"
+        probe.contains("NET_OK_ALLOW"),
+        "AllowAll: egress to 1.1.1.1:53 should succeed. probe={probe:?}"
     );
 }
 

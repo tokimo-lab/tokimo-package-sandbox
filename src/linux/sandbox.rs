@@ -14,7 +14,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -185,6 +185,16 @@ impl SandboxBackend for LinuxBackend {
         if Path::new("/lib64").is_dir() {
             args.extend(["--ro-bind", "/lib64", "/lib64"].iter().map(|s| s.to_string()));
         }
+        // /sys handling depends on network policy:
+        //   - AllowAll: bind-mount host's /sys so the guest sees the same
+        //     NIC list as the host (the netns is shared).
+        //   - Blocked:  provide an empty /sys mount point and let the init
+        //     binary mount a fresh sysfs from inside the new netns. Sysfs
+        //     in a fresh netns is filtered by the kernel to show only that
+        //     netns's interfaces (lo). A bind-mount would leak the host
+        //     view, so we cannot use it here.
+        // The actual mount is appended below inside the network-policy
+        // match block so the two modes stay symmetric.
         if Path::new("/etc/alternatives").is_dir() {
             args.extend(
                 ["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
@@ -289,9 +299,19 @@ impl SandboxBackend for LinuxBackend {
 
         // Network policy.
         match config.network {
-            NetworkPolicy::AllowAll => {}
+            NetworkPolicy::AllowAll => {
+                if Path::new("/sys").is_dir() {
+                    args.extend(["--ro-bind", "/sys", "/sys"].iter().map(|s| s.to_string()));
+                }
+            }
             NetworkPolicy::Blocked => {
                 args.push("--unshare-net".to_string());
+                args.extend(["--dir", "/sys"].iter().map(|s| s.to_string()));
+                args.extend([
+                    "--setenv".to_string(),
+                    "TOKIMO_SANDBOX_MOUNT_SYSFS".to_string(),
+                    "1".to_string(),
+                ]);
                 args.extend([
                     "--setenv".to_string(),
                     "TOKIMO_SANDBOX_BRINGUP_LO".to_string(),

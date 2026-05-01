@@ -174,6 +174,14 @@ fn run() -> Result<(), String> {
         if let Err(e) = chroot("/mnt/work") {
             return Err(format!("chroot /mnt/work: {e}"));
         }
+    } else if !pre_chrooted && env::var("TOKIMO_SANDBOX_MOUNT_SYSFS").as_deref() == Ok("1") {
+        // bwrap + Blocked mode: host provides an empty /sys; mount fresh
+        // sysfs here so `/sys/class/net` is filtered by our new netns.
+        match mount_fs("sysfs", "/sys", "sysfs", 0, "") {
+            Ok(()) => {}
+            Err(e) if e.contains("Resource busy") || e.contains("16") => {}
+            Err(e) => eprintln!("[tokimo-sandbox-init] WARN: mount /sys: {e}"),
+        }
     }
 
     let mut mask = SigSet::empty();
