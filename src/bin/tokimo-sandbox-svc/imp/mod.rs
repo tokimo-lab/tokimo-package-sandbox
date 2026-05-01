@@ -57,8 +57,6 @@ use tokimo_package_sandbox::svc_protocol::{
 };
 use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
-#[allow(dead_code)] // retained for reference; superseded by `netstack`.
-mod hcn;
 mod hcs;
 mod hvsock;
 mod netstack;
@@ -936,7 +934,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         init_port,
         netstack_port,
     );
-    let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
+
 
     let api = hcs::HcsApi::init().map_err(|e| RpcError::new("hcs_init", e))?;
     let cs = api

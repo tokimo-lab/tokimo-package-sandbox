@@ -35,10 +35,10 @@ Key types exported from `src/lib.rs`: `Sandbox`, `SandboxBackend`, `ConfigurePar
 Sandbox client (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (LocalSystem)
                                                 │
                                                 ├─ ComputeCore.dll (HCS API) ──▶ Hyper-V micro-VM
-                                                └─ computenetwork.dll (HCN)  ──▶ NAT network + endpoint
+                                                └─ smoltcp userspace netstack ──▶ NAT (AllowAll)
 ```
 
-The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using JSON-RPC over length-prefixed frames (`src/svc_protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, creates a NAT network via HCN, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
+The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using JSON-RPC over length-prefixed frames (`src/svc_protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, runs a userspace netstack (smoltcp) for NAT, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
 
 Guest-side: `tokimo-sandbox-init` (`src/bin/tokimo-sandbox-init/`) runs as PID 1 inside the sandbox container. It supports two transports:
 - **Unix SEQPACKET** — for Linux bwrap backend
@@ -184,14 +184,6 @@ The verified API surface, grouped by file:
 | `Win32_System_LibraryLoader` | `GetProcAddress`, `LoadLibraryW` |
 | `windows::core` | `HSTRING`, `PCSTR` |
 
-### `src/bin/tokimo-sandbox-svc/imp/hcn.rs` (computenetwork.dll loader)
-
-| Crate feature | Items used |
-|---|---|
-| `Win32_Foundation` | `FreeLibrary`, `HLOCAL`, `HMODULE`, `LocalFree` |
-| `Win32_System_LibraryLoader` | `GetProcAddress`, `LoadLibraryW` |
-| `windows::core` | `GUID`, `HSTRING`, `PCSTR` |
-
 ### `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` (AF_HYPERV listener)
 
 | Crate feature | Items used |
@@ -251,7 +243,6 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 | `src/bin/tokimo-sandbox-svc/main.rs` | Service entry point |
 | `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, per-session handler |
 | `src/bin/tokimo-sandbox-svc/imp/hcs.rs` | HCS API wrapper: loads `ComputeCore.dll`, exposes create/start/terminate/close/poll |
-| `src/bin/tokimo-sandbox-svc/imp/hcn.rs` | HCN API wrapper: loads `computenetwork.dll`, manages NAT network + per-session endpoints |
 | `src/bin/tokimo-sandbox-svc/imp/vmconfig.rs` | HCS Schema 2.x JSON config builder; `alloc_session_init_port()` for per-session hvsock GUIDs |
 | `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` | AF_HYPERV listener with per-session ServiceId |
 | `src/bin/tokimo-sandbox-svc/imp/vhdx_pool.rs` | Per-target rootfs VHDX leasing (ephemeral clone vs persistent lock) |

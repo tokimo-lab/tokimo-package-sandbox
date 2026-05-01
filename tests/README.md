@@ -57,9 +57,6 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 |---|---|
 | `target/integration/test.log` | Last `cargo test` output (test results) |
 | `target/integration/svc.log` | Last service console-mode stdout |
-| `C:\tokimo-debug\last-hcs-session-config.json` | Last HCS schema 2.x config sent to ComputeCore.dll |
-| `C:\tokimo-debug\last-hcn-network.json` | Last HCN NAT network create payload |
-| `C:\tokimo-debug\last-hcn-endpoint.json` | Last HCN endpoint create payload |
 | `C:\tokimo-debug\last-vm-com2.log` | Last guest kernel kmsg (COM2) |
 | `C:\tokimo-debug\last-vm-tunnel.log` | Last init-control tunnel byte log |
 
