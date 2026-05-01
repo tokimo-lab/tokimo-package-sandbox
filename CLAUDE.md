@@ -58,8 +58,9 @@ Sandbox client (library, in-process)
                        [--unshare-net for Blocked]
                        --bind / staging
                        --cap-add CAP_SYS_ADMIN
-                       --setenv TOKIMO_SANDBOX_CONTROL_FD=<n>
-                       -- /path/to/tokimo-sandbox-init
+                       -- /path/to/tokimo-sandbox-init bwrap
+                              --control-fd=<n>
+                              [--bringup-lo --mount-sysfs for Blocked]
                                          │
                                          └─ runs as PID 2 (bwrap is PID 1)
                                             speaks the same protocol as the
@@ -325,12 +326,10 @@ See `docs/macos-testing.md` for the full setup walkthrough.
 |---|---|
 | `SAFEBOX_DISABLE=1` | Bypass sandbox entirely, run natively (debug escape hatch) |
 | `TOKIMO_VERIFY_CALLER=1` | Enforce Authenticode verification of pipe clients (Windows service) |
-| `TOKIMO_SANDBOX_CONTROL_FD=<n>` | Linux/bwrap: tells init which inherited fd is the SEQPACKET control socket |
-| `TOKIMO_SANDBOX_ALLOW_NON_PID1=1` | Linux/bwrap: bypass the strict PID-1 handshake check (init runs as PID 2 because bwrap is PID 1) |
-| `TOKIMO_SANDBOX_BRINGUP_LO=1` | Linux/bwrap Blocked policy: have init bring up `lo` after entering the new netns |
-| `TOKIMO_SANDBOX_MOUNT_SYSFS=1` | Linux/bwrap Blocked policy: have init mount a fresh `sysfs` at `/sys` so `/sys/class/net` is filtered by the new netns |
 | `TOKIMO_SANDBOX_PRE_CHROOTED=1` | VM modes: skip init's mount/chroot setup because `init.sh` already did it |
 | `TOKIMO_VM_DIR=<path>` | macOS / Windows: override VM artifact discovery (default walks up from cwd looking for `vm/`) |
+
+Linux/bwrap configuration is passed via argv (subcommand `tokimo-sandbox-init bwrap --control-fd=<n> [--bringup-lo] [--mount-sysfs]`) rather than env vars, so nothing leaks into spawned children.
 
 ## Windows VM artifacts
 

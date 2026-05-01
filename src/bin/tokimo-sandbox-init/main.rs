@@ -111,10 +111,49 @@ fn main() {
     std::process::exit(1);
 }
 
+/// Argv-driven Linux/bwrap configuration.
+///
+/// Invoked as: `tokimo-sandbox-init bwrap --control-fd=N [--bringup-lo]
+/// [--mount-sysfs]`. VM modes (macOS VZ / Windows HCS) still use env-var
+/// driven config because they're triggered from `init.sh` shipped inside
+/// the initrd image, which we don't want to rev unilaterally; their flags
+/// (`TOKIMO_SANDBOX_VSOCK_PORT`, `TOKIMO_SANDBOX_PRE_CHROOTED`,
+/// `TOKIMO_SANDBOX_GUEST_LISTENS`, `TOKIMO_SANDBOX_SERIAL_MODE`) are
+/// auto-stripped from spawned-child env by `snapshot_base_env`.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct BwrapCli {
+    control_fd: Option<i32>,
+    bringup_lo: bool,
+    mount_sysfs: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_bwrap_cli() -> Option<BwrapCli> {
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) != Some("bwrap") {
+        return None;
+    }
+    let mut cli = BwrapCli::default();
+    for a in &args[2..] {
+        if let Some(v) = a.strip_prefix("--control-fd=") {
+            cli.control_fd = Some(v.parse().ok()?);
+        } else if a == "--bringup-lo" {
+            cli.bringup_lo = true;
+        } else if a == "--mount-sysfs" {
+            cli.mount_sysfs = true;
+        } else {
+            eprintln!("[tokimo-sandbox-init] WARN: unknown bwrap arg {a:?}");
+        }
+    }
+    Some(cli)
+}
+
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), String> {
     let pid = getpid();
-    let bwrap_mode = std::env::var_os("TOKIMO_SANDBOX_CONTROL_FD").is_some();
+    let bwrap_cli = parse_bwrap_cli();
+    let bwrap_mode = bwrap_cli.is_some();
     if pid.as_raw() != 1 && !bwrap_mode {
         return Err(format!("init must be PID 1 (got {}); host forgot --as-pid-1", pid));
     }
@@ -174,7 +213,7 @@ fn run() -> Result<(), String> {
         if let Err(e) = chroot("/mnt/work") {
             return Err(format!("chroot /mnt/work: {e}"));
         }
-    } else if !pre_chrooted && env::var("TOKIMO_SANDBOX_MOUNT_SYSFS").as_deref() == Ok("1") {
+    } else if !pre_chrooted && bwrap_cli.as_ref().map(|c| c.mount_sysfs).unwrap_or(false) {
         // bwrap + Blocked mode: host provides an empty /sys; mount fresh
         // sysfs here so `/sys/class/net` is filtered by our new netns.
         match mount_fs("sysfs", "/sys", "sysfs", 0, "") {
@@ -231,16 +270,16 @@ fn run() -> Result<(), String> {
 
     // Choose transport.
     // Priority order:
-    //   1. Linux bwrap mode: TOKIMO_SANDBOX_CONTROL_FD points at an
+    //   1. Linux bwrap mode: argv `bwrap --control-fd=N` points at an
     //      already-connected SEQPACKET socket inherited from the host
     //      via socketpair + pre_exec(clear CLOEXEC).
     //   2. Serial mode (legacy Windows HCS).
     //   3. Vsock (modern Windows HCS / macOS VZ).
     //   4. Default: bind a SEQPACKET listener at the well-known path.
-    if let Ok(raw_str) = env::var("TOKIMO_SANDBOX_CONTROL_FD") {
-        let raw: i32 = raw_str
-            .parse()
-            .map_err(|e| format!("bad TOKIMO_SANDBOX_CONTROL_FD={raw_str}: {e}"))?;
+    if let Some(cli) = bwrap_cli.as_ref() {
+        let raw = cli
+            .control_fd
+            .ok_or_else(|| "bwrap mode requires --control-fd=N".to_string())?;
         // Set non-blocking — mio + recv_frame_seqpacket expect EAGAIN on no-data.
         let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
         if flags == -1 {
@@ -258,7 +297,7 @@ fn run() -> Result<(), String> {
         let client = unsafe { OwnedFd::from_raw_fd(raw) };
 
         // bwrap-side bringup: optional loopback up.
-        if env::var("TOKIMO_SANDBOX_BRINGUP_LO").as_deref() == Ok("1") {
+        if cli.bringup_lo {
             if let Err(e) = bringup_lo() {
                 eprintln!("[tokimo-sandbox-init] WARN bringup_lo: {e}");
             }

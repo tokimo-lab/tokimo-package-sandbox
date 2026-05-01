@@ -298,6 +298,8 @@ impl SandboxBackend for LinuxBackend {
         args.extend(["--bind".to_string(), "/".to_string(), "/.tps_host".to_string()]);
 
         // Network policy.
+        let mut mount_sysfs = false;
+        let mut bringup_lo = false;
         match config.network {
             NetworkPolicy::AllowAll => {
                 if Path::new("/sys").is_dir() {
@@ -307,39 +309,38 @@ impl SandboxBackend for LinuxBackend {
             NetworkPolicy::Blocked => {
                 args.push("--unshare-net".to_string());
                 args.extend(["--dir", "/sys"].iter().map(|s| s.to_string()));
-                args.extend([
-                    "--setenv".to_string(),
-                    "TOKIMO_SANDBOX_MOUNT_SYSFS".to_string(),
-                    "1".to_string(),
-                ]);
-                args.extend([
-                    "--setenv".to_string(),
-                    "TOKIMO_SANDBOX_BRINGUP_LO".to_string(),
-                    "1".to_string(),
-                ]);
+                mount_sysfs = true;
+                bringup_lo = true;
             }
         }
 
-        // Tell init how to find the inherited control fd.
-        args.extend([
-            "--setenv".to_string(),
-            "TOKIMO_SANDBOX_CONTROL_FD".to_string(),
-            child_fd_raw.to_string(),
-        ]);
-
         args.push("--".to_string());
         args.push(init_path.display().to_string());
+        // Init subcommand + flags. The control fd is inherited from the
+        // socketpair via pre_exec (CLOEXEC cleared); init is told its
+        // numeric value via argv. See `tokimo-sandbox-init bwrap` parser.
+        args.push("bwrap".to_string());
+        args.push(format!("--control-fd={child_fd_raw}"));
+        if bringup_lo {
+            args.push("--bringup-lo".to_string());
+        }
+        if mount_sysfs {
+            args.push("--mount-sysfs".to_string());
+        }
 
         // Make the init binary visible inside the container at the exact
         // same path we just substituted into argv. bwrap re-execs into
         // the container's mount namespace before running the init, so
         // the path must resolve there.
         let init_dir = init_path.parent().unwrap_or(Path::new("/"));
-        // Insert this BEFORE the `--` separator. We'll splice it in.
-        // Easier: just push another --ro-bind earlier — but at this point
-        // we've already pushed `--`. Recover by inserting before tail.
-        let tail_len = 2; // [--, init_path]
-        let insert_at = args.len() - tail_len;
+        // Insert this BEFORE the `--` separator. We tracked the tail
+        // length (init_path + bwrap subcommand + flags) so we can splice
+        // in --ro-bind without disturbing it.
+        let tail_len = 1 /* init_path */ + 1 /* "bwrap" */ + 1 /* --control-fd */
+            + bringup_lo as usize + mount_sysfs as usize;
+        // The `--` separator sits before the tail; insert --ro-bind in
+        // front of it.
+        let insert_at = args.len() - tail_len - 1;
         args.insert(insert_at, "--ro-bind".to_string());
         args.insert(insert_at + 1, init_dir.display().to_string());
         args.insert(insert_at + 2, init_dir.display().to_string());
@@ -374,12 +375,7 @@ impl SandboxBackend for LinuxBackend {
         // bwrap mode: init runs as PID 2 (bwrap is PID 1) — we
         // intentionally avoid `--as-pid-1` because the nested user_ns
         // it creates strips CAP_SYS_ADMIN over our outer mounts.
-        // Tell InitClient to allow the non-PID-1 hello.
-        // SAFETY: env-var writes are not thread-safe in general; we
-        // accept that this is set before any concurrent threads run.
-        unsafe {
-            std::env::set_var("TOKIMO_SANDBOX_ALLOW_NON_PID1", "1");
-        }
+        // `from_fd` defaults to expect_pid1=false (correct for bwrap).
         let init_client =
             InitClient::from_fd(host_end).map_err(|e| Error::other(format!("InitClient::from_fd: {e}")))?;
         init_client

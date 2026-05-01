@@ -50,12 +50,17 @@ struct Shared {
 /// + shared state).
 pub struct InitClient {
     inner: Arc<Inner>,
+    /// True if the host expects init to be PID 1 (VM modes). False for
+    /// bwrap mode where bwrap is PID 1 and init is PID 2. The host knows
+    /// which mode it's in, so this is set by the constructor rather than
+    /// inferred via env-var hack.
+    expect_pid1: bool,
 }
 
 struct Inner {
     sock: OwnedFd,
     /// Mutex around send so concurrent op submissions don't interleave on
-    /// the SEQPACKET (kernel handles atomicity per packet, but our build
+    /// the SEQPACKET (kernel atomicity is per-packet, but our build
     /// of the JSON payload would otherwise be racy).
     send_lock: Mutex<()>,
     state: Arc<(Mutex<Shared>, Condvar)>,
@@ -68,7 +73,19 @@ impl InitClient {
     /// Wrap an already-connected SEQPACKET socket (e.g. one half of a
     /// `socketpair(2)` whose other end was inherited by the bwrap+init
     /// child via `Command::pre_exec`). Spawns the reader thread.
+    /// Bwrap mode: init runs as PID 2 (bwrap is PID 1).
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
+        Self::from_fd_inner(fd, false)
+    }
+
+    /// Same as [`from_fd`] but for VM-mode transports where init is
+    /// guaranteed to be PID 1; rejects the Hello reply otherwise.
+    #[allow(dead_code)]
+    pub fn from_fd_expect_pid1(fd: OwnedFd) -> Result<Self> {
+        Self::from_fd_inner(fd, true)
+    }
+
+    fn from_fd_inner(fd: OwnedFd, expect_pid1: bool) -> Result<Self> {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
         let reader_fd_raw = fd.as_raw_fd();
@@ -85,6 +102,7 @@ impl InitClient {
                 counter: AtomicU64::new(0),
                 _reader: Mutex::new(Some(reader)),
             }),
+            expect_pid1,
         })
     }
 
@@ -121,8 +139,7 @@ impl InitClient {
                 // strict PID-1 check is meaningful only for the VM
                 // backends where init is the literal first userspace
                 // process.
-                let allow_non_pid1 = std::env::var_os("TOKIMO_SANDBOX_ALLOW_NON_PID1").is_some();
-                if init_pid != 1 && !allow_non_pid1 {
+                if init_pid != 1 && self.expect_pid1 {
                     return Err(Error::exec(format!(
                         "init not PID 1 (got {init_pid}); host forgot --as-pid-1"
                     )));
