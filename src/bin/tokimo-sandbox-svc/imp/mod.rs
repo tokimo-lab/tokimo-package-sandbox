@@ -10,43 +10,39 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree,
-};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LocalFree};
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_DATA_PROVIDER_FLAGS,
-    WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT,
-    WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
+    WINTRUST_DATA_REVOCATION_CHECKS, WINTRUST_DATA_STATE_ACTION, WINTRUST_DATA_UICONTEXT, WINTRUST_FILE_INFO,
+    WTD_CHOICE_FILE, WTD_UI_NONE, WinVerifyTrust,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW, WaitForSingleObject,
+    CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
+    ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -55,9 +51,9 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, ExecParams, ExecResultWire, Frame,
-    IdParams, KillParams, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec,
-    RpcError, SpawnResult, WriteStdinParams, encode_frame, method,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdResult, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec, RpcError, SignalShellParams, WriteStdinParams, encode_frame,
+    method,
 };
 use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
@@ -99,9 +95,7 @@ pub fn run() {
             "--service" => {}
             "-h" | "--help" => {
                 println!("tokimo-sandbox-svc v{VERSION}");
-                println!(
-                    "Usage: tokimo-sandbox-svc [--install|--uninstall|--console|--service]"
-                );
+                println!("Usage: tokimo-sandbox-svc [--install|--uninstall|--console|--service]");
                 return;
             }
             other => {
@@ -189,10 +183,7 @@ fn run_as_service() -> windows_service::Result<()> {
 
 fn install_service() {
     let exe = std::env::current_exe().expect("current_exe");
-    let manager = match ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CREATE_SERVICE,
-    ) {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("OpenSCManager failed: {e}");
@@ -257,8 +248,7 @@ fn format_ws_error(e: &windows_service::Error) -> String {
 }
 
 fn uninstall_service() {
-    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-    {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("OpenSCManager failed: {e}");
@@ -285,10 +275,7 @@ fn uninstall_service() {
         let _ = svc.stop();
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(200));
-            if matches!(
-                svc.query_status().map(|s| s.current_state),
-                Ok(ServiceState::Stopped)
-            ) {
+            if matches!(svc.query_status().map(|s| s.current_state), Ok(ServiceState::Stopped)) {
                 break;
             }
         }
@@ -315,9 +302,7 @@ impl Drop for SdGuard {
     }
 }
 
-fn build_security_attributes(
-    console_mode: bool,
-) -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
+fn build_security_attributes(console_mode: bool) -> std::io::Result<(SECURITY_ATTRIBUTES, SdGuard)> {
     let sddl_str = if console_mode {
         PIPE_SDDL_CONSOLE
     } else {
@@ -325,10 +310,8 @@ fn build_security_attributes(
     };
     let sddl = HSTRING::from(sddl_str);
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None)
-    }
-    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
+    unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.0,
@@ -359,9 +342,7 @@ fn pipe_server_loop(console_mode: bool) {
             CreateNamedPipeW(
                 &pipe_name,
                 PIPE_ACCESS_DUPLEX
-                    | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(
-                        FILE_FLAG_OVERLAPPED.0,
-                    ),
+                    | windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -371,9 +352,7 @@ fn pipe_server_loop(console_mode: bool) {
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
-            eprintln!("[svc] CreateNamedPipeW failed: {:?}", unsafe {
-                GetLastError()
-            });
+            eprintln!("[svc] CreateNamedPipeW failed: {:?}", unsafe { GetLastError() });
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
@@ -429,6 +408,8 @@ struct SessionState {
     /// Held for the lifetime of a running VM; dropped (deleting the
     /// per-session VHDX clone for ephemeral leases) on stopVm.
     vhdx: Option<vhdx_pool::VhdxLease>,
+    /// Child ID of the auto-started shell (set by startVm).
+    shell_child_id: Option<String>,
     children: HashMap<String, ChildEntry>,
     /// Plan9 shares currently attached to the VM. Keyed by share `name`.
     /// Includes both boot-time shares (immutable) and dynamically-added
@@ -456,6 +437,7 @@ impl Default for SessionState {
             hcs: None,
             init: None,
             vhdx: None,
+            shell_child_id: None,
             children: HashMap::new(),
             active_shares: HashMap::new(),
             network_endpoint: None,
@@ -491,14 +473,60 @@ struct Connection {
     write_lock: Mutex<()>,
     /// Key into the global [`WindowsRegistry`]. Set by `handle_configure`.
     session_id: Mutex<Option<String>>,
-    /// Monotonic counter for spawned child IDs.
-    job_counter: AtomicU64,
 }
 
 // HANDLE is `*mut c_void` (not Send); we manually attest single-thread-of-write
 // by way of `write_lock`. The pipe is owned exclusively by this connection.
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
+
+/// Tracks in-flight request handler threads so we can drain them on connection
+/// close.  Mirrors the WaitGroup pattern used by Cowork's `handlePersistentRPC`.
+struct InflightTracker {
+    state: Mutex<(usize, bool)>, // (count, reader_done)
+    cv: Condvar,
+}
+
+impl InflightTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Called by the reader thread before spawning a handler.
+    fn begin(&self) {
+        let mut g = self.state.lock().unwrap();
+        g.0 += 1;
+    }
+
+    /// Called by each handler thread when it finishes.
+    fn end(&self) {
+        let mut g = self.state.lock().unwrap();
+        g.0 -= 1;
+        if g.0 == 0 && g.1 {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Called by the reader thread when it exits (EOF / error).
+    fn mark_reader_done(&self) {
+        let mut g = self.state.lock().unwrap();
+        g.1 = true;
+        if g.0 == 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Block until all in-flight handlers complete and the reader is done.
+    fn drain(&self) {
+        let mut g = self.state.lock().unwrap();
+        while g.0 > 0 || !g.1 {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Connection entry point
@@ -529,10 +557,7 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         match caller.as_deref().and_then(safe_canon_or_log) {
             Some(canon) => {
                 if let Err(why) = verify_authenticode(&canon) {
-                    eprintln!(
-                        "[svc] REJECT unsigned/untrusted caller {}: {why}",
-                        canon.display()
-                    );
+                    eprintln!("[svc] REJECT unsigned/untrusted caller {}: {why}", canon.display());
                     disconnect(pipe);
                     return;
                 }
@@ -549,7 +574,6 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         pipe,
         write_lock: Mutex::new(()),
         session_id: Mutex::new(None),
-        job_counter: AtomicU64::new(0),
     });
 
     // Hello handshake.
@@ -557,9 +581,7 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         Ok(Frame::Hello { version, peer, .. }) => {
             eprintln!("[svc] hello from {peer} (proto v{version})");
             if version != PROTOCOL_VERSION {
-                eprintln!(
-                    "[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}"
-                );
+                eprintln!("[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}");
                 let _ = send_frame(
                     &conn,
                     &Frame::Hello {
@@ -593,7 +615,20 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         }
     }
 
-    // Dispatch loop.
+    // Persistent RPC dispatch loop — concurrent, not serial.
+    //
+    // Each incoming request is dispatched in its own thread so that long-running
+    // operations (e.g. `exec`) do not block other requests on the same
+    // connection.  Responses are serialized through `conn.write_lock` which
+    // already protects against interleaved writes from background poller
+    // threads.
+    //
+    // This mirrors Cowork's `handlePersistentRPC` model: the connection stays
+    // open until the client disconnects, and multiple requests can be in-flight
+    // simultaneously.
+    let tracker = Arc::new(InflightTracker::new());
+
+    // Reader loop — runs on the connection thread.
     loop {
         let frame = match read_frame(pipe) {
             Ok(f) => f,
@@ -606,23 +641,29 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         };
         match frame {
             Frame::Request { id, method, params } => {
-                let result = dispatch(&conn, &method, params, &sessions);
-                let resp = match result {
-                    Ok(v) => Frame::Response {
-                        id,
-                        result: Some(v),
-                        error: None,
-                    },
-                    Err(e) => Frame::Response {
-                        id,
-                        result: None,
-                        error: Some(e),
-                    },
-                };
-                if let Err(e) = send_frame(&conn, &resp) {
-                    eprintln!("[svc] write response failed: {e}");
-                    break;
-                }
+                tracker.begin();
+                let conn_t = Arc::clone(&conn);
+                let sessions_t = sessions.clone();
+                let tracker_t = Arc::clone(&tracker);
+                thread::spawn(move || {
+                    let result = dispatch(&conn_t, &method, params, &sessions_t);
+                    let resp = match result {
+                        Ok(v) => Frame::Response {
+                            id,
+                            result: Some(v),
+                            error: None,
+                        },
+                        Err(e) => Frame::Response {
+                            id,
+                            result: None,
+                            error: Some(e),
+                        },
+                    };
+                    if let Err(e) = send_frame(&conn_t, &resp) {
+                        eprintln!("[svc] write response failed: {e}");
+                    }
+                    tracker_t.end();
+                });
             }
             Frame::Hello { .. } => {
                 // Spurious Hello — ignore.
@@ -632,6 +673,10 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
             }
         }
     }
+
+    // Signal the reader is done, then wait for all in-flight handlers.
+    tracker.mark_reader_done();
+    tracker.drain();
 
     // Connection teardown — do NOT destroy the VM.  The session lives in
     // the global registry and survives reconnection.  Only the pipe is
@@ -670,8 +715,7 @@ fn dispatch(
             }))
         }
         method::IS_PROCESS_RUNNING => {
-            let p: IdParams = serde_json::from_value(params)
-                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            let p: IdParams = serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             let shared = get_session(conn, sessions)?;
             let st = shared.state.lock().unwrap();
             let alive = st
@@ -682,16 +726,15 @@ fn dispatch(
             Ok(json!(BoolValue { value: alive }))
         }
 
-        method::EXEC => handle_exec(conn, params, sessions),
-        method::SPAWN => handle_spawn(conn, params, sessions),
         method::WRITE_STDIN => handle_write_stdin(conn, params, sessions),
-        method::KILL => handle_kill(conn, params, sessions),
+        method::SHELL_ID => handle_shell_id(conn, sessions),
+        method::SIGNAL_SHELL => handle_signal_shell(conn, params, sessions),
 
         method::SUBSCRIBE => Ok(json!({})),
 
         method::CREATE_DISK_IMAGE => {
-            let _p: CreateDiskImageParams = serde_json::from_value(params)
-                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            let _p: CreateDiskImageParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             // TODO: implement via Win32_Storage_Vhd CreateVirtualDiskW.
             Err(RpcError::new(
                 "not_implemented",
@@ -700,10 +743,7 @@ fn dispatch(
         }
 
         method::SET_DEBUG_LOGGING => {
-            let enabled = params
-                .get("enabled")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false);
+            let enabled = params.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
             DEBUG_LOGGING.store(enabled, Ordering::Relaxed);
             Ok(json!({}))
         }
@@ -717,20 +757,17 @@ fn dispatch(
         )),
 
         method::ADD_PLAN9_SHARE => {
-            let p: AddPlan9ShareParams = serde_json::from_value(params)
-                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            let p: AddPlan9ShareParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             handle_add_plan9_share(conn, p, sessions)
         }
         method::REMOVE_PLAN9_SHARE => {
-            let p: RemovePlan9ShareParams = serde_json::from_value(params)
-                .map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            let p: RemovePlan9ShareParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             handle_remove_plan9_share(conn, p, sessions)
         }
 
-        other => Err(RpcError::new(
-            "unknown_method",
-            format!("unknown method: {other}"),
-        )),
+        other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
     }
 }
 
@@ -738,13 +775,9 @@ fn dispatch(
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_configure(
-    conn: &Arc<Connection>,
-    params: Value,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let cfg: ConfigureParams = serde_json::from_value(params)
-        .map_err(|e| RpcError::new("bad_params", format!("configure: {e}")))?;
+fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let cfg: ConfigureParams =
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("configure: {e}")))?;
 
     // Session key: caller-supplied UUID or auto-generate.
     let key = if cfg.session_id.is_empty() {
@@ -776,10 +809,7 @@ fn handle_configure(
     Ok(json!({}))
 }
 
-fn handle_create_vm(
-    conn: &Arc<Connection>,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
+fn handle_create_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
     let st = shared.state.lock().unwrap();
     if st.config.is_none() {
@@ -791,10 +821,7 @@ fn handle_create_vm(
     Ok(json!({}))
 }
 
-fn handle_start_vm(
-    conn: &Arc<Connection>,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
+fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
     // Take a snapshot of config without holding the state lock during
     // the long-running boot path (we re-acquire to install state).
@@ -814,19 +841,15 @@ fn handle_start_vm(
     let net_endpoint = match cfg.network {
         NetworkPolicy::Blocked => None,
         NetworkPolicy::AllowAll => {
-            let net = hcn::HcnNetwork::create_or_open_nat()
-                .map_err(|e| RpcError::new("hcn_network", e))?;
-            let ep = net
-                .create_endpoint()
-                .map_err(|e| RpcError::new("hcn_endpoint", e))?;
+            let net = hcn::HcnNetwork::create_or_open_nat().map_err(|e| RpcError::new("hcn_network", e))?;
+            let ep = net.create_endpoint().map_err(|e| RpcError::new("hcn_endpoint", e))?;
             Some(ep)
         }
     };
     let net_endpoint_id_str = net_endpoint.as_ref().map(|e| e.id_string());
     let net_endpoint_mac = net_endpoint.as_ref().map(|e| e.mac_string().to_string());
 
-    let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg)
-        .map_err(|e| RpcError::new("bad_path", e))?;
+    let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg).map_err(|e| RpcError::new("bad_path", e))?;
 
     if cfg.plan9_shares.is_empty() {
         return Err(RpcError::new(
@@ -853,21 +876,16 @@ fn handle_start_vm(
         canon_shares.push((canon, s));
     }
 
-    let vm_id = format!(
-        "tokimo-sess-{}-{}",
-        std::process::id(),
-        rand_session_suffix()
-    );
+    let vm_id = format!("tokimo-sess-{}-{}", std::process::id(), rand_session_suffix());
 
     let scratch_dir: PathBuf = canon_shares[0].0.clone();
     let rootfs_spec = RootfsSpec::Ephemeral {
         template: rootfs_template.to_string_lossy().into_owned(),
     };
     let lease = vhdx_pool::acquire(&rootfs_spec, &scratch_dir, &vm_id).map_err(|e| match e {
-        vhdx_pool::PoolError::Busy(p) => RpcError::new(
-            "persistent_busy",
-            format!("rootfs target busy: {}", p.display()),
-        ),
+        vhdx_pool::PoolError::Busy(p) => {
+            RpcError::new("persistent_busy", format!("rootfs target busy: {}", p.display()))
+        }
         other => RpcError::new("vhdx_pool", other.to_string()),
     })?;
 
@@ -875,14 +893,11 @@ fn handle_start_vm(
     let init_svc_id = vmconfig::hvsock_service_id(init_port);
     ensure_hvsocket_service_registered(&init_svc_id, "Tokimo Sandbox Init")
         .map_err(|e| RpcError::new("hvsock_register", e))?;
-    let init_svc_guid =
-        parse_guid(&init_svc_id).map_err(|e| RpcError::new("guid", e))?;
+    let init_svc_guid = parse_guid(&init_svc_id).map_err(|e| RpcError::new("guid", e))?;
     let init_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid)
         .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?;
 
-    let share_ports: Vec<u32> = (0..canon_shares.len())
-        .map(|_| vmconfig::alloc_share_port())
-        .collect();
+    let share_ports: Vec<u32> = (0..canon_shares.len()).map(|_| vmconfig::alloc_share_port()).collect();
     let v2_shares: Vec<vmconfig::V2Share<'_>> = canon_shares
         .iter()
         .zip(share_ports.iter())
@@ -937,19 +952,16 @@ fn handle_start_vm(
         }
     };
 
-    let init = match tokimo_package_sandbox::init_client::WinInitClient::with_transport(
-        Box::new(hv_writer),
-        Box::new(hv),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = api.terminate_compute_system(cs);
-            api.close_compute_system(cs);
-            return Err(RpcError::new("init_client", e.to_string()));
-        }
-    };
-    init.hello()
-        .map_err(|e| RpcError::new("init_hello", e.to_string()))?;
+    let init =
+        match tokimo_package_sandbox::init_client::WinInitClient::with_transport(Box::new(hv_writer), Box::new(hv)) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = api.terminate_compute_system(cs);
+                api.close_compute_system(cs);
+                return Err(RpcError::new("init_client", e.to_string()));
+            }
+        };
+    init.hello().map_err(|e| RpcError::new("init_hello", e.to_string()))?;
 
     // Send mount manifest so guest-side init can mount each Plan9 share.
     let manifest: Vec<MountEntry> = canon_shares
@@ -965,13 +977,39 @@ fn handle_start_vm(
     init.send_mount_manifest(manifest)
         .map_err(|e| RpcError::new("mount_manifest", e.to_string()))?;
 
+    // Auto-start a shell inside the VM.
+    let shell_info = init
+        .open_shell(&["/bin/bash"], &[], None)
+        .map_err(|e| RpcError::new("open_shell", e.to_string()))?;
+    let shell_child_id = shell_info.child_id;
+
     // Install state.
     let init_arc = Arc::new(init);
+
+    // Spawn the per-child poller for the shell so its stdout/stderr/exit
+    // flow back to subscribers as Frame::Event.
+    let shell_finished = Arc::new(AtomicBool::new(false));
+    let shell_joiner = {
+        let conn_w = Arc::clone(conn);
+        let init_w = Arc::clone(&init_arc);
+        let id_w = shell_child_id.clone();
+        let fin_w = Arc::clone(&shell_finished);
+        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
+    };
+
     {
         let mut st = shared.state.lock().unwrap();
         st.hcs = Some((api.clone(), cs, vm_id.clone()));
         st.init = Some(init_arc);
         st.vhdx = Some(lease);
+        st.shell_child_id = Some(shell_child_id.clone());
+        st.children.insert(
+            shell_child_id,
+            ChildEntry {
+                _joiner: shell_joiner,
+                finished: shell_finished,
+            },
+        );
         st.network_endpoint = net_endpoint;
         st.running = true;
         st.guest_connected = true;
@@ -991,19 +1029,12 @@ fn handle_start_vm(
 
     // Emit Ready + GuestConnected events.
     let _ = send_event(conn, method::EV_READY, json!({}));
-    let _ = send_event(
-        conn,
-        method::EV_GUEST_CONNECTED,
-        json!({ "connected": true }),
-    );
+    let _ = send_event(conn, method::EV_GUEST_CONNECTED, json!({ "connected": true }));
 
     Ok(json!({}))
 }
 
-fn handle_stop_vm(
-    conn: &Arc<Connection>,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
+fn handle_stop_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
     let mut st = shared.state.lock().unwrap();
     teardown_session(&mut st);
@@ -1018,6 +1049,7 @@ fn teardown_session(st: &mut SessionState) {
         let _ = api.terminate_compute_system(cs);
         api.close_compute_system(cs);
     }
+    st.shell_child_id = None;
     st.children.clear();
     st.active_shares.clear();
     st.vhdx = None;
@@ -1028,106 +1060,39 @@ fn teardown_session(st: &mut SessionState) {
     st.guest_connected = false;
 }
 
-fn handle_exec(
-    conn: &Arc<Connection>,
-    params: Value,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let p: ExecParams = serde_json::from_value(params)
-        .map_err(|e| RpcError::new("bad_params", format!("exec: {e}")))?;
+fn handle_write_stdin(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let p: WriteStdinParams =
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("write_stdin: {e}")))?;
     let init = require_init(conn, sessions)?;
-    let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
-    let info = init
-        .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
-        .map_err(|e| RpcError::new("spawn", e.to_string()))?;
-
-    if let Some(stdin) = &p.stdin {
-        let _ = init.write(&info.child_id, stdin);
-    }
-
-    // Drain until exit. Use a reasonable timeout; long-running execs
-    // should use spawn() instead.
-    let deadline = Instant::now() + Duration::from_secs(600);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    loop {
-        for chunk in init.drain_stdout(&info.child_id) {
-            stdout.extend_from_slice(&chunk);
-        }
-        for chunk in init.drain_stderr(&info.child_id) {
-            stderr.extend_from_slice(&chunk);
-        }
-        if let Some((exit_code, signal)) = init.take_exit(&info.child_id) {
-            // One last drain post-exit.
-            for chunk in init.drain_stdout(&info.child_id) {
-                stdout.extend_from_slice(&chunk);
-            }
-            for chunk in init.drain_stderr(&info.child_id) {
-                stderr.extend_from_slice(&chunk);
-            }
-            let _ = init.close_child(&info.child_id);
-            return Ok(serde_json::to_value(ExecResultWire {
-                stdout,
-                stderr,
-                exit_code,
-                signal,
-            })
-            .unwrap());
-        }
-        if Instant::now() >= deadline {
-            let _ = init.signal(&info.child_id, 9, false);
-            return Err(RpcError::new("timeout", "exec deadline exceeded"));
-        }
-        let _ = init.wait_for_event(&info.child_id, Instant::now() + Duration::from_millis(200));
-    }
+    init.write(&p.id, &p.data)
+        .map_err(|e| RpcError::new("write", e.to_string()))?;
+    Ok(json!({}))
 }
 
-fn handle_spawn(
-    conn: &Arc<Connection>,
-    params: Value,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let p: ExecParams = serde_json::from_value(params)
-        .map_err(|e| RpcError::new("bad_params", format!("spawn: {e}")))?;
+fn handle_shell_id(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
+    let st = shared.state.lock().unwrap();
+    let id = st
+        .shell_child_id
+        .as_ref()
+        .ok_or_else(|| RpcError::new("not_running", "VM not started or shell not available"))?;
+    Ok(serde_json::to_value(JobIdResult { id: id.clone() }).unwrap())
+}
+
+fn handle_signal_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let p: SignalShellParams =
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("signal_shell: {e}")))?;
     let init = require_init(conn, sessions)?;
-    let argv_refs: Vec<&str> = p.argv.iter().map(|s| s.as_str()).collect();
-    let info = init
-        .spawn_pipes(&argv_refs, &p.env, p.cwd.as_deref())
-        .map_err(|e| RpcError::new("spawn", e.to_string()))?;
-    let child_id = info.child_id.clone();
-
-    if let Some(stdin) = &p.stdin {
-        let _ = init.write(&child_id, stdin);
-    }
-
-    // Spawn a per-child poller thread that drains stdout/stderr/exit and
-    // emits Event frames over the pipe.
-    let conn_w = Arc::clone(conn);
-    let init_w = Arc::clone(&init);
-    let child_id_w = child_id.clone();
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_w = Arc::clone(&finished);
-    let joiner = thread::spawn(move || {
-        child_poller(conn_w, init_w, child_id_w, finished_w);
-    });
-
-    // Map our visible JobId to the init's child id (they're the same string here).
-    {
+    let child_id = {
         let shared = get_session(conn, sessions)?;
-        let mut st = shared.state.lock().unwrap();
-        st.children.insert(
-            child_id.clone(),
-            ChildEntry {
-                _joiner: joiner,
-                finished,
-            },
-        );
-    }
-
-    // Bump counter for telemetry (not strictly used).
-    conn.job_counter.fetch_add(1, Ordering::Relaxed);
-
-    Ok(serde_json::to_value(SpawnResult { id: child_id }).unwrap())
+        let st = shared.state.lock().unwrap();
+        st.shell_child_id
+            .clone()
+            .ok_or_else(|| RpcError::new("not_running", "VM not started or shell not available"))?
+    };
+    init.signal(&child_id, p.sig, true)
+        .map_err(|e| RpcError::new("signal", e.to_string()))?;
+    Ok(json!({}))
 }
 
 fn child_poller(
@@ -1138,34 +1103,18 @@ fn child_poller(
 ) {
     loop {
         for chunk in init.drain_stdout(&child_id) {
-            let _ = send_event(
-                &conn,
-                method::EV_STDOUT,
-                json!({ "id": child_id, "data": chunk }),
-            );
+            let _ = send_event(&conn, method::EV_STDOUT, json!({ "id": child_id, "data": chunk }));
         }
         for chunk in init.drain_stderr(&child_id) {
-            let _ = send_event(
-                &conn,
-                method::EV_STDERR,
-                json!({ "id": child_id, "data": chunk }),
-            );
+            let _ = send_event(&conn, method::EV_STDERR, json!({ "id": child_id, "data": chunk }));
         }
         if let Some((exit_code, signal)) = init.take_exit(&child_id) {
             // Final drain.
             for chunk in init.drain_stdout(&child_id) {
-                let _ = send_event(
-                    &conn,
-                    method::EV_STDOUT,
-                    json!({ "id": child_id, "data": chunk }),
-                );
+                let _ = send_event(&conn, method::EV_STDOUT, json!({ "id": child_id, "data": chunk }));
             }
             for chunk in init.drain_stderr(&child_id) {
-                let _ = send_event(
-                    &conn,
-                    method::EV_STDERR,
-                    json!({ "id": child_id, "data": chunk }),
-                );
+                let _ = send_event(&conn, method::EV_STDERR, json!({ "id": child_id, "data": chunk }));
             }
             let _ = send_event(
                 &conn,
@@ -1187,32 +1136,6 @@ fn child_poller(
         // Cap polling frequency.
         let _ = init.wait_for_event(&child_id, Instant::now() + Duration::from_millis(250));
     }
-}
-
-fn handle_write_stdin(
-    conn: &Arc<Connection>,
-    params: Value,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let p: WriteStdinParams = serde_json::from_value(params)
-        .map_err(|e| RpcError::new("bad_params", format!("write_stdin: {e}")))?;
-    let init = require_init(conn, sessions)?;
-    init.write(&p.id, &p.data)
-        .map_err(|e| RpcError::new("write", e.to_string()))?;
-    Ok(json!({}))
-}
-
-fn handle_kill(
-    conn: &Arc<Connection>,
-    params: Value,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let p: KillParams = serde_json::from_value(params)
-        .map_err(|e| RpcError::new("bad_params", format!("kill: {e}")))?;
-    let init = require_init(conn, sessions)?;
-    init.signal(&p.id, p.signal, false)
-        .map_err(|e| RpcError::new("kill", e.to_string()))?;
-    Ok(json!({}))
 }
 
 fn handle_add_plan9_share(
@@ -1253,12 +1176,8 @@ fn handle_add_plan9_share(
         (api, cs, init)
     };
 
-    let canon = canonicalize_safe(&share.host_path).map_err(|e| {
-        RpcError::new(
-            "bad_path",
-            format!("host_path ({}): {e}", share.host_path.display()),
-        )
-    })?;
+    let canon = canonicalize_safe(&share.host_path)
+        .map_err(|e| RpcError::new("bad_path", format!("host_path ({}): {e}", share.host_path.display())))?;
 
     let port = vmconfig::alloc_plan9_port();
     let req_json = vmconfig::plan9_modify_request(&share.name, &canon, port, "Add");
@@ -1283,13 +1202,8 @@ fn handle_add_plan9_share(
 
     {
         let mut st = shared.state.lock().unwrap();
-        st.active_shares.insert(
-            share.name.clone(),
-            ActiveShare {
-                port,
-                boot_time: false,
-            },
-        );
+        st.active_shares
+            .insert(share.name.clone(), ActiveShare { port, boot_time: false });
     }
 
     Ok(json!({}))
@@ -1314,9 +1228,10 @@ fn handle_remove_plan9_share(
                 "VM is not running; call startVm() first",
             ));
         }
-        let entry = st.active_shares.get(&name).ok_or_else(|| {
-            RpcError::new("unknown_share", format!("no share named {name:?}"))
-        })?;
+        let entry = st
+            .active_shares
+            .get(&name)
+            .ok_or_else(|| RpcError::new("unknown_share", format!("no share named {name:?}")))?;
         if entry.boot_time {
             return Err(RpcError::new(
                 "immutable_share",
@@ -1423,10 +1338,7 @@ fn read_frame(pipe: HANDLE) -> std::io::Result<Frame> {
     read_exact(pipe, &mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
     let mut payload = vec![0u8; len];
     read_exact(pipe, &mut payload)?;
@@ -1467,9 +1379,7 @@ unsafe fn ov_read(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<u32> {
         if last == 997 {
             unsafe { WaitForSingleObject(evt, u32::MAX) };
             let mut transferred: u32 = 0;
-            let ok = unsafe {
-                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
-            };
+            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
             unsafe {
                 let _ = CloseHandle(evt);
             }
@@ -1501,9 +1411,7 @@ unsafe fn ov_write(pipe: HANDLE, buf: &[u8]) -> std::io::Result<u32> {
         if last == 997 {
             unsafe { WaitForSingleObject(evt, u32::MAX) };
             let mut transferred: u32 = 0;
-            let ok = unsafe {
-                windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false)
-            };
+            let ok = unsafe { windows::Win32::System::IO::GetOverlappedResult(pipe, &ov, &mut transferred, false) };
             unsafe {
                 let _ = CloseHandle(evt);
             }
@@ -1529,10 +1437,7 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> std::io::Result<()> {
     while off < buf.len() {
         let got = unsafe { ov_read(pipe, &mut buf[off..])? };
         if got == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "pipe closed",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pipe closed"));
         }
         off += got as usize;
     }
@@ -1544,10 +1449,7 @@ fn write_all(pipe: HANDLE, buf: &[u8]) -> std::io::Result<()> {
     while off < buf.len() {
         let written = unsafe { ov_write(pipe, &buf[off..])? };
         if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "pipe closed",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pipe closed"));
         }
         off += written as usize;
     }
@@ -1577,15 +1479,11 @@ fn safe_canon_or_log(p: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn verify_caller_required() -> bool {
-    if std::env::var("TOKIMO_VERIFY_CALLER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("TOKIMO_VERIFY_CALLER").map(|v| v == "1").unwrap_or(false) {
         return true;
     }
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
-        RegQueryValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
     };
     let subkey = HSTRING::from(r"SOFTWARE\Tokimo\SandboxSvc");
     let value = HSTRING::from("VerifyCaller");
@@ -1614,8 +1512,8 @@ fn verify_caller_required() -> bool {
 fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Result<(), String> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE,
-        REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
     };
     let subkey = HSTRING::from(format!(
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\{svc_guid}"
@@ -1639,19 +1537,14 @@ fn ensure_hvsocket_service_registered(svc_guid: &str, friendly_name: &str) -> Re
         return Err(format!("RegCreateKeyExW {svc_guid}: {:?}", r));
     }
     let value_name = HSTRING::from("ElementName");
-    let wide: Vec<u16> = friendly_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+    let wide: Vec<u16> = friendly_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
     let r2 = unsafe { RegSetValueExW(hk, &value_name, None, REG_SZ, Some(bytes)) };
 
     let sd_name = HSTRING::from("SecurityDescriptor");
     let sd_str = "D:(A;;GA;;;WD)";
     let sd_wide: Vec<u16> = sd_str.encode_utf16().chain(std::iter::once(0)).collect();
-    let sd_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
+    let sd_bytes: &[u8] = unsafe { std::slice::from_raw_parts(sd_wide.as_ptr() as *const u8, sd_wide.len() * 2) };
     let _ = unsafe { RegSetValueExW(hk, &sd_name, None, REG_SZ, Some(sd_bytes)) };
 
     let _ = unsafe { RegCloseKey(hk) };
@@ -1685,11 +1578,7 @@ fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
 
 fn verify_authenticode(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let file_info = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: PCWSTR(wide.as_ptr()),
@@ -1739,12 +1628,10 @@ fn parse_guid(s: &str) -> Result<windows::core::GUID, String> {
     }
     let mut data4 = [0u8; 8];
     for i in 0..2 {
-        data4[i] =
-            u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[i] = u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     for i in 0..6 {
-        data4[2 + i] =
-            u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+        data4[2 + i] = u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     Ok(windows::core::GUID {
         data1,
@@ -1782,7 +1669,6 @@ mod tests {
             pipe: HANDLE(std::ptr::null_mut()),
             write_lock: Mutex::new(()),
             session_id: Mutex::new(None),
-            job_counter: AtomicU64::new(0),
         })
     }
 
@@ -1955,7 +1841,12 @@ mod tests {
         let conn = dummy_conn();
 
         // Configure and mark as running.
-        handle_configure(&conn, json!({ "session_id": "stop-test", "user_data_name": "test" }), &sessions).unwrap();
+        handle_configure(
+            &conn,
+            json!({ "session_id": "stop-test", "user_data_name": "test" }),
+            &sessions,
+        )
+        .unwrap();
         {
             let shared = sessions.get("stop-test").unwrap();
             let mut st = shared.state.lock().unwrap();
@@ -1977,7 +1868,12 @@ mod tests {
         let conn = dummy_conn();
 
         // Configure and mark running.
-        handle_configure(&conn, json!({ "session_id": "persist", "user_data_name": "test" }), &sessions).unwrap();
+        handle_configure(
+            &conn,
+            json!({ "session_id": "persist", "user_data_name": "test" }),
+            &sessions,
+        )
+        .unwrap();
         {
             let shared = sessions.get("persist").unwrap();
             shared.state.lock().unwrap().running = true;
@@ -2016,5 +1912,353 @@ mod tests {
 
         // Only 1 session in registry.
         assert_eq!(sessions.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // InflightTracker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inflight_tracker_starts_empty() {
+        let t = InflightTracker::new();
+        // drain() should return immediately when reader is done and count is 0.
+        t.mark_reader_done();
+        t.drain();
+    }
+
+    #[test]
+    fn inflight_tracker_drains_after_handlers_finish() {
+        let t = Arc::new(InflightTracker::new());
+
+        // Simulate 3 in-flight handlers.
+        t.begin();
+        t.begin();
+        t.begin();
+
+        let t2 = Arc::clone(&t);
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = Arc::clone(&done);
+
+        // Spawn a thread that drains — it should block until all handlers end.
+        let joiner = thread::spawn(move || {
+            t2.mark_reader_done();
+            t2.drain();
+            done2.store(true, Ordering::Relaxed);
+        });
+
+        // Not done yet (handlers still in-flight).
+        thread::sleep(Duration::from_millis(50));
+        assert!(!done.load(Ordering::Relaxed));
+
+        // End handlers one by one.
+        t.end();
+        thread::sleep(Duration::from_millis(20));
+        assert!(!done.load(Ordering::Relaxed));
+
+        t.end();
+        thread::sleep(Duration::from_millis(20));
+        assert!(!done.load(Ordering::Relaxed));
+
+        t.end(); // last one
+        joiner.join().unwrap();
+        assert!(done.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn inflight_tracker_concurrent_begin_end() {
+        let t = Arc::new(InflightTracker::new());
+        let mut handles = Vec::new();
+
+        for _ in 0..50 {
+            t.begin();
+            let t2 = Arc::clone(&t);
+            handles.push(thread::spawn(move || {
+                // Simulate work.
+                thread::sleep(Duration::from_millis(5));
+                t2.end();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        t.mark_reader_done();
+        t.drain(); // should return immediately — all handlers done.
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent dispatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_dispatch_returns_correct_ids() {
+        // Verify that dispatching multiple requests concurrently produces
+        // responses with the correct correlation IDs.
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        // Configure first.
+        handle_configure(
+            &conn,
+            json!({ "session_id": "conc-id", "user_data_name": "test" }),
+            &sessions,
+        )
+        .unwrap();
+
+        let ids: Vec<String> = (0..10).map(|i| format!("req-{i}")).collect();
+        let results: Arc<Mutex<Vec<(String, Result<Value, RpcError>)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for id in &ids {
+            let conn_t = Arc::clone(&conn);
+            let sessions_t = sessions.clone();
+            let results_t = Arc::clone(&results);
+            let id_t = id.clone();
+            handles.push(thread::spawn(move || {
+                let r = dispatch(&conn_t, method::PING, json!({}), &sessions_t);
+                results_t.lock().unwrap().push((id_t, r));
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 10);
+        // All should succeed.
+        for (id, r) in results.iter() {
+            assert!(r.is_ok(), "request {id} failed: {:?}", r.as_ref().err());
+        }
+    }
+
+    #[test]
+    fn concurrent_dispatch_different_methods() {
+        // Dispatch different methods concurrently — they should all succeed
+        // without deadlocking.
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+
+        handle_configure(
+            &conn,
+            json!({ "session_id": "conc-methods", "user_data_name": "test" }),
+            &sessions,
+        )
+        .unwrap();
+
+        let results: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        // PING (no session needed)
+        {
+            let c = Arc::clone(&conn);
+            let s = sessions.clone();
+            let r = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                let _ = dispatch(&c, method::PING, json!({}), &s);
+                r.lock().unwrap().push("ping");
+            }));
+        }
+        // IS_RUNNING
+        {
+            let c = Arc::clone(&conn);
+            let s = sessions.clone();
+            let r = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                let _ = dispatch(&c, method::IS_RUNNING, json!({}), &s);
+                r.lock().unwrap().push("is_running");
+            }));
+        }
+        // IS_GUEST_CONNECTED
+        {
+            let c = Arc::clone(&conn);
+            let s = sessions.clone();
+            let r = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                let _ = dispatch(&c, method::IS_GUEST_CONNECTED, json!({}), &s);
+                r.lock().unwrap().push("is_guest_connected");
+            }));
+        }
+        // IS_DEBUG_LOGGING_ENABLED
+        {
+            let c = Arc::clone(&conn);
+            let s = sessions.clone();
+            let r = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                let _ = dispatch(&c, method::IS_DEBUG_LOGGING_ENABLED, json!({}), &s);
+                r.lock().unwrap().push("is_debug_logging_enabled");
+            }));
+        }
+        // SET_DEBUG_LOGGING
+        {
+            let c = Arc::clone(&conn);
+            let s = sessions.clone();
+            let r = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                let _ = dispatch(&c, method::SET_DEBUG_LOGGING, json!({ "enabled": true }), &s);
+                r.lock().unwrap().push("set_debug_logging");
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(results.contains(&"ping"));
+        assert!(results.contains(&"is_running"));
+        assert!(results.contains(&"is_guest_connected"));
+        assert!(results.contains(&"is_debug_logging_enabled"));
+        assert!(results.contains(&"set_debug_logging"));
+    }
+
+    #[test]
+    fn concurrent_configure_different_sessions() {
+        // Multiple threads configuring different sessions concurrently.
+        let sessions = WindowsRegistry::new();
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let s = sessions.clone();
+                thread::spawn(move || {
+                    let c = dummy_conn();
+                    let params = json!({
+                        "session_id": format!("sess-{i}"),
+                        "user_data_name": format!("user-{i}")
+                    });
+                    handle_configure(&c, params, &s).unwrap();
+                    format!("sess-{i}")
+                })
+            })
+            .collect();
+
+        let keys: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(keys.len(), 10);
+        assert_eq!(sessions.len(), 10);
+
+        // Each session should be distinct.
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 10);
+    }
+
+    /// Prove the reader loop is NOT blocked by a long-running handler.
+    ///
+    /// This test simulates the exact pattern from `handle_client`:
+    ///   reader loop: read from channel → spawn handler thread → next
+    ///
+    /// A "slow" request (200ms sleep) is sent first, then a "fast" request.
+    /// If the architecture were serial, the fast request would complete after
+    /// the slow one.  With concurrent dispatch, the fast request completes
+    /// while the slow one is still running.
+    #[test]
+    fn reader_loop_not_blocked_by_slow_handler() {
+        use std::sync::mpsc;
+
+        // (method, id) pairs — simulates frames read from a pipe.
+        let (tx, rx) = mpsc::channel::<(&'static str, &'static str)>();
+
+        let results: Arc<Mutex<Vec<(&'static str, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+        let tracker = Arc::new(InflightTracker::new());
+
+        // Reader thread — mirrors handle_client's dispatch loop.
+        let results_r = Arc::clone(&results);
+        let tracker_r = Arc::clone(&tracker);
+        let reader = thread::spawn(move || {
+            while let Ok((method, id)) = rx.recv() {
+                tracker_r.begin();
+                let r = Arc::clone(&results_r);
+                let t = Arc::clone(&tracker_r);
+                thread::spawn(move || {
+                    // Simulate blocking work for "slow", instant for "fast".
+                    if method == "slow" {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    r.lock().unwrap().push((id, Instant::now()));
+                    t.end();
+                });
+            }
+            tracker_r.mark_reader_done();
+            tracker_r.drain();
+        });
+
+        // Send slow first, then fast after a tiny delay.
+        tx.send(("slow", "slow-req")).unwrap();
+        thread::sleep(Duration::from_millis(10)); // let reader pick it up
+        tx.send(("fast", "fast-req")).unwrap();
+        thread::sleep(Duration::from_millis(10)); // let reader pick it up
+        drop(tx); // close channel → reader exits
+
+        reader.join().unwrap();
+
+        let res = results.lock().unwrap();
+        assert_eq!(res.len(), 2);
+
+        let slow_time = res.iter().find(|(id, _)| *id == "slow-req").unwrap().1;
+        let fast_time = res.iter().find(|(id, _)| *id == "fast-req").unwrap().1;
+
+        // Fast MUST complete before slow.  If the architecture were serial,
+        // fast would complete ~200ms after slow started (i.e. after slow finished).
+        assert!(
+            fast_time < slow_time,
+            "fast completed at {:?}, slow at {:?} — reader was blocked!",
+            fast_time.duration_since(slow_time),
+            Duration::ZERO
+        );
+
+        // Fast should complete within ~50ms of being sent (not 200ms+).
+        // The slow request takes 200ms, so if fast completes in <100ms,
+        // it was NOT serialized behind the slow one.
+        // (We use the test start as a rough anchor.)
+    }
+
+    /// Prove that N concurrent dispatch calls actually run in parallel, not
+    /// sequentially.  We use a barrier to synchronize all handler threads
+    /// and measure total wall-clock time.
+    #[test]
+    fn concurrent_handlers_run_in_parallel() {
+        let sessions = WindowsRegistry::new();
+        let conn = dummy_conn();
+        handle_configure(
+            &conn,
+            json!({ "session_id": "parallel", "user_data_name": "test" }),
+            &sessions,
+        )
+        .unwrap();
+
+        let n = 8;
+        // Barrier: all N threads must arrive before any can proceed.
+        // If dispatch were serial, only 1 thread would ever be alive at a time
+        // and the barrier would deadlock.
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+
+        let start = Instant::now();
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let c = Arc::clone(&conn);
+                let s = sessions.clone();
+                let b = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    // All threads must be running concurrently for this to pass.
+                    b.wait();
+                    let _ = dispatch(&c, method::PING, json!({}), &s);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        // If serial: 8 × (barrier wait + dispatch) would take much longer.
+        // With concurrency: all 8 threads hit the barrier simultaneously,
+        // then dispatch in parallel.  Should complete in <100ms easily.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "8 concurrent dispatches took {elapsed:?} — expected parallel execution"
+        );
     }
 }

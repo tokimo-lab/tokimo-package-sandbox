@@ -13,3 +13,6 @@ Cargo.lock
 /.claude/
 /packaging/vm-image/tokimo-os-arm64/
 .github/copilot-instructions.md
+
+# Per-user IDE config
+/.vscode/

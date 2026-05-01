@@ -92,10 +92,9 @@ pub mod method {
     pub const IS_RUNNING: &str = "isRunning";
     pub const IS_GUEST_CONNECTED: &str = "isGuestConnected";
     pub const IS_PROCESS_RUNNING: &str = "isProcessRunning";
-    pub const EXEC: &str = "exec";
-    pub const SPAWN: &str = "spawn";
     pub const WRITE_STDIN: &str = "writeStdin";
-    pub const KILL: &str = "kill";
+    pub const SHELL_ID: &str = "shellId";
+    pub const SIGNAL_SHELL: &str = "signalShell";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const CREATE_DISK_IMAGE: &str = "createDiskImage";
     pub const SET_DEBUG_LOGGING: &str = "setDebugLogging";
@@ -123,13 +122,9 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Encode a frame as `[u32 BE length][JSON body]`.
 pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
-    let body = serde_json::to_vec(frame)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let body = serde_json::to_vec(frame).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
     let mut buf = Vec::with_capacity(4 + body.len());
     buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -140,44 +135,16 @@ pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
 /// Decode a frame from a byte slice that already contains exactly one
 /// JSON body (no length prefix).
 pub fn decode_body(body: &[u8]) -> std::io::Result<Frame> {
-    serde_json::from_slice(body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ---------------------------------------------------------------------------
 // Typed param/result helpers
 // ---------------------------------------------------------------------------
 
+/// Wire result for `shellId` (and any other op returning a single JobId).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecParams {
-    pub argv: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-    #[serde(default)]
-    pub pty: bool,
-    #[serde(default)]
-    pub pty_rows: u16,
-    #[serde(default)]
-    pub pty_cols: u16,
-    #[serde(default)]
-    pub stdin: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResultWire {
-    #[serde(default)]
-    pub stdout: Vec<u8>,
-    #[serde(default)]
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    #[serde(default)]
-    pub signal: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnResult {
+pub struct JobIdResult {
     pub id: String,
 }
 
@@ -187,10 +154,11 @@ pub struct WriteStdinParams {
     pub data: Vec<u8>,
 }
 
+/// Parameters for `signalShell` — deliver a POSIX signal to the active
+/// shell's foreground process group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KillParams {
-    pub id: String,
-    pub signal: i32,
+pub struct SignalShellParams {
+    pub sig: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{ConfigureParams, Event, ExecOpts, ExecResult, JobId, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, ExecParams, ExecResultWire, IdParams,
-    KillParams, RemovePlan9ShareParams, SpawnResult, WriteStdinParams, method,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdResult, RemovePlan9ShareParams,
+    SignalShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -93,38 +93,9 @@ impl SandboxBackend for WindowsBackend {
         Ok(b.value)
     }
 
-    fn exec(&self, argv: &[String], opts: ExecOpts) -> Result<ExecResult> {
-        let p = ExecParams {
-            argv: argv.to_vec(),
-            cwd: opts.cwd,
-            env: opts.env,
-            pty: opts.pty,
-            pty_rows: opts.pty_rows,
-            pty_cols: opts.pty_cols,
-            stdin: opts.stdin,
-        };
-        let v = self.call(method::EXEC, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
-        let r: ExecResultWire = serde_json::from_value(v)?;
-        Ok(ExecResult {
-            stdout: r.stdout,
-            stderr: r.stderr,
-            exit_code: r.exit_code,
-            signal: r.signal,
-        })
-    }
-
-    fn spawn(&self, argv: &[String], opts: ExecOpts) -> Result<JobId> {
-        let p = ExecParams {
-            argv: argv.to_vec(),
-            cwd: opts.cwd,
-            env: opts.env,
-            pty: opts.pty,
-            pty_rows: opts.pty_rows,
-            pty_cols: opts.pty_cols,
-            stdin: opts.stdin,
-        };
-        let v = self.call(method::SPAWN, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
-        let r: SpawnResult = serde_json::from_value(v)?;
+    fn shell_id(&self) -> Result<JobId> {
+        let v = self.call(method::SHELL_ID, json!({}), SHORT_CALL_TIMEOUT)?;
+        let r: JobIdResult = serde_json::from_value(v)?;
         Ok(JobId(r.id))
     }
 
@@ -133,20 +104,13 @@ impl SandboxBackend for WindowsBackend {
             id: id.0.clone(),
             data: data.to_vec(),
         };
-        self.call(
-            method::WRITE_STDIN,
-            serde_json::to_value(&p)?,
-            SHORT_CALL_TIMEOUT,
-        )?;
+        self.call(method::WRITE_STDIN, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         Ok(())
     }
 
-    fn kill(&self, id: &JobId, signal: i32) -> Result<()> {
-        let p = KillParams {
-            id: id.0.clone(),
-            signal,
-        };
-        self.call(method::KILL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+    fn signal_shell(&self, sig: i32) -> Result<()> {
+        let p = SignalShellParams { sig };
+        self.call(method::SIGNAL_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         Ok(())
     }
 
@@ -164,11 +128,7 @@ impl SandboxBackend for WindowsBackend {
             path: path.to_path_buf(),
             gib,
         };
-        self.call(
-            method::CREATE_DISK_IMAGE,
-            serde_json::to_value(&p)?,
-            LONG_CALL_TIMEOUT,
-        )?;
+        self.call(method::CREATE_DISK_IMAGE, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 
@@ -182,11 +142,7 @@ impl SandboxBackend for WindowsBackend {
     }
 
     fn is_debug_logging_enabled(&self) -> Result<bool> {
-        let v = self.call(
-            method::IS_DEBUG_LOGGING_ENABLED,
-            json!({}),
-            SHORT_CALL_TIMEOUT,
-        )?;
+        let v = self.call(method::IS_DEBUG_LOGGING_ENABLED, json!({}), SHORT_CALL_TIMEOUT)?;
         let b: BoolValue = serde_json::from_value(v)?;
         Ok(b.value)
     }
@@ -207,23 +163,13 @@ impl SandboxBackend for WindowsBackend {
 
     fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
         let p = AddPlan9ShareParams { share };
-        self.call(
-            method::ADD_PLAN9_SHARE,
-            serde_json::to_value(&p)?,
-            LONG_CALL_TIMEOUT,
-        )?;
+        self.call(method::ADD_PLAN9_SHARE, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 
     fn remove_plan9_share(&self, name: &str) -> Result<()> {
-        let p = RemovePlan9ShareParams {
-            name: name.to_string(),
-        };
-        self.call(
-            method::REMOVE_PLAN9_SHARE,
-            serde_json::to_value(&p)?,
-            LONG_CALL_TIMEOUT,
-        )?;
+        let p = RemovePlan9ShareParams { name: name.to_string() };
+        self.call(method::REMOVE_PLAN9_SHARE, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 }

@@ -24,7 +24,7 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{ConfigureParams, Event, ExecOpts, ExecResult, JobId, NetworkPolicy, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -330,48 +330,12 @@ impl SandboxBackend for MacosBackend {
         }
     }
 
-    fn exec(&self, argv: &[String], opts: ExecOpts) -> Result<ExecResult> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-
-        if opts.pty {
-            return Err(Error::not_implemented("PTY mode on macOS"));
+    fn shell_id(&self) -> Result<JobId> {
+        let state = self.state.lock().unwrap();
+        match &*state {
+            State::Running(rs) => Ok(JobId(rs.shell_id.clone())),
+            _ => Err(Error::VmNotRunning),
         }
-
-        let timeout = Duration::from_secs(300);
-        let (stdout, stderr, code) = init.run_oneshot(argv, &opts.env, opts.cwd.as_deref(), timeout)?;
-
-        Ok(ExecResult {
-            stdout,
-            stderr,
-            exit_code: code,
-            signal: None,
-        })
-    }
-
-    fn spawn(&self, argv: &[String], opts: ExecOpts) -> Result<JobId> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-
-        if opts.pty {
-            return Err(Error::not_implemented("PTY mode on macOS"));
-        }
-
-        let info = init.spawn_pipes(argv, &opts.env, opts.cwd.as_deref())?;
-        if let Some(data) = opts.stdin {
-            init.write(&info.child_id, &data)?;
-        }
-        Ok(JobId(info.child_id))
     }
 
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
@@ -385,15 +349,15 @@ impl SandboxBackend for MacosBackend {
         init.write(id.as_str(), data)
     }
 
-    fn kill(&self, id: &JobId, signal: i32) -> Result<()> {
-        let init = {
+    fn signal_shell(&self, sig: i32) -> Result<()> {
+        let (init, child_id) = {
             let state = self.state.lock().unwrap();
             match &*state {
-                State::Running(rs) => rs.init.clone(),
+                State::Running(rs) => (rs.init.clone(), rs.shell_id.clone()),
                 _ => return Err(Error::VmNotRunning),
             }
         };
-        init.signal(id.as_str(), signal, true)
+        init.signal(&child_id, sig, true)
     }
 
     fn subscribe(&self) -> Result<Receiver<Event>> {

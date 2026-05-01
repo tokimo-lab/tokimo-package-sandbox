@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{ConfigureParams, Event, ExecOpts, ExecResult, JobId, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -21,10 +21,13 @@ pub trait SandboxBackend: Send + Sync + 'static {
     fn is_guest_connected(&self) -> Result<bool>;
     fn is_process_running(&self, id: &JobId) -> Result<bool>;
 
-    fn exec(&self, argv: &[String], opts: ExecOpts) -> Result<ExecResult>;
-    fn spawn(&self, argv: &[String], opts: ExecOpts) -> Result<JobId>;
+    fn shell_id(&self) -> Result<JobId>;
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()>;
-    fn kill(&self, id: &JobId, signal: i32) -> Result<()>;
+    /// Deliver a POSIX signal to the active shell's foreground process
+    /// group. Errors if no shell is currently bound (VM not started or
+    /// already stopped). The signal number is the raw Linux value
+    /// (`SIGINT = 2`, `SIGTERM = 15`, …).
+    fn signal_shell(&self, sig: i32) -> Result<()>;
 
     fn subscribe(&self) -> Result<Receiver<Event>>;
 
@@ -32,11 +35,7 @@ pub trait SandboxBackend: Send + Sync + 'static {
     fn set_debug_logging(&self, enabled: bool) -> Result<()>;
     fn is_debug_logging_enabled(&self) -> Result<bool>;
     fn send_guest_response(&self, raw: serde_json::Value) -> Result<()>;
-    fn passthrough(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value>;
+    fn passthrough(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value>;
 
     // -- Dynamic Plan9 share management ------------------------------
     fn add_plan9_share(&self, share: Plan9Share) -> Result<()>;

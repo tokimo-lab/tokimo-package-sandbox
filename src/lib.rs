@@ -4,7 +4,7 @@
 //! by Claude `cowork-svc.exe`. See the [`api`] module for details.
 //!
 //! ```no_run
-//! use tokimo_package_sandbox::{Sandbox, ConfigureParams, ExecOpts};
+//! use tokimo_package_sandbox::{Sandbox, ConfigureParams};
 //! let sb = Sandbox::connect().unwrap();
 //! sb.configure(ConfigureParams {
 //!     user_data_name: "demo".into(),
@@ -15,8 +15,8 @@
 //! }).unwrap();
 //! sb.create_vm().unwrap();
 //! sb.start_vm().unwrap();
-//! let r = sb.exec(&["uname", "-a"], ExecOpts::default()).unwrap();
-//! println!("{}", r.stdout_str());
+//! let shell = sb.shell_id().unwrap();
+//! sb.write_stdin(&shell, b"echo hello\n").unwrap();
 //! sb.stop_vm().unwrap();
 //! ```
 
@@ -36,9 +36,7 @@ pub(crate) mod macos;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
-pub use api::{
-    ConfigureParams, Event, ExecOpts, ExecResult, JobId, NetworkPolicy, Plan9Share, Sandbox,
-};
+pub use api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, Sandbox};
 pub use backend::SandboxBackend;
 pub use error::{Error, Result};
 

@@ -1,15 +1,18 @@
 //! HCS schema 2.x JSON config builder.
 //!
-//! Cowork-style layout:
+//! Layout:
 //!   * Boot disk: SCSI controller 0 attachment 0 = `rootfs.vhdx` (ext4)
-//!   * Workspace: Plan9-over-vsock single share `work` on `PORT_WORK`
-//!   * Control:   AF_HYPERV/HvSocket on `PORT_INIT_CONTROL` (session mode)
+//!   * Workspace: zero or more Plan9-over-vsock shares (one per
+//!                `Plan9Share` in `ConfigureParams`)
+//!   * Control:   AF_HYPERV/HvSocket, per-session vsock port allocated by
+//!                [`alloc_session_init_port`]
 //!   * Console:   COM2 named pipe (kernel kmsg dump)
 //!
 //! The kernel cmdline tells initramfs-tools to mount `/dev/sda` as the
 //! ext4 rootfs. The custom `/sbin/init` shim (built into rootfs.vhdx)
-//! takes over PID 1 after switch_root, mounts the workspace via
-//! `vsock9p`, and exec's the Rust agent.
+//! takes over PID 1 after switch_root, learns about every share via the
+//! `MountManifest` control op, and serves shell sessions over the init
+//! channel.
 
 #![cfg(target_os = "windows")]
 
@@ -23,13 +26,6 @@ fn strip_extended_prefix(p: &Path) -> String {
         s.into_owned()
     }
 }
-
-/// vsock port for the workspace Plan9 share.
-pub const PORT_WORK: u32 = 50002;
-/// AF_VSOCK port the init binary listens on for the host↔guest control
-/// protocol in session mode (default; per-session overrides may be used).
-/// Maps to HvSocket service GUID `0000C353-FACB-11E6-BD58-64006A7986D3`.
-pub const PORT_INIT_CONTROL: u32 = 50003;
 
 /// Allocate a unique vsock port per session so concurrent VMs get distinct
 /// HvSocket service GUIDs (Hyper-V requires `(VmId, ServiceId)` to be
@@ -66,166 +62,6 @@ pub fn hvsock_service_id(port: u32) -> String {
     format!("{:08X}-FACB-11E6-BD58-64006A7986D3", port)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    vm_id: &str,
-    kernel: &Path,
-    initrd: &Path,
-    rootfs_vhdx: &Path,
-    workspace: &Path,
-    cmd_b64: &str,
-    memory_mb: u64,
-    cpu_count: usize,
-) -> String {
-    build_ex(
-        vm_id,
-        kernel,
-        initrd,
-        rootfs_vhdx,
-        workspace,
-        cmd_b64,
-        memory_mb,
-        cpu_count,
-        false,
-        None,
-        PORT_INIT_CONTROL,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_ex(
-    vm_id: &str,
-    kernel: &Path,
-    initrd: &Path,
-    rootfs_vhdx: &Path,
-    workspace: &Path,
-    cmd_b64: &str,
-    memory_mb: u64,
-    cpu_count: usize,
-    session: bool,
-    runtime_id: Option<&str>,
-    init_port: u32,
-) -> String {
-    let kernel_s = strip_extended_prefix(kernel);
-    let initrd_s = strip_extended_prefix(initrd);
-    let rootfs_s = strip_extended_prefix(rootfs_vhdx);
-    let workspace_s = strip_extended_prefix(workspace);
-
-    // SCSI controller 0, attachment 0: the rootfs VHDX. The guest's
-    // initramfs-tools sees this as /dev/sda.
-    let scsi = serde_json::json!({
-        "0": {
-            "Attachments": {
-                "0": {
-                    "Type": "VirtualDisk",
-                    "Path": rootfs_s,
-                    "ReadOnly": false
-                }
-            }
-        }
-    });
-
-    // Single Plan9-over-vsock share for the user workspace. The guest
-    // mounts it at /mnt/work via vsock9p (using `trans=fd`).
-    let plan9 = serde_json::json!({
-        "Shares": [
-            {
-                "Name": "work",
-                "AccessName": "work",
-                "Path": workspace_s,
-                "Port": PORT_WORK
-            }
-        ]
-    });
-
-    let mut devices = serde_json::Map::new();
-    devices.insert("Scsi".into(), scsi);
-    devices.insert("Plan9".into(), plan9);
-
-    // HvSocket device — required for AF_HYPERV host↔guest control plane.
-    // Cowork strings reveal both DefaultBind and DefaultConnect SDDLs, but
-    // the most permissive form `D:(A;;GA;;;WD)` (no protected flag) matches
-    // exactly what cowork-svc embeds. Wide-open ACL — guest is implicitly
-    // trusted because we own the VM.
-    // Per-service config: explicitly register PORT_INIT_CONTROL with
-    // AllowWildcardBinds=true so the host listener bound on
-    // HV_GUID_WILDCARD VmId is reachable from this VM. Cowork uses the
-    // same pattern (strings show ServiceTable + AllowWildcardBinds).
-    let init_svc_guid = hvsock_service_id(init_port);
-    devices.insert(
-        "HvSocket".into(),
-        serde_json::json!({
-            "HvSocketConfig": {
-                "DefaultBindSecurityDescriptor":    "D:(A;;GA;;;WD)",
-                "DefaultConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
-                "ServiceTable": {
-                    init_svc_guid: {
-                        "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
-                        "ConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
-                        "AllowWildcardBinds": true
-                    }
-                }
-            }
-        }),
-    );
-
-    // COM port wiring depends on session vs. one-shot mode.
-    if session {
-        // Session mode: COM1 is unused (init talks via AF_HYPERV vsock).
-        // COM2 is the kernel console + diagnostic dump.
-        devices.insert(
-            "ComPorts".into(),
-            serde_json::json!({
-                "1": { "NamedPipe": format!(r"\\.\pipe\tokimo-vm-com2-{}", vm_id) }
-            }),
-        );
-    } else {
-        devices.insert(
-            "ComPorts".into(),
-            serde_json::json!({
-                "0": { "NamedPipe": format!(r"\\.\pipe\tokimo-vm-com1-{}", vm_id) }
-            }),
-        );
-    }
-
-    let kernel_cmdline = if session {
-        // ttyS1 = COM2 for kernel logs. tokimo.* parsed by /sbin/init shim.
-        format!(
-            "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
-             tokimo.session=1 tokimo.work_port={PORT_WORK} \
-             tokimo.init_port={init_port}"
-        )
-    } else {
-        format!(
-            "console=ttyS0 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
-             tokimo.work_port={PORT_WORK} run={cmd_b64}"
-        )
-    };
-
-    let vm = serde_json::json!({
-        "ComputeTopology": {
-            "Memory": { "SizeInMB": memory_mb },
-            "Processor": { "Count": cpu_count }
-        },
-        "Chipset": {
-            "LinuxKernelDirect": {
-                "KernelFilePath": kernel_s,
-                "InitRdPath": initrd_s,
-                "KernelCmdLine": kernel_cmdline
-            }
-        },
-        "Devices": devices
-    });
-
-    let top = serde_json::json!({
-        "SchemaVersion": { "Major": 2, "Minor": 5 },
-        "Owner": "tokimo-sandbox-svc",
-        "VirtualMachine": vm
-    });
-    let _ = runtime_id; // HCS auto-assigns; we query it back via get_runtime_id.
-    top.to_string()
-}
-
 /// One share for a V2 multi-share session config.
 pub struct V2Share<'a> {
     pub host_path: &'a Path,
@@ -240,30 +76,13 @@ pub struct V2Share<'a> {
 /// (`/dev/sda`) read-write — persistent vs ephemeral lifecycle is
 /// managed at a higher layer (`vhdx_pool`).
 ///
-/// The kernel cmdline carries only `tokimo.init_port=`; the legacy
-/// `tokimo.work_port=` is intentionally absent because the V2 init
+/// The kernel cmdline carries only `tokimo.init_port=`; the V2 init
 /// learns about every share through a `MountManifest` op on the init
 /// vsock channel after `Hello` and before any shells are spawned.
-#[allow(clippy::too_many_arguments)]
-pub fn build_session_v2(
-    vm_id: &str,
-    kernel: &Path,
-    initrd: &Path,
-    rootfs_vhdx: &Path,
-    shares: &[V2Share<'_>],
-    memory_mb: u64,
-    cpu_count: usize,
-    init_port: u32,
-) -> String {
-    build_session_v2_ex(
-        vm_id, kernel, initrd, rootfs_vhdx, shares, memory_mb, cpu_count, init_port, None, None,
-    )
-}
-
-/// Variant with optional network endpoint (Hyper-V NAT). When
-/// `network_endpoint_id` is `Some(guid_bare_string)` an HCS NetworkAdapter
-/// device referencing that endpoint is added to the schema; otherwise no
-/// NIC is exposed to the guest.
+///
+/// When `network_endpoint_id` is `Some(guid_bare_string)` an HCS
+/// NetworkAdapter device referencing that endpoint is added to the
+/// schema; otherwise no NIC is exposed to the guest.
 #[allow(clippy::too_many_arguments)]
 pub fn build_session_v2_ex(
     vm_id: &str,
@@ -361,10 +180,7 @@ pub fn build_session_v2_ex(
             }
         }
         nics.insert(ep_id.to_string(), serde_json::Value::Object(nic));
-        devices.insert(
-            "NetworkAdapters".into(),
-            serde_json::Value::Object(nics),
-        );
+        devices.insert("NetworkAdapters".into(), serde_json::Value::Object(nics));
     }
     // ----- end network adapter -----
 
@@ -407,12 +223,7 @@ pub fn build_session_v2_ex(
 /// As with [`build_session_v2`], no `ReadOnly` field is emitted —
 /// HCS Plan9 rejects it; read-only is enforced guest-side via the
 /// 9p mount flags carried over the AddMount op.
-pub fn plan9_modify_request(
-    name: &str,
-    host_path: &Path,
-    port: u32,
-    request_type: &str,
-) -> String {
+pub fn plan9_modify_request(name: &str, host_path: &Path, port: u32, request_type: &str) -> String {
     let settings = serde_json::json!({
         "Name": name,
         "AccessName": name,
@@ -434,87 +245,24 @@ pub fn alloc_plan9_port() -> u32 {
     alloc_share_port()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn schema_has_scsi_vhdx_and_plan9_workspace() {
-        let s = build(
-            "id",
-            &PathBuf::from(r"C:\k"),
-            &PathBuf::from(r"C:\i"),
-            &PathBuf::from(r"C:\rootfs.vhdx"),
-            &PathBuf::from(r"C:\work"),
-            "Y21k",
-            512,
-            2,
-        );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        let scsi = &v["VirtualMachine"]["Devices"]["Scsi"]["0"]["Attachments"]["0"];
-        assert_eq!(scsi["Type"], "VirtualDisk");
-        assert_eq!(scsi["Path"], r"C:\rootfs.vhdx");
-        let shares = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"]
-            .as_array()
-            .expect("shares");
-        assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0]["Name"], "work");
-        assert_eq!(shares[0]["Port"], PORT_WORK);
-    }
-
-    #[test]
-    fn cmdline_carries_root_and_ports() {
-        let s = build(
-            "id",
-            &PathBuf::from(r"C:\k"),
-            &PathBuf::from(r"C:\i"),
-            &PathBuf::from(r"C:\rootfs.vhdx"),
-            &PathBuf::from(r"C:\work"),
-            "Y21k",
-            512,
-            2,
-        );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
-            .as_str()
-            .unwrap();
-        assert!(cmdline.contains("root=/dev/sda"));
-        assert!(cmdline.contains("rootfstype=ext4"));
-        assert!(cmdline.contains("tokimo.work_port=50002"));
-        assert!(cmdline.contains("run=Y21k"));
-    }
-
-    #[test]
-    fn session_cmdline_has_init_port() {
-        let s = build_ex(
-            "id",
-            &PathBuf::from(r"C:\k"),
-            &PathBuf::from(r"C:\i"),
-            &PathBuf::from(r"C:\rootfs.vhdx"),
-            &PathBuf::from(r"C:\work"),
-            "",
-            512,
-            2,
-            true,
-            None,
-            PORT_INIT_CONTROL,
-        );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
-            .as_str()
-            .unwrap();
-        assert!(cmdline.contains("tokimo.session=1"));
-        assert!(cmdline.contains("tokimo.init_port=50003"));
-        assert!(cmdline.contains("console=ttyS1"));
+    fn dummy_paths() -> (PathBuf, PathBuf, PathBuf) {
+        (
+            PathBuf::from(r"C:\k"),
+            PathBuf::from(r"C:\i"),
+            PathBuf::from(r"C:\persist.vhdx"),
+        )
     }
 
     #[test]
     fn v2_multi_share_schema_and_cmdline() {
+        let (k, i, rootfs) = dummy_paths();
         let work = PathBuf::from(r"C:\work");
         let ro = PathBuf::from(r"C:\readonly");
-        let rootfs = PathBuf::from(r"C:\persist.vhdx");
         let shares = [
             V2Share {
                 host_path: &work,
@@ -529,16 +277,7 @@ mod tests {
                 read_only: true,
             },
         ];
-        let s = build_session_v2(
-            "id",
-            &PathBuf::from(r"C:\k"),
-            &PathBuf::from(r"C:\i"),
-            &rootfs,
-            &shares,
-            1024,
-            2,
-            0x4000_0001,
-        );
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, &shares, 1024, 2, 0x4000_0001, None, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // SCSI carries the persistent rootfs path.
@@ -556,20 +295,17 @@ mod tests {
         assert!(arr[0].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
         assert_eq!(arr[1]["Name"], "s1");
         assert!(arr[1].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
-        // Share port is in the low decimal range so HCS Plan9 accepts it.
         let port = arr[1]["Port"].as_u64().unwrap();
         assert!(
             (50100..58292).contains(&(port as u32)),
             "share port {port} out of HCS-Plan9 range"
         );
 
-        // HvSocket service table registers ONLY the init port — share
-        // ports are owned by HCS's internal Plan9 server.
+        // HvSocket service table registers ONLY the init port.
         let table = v["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
             .as_object()
             .unwrap();
         assert!(table.contains_key(&hvsock_service_id(0x4000_0001)));
-        // Share ports must NOT be in the service table.
         let sp0 = arr[0]["Port"].as_u64().unwrap() as u32;
         let sp1 = arr[1]["Port"].as_u64().unwrap() as u32;
         assert!(!table.contains_key(&hvsock_service_id(sp0)));
@@ -579,11 +315,72 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(cmdline.contains("tokimo.init_port=1073741825"));
-        // V2 cmdline must NOT carry the legacy single-share work_port.
+        assert!(cmdline.contains("root=/dev/sda"));
+        assert!(cmdline.contains("rootfstype=ext4"));
+        assert!(cmdline.contains("console=ttyS1"));
+        // The legacy single-share work_port must not leak into v2 cmdline.
         assert!(
             !cmdline.contains("tokimo.work_port="),
-            "v2 cmdline should not carry tokimo.work_port=, got: {cmdline}"
+            "v2 cmdline must not carry tokimo.work_port=, got: {cmdline}"
         );
+    }
+
+    #[test]
+    fn v2_zero_shares_and_topology() {
+        let (k, i, rootfs) = dummy_paths();
+        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, &[], 4096, 8, 0x4000_00AB, None, None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Memory"]["SizeInMB"], 4096);
+        assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Processor"]["Count"], 8);
+
+        let arr = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"].as_array().unwrap();
+        assert!(arr.is_empty(), "no shares means empty array");
+
+        // COM2 named pipe carries the vm_id.
+        let pipe = v["VirtualMachine"]["Devices"]["ComPorts"]["1"]["NamedPipe"]
+            .as_str()
+            .unwrap();
+        assert!(pipe.contains("vm-foo"));
+
+        // No NetworkAdapter when network_endpoint_id is None.
+        assert!(
+            v["VirtualMachine"]["Devices"].get("NetworkAdapters").is_none()
+                && v["VirtualMachine"]["Devices"].get("NetworkAdapter").is_none(),
+            "no NIC expected when endpoint id is None"
+        );
+    }
+
+    #[test]
+    fn v2_with_network_endpoint() {
+        let (k, i, rootfs) = dummy_paths();
+        let endpoint = "11111111-2222-3333-4444-555555555555";
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, &[], 1024, 2, 0x4000_0002, Some(endpoint), None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // The schema must mention the endpoint id somewhere under Devices —
+        // the exact key shape (NetworkAdapters object vs array) is HCS
+        // version dependent, so just check raw containment.
+        let raw = v["VirtualMachine"]["Devices"].to_string();
+        assert!(
+            raw.to_ascii_lowercase().contains(endpoint),
+            "endpoint id {endpoint} not present in devices block: {raw}"
+        );
+    }
+
+    #[test]
+    fn hvsock_service_id_format() {
+        assert_eq!(hvsock_service_id(0x4000_0001), "40000001-FACB-11E6-BD58-64006A7986D3");
+        assert_eq!(hvsock_service_id(50002), "0000C352-FACB-11E6-BD58-64006A7986D3");
+    }
+
+    #[test]
+    fn alloc_session_init_port_is_in_high_range_and_unique() {
+        let a = alloc_session_init_port();
+        let b = alloc_session_init_port();
+        assert_ne!(a, b);
+        for p in [a, b] {
+            assert_eq!(p & 0xFF00_0000, 0x4000_0000, "port {p:#x} out of range");
+        }
     }
 
     #[test]
@@ -593,8 +390,6 @@ mod tests {
         let s2 = alloc_share_port();
         assert_ne!(i1, s1);
         assert_ne!(s1, s2);
-        // Init ports stay in the high 0x4000_0000 range; share ports stay in
-        // a low decimal range that HCS Plan9 accepts.
         assert_eq!(i1 & 0xFF00_0000, 0x4000_0000);
         assert!((50100..58292).contains(&s1));
         assert!((50100..58292).contains(&s2));

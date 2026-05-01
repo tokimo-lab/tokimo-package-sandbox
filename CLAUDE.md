@@ -6,24 +6,55 @@ Cross-platform native sandbox for running arbitrary commands in isolated environ
 - **macOS**: Apple Seatbelt (VZVirtualMachine / `arcbox-vz`)
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 
+## Public API
+
+A single [`Sandbox`](src/api.rs) handle exposes a command-style RPC interface (17 methods). Backed by a per-platform [`SandboxBackend`](src/backend.rs) trait implementation:
+
+```rust
+use tokimo_package_sandbox::{Sandbox, ConfigureParams, ExecOpts};
+
+let sb = Sandbox::connect().unwrap();
+sb.configure(ConfigureParams {
+    user_data_name: "demo".into(),
+    memory_mb: 4096,
+    cpu_count: 4,
+    ..Default::default()
+}).unwrap();
+sb.create_vm().unwrap();   // Windows: HCS compute system; Linux/macOS: no-op
+sb.start_vm().unwrap();
+let r = sb.exec(&["uname", "-a"], ExecOpts::default()).unwrap();
+println!("{}", r.stdout_str());
+sb.stop_vm().unwrap();
+```
+
+Key types exported from `src/lib.rs`: `Sandbox`, `SandboxBackend`, `ConfigureParams`, `ExecOpts`, `ExecResult`, `JobId`, `Event`, `NetworkPolicy`, `Plan9Share`, `Error`, `Result`.
+
 ## Architecture (Windows)
 
 ```
-host process (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (LocalSystem)
+Sandbox client (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (LocalSystem)
                                                 │
-                                                └── ComputeCore.dll (HCS API) ──▶ Hyper-V micro-VM
+                                                ├─ ComputeCore.dll (HCS API) ──▶ Hyper-V micro-VM
+                                                └─ computenetwork.dll (HCN)  ──▶ NAT network + endpoint
 ```
 
-The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using a JSON length-prefixed wire protocol (`src/windows/protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
+The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using JSON-RPC over length-prefixed frames (`src/svc_protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, creates a NAT network via HCN, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
 
-Two deployment modes:
+Guest-side: `tokimo-sandbox-init` (`src/bin/tokimo-sandbox-init/`) runs as PID 1 inside the sandbox container. It supports two transports:
+- **Unix SEQPACKET** — for Linux bwrap backend
+- **VSOCK stream** — for macOS VZ and Windows Hyper-V backends
+
+Wire protocol: `src/protocol/` (shared host ↔ init), `src/svc_protocol.rs` (host ↔ Windows service).
+
+## Deployment modes (Windows)
+
 - **MSIX** (`packaging/windows/`, `scripts/build-msix.ps1`): recommended for production — registers service name `TokimoSandboxSvc` via `desktop6:Service`.
 - **CLI install** (`--install` / `--uninstall`): registers service name `tokimo-sandbox-svc` (lowercase-kebab) — for development. The two names are intentionally different so both can coexist on the same machine.
 - **Console mode** (`--console`): foreground dev mode, no SCM registration needed.
 
 ## Windows APIs — all through the `windows` crate (verified)
 
-**No hand-written FFI, no manual `extern "system"` blocks.** Every Win32 call goes through the `windows = "0.62"` crate. The only exception is `ComputeCore.dll` (HCS API), loaded dynamically via the `windows` crate's own `LoadLibraryW` + `GetProcAddress`.
+**No hand-written FFI, no manual `extern "system"` blocks.** Every Win32 call goes through the `windows = "0.62"` crate. The exceptions are `ComputeCore.dll` (HCS API) and `computenetwork.dll` (HCN), loaded dynamically via the `windows` crate's own `LoadLibraryW` + `GetProcAddress`.
 
 The verified API surface, grouped by file:
 
@@ -38,6 +69,16 @@ The verified API surface, grouped by file:
 | `windows::core` | `HSTRING` |
 | std | `std::os::windows::io::FromRawHandle` |
 
+### `src/windows/ov_pipe.rs` (OVERLAPPED Read/Write wrapper)
+
+| Crate feature | Items used |
+|---|---|
+| `Win32_Foundation` | `CloseHandle`, `DUPLICATE_SAME_ACCESS`, `DuplicateHandle`, `ERROR_BROKEN_PIPE`, `ERROR_HANDLE_EOF`, `ERROR_IO_PENDING`, `ERROR_PIPE_NOT_CONNECTED`, `GetLastError`, `HANDLE`, `WAIT_OBJECT_0` |
+| `Win32_Storage_FileSystem` | `ReadFile`, `WriteFile` |
+| `Win32_System_IO` | `GetOverlappedResult`, `OVERLAPPED` |
+| `Win32_System_Threading` | `CreateEventW`, `GetCurrentProcess`, `INFINITE`, `WaitForSingleObject` |
+| `windows::core` | `PCWSTR` |
+
 ### `src/windows/safe_path.rs` (TOCTOU-safe canonicalization)
 
 | Crate feature | Items used |
@@ -50,11 +91,12 @@ The verified API surface, grouped by file:
 
 | Crate feature | Items used |
 |---|---|
-| `Win32_Foundation` | `CloseHandle`, `GetLastError`, `HANDLE`, `HLOCAL`, `HWND`, `INVALID_HANDLE_VALUE`, `LocalFree` |
+| `Win32_Foundation` | `CloseHandle`, `ERROR_SUCCESS`, `GetLastError`, `HANDLE`, `HLOCAL`, `HWND`, `INVALID_HANDLE_VALUE`, `LocalFree` |
 | `Win32_Security` | `SECURITY_ATTRIBUTES`, `PSECURITY_DESCRIPTOR` |
 | `Win32_Security_Authorization` | `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `SDDL_REVISION_1` |
 | `Win32_Security_WinTrust` | `WinVerifyTrust`, `WINTRUST_ACTION_GENERIC_VERIFY_V2`, `WINTRUST_DATA`, `WINTRUST_DATA_0`, `WINTRUST_DATA_PROVIDER_FLAGS`, `WINTRUST_DATA_REVOCATION_CHECKS`, `WINTRUST_DATA_STATE_ACTION`, `WINTRUST_DATA_UICONTEXT`, `WINTRUST_FILE_INFO`, `WTD_CHOICE_FILE`, `WTD_UI_NONE` |
 | `Win32_Storage_FileSystem` | `FlushFileBuffers`, `PIPE_ACCESS_DUPLEX`, `ReadFile`, `WriteFile` |
+| `Win32_System_IO` | `OVERLAPPED` |
 | `Win32_System_Pipes` | `ConnectNamedPipe`, `CreateNamedPipeW`, `DisconnectNamedPipe`, `GetNamedPipeClientProcessId`, `PIPE_READMODE_MESSAGE`, `PIPE_TYPE_MESSAGE`, `PIPE_UNLIMITED_INSTANCES`, `PIPE_WAIT` |
 | `Win32_System_Registry` | `HKEY`, `HKEY_LOCAL_MACHINE`, `KEY_READ`, `REG_VALUE_TYPE`, `RegCloseKey`, `RegOpenKeyExW`, `RegQueryValueExW` |
 | `Win32_System_Threading` | `OpenProcess`, `PROCESS_NAME_FORMAT`, `PROCESS_QUERY_LIMITED_INFORMATION`, `QueryFullProcessImageNameW` |
@@ -69,6 +111,23 @@ The verified API surface, grouped by file:
 | `Win32_System_LibraryLoader` | `GetProcAddress`, `LoadLibraryW` |
 | `windows::core` | `HSTRING`, `PCSTR` |
 
+### `src/bin/tokimo-sandbox-svc/imp/hcn.rs` (computenetwork.dll loader)
+
+| Crate feature | Items used |
+|---|---|
+| `Win32_Foundation` | `FreeLibrary`, `HLOCAL`, `HMODULE`, `LocalFree` |
+| `Win32_System_LibraryLoader` | `GetProcAddress`, `LoadLibraryW` |
+| `windows::core` | `GUID`, `HSTRING`, `PCSTR` |
+
+### `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` (AF_HYPERV listener)
+
+| Crate feature | Items used |
+|---|---|
+| `Win32_Foundation` | `DuplicateHandle`, `HANDLE` |
+| `Win32_Networking_WinSock` | `AF_HYPERV`, `HV_GUID_WILDCARD`, `HV_GUID_ZERO`, `HVSOCKET_ADDRESS_INFO`, `HVSOCKET_CONNECT_TIMEOUT`, `HVSOCKET_CONNECTED_FLAG`, `HV_ADDRESS_FAMILY`, `WSADATA`, `WSAStartup`, `WSAGetLastError`, `bind`, `closesocket`, `listen`, `socket`, `WSAEACCES`, `WSAEADDRINUSE` |
+| `Win32_System_Threading` | `GetCurrentProcess` |
+| `windows::core` | `GUID` |
+
 ### `windows-service` crate (SCM integration)
 
 From `windows-service = "0.8"` (only used in `imp/mod.rs`):
@@ -81,31 +140,48 @@ From `windows-service = "0.8"` (only used in `imp/mod.rs`):
 
 ### Cargo features declared but **NOT used** in source
 
-These three are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies]` but have no corresponding `use` in the codebase:
+These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies]` but have no corresponding `use` in the codebase:
 
 - `Win32_Security_Cryptography`
-- `Win32_System_IO`
 - `Win32_System_Memory`
 
 ## Key source layout
 
 | Path | Purpose |
 |---|---|
-| `src/lib.rs` | Public API: `run()`, `SandboxConfig`, `NetworkPolicy`, `ExecutionResult` |
-| `src/windows/mod.rs` | Windows backend entry point (library side): path discovery, network policy translation |
-| `src/windows/session.rs` | `Session::open()`: path discovery → named-pipe OpenSession → `WinInitClient::new` → `hello()` → `open_shell()` |
-| `src/windows/client.rs` | Named-pipe client: `WaitNamedPipeW` → `CreateFileW` (FILE_FLAG_OVERLAPPED) → send OpenSession request → read SessionOpened response |
-| `src/windows/ov_pipe.rs` | **Critical**: OVERLAPPED Read/Write wrapper. Windows sync pipes serialize ReadFile+WriteFile on the same instance even across threads; OVERLAPPED mode is required for concurrent I/O |
-| `src/windows/init_client.rs` | Runs the init control protocol (Hello/Spawn/Exec/Kill…) over the transparent pipe tunnel; reader thread + Mutex writer |
-| `src/windows/protocol.rs` | Wire protocol types: `SvcRequest`, `SvcResponse`, length-prefixed framing |
-| `src/windows/safe_path.rs` | TOCTOU-safe `canonicalize_safe`: rejects symlinks/junctions/hardlinks via `GetFileInformationByHandle` |
-| `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, per-session session handler |
-| `src/bin/tokimo-sandbox-svc/imp/hcs.rs` | HCS API wrapper: loads `ComputeCore.dll`, exposes `create/start/terminate/close/poll` |
+| `src/lib.rs` | Crate root: re-exports public API types, declares platform modules |
+| `src/api.rs` | Public `Sandbox` handle (17 commands), `ConfigureParams`, `ExecOpts`, `ExecResult`, `Event`, `JobId`, `Plan9Share`, `NetworkPolicy` |
+| `src/backend.rs` | `SandboxBackend` trait — per-platform implementation contract |
+| `src/platform.rs` | `default_backend()` — dispatches to the OS-specific backend |
+| `src/error.rs` | `Error` enum + `Result<T>` alias |
+| `src/protocol/` | Host ↔ init wire protocol (shared across all backends) |
+| `src/protocol/types.rs` | `Frame` envelope, `StdioMode`, op/event enums, version constants |
+| `src/protocol/wire.rs` | Frame encode/decode, SEQPACKET + stream transport helpers |
+| `src/svc_protocol.rs` | Host ↔ Windows service JSON-RPC: `Frame`, method names, typed param/result structs, `RootfsSpec` |
+| `src/windows/mod.rs` | Windows backend module declarations |
+| `src/windows/sandbox.rs` | `WindowsBackend: SandboxBackend` — forwards API calls as JSON-RPC over named pipe |
+| `src/windows/client.rs` | Named-pipe client: `WaitNamedPipeW` → `CreateFileW` (FILE_FLAG_OVERLAPPED) → `Hello` handshake |
+| `src/windows/ov_pipe.rs` | OVERLAPPED Read/Write wrapper for concurrent pipe I/O |
+| `src/windows/init_client.rs` | Runs the init control protocol over the transparent pipe tunnel; reader thread + Mutex writer |
+| `src/windows/safe_path.rs` | TOCTOU-safe `canonicalize_safe`: rejects symlinks/junctions/hardlinks |
+| `src/linux/mod.rs` | Linux backend module declarations |
+| `src/linux/sandbox.rs` | `LinuxBackend: SandboxBackend` — wraps bwrap in-process |
+| `src/linux/init_client.rs` | Linux init client (Unix SEQPACKET transport) |
+| `src/macos/mod.rs` | macOS backend module declarations |
+| `src/macos/sandbox.rs` | `MacosBackend: SandboxBackend` — boots VZ virtual machine |
+| `src/macos/vm.rs` | VZ VM lifecycle |
+| `src/macos/vsock_init_client.rs` | macOS init client (VSOCK transport) |
+| `src/bin/tokimo-sandbox-init/main.rs` | Guest PID 1 binary: accepts connections on SEQPACKET or VSOCK, manages child processes |
+| `src/bin/tokimo-sandbox-init/server.rs` | Init's main request loop |
+| `src/bin/tokimo-sandbox-init/child.rs` | Child process management (fork/exec, pipes, PTY) |
+| `src/bin/tokimo-sandbox-init/pty.rs` | PTY allocation inside the guest |
+| `src/bin/tokimo-sandbox-svc/main.rs` | Service entry point |
+| `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, per-session handler |
+| `src/bin/tokimo-sandbox-svc/imp/hcs.rs` | HCS API wrapper: loads `ComputeCore.dll`, exposes create/start/terminate/close/poll |
+| `src/bin/tokimo-sandbox-svc/imp/hcn.rs` | HCN API wrapper: loads `computenetwork.dll`, manages NAT network + per-session endpoints |
 | `src/bin/tokimo-sandbox-svc/imp/vmconfig.rs` | HCS Schema 2.x JSON config builder; `alloc_session_init_port()` for per-session hvsock GUIDs |
-| `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` | AF_HYPERV listener: `HV_GUID_WILDCARD` VmId (required by Hyper-V parent-partition rules) + per-session `ServiceId` |
-| `src/host/` | Cross-platform helpers (stdio plumbing, PTY, net observer) |
-| `src/linux/` | Linux backend: bwrap + seccomp + init client |
-| `src/macos/` | macOS backend: VZ virtual machine + vsock comms |
+| `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` | AF_HYPERV listener with per-session ServiceId |
+| `src/bin/tokimo-sandbox-svc/imp/vhdx_pool.rs` | Per-target rootfs VHDX leasing (ephemeral clone vs persistent lock) |
 | `packaging/windows/AppxManifest.xml` | MSIX manifest declaring `desktop6:Service` |
 | `scripts/build-msix.ps1` | MSIX build script (optional Authenticode signing) |
 
@@ -123,12 +199,7 @@ cargo run --bin tokimo-sandbox-svc -- --console
 # Uninstall
 .\target\debug\tokimo-sandbox-svc.exe --uninstall
 
-# Tests (concurrent — 14 Windows session integration tests)
-cargo test --test session -- --test-threads=4
-# Or sequential (slower but no concurrency needed)
-cargo test --test session -- --test-threads=1
-
-# Unit tests only
+# Tests (unit tests in #[cfg(test)] modules within the binary crate)
 cargo test --lib
 cargo test --bin tokimo-sandbox-svc --lib
 

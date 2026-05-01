@@ -25,7 +25,7 @@ use std::{env, thread};
 
 use nix::sys::socket::{SockFlag, socketpair};
 
-use crate::api::{ConfigureParams, Event, ExecOpts, ExecResult, JobId, NetworkPolicy, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::linux::init_client::{DrainedEvent, InitClient};
@@ -37,6 +37,7 @@ struct BackendState {
     init_client: Option<Arc<InitClient>>,
     /// Shell child_id from OpenShell (kept alive as sentinel).
     shell_child_id: Option<String>,
+    shell_job_id: Option<JobId>,
     /// PID of the bwrap process.
     bwrap_pid: Option<u32>,
     /// Per-JobId spawn info.
@@ -67,6 +68,7 @@ impl Default for BackendState {
             bwrap_child: None,
             init_client: None,
             shell_child_id: None,
+            shell_job_id: None,
             bwrap_pid: None,
             jobs: HashMap::new(),
             child_to_job: HashMap::new(),
@@ -144,11 +146,7 @@ impl SandboxBackend for LinuxBackend {
             return Err(Error::VmAlreadyRunning);
         }
 
-        let config = g
-            .config
-            .as_ref()
-            .ok_or_else(|| Error::NotConfigured)?
-            .clone();
+        let config = g.config.as_ref().ok_or_else(|| Error::NotConfigured)?.clone();
 
         // 1. socketpair(SEQPACKET) for the init control channel. The host
         //    side stays CLOEXEC; the child side has CLOEXEC cleared in
@@ -168,18 +166,31 @@ impl SandboxBackend for LinuxBackend {
 
         // 3. Build bwrap args.
         let mut args: Vec<String> = vec![
-            "--ro-bind", "/usr", "/usr",
-            "--ro-bind", "/bin", "/bin",
-            "--ro-bind", "/sbin", "/sbin",
-            "--ro-bind", "/lib", "/lib",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            "/sbin",
+            "/sbin",
+            "--ro-bind",
+            "/lib",
+            "/lib",
         ]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
         if Path::new("/lib64").is_dir() {
             args.extend(["--ro-bind", "/lib64", "/lib64"].iter().map(|s| s.to_string()));
         }
         if Path::new("/etc/alternatives").is_dir() {
-            args.extend(["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
-                .iter().map(|s| s.to_string()));
+            args.extend(
+                ["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
         }
         // Network/DNS files (only if present on host).
         for p in [
@@ -194,40 +205,68 @@ impl SandboxBackend for LinuxBackend {
                 args.extend(["--ro-bind".to_string(), p.into(), p.into()]);
             }
         }
-        args.extend([
-            "--proc", "/proc",
-            // NOTE: Avoid `--dev /dev` — bwrap's devtmpfs setup forces a
-            // nested user_ns (uid_map "1000 0 1") in which init no longer
-            // has CAP_SYS_ADMIN over outer-userns mounts, breaking
-            // dynamic AddMountFd binds. Stage /dev as tmpfs + bind the
-            // standard device nodes individually.
-            "--tmpfs", "/dev",
-            "--dev-bind", "/dev/null", "/dev/null",
-            "--dev-bind", "/dev/zero", "/dev/zero",
-            "--dev-bind", "/dev/full", "/dev/full",
-            "--dev-bind", "/dev/random", "/dev/random",
-            "--dev-bind", "/dev/urandom", "/dev/urandom",
-            "--dev-bind", "/dev/tty", "/dev/tty",
-            "--symlink", "/proc/self/fd", "/dev/fd",
-            "--symlink", "/proc/self/fd/0", "/dev/stdin",
-            "--symlink", "/proc/self/fd/1", "/dev/stdout",
-            "--symlink", "/proc/self/fd/2", "/dev/stderr",
-            "--tmpfs", "/tmp",
-            "--unshare-pid",
-            "--unshare-ipc",
-            "--unshare-uts",
-            "--die-with-parent",
-            // (Intentionally NOT using --as-pid-1: it creates a nested
-            // user_ns where init no longer has CAP_SYS_ADMIN over the
-            // mounts created by the outer bwrap user_ns, which breaks
-            // dynamic AddMountFd binds. bwrap will sit at PID 1 and
-            // init will be PID 2 inside the new pid_ns; that's fine.)
-            // Required for AddMountFd dynamic mounts: bwrap drops all
-            // caps by default in unprivileged user_ns mode; we need
-            // CAP_SYS_ADMIN inside the user_ns to call mount(MS_BIND)
-            // for runtime-added Plan9 shares.
-            "--cap-add", "CAP_SYS_ADMIN",
-        ].iter().map(|s| s.to_string()));
+        args.extend(
+            [
+                "--proc",
+                "/proc",
+                // NOTE: Avoid `--dev /dev` — bwrap's devtmpfs setup forces a
+                // nested user_ns (uid_map "1000 0 1") in which init no longer
+                // has CAP_SYS_ADMIN over outer-userns mounts, breaking
+                // dynamic AddMountFd binds. Stage /dev as tmpfs + bind the
+                // standard device nodes individually.
+                "--tmpfs",
+                "/dev",
+                "--dev-bind",
+                "/dev/null",
+                "/dev/null",
+                "--dev-bind",
+                "/dev/zero",
+                "/dev/zero",
+                "--dev-bind",
+                "/dev/full",
+                "/dev/full",
+                "--dev-bind",
+                "/dev/random",
+                "/dev/random",
+                "--dev-bind",
+                "/dev/urandom",
+                "/dev/urandom",
+                "--dev-bind",
+                "/dev/tty",
+                "/dev/tty",
+                "--symlink",
+                "/proc/self/fd",
+                "/dev/fd",
+                "--symlink",
+                "/proc/self/fd/0",
+                "/dev/stdin",
+                "--symlink",
+                "/proc/self/fd/1",
+                "/dev/stdout",
+                "--symlink",
+                "/proc/self/fd/2",
+                "/dev/stderr",
+                "--tmpfs",
+                "/tmp",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--die-with-parent",
+                // (Intentionally NOT using --as-pid-1: it creates a nested
+                // user_ns where init no longer has CAP_SYS_ADMIN over the
+                // mounts created by the outer bwrap user_ns, which breaks
+                // dynamic AddMountFd binds. bwrap will sit at PID 1 and
+                // init will be PID 2 inside the new pid_ns; that's fine.)
+                // Required for AddMountFd dynamic mounts: bwrap drops all
+                // caps by default in unprivileged user_ns mode; we need
+                // CAP_SYS_ADMIN inside the user_ns to call mount(MS_BIND)
+                // for runtime-added Plan9 shares.
+                "--cap-add",
+                "CAP_SYS_ADMIN",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
 
         // Boot-time Plan9-style binds.
         for share in &config.plan9_shares {
@@ -246,11 +285,7 @@ impl SandboxBackend for LinuxBackend {
         // `/.tps_host` remains a writable view of the host fs from
         // inside the sandbox. This is a known leak for the bwrap
         // backend; the dot-prefix hides it from default `ls /` listings.
-        args.extend([
-            "--bind".to_string(),
-            "/".to_string(),
-            "/.tps_host".to_string(),
-        ]);
+        args.extend(["--bind".to_string(), "/".to_string(), "/.tps_host".to_string()]);
 
         // Network policy.
         match config.network {
@@ -305,9 +340,7 @@ impl SandboxBackend for LinuxBackend {
                 Ok(())
             });
         }
-        let child = cmd
-            .spawn()
-            .map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
+        let child = cmd.spawn().map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
 
         // 5. Drop our copy of the child end. host_end is the active control fd.
         drop(child_end);
@@ -324,9 +357,11 @@ impl SandboxBackend for LinuxBackend {
         // Tell InitClient to allow the non-PID-1 hello.
         // SAFETY: env-var writes are not thread-safe in general; we
         // accept that this is set before any concurrent threads run.
-        unsafe { std::env::set_var("TOKIMO_SANDBOX_ALLOW_NON_PID1", "1"); }
-        let init_client = InitClient::from_fd(host_end)
-            .map_err(|e| Error::other(format!("InitClient::from_fd: {e}")))?;
+        unsafe {
+            std::env::set_var("TOKIMO_SANDBOX_ALLOW_NON_PID1", "1");
+        }
+        let init_client =
+            InitClient::from_fd(host_end).map_err(|e| Error::other(format!("InitClient::from_fd: {e}")))?;
         init_client
             .hello()
             .map_err(|e| Error::other(format!("init hello failed: {e}")))?;
@@ -339,7 +374,18 @@ impl SandboxBackend for LinuxBackend {
         // 7. Update state.
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         g.init_client = Some(Arc::clone(&init_client));
-        g.shell_child_id = Some(shell_info.child_id);
+        g.shell_child_id = Some(shell_info.child_id.clone());
+        let shell_job_id = JobId(format!("j{}", g.next_job_id));
+        g.next_job_id += 1;
+        g.jobs.insert(
+            shell_job_id.0.clone(),
+            JobSpawnInfo {
+                child_id: shell_info.child_id.clone(),
+                pty_fd: None,
+            },
+        );
+        g.child_to_job.insert(shell_info.child_id.clone(), shell_job_id.clone());
+        g.shell_job_id = Some(shell_job_id);
         drop(g);
 
         // 8. Start event pump.
@@ -407,6 +453,7 @@ impl SandboxBackend for LinuxBackend {
         // 3. Clean up.
         g.init_client = None;
         g.shell_child_id = None;
+        g.shell_job_id = None;
         g.bwrap_pid = None;
         g.jobs.clear();
         g.child_to_job.clear();
@@ -435,110 +482,30 @@ impl SandboxBackend for LinuxBackend {
     fn is_process_running(&self, id: &JobId) -> Result<bool> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g
-            .init_client
-            .as_ref()
-            .ok_or_else(|| Error::VmNotRunning)?;
-        let job = g.jobs.get(id.as_str()).ok_or_else(|| {
-            Error::other(format!("unknown job: {}", id.as_str()))
-        })?;
+        let client = g.init_client.as_ref().ok_or_else(|| Error::VmNotRunning)?;
+        let job = g
+            .jobs
+            .get(id.as_str())
+            .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
 
         // Check if exit status has been recorded.
         let has_exit = client.take_exit(&job.child_id).is_some();
         Ok(!has_exit && !client.is_dead())
     }
 
-    fn exec(&self, argv: &[String], opts: ExecOpts) -> Result<ExecResult> {
-        self.ensure_running()?;
-
+    fn shell_id(&self) -> Result<JobId> {
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g
-            .init_client
-            .as_ref()
-            .ok_or_else(|| Error::VmNotRunning)?
-            .clone();
-        drop(g);
-
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let cwd = opts.cwd.as_deref();
-        let timeout = Duration::from_secs(300); // 5 min default timeout.
-
-        let (stdout_bytes, stderr_bytes, exit_code) = client
-            .run_oneshot(&argv_refs, &opts.env, cwd, timeout)
-            .map_err(|e| Error::other(format!("exec failed: {e}")))?;
-
-        Ok(ExecResult {
-            stdout: stdout_bytes,
-            stderr: stderr_bytes,
-            exit_code,
-            signal: None,
-        })
-    }
-
-    fn spawn(&self, argv: &[String], opts: ExecOpts) -> Result<JobId> {
-        self.ensure_running()?;
-
-        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g
-            .init_client
-            .as_ref()
-            .ok_or_else(|| Error::VmNotRunning)?
-            .clone();
-
-        let job_id_num = g.next_job_id;
-        g.next_job_id += 1;
-        let job_id_str = format!("j{}", job_id_num);
-        let job_id = JobId(job_id_str.clone());
-
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let cwd = opts.cwd.as_deref();
-
-        let (spawn_info, pty_fd) = if opts.pty {
-            let (info, fd) = client
-                .spawn_pty(&argv_refs, &opts.env, cwd, opts.pty_rows, opts.pty_cols)
-                .map_err(|e| Error::other(format!("spawn pty failed: {e}")))?;
-            (info, Some(fd))
-        } else {
-            let info = client
-                .spawn_pipes(&argv_refs, &opts.env, cwd)
-                .map_err(|e| Error::other(format!("spawn pipes failed: {e}")))?;
-            (info, None)
-        };
-
-        g.jobs.insert(
-            job_id_str.clone(),
-            JobSpawnInfo {
-                child_id: spawn_info.child_id.clone(),
-                pty_fd,
-            },
-        );
-        g.child_to_job.insert(spawn_info.child_id.clone(), job_id.clone());
-
-        // If initial stdin is provided, write it.
-        if let Some(ref data) = opts.stdin {
-            if !opts.pty {
-                // For pipes mode only; PTY would require writing to pty_fd.
-                client
-                    .write(&spawn_info.child_id, data)
-                    .map_err(|e| Error::other(format!("write stdin failed: {e}")))?;
-            }
-        }
-
-        drop(g);
-
-        Ok(job_id)
+        g.shell_job_id.clone().ok_or_else(|| Error::VmNotRunning)
     }
 
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g
-            .init_client
-            .as_ref()
-            .ok_or_else(|| Error::VmNotRunning)?;
-        let job = g.jobs.get(id.as_str()).ok_or_else(|| {
-            Error::other(format!("unknown job: {}", id.as_str()))
-        })?;
+        let client = g.init_client.as_ref().ok_or_else(|| Error::VmNotRunning)?;
+        let job = g
+            .jobs
+            .get(id.as_str())
+            .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
 
         if let Some(ref pty_fd) = job.pty_fd {
             // PTY mode: write directly to the master fd in the host process.
@@ -561,21 +528,14 @@ impl SandboxBackend for LinuxBackend {
         Ok(())
     }
 
-    fn kill(&self, id: &JobId, signal: i32) -> Result<()> {
+    fn signal_shell(&self, sig: i32) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g
-            .init_client
-            .as_ref()
-            .ok_or_else(|| Error::VmNotRunning)?;
-        let job = g.jobs.get(id.as_str()).ok_or_else(|| {
-            Error::other(format!("unknown job: {}", id.as_str()))
-        })?;
-
+        let child_id = g.shell_child_id.clone().ok_or(Error::VmNotRunning)?;
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?;
         client
-            .signal(&job.child_id, signal, true)
-            .map_err(|e| Error::other(format!("kill failed: {e}")))?;
-        Ok(())
+            .signal(&child_id, sig, true)
+            .map_err(|e| Error::other(format!("signal_shell: {e}")))
     }
 
     fn subscribe(&self) -> Result<std::sync::mpsc::Receiver<Event>> {
@@ -610,12 +570,15 @@ impl SandboxBackend for LinuxBackend {
 
     fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
         self.ensure_running()?;
-        let host_path = share.host_path.canonicalize()
+        let host_path = share
+            .host_path
+            .canonicalize()
             .map_err(|e| Error::other(format!("canonicalize {:?}: {e}", share.host_path)))?;
         if !host_path.is_dir() {
             return Err(Error::other(format!("{host_path:?} is not a directory")));
         }
-        let host_path_str = host_path.to_str()
+        let host_path_str = host_path
+            .to_str()
             .ok_or_else(|| Error::other(format!("non-UTF-8 host path: {host_path:?}")))?
             .to_string();
 
@@ -677,11 +640,7 @@ impl SandboxBackend for LinuxBackend {
 struct SyncStatePtr(*const Mutex<BackendState>);
 unsafe impl Send for SyncStatePtr {}
 
-fn event_pump_loop(
-    client: Arc<InitClient>,
-    stop: Arc<AtomicBool>,
-    state_ptr: SyncStatePtr,
-) {
+fn event_pump_loop(client: Arc<InitClient>, stop: Arc<AtomicBool>, state_ptr: SyncStatePtr) {
     loop {
         if stop.load(Ordering::Relaxed) || client.is_dead() {
             return;
@@ -729,7 +688,11 @@ fn event_pump_loop(
                     if let Some(jid) = g.child_to_job.get(&child_id).cloned() {
                         LinuxBackend::broadcast_event(
                             &mut g,
-                            Event::Exit { id: jid, exit_code: code, signal },
+                            Event::Exit {
+                                id: jid,
+                                exit_code: code,
+                                signal,
+                            },
                         );
                     }
                 }
@@ -782,10 +745,7 @@ fn find_init_binary() -> Result<PathBuf> {
     }
 
     // 3. Check /usr/bin or /usr/local/bin.
-    for candidate in [
-        "/usr/bin/tokimo-sandbox-init",
-        "/usr/local/bin/tokimo-sandbox-init",
-    ] {
+    for candidate in ["/usr/bin/tokimo-sandbox-init", "/usr/local/bin/tokimo-sandbox-init"] {
         let p = PathBuf::from(candidate);
         if p.is_file() {
             return Ok(p);

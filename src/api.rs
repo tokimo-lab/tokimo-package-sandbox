@@ -131,61 +131,7 @@ fn default_cpu_count() -> u32 {
     4
 }
 
-/// Stdio plumbing for [`Sandbox::exec`] / [`Sandbox::spawn`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExecOpts {
-    /// Working directory inside the guest. If `None`, the guest's default
-    /// (typically the user's home dir) is used.
-    #[serde(default)]
-    pub cwd: Option<String>,
-
-    /// Environment variables to set inside the guest. Replaces the guest
-    /// shell's default environment (the inherited PATH from init is kept).
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-
-    /// Allocate a PTY for the child. Required for interactive use; without
-    /// it stdout/stderr are line-buffered pipes.
-    #[serde(default)]
-    pub pty: bool,
-
-    /// Initial PTY rows (only used when `pty == true`).
-    #[serde(default)]
-    pub pty_rows: u16,
-    /// Initial PTY cols (only used when `pty == true`).
-    #[serde(default)]
-    pub pty_cols: u16,
-
-    /// Optional initial stdin payload to send to the child immediately.
-    #[serde(default)]
-    pub stdin: Option<Vec<u8>>,
-}
-
-/// Result of a synchronous [`Sandbox::exec`] call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResult {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    /// Linux signal number that killed the process, if any.
-    pub signal: Option<i32>,
-}
-
-impl ExecResult {
-    pub fn success(&self) -> bool {
-        self.exit_code == 0 && self.signal.is_none()
-    }
-    /// Convenience: stdout decoded as UTF-8 (lossy).
-    pub fn stdout_str(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).into_owned()
-    }
-    /// Convenience: stderr decoded as UTF-8 (lossy).
-    pub fn stderr_str(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).into_owned()
-    }
-}
-
-/// Opaque guest-side child process identifier returned by [`Sandbox::spawn`].
+/// Opaque guest-side child process identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(pub String);
 
@@ -228,16 +174,10 @@ pub enum Event {
     /// Network status. Currently informational only — see TODOs.
     NetworkStatus { up: bool, message: String },
     /// API reachability probe result (controlled by `api_probe_url`).
-    ApiReachability {
-        reachable: bool,
-        latency_ms: Option<u64>,
-    },
+    ApiReachability { reachable: bool, latency_ms: Option<u64> },
     /// Raw notification from the service for which there's no typed variant
     /// yet. `method` is the wire method name, `params` is the JSON payload.
-    Raw {
-        method: String,
-        params: serde_json::Value,
-    },
+    Raw { method: String, params: serde_json::Value },
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +191,11 @@ pub enum Event {
 ///    Linux/macOS: in-process state).
 /// 2. [`Sandbox::configure`] — supply `ConfigureParams`.
 /// 3. [`Sandbox::create_vm`] (Windows-only; no-op on Linux/macOS) +
-///    [`Sandbox::start_vm`] — boot the guest.
-/// 4. [`Sandbox::exec`] / [`Sandbox::spawn`] / [`Sandbox::write_stdin`] /
-///    [`Sandbox::kill`] — interact with guest processes.
-/// 5. [`Sandbox::stop_vm`] — shut down.
+///    [`Sandbox::start_vm`] — boot the guest. A shell is auto-started.
+/// 4. [`Sandbox::shell_id`] — get the shell's [`JobId`].
+/// 5. [`Sandbox::write_stdin`] — send commands/data to the shell.
+///    [`Sandbox::subscribe`] — receive stdout/stderr/exit events.
+/// 6. [`Sandbox::stop_vm`] — shut down.
 #[derive(Clone)]
 pub struct Sandbox {
     inner: Arc<dyn SandboxBackend>,
@@ -317,36 +258,33 @@ impl Sandbox {
 
     // ---- Process control ------------------------------------------------
 
-    /// Run `cmd` synchronously, capturing stdout/stderr and returning when
-    /// the child exits.
-    pub fn exec<S: AsRef<str>>(&self, cmd: &[S], opts: ExecOpts) -> Result<ExecResult> {
-        let argv: Vec<String> = cmd.iter().map(|s| s.as_ref().to_owned()).collect();
-        if argv.is_empty() {
-            return Err(Error::validation("empty argv"));
-        }
-        self.inner.exec(&argv, opts)
+    /// Return the [`JobId`] of the shell auto-started by [`Sandbox::start_vm`].
+    /// Use with [`Sandbox::write_stdin`] to send commands and
+    /// [`Sandbox::subscribe`] to receive output.
+    pub fn shell_id(&self) -> Result<JobId> {
+        self.inner.shell_id()
     }
 
-    /// Spawn `cmd` asynchronously. Output is delivered via
-    /// [`Sandbox::subscribe`] events keyed by the returned [`JobId`].
-    pub fn spawn<S: AsRef<str>>(&self, cmd: &[S], opts: ExecOpts) -> Result<JobId> {
-        let argv: Vec<String> = cmd.iter().map(|s| s.as_ref().to_owned()).collect();
-        if argv.is_empty() {
-            return Err(Error::validation("empty argv"));
-        }
-        self.inner.spawn(&argv, opts)
-    }
-
-    /// Write bytes to the stdin of a spawned child.
+    /// Write bytes to the stdin of a child process (typically the shell).
+    /// Send `\x03` (Ctrl+C) to interrupt, `\x04` (Ctrl+D) for EOF.
     pub fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.inner.write_stdin(id, data)
     }
 
-    /// Send a Unix-style signal to a spawned child. (Maps to TerminateProcess
-    /// on Windows guests if/when supported; currently Linux-only guests so
-    /// `signal` semantics apply.)
-    pub fn kill(&self, id: &JobId, signal: i32) -> Result<()> {
-        self.inner.kill(id, signal)
+    /// Deliver a POSIX signal to the active shell's foreground process
+    /// group. Returns an error if no shell is bound. The signal value is
+    /// the raw Linux number (`2` for SIGINT, `15` for SIGTERM, etc.).
+    ///
+    /// Sending Ctrl+C bytes to stdin via [`Sandbox::write_stdin`] does
+    /// **not** raise SIGINT in pipe mode — only a PTY would, and the
+    /// current shell is in pipe mode. Use this method instead.
+    pub fn signal_shell(&self, sig: i32) -> Result<()> {
+        self.inner.signal_shell(sig)
+    }
+
+    /// Convenience wrapper for `signal_shell(SIGINT)` (signal 2).
+    pub fn interrupt_shell(&self) -> Result<()> {
+        self.inner.signal_shell(2)
     }
 
     // ---- Events ---------------------------------------------------------
@@ -383,11 +321,7 @@ impl Sandbox {
 
     /// Pass a method/params pair through to the underlying control-plane
     /// without typing. Used for methods not yet exposed by typed APIs.
-    pub fn passthrough(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    pub fn passthrough(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         self.inner.passthrough(method, params)
     }
 
@@ -438,10 +372,7 @@ fn validate_configure(p: &ConfigureParams) -> Result<()> {
             return Err(Error::validation("plan9 share name must not be empty"));
         }
         if !seen_names.insert(s.name.clone()) {
-            return Err(Error::validation(format!(
-                "duplicate plan9 share name: {}",
-                s.name
-            )));
+            return Err(Error::validation(format!("duplicate plan9 share name: {}", s.name)));
         }
         if !seen_guest.insert(s.guest_path.clone()) {
             return Err(Error::validation(format!(
