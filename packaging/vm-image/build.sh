@@ -247,7 +247,7 @@ find /usr/share/zoneinfo -type d -empty -delete 2>/dev/null || true
 # Stage kernel modules (initrd needs them) BEFORE removing them from rootfs.
 # The module-bundle step on the host does `docker cp /var/cache/tokimo-kmods/.` out.
 KVER_INNER=$(ls /lib/modules | head -1)
-KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover'
+KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun'
 # macOS VZ uses virtio-vsock + virtio-net (not Hyper-V). Add the virtio
 # transport modules for arm64 so the init binary can load them in the
 # guest VM. virtio_net requires net_failover (already listed) for SR-IOV
@@ -426,6 +426,20 @@ elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-sandbox-init" ]; then
 else
     echo "    NOTE: tokimo-sandbox-init not provided; session-mode bundles will not work."
     echo "    Set TOKIMO_INIT_BIN=/path/to/tokimo-sandbox-init or place it at initrd-prep/."
+fi
+
+# --- bake tokimo-tun-pump (Linux-only static musl) into initrd ---
+# Provides the guest end of the userspace netstack (TAP <-> vsock pump).
+if [ -n "$TOKIMO_TUN_PUMP_BIN" ] && [ -f "$TOKIMO_TUN_PUMP_BIN" ]; then
+    echo "    embedding tokimo-tun-pump: $TOKIMO_TUN_PUMP_BIN ($(du -sh "$TOKIMO_TUN_PUMP_BIN" | cut -f1))"
+    cp "$TOKIMO_TUN_PUMP_BIN" "$INITRD_DIR/bin/tokimo-tun-pump"
+    chmod +x "$INITRD_DIR/bin/tokimo-tun-pump"
+elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-tun-pump" ]; then
+    echo "    embedding tokimo-tun-pump from initrd-prep/"
+    cp "$PROJECT_DIR/initrd-prep/tokimo-tun-pump" "$INITRD_DIR/bin/tokimo-tun-pump"
+    chmod +x "$INITRD_DIR/bin/tokimo-tun-pump"
+else
+    echo "    NOTE: tokimo-tun-pump not provided; userspace netstack disabled."
 fi
 
 echo "    packing initrd..."

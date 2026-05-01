@@ -20,14 +20,18 @@ set -euo pipefail
 BASE=""
 INIT_BIN=""
 INIT_SH=""
+TUN_PUMP_BIN=""
+EXTRAS_DIR=""
 OUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --base)     BASE="$2";     shift 2 ;;
-        --init-bin) INIT_BIN="$2"; shift 2 ;;
-        --init-sh)  INIT_SH="$2";  shift 2 ;;
-        --out)      OUT="$2";      shift 2 ;;
+        --base)         BASE="$2";         shift 2 ;;
+        --init-bin)     INIT_BIN="$2";     shift 2 ;;
+        --init-sh)      INIT_SH="$2";      shift 2 ;;
+        --tun-pump-bin) TUN_PUMP_BIN="$2"; shift 2 ;;
+        --extras-dir)   EXTRAS_DIR="$2";   shift 2 ;;
+        --out)          OUT="$2";          shift 2 ;;
         -h|--help)
             sed -n '2,18p' "$0"
             exit 0
@@ -45,8 +49,9 @@ done
 [ -f "$BASE" ]     || { echo "rebake-initrd: base not found: $BASE" >&2; exit 1; }
 [ -x "$INIT_BIN" ] || { echo "rebake-initrd: init bin not executable: $INIT_BIN" >&2; exit 1; }
 [ -z "$INIT_SH" ]  || [ -f "$INIT_SH" ] || { echo "rebake-initrd: init.sh not found: $INIT_SH" >&2; exit 1; }
+[ -z "$TUN_PUMP_BIN" ] || [ -x "$TUN_PUMP_BIN" ] || { echo "rebake-initrd: tun-pump bin not executable: $TUN_PUMP_BIN" >&2; exit 1; }
 
-for tool in cpio gzip gunzip find install; do
+for tool in cpio gzip gunzip find install xz; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "rebake-initrd: missing $tool" >&2
         exit 1
@@ -66,6 +71,29 @@ install -m 0755 "$INIT_BIN" "$TMP/bin/tokimo-sandbox-init"
 if [ -n "$INIT_SH" ]; then
     echo "==> rebake: replacing /init from $INIT_SH ($(stat -c%s "$INIT_SH") bytes)"
     install -m 0755 "$INIT_SH" "$TMP/init"
+fi
+
+if [ -n "$TUN_PUMP_BIN" ]; then
+    echo "==> rebake: installing tun-pump -> /bin/tokimo-tun-pump ($(stat -c%s "$TUN_PUMP_BIN") bytes)"
+    install -m 0755 "$TUN_PUMP_BIN" "$TMP/bin/tokimo-tun-pump"
+fi
+
+if [ -n "$EXTRAS_DIR" ] && [ -d "$EXTRAS_DIR" ]; then
+    mkdir -p "$TMP/modules"
+    # Decompress any *.ko.xz extras into /modules/<name>.ko so init.sh's
+    # busybox insmod (which doesn't speak xz) can load them.
+    for f in "$EXTRAS_DIR"/*.ko.xz; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .ko.xz)
+        echo "==> rebake: decompressing extra module $name.ko.xz -> /modules/$name.ko"
+        xz -dc "$f" > "$TMP/modules/$name.ko"
+    done
+    for f in "$EXTRAS_DIR"/*.ko; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        echo "==> rebake: installing extra module $name -> /modules/$name"
+        install -m 0644 "$f" "$TMP/modules/$name"
+    done
 fi
 
 OUT_DIR="$(dirname "$OUT")"

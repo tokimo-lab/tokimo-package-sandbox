@@ -50,7 +50,7 @@ MODSRC="extracted-unsigned/usr/lib/modules/${KVER}-amd64"
 [ -d "$MODSRC" ] || MODSRC="extracted-unsigned/lib/modules/${KVER}-amd64"
 [ -d "$MODSRC" ] || { echo "FATAL: modules dir missing"; find extracted-unsigned -name modules -type d 2>/dev/null; exit 1; }
 
-WANT_RE='hv_sock|hv_utils|hv_vmbus|hv_storvsc|hv_netvsc|hyperv|vmw_vsock|vsock\.ko|9p\.ko|9pnet|fuse|netfs'
+WANT_RE='hv_sock|hv_utils|hv_vmbus|hv_storvsc|hv_netvsc|hyperv|vmw_vsock|vsock\.ko|9p\.ko|9pnet|fuse|netfs|tun\.ko'
 mkdir -p "$OUT/modules"
 echo "==> selecting modules..."
 find "$MODSRC" -name '*.ko*' | grep -E "$WANT_RE" | while read -r m; do

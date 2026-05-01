@@ -56,6 +56,21 @@ windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",
 ] }
 windows-service = "0.8"
+# Userspace network stack (replaces HCN NAT for NetworkPolicy::AllowAll).
+# See plan/cowork-networking-reverse-engineering.md and
+# docs/network-allow-all-failure-investigation.md for the rationale.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+] }
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "tokimo-tun-pump"
+path = "src/bin/tokimo-tun-pump/main.rs"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+] }
+crossbeam-channel = "0.5"

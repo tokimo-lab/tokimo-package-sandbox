@@ -21,6 +21,7 @@ test runner script under `scripts/`.** Currently only Windows has one.
 | **PowerShell 7 (`pwsh.exe`)** | The wrapper script uses strict mode and fails on `cargo`'s stderr-on-success under Windows PowerShell 5.1 (`$ErrorActionPreference='Stop'` + `NativeCommandError`). PS 7 handles it correctly. Path: `C:\Program Files\PowerShell\7\pwsh.exe`. |
 | **VM artifacts in `vm/`** | `vm/vmlinuz`, `vm/initrd.img`, `vm/rootfs.vhdx` must exist. Pull via `pwsh scripts/fetch-vm.ps1`. |
 | **`tokimo-sandbox-svc` running** | Either as an installed service (`tokimo-sandbox-svc.exe --install`) or in console mode (`tokimo-sandbox-svc.exe --console`). The runner script auto-launches console mode when needed. |
+| **WAN NIC `Forwarding=Enabled`** | Required for `network_allow_all_has_nic`. HCN's NAT network only enables IP forwarding on its own `vEthernet (tokimo-sandbox-nat)` adapter; the host's WAN-facing physical NIC defaults to `Forwarding=Disabled`, which causes reverse-NAT'd return packets to be misrouted out the WAN instead of into the NAT vSwitch. The guest then never sees a SYN-ACK and `bash exec 3<>/dev/tcp/...` hangs past 5 s with probe text `NET_PROBE_DONE`. Fix (elevated, one-shot, no reboot): `Set-NetIPInterface -InterfaceAlias '<WAN-alias>' -Forwarding Enabled`. See [docs/network-allow-all-failure-investigation.md](../docs/network-allow-all-failure-investigation.md) for the full pktmon trace. |
 
 ### Run
 

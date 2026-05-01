@@ -203,6 +203,16 @@ impl HcnNetwork {
         // gateway lives at .1; we hand .2 to this endpoint. Without a static
         // IpConfiguration HCS rejects attaching the NIC ("Construct" failure)
         // because the endpoint state is incomplete.
+        //
+        // The `OutBoundNAT` endpoint policy is what causes HNS to install
+        // the VFP SNAT rule that translates 192.168.127.2 → host IP for
+        // outbound traffic. Without it, packets leave the vSwitch with the
+        // VM's source IP and the upstream router has no return path —
+        // SYNs go out, SYN-ACKs never come back. (Confirmed via
+        // https://learn.microsoft.com/en-us/virtualization/api/hcn/hns_schema:
+        // OutBoundNAT lives under EndpointPolicyType, not NetworkPolicyType.
+        // Adding `New-NetNat` manually does NOT substitute — that's RRAS-NAT,
+        // a different code path from HNS/VFP NAT.)
         let settings = serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 16 },
             "HostComputeNetwork": net_id_str,
@@ -211,6 +221,12 @@ impl HcnNetwork {
                 {
                     "IpAddress": "192.168.127.2",
                     "PrefixLength": 24
+                }
+            ],
+            "Policies": [
+                {
+                    "Type": "OutBoundNAT",
+                    "Settings": {}
                 }
             ],
             "Routes": [

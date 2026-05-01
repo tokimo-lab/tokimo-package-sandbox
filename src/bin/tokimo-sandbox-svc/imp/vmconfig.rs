@@ -80,9 +80,13 @@ pub struct V2Share<'a> {
 /// learns about every share through a `MountManifest` op on the init
 /// vsock channel after `Hello` and before any shells are spawned.
 ///
-/// When `network_endpoint_id` is `Some(guid_bare_string)` an HCS
-/// NetworkAdapter device referencing that endpoint is added to the
-/// schema; otherwise no NIC is exposed to the guest.
+/// When `netstack_port` is `Some(port)` a SECOND HvSocket service GUID is
+/// registered for the userspace network stack control plane. The guest's
+/// `tokimo-tun-pump` connects to it from inside the VM and pumps Ethernet
+/// frames over hvsock; the host runs `imp::netstack` to terminate them.
+///
+/// When `netstack_port` is `None`, no NIC and no netstack channel are
+/// exposed (NetworkPolicy::Blocked).
 #[allow(clippy::too_many_arguments)]
 pub fn build_session_v2_ex(
     vm_id: &str,
@@ -93,8 +97,7 @@ pub fn build_session_v2_ex(
     memory_mb: u64,
     cpu_count: usize,
     init_port: u32,
-    network_endpoint_id: Option<&str>,
-    network_mac: Option<&str>,
+    netstack_port: Option<u32>,
 ) -> String {
     let kernel_s = strip_extended_prefix(kernel);
     let initrd_s = strip_extended_prefix(initrd);
@@ -148,6 +151,14 @@ pub fn build_session_v2_ex(
         "AllowWildcardBinds": true
     });
     svc_table.insert(hvsock_service_id(init_port), entry);
+    if let Some(p) = netstack_port {
+        let net_entry = serde_json::json!({
+            "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
+            "ConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
+            "AllowWildcardBinds": true
+        });
+        svc_table.insert(hvsock_service_id(p), net_entry);
+    }
     let _ = shares; // ports referenced via Plan9.Shares above
     devices.insert(
         "HvSocket".into(),
@@ -167,27 +178,22 @@ pub fn build_session_v2_ex(
         }),
     );
 
-    // ----- network adapter (network agent) -----
-    // When a HCN endpoint GUID is supplied, attach it to the VM as a single
-    // NIC. The map key MUST be the endpoint GUID (bare, hyphenated form).
-    if let Some(ep_id) = network_endpoint_id {
-        let mut nics = serde_json::Map::new();
-        let mut nic = serde_json::Map::new();
-        nic.insert("EndpointId".into(), serde_json::Value::String(ep_id.to_string()));
-        if let Some(mac) = network_mac {
-            if !mac.is_empty() {
-                nic.insert("MacAddress".into(), serde_json::Value::String(mac.to_string()));
-            }
-        }
-        nics.insert(ep_id.to_string(), serde_json::Value::Object(nic));
-        devices.insert("NetworkAdapters".into(), serde_json::Value::Object(nics));
-    }
-    // ----- end network adapter -----
+    // No NetworkAdapter is added: NetworkPolicy::AllowAll routes through
+    // the userspace netstack on `netstack_port` instead of HCN NAT. See
+    // `imp::netstack` and the cowork networking RE doc for the rationale.
+    let _ = netstack_port;
 
-    let kernel_cmdline = format!(
-        "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
-         tokimo.session=1 tokimo.init_port={init_port}"
-    );
+    let kernel_cmdline = match netstack_port {
+        Some(p) => format!(
+            "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
+             tokimo.session=1 tokimo.init_port={init_port} \
+             tokimo.net=netstack tokimo.netstack_port={p}"
+        ),
+        None => format!(
+            "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
+             tokimo.session=1 tokimo.init_port={init_port}"
+        ),
+    };
 
     let vm = serde_json::json!({
         "ComputeTopology": {
@@ -277,7 +283,7 @@ mod tests {
                 read_only: true,
             },
         ];
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, &shares, 1024, 2, 0x4000_0001, None, None);
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, &shares, 1024, 2, 0x4000_0001, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // SCSI carries the persistent rootfs path.
@@ -328,7 +334,7 @@ mod tests {
     #[test]
     fn v2_zero_shares_and_topology() {
         let (k, i, rootfs) = dummy_paths();
-        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, &[], 4096, 8, 0x4000_00AB, None, None);
+        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, &[], 4096, 8, 0x4000_00AB, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Memory"]["SizeInMB"], 4096);
@@ -343,28 +349,33 @@ mod tests {
             .unwrap();
         assert!(pipe.contains("vm-foo"));
 
-        // No NetworkAdapter when network_endpoint_id is None.
+        // No NetworkAdapter ever (userspace netstack handles egress).
         assert!(
             v["VirtualMachine"]["Devices"].get("NetworkAdapters").is_none()
                 && v["VirtualMachine"]["Devices"].get("NetworkAdapter").is_none(),
-            "no NIC expected when endpoint id is None"
+            "no NIC expected — netstack uses hvsock"
         );
     }
 
     #[test]
-    fn v2_with_network_endpoint() {
+    fn v2_with_netstack_port() {
         let (k, i, rootfs) = dummy_paths();
-        let endpoint = "11111111-2222-3333-4444-555555555555";
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, &[], 1024, 2, 0x4000_0002, Some(endpoint), None);
+        let port: u32 = 0x4000_00CD;
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, &[], 1024, 2, 0x4000_0002, Some(port));
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        // The schema must mention the endpoint id somewhere under Devices —
-        // the exact key shape (NetworkAdapters object vs array) is HCS
-        // version dependent, so just check raw containment.
-        let raw = v["VirtualMachine"]["Devices"].to_string();
-        assert!(
-            raw.to_ascii_lowercase().contains(endpoint),
-            "endpoint id {endpoint} not present in devices block: {raw}"
-        );
+
+        // Cmdline must select netstack mode and carry the port.
+        let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
+            .as_str()
+            .unwrap();
+        assert!(cmdline.contains("tokimo.net=netstack"));
+        assert!(cmdline.contains(&format!("tokimo.netstack_port={port}")));
+
+        // The HvSocket service table must include the netstack service id.
+        let table = v["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
+            .as_object()
+            .unwrap();
+        assert!(table.contains_key(&hvsock_service_id(port)));
     }
 
     #[test]

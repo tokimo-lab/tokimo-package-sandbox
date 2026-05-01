@@ -28,6 +28,7 @@ ROOTSHARE_PORT=""
 WORK_PORT=""
 SESSION_MODE=0
 INIT_PORT=50003
+NETSTACK_PORT=""
 GUEST_LISTENS=0
 NET_MODE=static
 for arg in $CMDLINE; do
@@ -37,6 +38,7 @@ for arg in $CMDLINE; do
         tokimo.work_port=*)          WORK_PORT="${arg#tokimo.work_port=}" ;;
         tokimo.session=1)            SESSION_MODE=1 ;;
         tokimo.init_port=*)          INIT_PORT="${arg#tokimo.init_port=}" ;;
+        tokimo.netstack_port=*)      NETSTACK_PORT="${arg#tokimo.netstack_port=}" ;;
         tokimo.guest_listens=1)      GUEST_LISTENS=1 ;;
         tokimo.net=*)                NET_MODE="${arg#tokimo.net=}" ;;
     esac
@@ -221,7 +223,47 @@ if [ "$SESSION_MODE" = 1 ]; then
     # does not exist and this block becomes a no-op.
     # ---------------------------------------------------------------------------
     /bin/busybox ip link set lo up 2>/dev/null || true
-    if [ -d /sys/class/net/eth0 ]; then
+    if [ "$NET_MODE" = "netstack" ] && [ -n "$NETSTACK_PORT" ]; then
+        # Userspace netstack: host runs smoltcp on its end of an hvsock
+        # and we tunnel raw Ethernet frames over a vsock connection
+        # bridged to a TAP device `tk0`. See `imp::netstack` on the host.
+        echo "tokimo-init: configuring tk0 via userspace netstack (vsock port $NETSTACK_PORT)" \
+            >/dev/kmsg 2>/dev/null || true
+
+        load_mod tun || true
+        if [ ! -e /dev/net/tun ]; then
+            /bin/busybox mkdir -p /dev/net
+            /bin/busybox mknod /dev/net/tun c 10 200 2>/dev/null || true
+            /bin/busybox chmod 0666 /dev/net/tun
+        fi
+
+        if [ -x /bin/tokimo-tun-pump ]; then
+            # tun-pump creates tk0 via TUNSETIFF, then dials the host. Run
+            # it in the background; it lives until the VM dies or the
+            # host's netstack thread shuts down.
+            /bin/tokimo-tun-pump "$NETSTACK_PORT" >/dev/kmsg 2>&1 &
+        else
+            echo "tokimo-init: tokimo-tun-pump missing — netstack disabled" \
+                >/dev/kmsg 2>/dev/null || true
+        fi
+
+        # Wait for tk0 to appear (tun-pump's TUNSETIFF creates it).
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -d /sys/class/net/tk0 ] && break
+            /bin/busybox sleep 0.1 2>/dev/null || /bin/busybox usleep 100000 2>/dev/null || true
+        done
+
+        if [ -d /sys/class/net/tk0 ]; then
+            /bin/busybox ip link set tk0 address 02:00:00:00:00:02 2>/dev/null || true
+            /bin/busybox ip addr add 192.168.127.2/24 dev tk0 2>/dev/null || true
+            /bin/busybox ip link set tk0 up 2>/dev/null || true
+            /bin/busybox ip route add default via 192.168.127.1 dev tk0 2>/dev/null || true
+            echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
+            echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
+        else
+            echo "tokimo-init: tk0 did not appear" >/dev/kmsg 2>/dev/null || true
+        fi
+    elif [ -d /sys/class/net/eth0 ]; then
         /bin/busybox ip link set eth0 up 2>/dev/null || true
         if [ "$NET_MODE" = "dhcp" ]; then
             echo "tokimo-init: configuring eth0 via DHCP (udhcpc)" >/dev/kmsg 2>/dev/null || true

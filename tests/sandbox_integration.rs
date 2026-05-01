@@ -472,6 +472,49 @@ fn network_allow_all_has_nic() {
 }
 
 // ---------------------------------------------------------------------------
+// 8.x DIAGNOSTIC — run with: cargo test --test sandbox_integration network_allow_all_diag -- --ignored --test-threads=1 --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn network_allow_all_diag() {
+    let mut cfg = config("net-diag");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let shell = sb.shell_id().expect("shell_id");
+
+    let cmds = b"echo === LINKS ===\n\
+ip -s link\n\
+echo === ADDR ===\n\
+ip -4 addr\n\
+echo === ROUTE ===\n\
+ip -4 route\n\
+echo === NEIGH-BEFORE ===\n\
+ip neigh\n\
+echo === ARPING-GW ===\n\
+timeout 3 arping -c 2 -I eth0 192.168.127.1 2>&1 || echo arping_failed_or_missing\n\
+echo === PING-GW ===\n\
+timeout 3 ping -c 2 -W 1 192.168.127.1 2>&1 || echo ping_gw_failed\n\
+echo === PING-1.1.1.1 ===\n\
+timeout 3 ping -c 2 -W 1 1.1.1.1 2>&1 || echo ping_1111_failed\n\
+echo === NEIGH-AFTER ===\n\
+ip neigh\n\
+echo === TCP-SYN-PROBE ===\n\
+(timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53 && echo TCP_OK || echo TCP_FAIL') &\n\
+sleep 6\n\
+echo === LINKS-AFTER ===\n\
+ip -s link\n\
+echo DIAG_DONE\n";
+    sb.write_stdin(&shell, cmds).unwrap();
+    let out = drain_until(&rx, &shell, "DIAG_DONE", Duration::from_secs(30));
+    sb.stop_vm().ok();
+    eprintln!("=== GUEST DIAG OUTPUT ===\n{out}\n=== END ===");
+}
+
+// ---------------------------------------------------------------------------
 // 9. Concurrent commands inside a single VM (single shell, bash background)
 // ---------------------------------------------------------------------------
 //

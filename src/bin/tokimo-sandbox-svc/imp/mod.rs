@@ -57,9 +57,11 @@ use tokimo_package_sandbox::svc_protocol::{
 };
 use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
+#[allow(dead_code)] // retained for reference; superseded by `netstack`.
 mod hcn;
 mod hcs;
 mod hvsock;
+mod netstack;
 mod vhdx_pool;
 mod vmconfig;
 
@@ -415,9 +417,10 @@ struct SessionState {
     /// Includes both boot-time shares (immutable) and dynamically-added
     /// shares; only the latter are removable.
     active_shares: HashMap<String, ActiveShare>,
-    /// HCN endpoint owned by this session (None when NetworkPolicy::Blocked).
-    /// Drop deletes the endpoint, releasing the NAT mapping on the host.
-    network_endpoint: Option<hcn::HcnEndpoint>,
+    /// Userspace netstack handle (None when NetworkPolicy::Blocked). The
+    /// AtomicBool is the shutdown flag; setting it makes the netstack
+    /// thread stop within ~50ms. The thread itself is detached.
+    netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     running: bool,
     guest_connected: bool,
 }
@@ -440,7 +443,7 @@ impl Default for SessionState {
             shell_child_id: None,
             children: HashMap::new(),
             active_shares: HashMap::new(),
-            network_endpoint: None,
+            netstack_shutdown: None,
             running: false,
             guest_connected: false,
         }
@@ -839,19 +842,13 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             .ok_or_else(|| RpcError::new("not_configured", "configure() not called"))?
     };
 
-    // Allocate HCN endpoint when network policy requires guest egress.
-    // Observed/Gated currently fall through to AllowAll (TODO: smoltcp
-    // userspace netstack — see plan/windows-service-upgrade.md Phase 4).
-    let net_endpoint = match cfg.network {
+    // NetworkPolicy::AllowAll routes through the userspace netstack on a
+    // dedicated hvsock channel; HCN NAT is no longer used. See
+    // `imp::netstack` and `docs/cowork-networking-reverse-engineering.md`.
+    let netstack_port: Option<u32> = match cfg.network {
         NetworkPolicy::Blocked => None,
-        NetworkPolicy::AllowAll => {
-            let net = hcn::HcnNetwork::create_or_open_nat().map_err(|e| RpcError::new("hcn_network", e))?;
-            let ep = net.create_endpoint().map_err(|e| RpcError::new("hcn_endpoint", e))?;
-            Some(ep)
-        }
+        NetworkPolicy::AllowAll => Some(vmconfig::alloc_session_init_port()),
     };
-    let net_endpoint_id_str = net_endpoint.as_ref().map(|e| e.id_string());
-    let net_endpoint_mac = net_endpoint.as_ref().map(|e| e.mac_string().to_string());
 
     let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg).map_err(|e| RpcError::new("bad_path", e))?;
 
@@ -901,6 +898,21 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     let init_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid)
         .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?;
 
+    // Per-session netstack hvsock listener (only when AllowAll). Must be
+    // bound BEFORE HCS starts so the guest can connect immediately at boot.
+    let netstack_listener = if let Some(p) = netstack_port {
+        let svc_id = vmconfig::hvsock_service_id(p);
+        ensure_hvsocket_service_registered(&svc_id, "Tokimo Sandbox Netstack")
+            .map_err(|e| RpcError::new("hvsock_register", e))?;
+        let svc_guid = parse_guid(&svc_id).map_err(|e| RpcError::new("guid", e))?;
+        Some(
+            hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, svc_guid)
+                .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
     let share_ports: Vec<u32> = (0..canon_shares.len()).map(|_| vmconfig::alloc_share_port()).collect();
     let v2_shares: Vec<vmconfig::V2Share<'_>> = canon_shares
         .iter()
@@ -922,8 +934,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         cfg.memory_mb,
         cfg.cpu_count as usize,
         init_port,
-        net_endpoint_id_str.as_deref(),
-        net_endpoint_mac.as_deref(),
+        netstack_port,
     );
     let _ = std::fs::write(r"C:\tokimo-debug\last-hcs-session-config.json", &cfg_json);
 
@@ -966,6 +977,39 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             }
         };
     init.hello().map_err(|e| RpcError::new("init_hello", e.to_string()))?;
+
+    // Accept the netstack connection (NetworkPolicy::AllowAll only). The
+    // guest-side `tokimo-tun-pump` connects from inside the VM after init.sh
+    // brings up tk0. We accept AFTER init.hello() so a slow netstack accept
+    // doesn't block the init handshake; the pump retries connect for ~30s.
+    let netstack_shutdown = if let Some(listener) = netstack_listener {
+        match hvsock::accept_guest(&listener, Duration::from_secs(30)) {
+            Ok(net_sock) => {
+                drop(listener);
+                match net_sock.try_clone() {
+                    Ok(writer) => {
+                        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let _ = netstack::spawn(
+                            Box::new(net_sock),
+                            Box::new(writer),
+                            Arc::clone(&shutdown),
+                        );
+                        Some(shutdown)
+                    }
+                    Err(e) => {
+                        eprintln!("[netstack] hv clone fail: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[netstack] accept timeout: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Send mount manifest so guest-side init can mount each Plan9 share.
     let manifest: Vec<MountEntry> = canon_shares
@@ -1014,7 +1058,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                 finished: shell_finished,
             },
         );
-        st.network_endpoint = net_endpoint;
+        st.netstack_shutdown = netstack_shutdown;
         st.running = true;
         st.guest_connected = true;
         // Record boot-time shares so dynamic add/remove can validate
@@ -1057,9 +1101,11 @@ fn teardown_session(st: &mut SessionState) {
     st.children.clear();
     st.active_shares.clear();
     st.vhdx = None;
-    // Drop endpoint AFTER the VM is terminated so HCS releases the NIC
-    // reference before HCN tries to delete it.
-    st.network_endpoint = None;
+    // Stop the userspace netstack thread before tearing down HCS so it
+    // can flush in-flight frames cleanly.
+    if let Some(s) = st.netstack_shutdown.take() {
+        s.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     st.running = false;
     st.guest_connected = false;
 }
