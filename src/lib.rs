@@ -29,6 +29,9 @@ pub mod session_registry;
 pub mod protocol;
 pub mod svc_protocol;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub mod netstack;
+
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]

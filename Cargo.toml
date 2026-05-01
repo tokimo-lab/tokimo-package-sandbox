@@ -38,6 +38,11 @@ libc = "0.2"
 arcbox-vz = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
+# Userspace network stack — same as Windows. See src/netstack/.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+] }
+crossbeam-channel = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration, SerialPortConfiguration,
-    SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SerialPortConfiguration, SharedDirectory,
+    SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration, VirtioSocketListener,
     VirtualMachine, VirtualMachineConfiguration, VirtualMachineState, is_supported,
 };
 use tokio::runtime::Runtime;
@@ -24,6 +24,10 @@ use crate::error::{Error, Result};
 
 /// Vsock port the guest's `tokimo-sandbox-init` listens on.
 pub(crate) const INIT_VSOCK_PORT: u32 = 2222;
+
+/// Vsock port the host listens on for the guest's `tokimo-tun-pump`
+/// netstack data channel (NetworkPolicy::AllowAll only).
+pub(crate) const NETSTACK_VSOCK_PORT: u32 = 4444;
 
 /// Tag used for the rootfs virtiofs share. Must match the hard-coded value
 /// in `tokimo-sandbox-init/main.rs` which mounts `work` at `/mnt/work`.
@@ -41,6 +45,10 @@ pub(crate) const DYN_SHARE_GUEST_PATH: &str = "/__tokimo_dyn";
 pub struct BootedVm {
     pub vm: VirtualMachine,
     pub vsock: OwnedFd,
+    /// Listener for the guest-initiated netstack connection. Present iff
+    /// `NetworkPolicy::AllowAll`. Caller is expected to `.accept()` once
+    /// after the init handshake completes.
+    pub netstack_listener: Option<VirtioSocketListener>,
     pub runtime: Arc<Runtime>,
 }
 
@@ -153,6 +161,26 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     let plan9 = config.plan9_shares.clone();
     let network = config.network;
 
+    // Cmdline picks netstack mode for AllowAll, no kernel NIC otherwise.
+    let cmdline = match network {
+        NetworkPolicy::AllowAll => format!(
+            "console=hvc0 earlyprintk=hvc0 \
+             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
+             tokimo.net=netstack tokimo.netstack_port={} \
+             net.ifnames=0 biosdevname=0 \
+             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+             HOME=/root TERM=xterm-256color LANG=C.UTF-8",
+            NETSTACK_VSOCK_PORT
+        ),
+        NetworkPolicy::Blocked => "console=hvc0 earlyprintk=hvc0 \
+             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
+             tokimo.net=blocked \
+             net.ifnames=0 biosdevname=0 \
+             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+             HOME=/root TERM=xterm-256color LANG=C.UTF-8"
+            .to_string(),
+    };
+
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -162,18 +190,11 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     );
 
     let rt_for_block = runtime.clone();
-    let (vm, vsock_fd) = rt_for_block.block_on(async move {
+    let (vm, vsock_fd, netstack_listener) = rt_for_block.block_on(async move {
         // ---- Boot loader -----------------------------------------------
         let mut boot_loader = LinuxBootLoader::new(&kernel_s)
             .map_err(|e| Error::other(format!("LinuxBootLoader: {e}")))?;
-        boot_loader.set_initial_ramdisk(&initrd_s).set_command_line(
-            "console=hvc0 earlyprintk=hvc0 \
-             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
-             tokimo.net=dhcp \
-             net.ifnames=0 biosdevname=0 \
-             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-             HOME=/root TERM=xterm-256color LANG=C.UTF-8",
-        );
+        boot_loader.set_initial_ramdisk(&initrd_s).set_command_line(&cmdline);
 
         // ---- VM config -------------------------------------------------
         let mut vm_cfg = VirtualMachineConfiguration::new()
@@ -199,14 +220,10 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         let serial_read_fd = serial.read_fd();
         vm_cfg.add_serial_port(serial);
 
-        match network {
-            NetworkPolicy::AllowAll => {
-                let nic = NetworkDeviceConfiguration::nat()
-                    .map_err(|e| Error::other(format!("NetworkDevice::nat: {e}")))?;
-                vm_cfg.add_network_device(nic);
-            }
-            NetworkPolicy::Blocked => {}
-        }
+        // No kernel NIC: networking goes through the userspace netstack via
+        // vsock + tk0 TUN inside the guest. NetworkPolicy::Blocked uses the
+        // same code path with cmdline `tokimo.net=blocked` so init.sh skips
+        // the netstack setup.
 
         // Rootfs (tag "work").
         let rootfs_dir = SharedDirectory::new(&rootfs_s, false)
@@ -269,6 +286,18 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
             .first()
             .ok_or_else(|| Error::other("no virtio-socket device on running VM"))?;
 
+        // Set up the netstack listener BEFORE the init handshake so that
+        // tokimo-tun-pump (started early in init.sh) can connect on its
+        // first try. NetworkPolicy::Blocked skips this entirely.
+        let netstack_listener = match network {
+            NetworkPolicy::AllowAll => Some(
+                socket_dev
+                    .listen(NETSTACK_VSOCK_PORT)
+                    .map_err(|e| Error::other(format!("netstack listen: {e}")))?,
+            ),
+            NetworkPolicy::Blocked => None,
+        };
+
         let connect_timeout = Duration::from_secs(30);
         let deadline = Instant::now() + connect_timeout;
         let mut conn = None;
@@ -295,12 +324,13 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         })?;
 
         let vsock_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
-        Ok::<_, Error>((vm, vsock_fd))
+        Ok::<_, Error>((vm, vsock_fd, netstack_listener))
     })?;
 
     Ok(BootedVm {
         vm,
         vsock: vsock_fd,
+        netstack_listener,
         runtime,
     })
 }

@@ -17,3 +17,5 @@ Cargo.lock
 
 # Per-user IDE config
 /.vscode/
+.cargo-docker/
+.rustup-docker/

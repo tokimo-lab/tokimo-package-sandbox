@@ -113,7 +113,8 @@ fn shell_env_does_not_leak_init_control_vars() {
     sb.start_vm().expect("start_vm");
     let shell = sb.shell_id().expect("shell_id");
 
-    sb.write_stdin(&shell, b"env | grep -c '^TOKIMO_SANDBOX_' || true\n").unwrap();
+    sb.write_stdin(&shell, b"env | grep -c '^TOKIMO_SANDBOX_' || true\n")
+        .unwrap();
     sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
@@ -704,12 +705,7 @@ fn concurrent_commands_in_single_shell() {
 // concurrency: two shells running in parallel, each individually
 // addressable for write/signal/close.
 
-fn drain_until_for_id(
-    rx: &Receiver<Event>,
-    target: &JobId,
-    needle: &str,
-    timeout: Duration,
-) -> String {
+fn drain_until_for_id(rx: &Receiver<Event>, target: &JobId, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut buf = String::new();
     while Instant::now() < deadline {
@@ -766,10 +762,22 @@ fn multi_shell_isolated_streams() {
     sb.close_shell(&shell_b).expect("close_shell B");
     sb.stop_vm().ok();
 
-    assert!(from_a.contains("MARK_FROM_A_F00D"), "A stream missing A marker: {from_a:?}");
-    assert!(!from_a.contains("MARK_FROM_B_BEEF"), "A stream leaked B marker: {from_a:?}");
-    assert!(from_b.contains("MARK_FROM_B_BEEF"), "B stream missing B marker: {from_b:?}");
-    assert!(!from_b.contains("MARK_FROM_A_F00D"), "B stream leaked A marker: {from_b:?}");
+    assert!(
+        from_a.contains("MARK_FROM_A_F00D"),
+        "A stream missing A marker: {from_a:?}"
+    );
+    assert!(
+        !from_a.contains("MARK_FROM_B_BEEF"),
+        "A stream leaked B marker: {from_a:?}"
+    );
+    assert!(
+        from_b.contains("MARK_FROM_B_BEEF"),
+        "B stream missing B marker: {from_b:?}"
+    );
+    assert!(
+        !from_b.contains("MARK_FROM_A_F00D"),
+        "B stream leaked A marker: {from_b:?}"
+    );
 }
 
 #[test]
@@ -815,7 +823,10 @@ fn multi_shell_independent_signals() {
 
     assert!(a_exited, "A should have exited from SIGINT");
     assert!(!b_exited, "B should NOT have exited (signal was scoped to A)");
-    assert!(probe.contains("B_STILL_ALIVE_77"), "B unresponsive after A's SIGINT: {probe:?}");
+    assert!(
+        probe.contains("B_STILL_ALIVE_77"),
+        "B unresponsive after A's SIGINT: {probe:?}"
+    );
 }
 
 #[test]
@@ -827,7 +838,10 @@ fn list_shells_tracks_lifecycle() {
     let boot = sb.shell_id().expect("shell_id");
     let initial = sb.list_shells().expect("list_shells (initial)");
     assert_eq!(initial.len(), 1, "expected only the boot shell, got {initial:?}");
-    assert!(initial.contains(&boot), "boot shell missing from initial list: {initial:?}");
+    assert!(
+        initial.contains(&boot),
+        "boot shell missing from initial list: {initial:?}"
+    );
 
     let extra1 = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell #1");
     let extra2 = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell #2");
@@ -842,15 +856,21 @@ fn list_shells_tracks_lifecycle() {
     // close_shell removes the bookkeeping synchronously; list_shells must
     // reflect the change immediately, even if Event::Exit hasn't propagated.
     let after_close = sb.list_shells().expect("list_shells (after close)");
-    assert_eq!(after_close.len(), 2, "expected 2 shells after close, got {after_close:?}");
-    assert!(!after_close.contains(&extra1), "closed shell still listed: {after_close:?}");
+    assert_eq!(
+        after_close.len(),
+        2,
+        "expected 2 shells after close, got {after_close:?}"
+    );
+    assert!(
+        !after_close.contains(&extra1),
+        "closed shell still listed: {after_close:?}"
+    );
     assert!(after_close.contains(&boot), "boot shell vanished: {after_close:?}");
     assert!(after_close.contains(&extra2), "extra2 vanished: {after_close:?}");
 
     sb.close_shell(&extra2).ok();
     sb.stop_vm().ok();
 }
-
 
 // =========================================================================
 // PTY tests (PROTOCOL_VERSION 4)
@@ -985,4 +1005,3 @@ fn pty_shell_color_escape_codes_pass_through() {
         String::from_utf8_lossy(&captured)
     );
 }
-
