@@ -280,6 +280,14 @@ impl Sandbox {
         self.inner.close_shell(id)
     }
 
+    /// Enumerate all currently-active shell JobIds in this session
+    /// (boot shell + any live `spawn_shell` returns). Order is
+    /// unspecified. Useful for UIs that need to render a session's
+    /// running shells, or for graceful shutdown loops.
+    pub fn list_shells(&self) -> Result<Vec<JobId>> {
+        self.inner.list_shells()
+    }
+
     /// Write bytes to the stdin of a child process (typically a shell).
     /// Send `\x03` (Ctrl+C) to interrupt, `\x04` (Ctrl+D) for EOF.
     pub fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {

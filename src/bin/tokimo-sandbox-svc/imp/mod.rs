@@ -51,7 +51,7 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdResult, MAX_FRAME_BYTES,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult, MAX_FRAME_BYTES,
     PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec, RpcError, SignalShellParams, WriteStdinParams, encode_frame,
     method,
 };
@@ -730,6 +730,7 @@ fn dispatch(
         method::SHELL_ID => handle_shell_id(conn, sessions),
         method::SPAWN_SHELL => handle_spawn_shell(conn, sessions),
         method::CLOSE_SHELL => handle_close_shell(conn, params, sessions),
+        method::LIST_SHELLS => handle_list_shells(conn, sessions),
         method::SIGNAL_SHELL => handle_signal_shell(conn, params, sessions),
 
         method::SUBSCRIBE => Ok(json!({})),
@@ -1152,6 +1153,15 @@ fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
         }
     }
     Ok(json!({}))
+}
+
+fn handle_list_shells(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
+    let st = shared.state.lock().unwrap();
+    // Every entry in `st.children` is a shell (boot or spawn_shell).
+    // Order is unspecified per trait contract.
+    let ids: Vec<String> = st.children.keys().cloned().collect();
+    Ok(serde_json::to_value(JobIdListResult { ids }).unwrap())
 }
 
 fn child_poller(

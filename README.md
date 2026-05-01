@@ -421,7 +421,7 @@ cargo test --bin tokimo-sandbox-svc --lib  # 34 svc tests (vmconfig, vhdx_pool, 
 
 ### Windows integration tests
 
-End-to-end tests (15 cases, ~42 s) live in [`tests/sandbox_integration.rs`](tests/sandbox_integration.rs) and exercise the **real** HCS-backed VM through `\\.\pipe\tokimo-sandbox-svc` — no mocks. Coverage: lifecycle, shell I/O, multi-shell streams + signals, plan9 share dynamics, network policy, multi-session concurrency.
+End-to-end tests (16 cases, ~45 s) live in [`tests/sandbox_integration.rs`](tests/sandbox_integration.rs) and exercise the **real** HCS-backed VM through `\\.\pipe\tokimo-sandbox-svc` — no mocks. Coverage: lifecycle, shell I/O, multi-shell streams + signals + enumeration, plan9 share dynamics, network policy, multi-session concurrency.
 
 **Hard requirements:**
 

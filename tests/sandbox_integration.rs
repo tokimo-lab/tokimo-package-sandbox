@@ -604,3 +604,36 @@ fn multi_shell_independent_signals() {
     assert!(!b_exited, "B should NOT have exited (signal was scoped to A)");
     assert!(probe.contains("B_STILL_ALIVE_77"), "B unresponsive after A's SIGINT: {probe:?}");
 }
+
+#[test]
+fn list_shells_tracks_lifecycle() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("list-shells")).expect("configure");
+    sb.start_vm().expect("start_vm");
+
+    let boot = sb.shell_id().expect("shell_id");
+    let initial = sb.list_shells().expect("list_shells (initial)");
+    assert_eq!(initial.len(), 1, "expected only the boot shell, got {initial:?}");
+    assert!(initial.contains(&boot), "boot shell missing from initial list: {initial:?}");
+
+    let extra1 = sb.spawn_shell().expect("spawn_shell #1");
+    let extra2 = sb.spawn_shell().expect("spawn_shell #2");
+
+    let after_spawn = sb.list_shells().expect("list_shells (after spawn)");
+    assert_eq!(after_spawn.len(), 3, "expected 3 shells, got {after_spawn:?}");
+    for id in [&boot, &extra1, &extra2] {
+        assert!(after_spawn.contains(id), "{id:?} missing from {after_spawn:?}");
+    }
+
+    sb.close_shell(&extra1).expect("close_shell #1");
+    // close_shell removes the bookkeeping synchronously; list_shells must
+    // reflect the change immediately, even if Event::Exit hasn't propagated.
+    let after_close = sb.list_shells().expect("list_shells (after close)");
+    assert_eq!(after_close.len(), 2, "expected 2 shells after close, got {after_close:?}");
+    assert!(!after_close.contains(&extra1), "closed shell still listed: {after_close:?}");
+    assert!(after_close.contains(&boot), "boot shell vanished: {after_close:?}");
+    assert!(after_close.contains(&extra2), "extra2 vanished: {after_close:?}");
+
+    sb.close_shell(&extra2).ok();
+    sb.stop_vm().ok();
+}

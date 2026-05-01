@@ -365,6 +365,19 @@ impl SandboxBackend for MacosBackend {
         init.signal(id.as_str(), 15, true)
     }
 
+    fn list_shells(&self) -> Result<Vec<JobId>> {
+        let init = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => rs.init.clone(),
+                _ => return Err(Error::VmNotRunning),
+            }
+        };
+        // child_ids() returns every live child the init tracks; in this
+        // backend they're all shells (we don't currently expose `Op::Exec`).
+        Ok(init.child_ids().into_iter().map(JobId).collect())
+    }
+
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         let init = {
             let state = self.state.lock().unwrap();

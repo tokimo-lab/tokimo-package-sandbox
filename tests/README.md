@@ -64,7 +64,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 
 ### Test inventory
 
-15 tests, all currently green (~42 s wall):
+16 tests, all currently green (~45 s wall):
 
 | # | Name | What it asserts |
 |---|------|-----------------|
@@ -83,6 +83,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 | 13 | `concurrent_commands_in_single_shell` | `(sleep 2; echo A) & (sleep 5; echo B) & wait` finishes in <7 s wall (parallel, not sequential) and both stdout markers appear |
 | 14 | `multi_shell_isolated_streams` | `spawn_shell()` yields a fresh `JobId`; `write_stdin` to two shells produces stdout events tagged correctly — neither stream leaks the other's marker |
 | 15 | `multi_shell_independent_signals` | `signal_shell(A, SIGINT)` kills only A; B remains responsive (`echo` round-trip) until `close_shell(B)` |
+| 16 | `list_shells_tracks_lifecycle` | `list_shells()` reports `[boot]` initially; grows to 3 after two `spawn_shell()`; shrinks after `close_shell()` — set ops are synchronous, no event wait needed |
 
 ### Cross-platform portability of the test source
 

@@ -96,6 +96,7 @@ pub mod method {
     pub const SHELL_ID: &str = "shellId";
     pub const SPAWN_SHELL: &str = "spawnShell";
     pub const CLOSE_SHELL: &str = "closeShell";
+    pub const LIST_SHELLS: &str = "listShells";
     pub const SIGNAL_SHELL: &str = "signalShell";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const CREATE_DISK_IMAGE: &str = "createDiskImage";
@@ -148,6 +149,12 @@ pub fn decode_body(body: &[u8]) -> std::io::Result<Frame> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobIdResult {
     pub id: String,
+}
+
+/// Wire result for `listShells` — the set of currently-active shell JobIds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobIdListResult {
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

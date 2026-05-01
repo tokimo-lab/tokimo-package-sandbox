@@ -540,6 +540,13 @@ impl SandboxBackend for LinuxBackend {
         Ok(())
     }
 
+    fn list_shells(&self) -> Result<Vec<JobId>> {
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        // All entries in `jobs` come from open_shell calls (boot + spawned).
+        // Order is unspecified per trait contract.
+        Ok(g.jobs.keys().cloned().map(JobId).collect())
+    }
+
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;

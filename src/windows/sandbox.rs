@@ -16,7 +16,7 @@ use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdResult, RemovePlan9ShareParams,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, RemovePlan9ShareParams,
     SignalShellParams, WriteStdinParams, method,
 };
 
@@ -109,6 +109,12 @@ impl SandboxBackend for WindowsBackend {
         let p = IdParams { id: id.0.clone() };
         self.call(method::CLOSE_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         Ok(())
+    }
+
+    fn list_shells(&self) -> Result<Vec<JobId>> {
+        let v = self.call(method::LIST_SHELLS, json!({}), SHORT_CALL_TIMEOUT)?;
+        let r: JobIdListResult = serde_json::from_value(v)?;
+        Ok(r.ids.into_iter().map(JobId).collect())
     }
 
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {

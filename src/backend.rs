@@ -30,6 +30,10 @@ pub trait SandboxBackend: Send + Sync + 'static {
     /// Terminate a shell previously returned by `shell_id()` or
     /// `spawn_shell()`. Sends SIGTERM and removes the bookkeeping.
     fn close_shell(&self, id: &JobId) -> Result<()>;
+    /// Enumerate all currently-active shell JobIds in this session
+    /// (the boot shell from `shell_id()` plus any `spawn_shell()` returns
+    /// that haven't been closed). Order is unspecified.
+    fn list_shells(&self) -> Result<Vec<JobId>>;
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()>;
     /// Deliver a POSIX signal to a specific shell's foreground process
     /// group. The signal number is the raw Linux value
