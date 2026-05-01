@@ -25,7 +25,7 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -217,6 +217,63 @@ impl SandboxBackend for MacosBackend {
             let _ = runtime.block_on(vm.stop());
             let _ = std::fs::remove_dir_all(&session_dir);
             return Err(e);
+        }
+
+        // ---- Network: DHCP on eth0 (AllowAll) ---------------------------
+        // initrd.img hard-codes the Hyper-V HCN subnet (192.168.127.2/24).
+        // VZ NAT uses a different subnet (vmnet picks something like
+        // 192.168.64.x) so re-do address acquisition via udhcpc inside the
+        // chrooted rootfs. NetworkPolicy::Blocked has no NIC and skips this.
+        if matches!(params.network, NetworkPolicy::AllowAll) {
+            // Run udhcpc and capture diagnostics. The shell exits 0 even if
+            // udhcpc fails so the boot path is not blocked by transient
+            // vmnet bring-up issues.
+            let dhcp_script = r#"
+                set +e
+                BB=/usr/bin/busybox
+                if [ ! -d /sys/class/net/eth0 ]; then
+                    echo "tokimo-dhcp: no eth0" >&2
+                    exit 0
+                fi
+                $BB ip addr flush dev eth0 2>/dev/null
+                $BB ip route flush dev eth0 2>/dev/null
+                $BB ip link set eth0 up 2>/dev/null
+
+                # Minimal udhcpc lease-apply script. busybox udhcpc requires
+                # a script - the package's default lives at varying paths so
+                # we inline our own.
+                cat >/tmp/udhcpc.sh <<'SH'
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        /usr/bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        /usr/bin/busybox ip addr add "$ip/$mask" dev "$interface"
+        if [ -n "$router" ]; then
+            /usr/bin/busybox ip route add default via "${router%% *}" dev "$interface" 2>/dev/null
+        fi
+        ;;
+esac
+exit 0
+SH
+                chmod +x /tmp/udhcpc.sh
+                $BB udhcpc -i eth0 -n -t 5 -T 1 -q -s /tmp/udhcpc.sh >/tmp/udhcpc.log 2>&1
+                rc=$?
+                echo "tokimo-dhcp: udhcpc rc=$rc" >&2
+                $BB ip -4 addr show eth0 >&2
+                $BB ip route >&2
+                echo nameserver 1.1.1.1 > /etc/resolv.conf
+                echo nameserver 8.8.8.8 >> /etc/resolv.conf
+                exit 0
+            "#;
+            let argv = vec!["/bin/sh".to_string(), "-c".to_string(), dhcp_script.to_string()];
+            if let Ok((stdout, stderr, code)) = init.run_oneshot(&argv, &[], None, Duration::from_secs(15)) {
+                tracing::info!(
+                    code,
+                    stdout = %String::from_utf8_lossy(&stdout),
+                    stderr = %String::from_utf8_lossy(&stderr),
+                    "macos guest DHCP"
+                );
+            }
         }
 
         // ---- Mount the dynamic-share pool -------------------------------
