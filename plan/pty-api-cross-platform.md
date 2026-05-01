@@ -171,32 +171,58 @@ flowchart TB
    - `close_shell(&id)`: if `pty_fd` present, drop the fd before signal
      (closes master, slave gets EOF, child exits naturally).
 
-2. **`init_client.rs`** — `spawn_pty` and `resize` already exist
-   ([init_client.rs](../src/linux/init_client.rs#L270),
-   [resize](../src/linux/init_client.rs#L355)). No changes.
+2. **`init_client.rs`** — commit `33b2be4` removed the previously-existing
+   `spawn_pty` / `resize` / pipe-spawn helpers as "dead code". They
+   need to be re-added now that PTY is becoming a live feature. Add:
+   ```rust
+   pub fn spawn_pty(
+       &self,
+       argv: &[String],
+       env: &[(String, String)],
+       cwd: Option<&str>,
+       rows: u16,
+       cols: u16,
+   ) -> Result<(SpawnInfo, OwnedFd)>;
+
+   pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()>;
+   ```
+   The init server already handles `StdioMode::Pty` and `Op::Resize`
+   ([server.rs](../src/bin/tokimo-sandbox-init/server.rs#L1347)) — the
+   wire protocol is intact, only the host-side client conveniences
+   were trimmed. `spawn_pty` recovers the master fd via SCM_RIGHTS on
+   the SEQPACKET reply (existing init server behaviour).
 
 3. **`backend.rs`** — implement `resize_shell` calling
    `init_client.resize(child_id, rows, cols)`.
 
 ### macOS (`src/macos/`)
 
-1. **`vsock_init_client.rs`** — replace `spawn_pty`'s
-   `Err(not_implemented)`
-   ([line 202](../src/macos/vsock_init_client.rs#L202)) with the same
-   `spawn_ack` flow as `spawn_pipes`, just sending
-   `StdioMode::Pty { rows, cols }`. Return type changes to
-   `Result<SpawnInfo>` (no fd over VSOCK). The init-side PTY relay in
-   `tokimo-sandbox-init` already converts master-fd reads into
-   `Reply::Stdout { child_id, data }` over the stream.
+1. **`vsock_init_client.rs`** — commit `9e54406` removed the previous
+   `spawn_pty` / `resize` helpers as "dead code" alongside Linux's
+   parallel cleanup. Currently only `spawn_pipes` / `write` / `signal`
+   exist. Add (mirroring Linux):
+   ```rust
+   pub fn spawn_pty(
+       &self,
+       argv: &[String],
+       env: &[(String, String)],
+       cwd: Option<&str>,
+       rows: u16,
+       cols: u16,
+   ) -> Result<SpawnInfo>;          // no fd over VSOCK
 
-2. **`sandbox.rs`** — `spawn_shell_with` branches on `opts.pty`. PTY
-   children's stdout flows through the existing `event_pump_loop`
-   ([macos/sandbox.rs](../src/macos/sandbox.rs#L521)) → `Event::Stdout`.
+   pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()>;
+   ```
+   Both use the existing `spawn_ack` / `ack_op` helpers — just send
+   `Op::Spawn { stdio: StdioMode::Pty { rows, cols } }` and `Op::Resize`.
+   The init server's stream-bridged PTY relay already converts master-fd
+   reads into `Reply::Stdout { child_id, data }` chunks.
+
+2. **`sandbox.rs`** — `spawn_shell` branches on `opts.pty`. PTY children's
+   stdout flows through the existing `event_pump_loop` → `Event::Stdout`.
    No `pty_children` exclusion set is needed (everything is uniform).
 
-3. **`resize_shell`** — call existing
-   `init.resize(child_id, rows, cols)`
-   ([vsock_init_client.rs](../src/macos/vsock_init_client.rs#L256)).
+3. **`resize_shell`** — call new `init.resize(child_id, rows, cols)`.
 
 ### Windows (largest gap)
 
@@ -344,3 +370,7 @@ Update ~3 call sites of `spawn_shell()` →
 
 - 决策：选择 ShellOpts + resize_shell 方案（三平台事件流统一），不引入 PtyHandle 第二种返回类型。
 - 决策：不保留向后兼容。直接替换 `spawn_shell()` 签名为 `spawn_shell(ShellOpts)`，旧调用点更新为传 `ShellOpts::default()`。
+- 调整：拉取上游后发现两个 cleanup commits同时删了三平台 init_client 中的“未使用 PTY API”：
+  - `33b2be4` 删 `src/linux/init_client.rs` 的 `spawn_pty`/`resize`。
+  - `9e54406` 删 `src/macos/vsock_init_client.rs` 的 `spawn_pty`/`resize`。
+  Windows `src/windows/init_client.rs` 本来就没有。Wire 协议（`Op::Spawn` w/ `StdioMode::Pty`、`Op::Resize`）在 init server 端完整保留。计划随之调整：**三平台 init_client 都需要重加 `spawn_pty` + `resize` 客户端便利方法**。
