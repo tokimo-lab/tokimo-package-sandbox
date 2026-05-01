@@ -19,12 +19,14 @@ set -euo pipefail
 
 BASE=""
 INIT_BIN=""
+INIT_SH=""
 OUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --base)     BASE="$2";     shift 2 ;;
         --init-bin) INIT_BIN="$2"; shift 2 ;;
+        --init-sh)  INIT_SH="$2";  shift 2 ;;
         --out)      OUT="$2";      shift 2 ;;
         -h|--help)
             sed -n '2,18p' "$0"
@@ -42,6 +44,7 @@ done
 [ -n "$OUT" ]      || { echo "rebake-initrd: --out required"      >&2; exit 2; }
 [ -f "$BASE" ]     || { echo "rebake-initrd: base not found: $BASE" >&2; exit 1; }
 [ -x "$INIT_BIN" ] || { echo "rebake-initrd: init bin not executable: $INIT_BIN" >&2; exit 1; }
+[ -z "$INIT_SH" ]  || [ -f "$INIT_SH" ] || { echo "rebake-initrd: init.sh not found: $INIT_SH" >&2; exit 1; }
 
 for tool in cpio gzip gunzip find install; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -59,6 +62,11 @@ gunzip -c "$BASE" | ( cd "$TMP" && cpio -idm --quiet )
 mkdir -p "$TMP/bin"
 echo "==> rebake: installing init binary -> /bin/tokimo-sandbox-init ($(stat -c%s "$INIT_BIN") bytes)"
 install -m 0755 "$INIT_BIN" "$TMP/bin/tokimo-sandbox-init"
+
+if [ -n "$INIT_SH" ]; then
+    echo "==> rebake: replacing /init from $INIT_SH ($(stat -c%s "$INIT_SH") bytes)"
+    install -m 0755 "$INIT_SH" "$TMP/init"
+fi
 
 OUT_DIR="$(dirname "$OUT")"
 mkdir -p "$OUT_DIR"

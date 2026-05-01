@@ -14,7 +14,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,7 +25,7 @@ use std::{env, thread};
 
 use nix::sys::socket::{SockFlag, socketpair};
 
-use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::linux::init_client::{DrainedEvent, InitClient};
@@ -518,24 +518,103 @@ impl SandboxBackend for LinuxBackend {
         g.shell_job_id.clone().ok_or_else(|| Error::VmNotRunning)
     }
 
-    fn spawn_shell(&self) -> Result<JobId> {
+    fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
         self.ensure_running()?;
-        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?);
-        let shell_info = client
-            .open_shell(&["/bin/bash"], &[], None)
-            .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
-        let job_id = JobId(format!("j{}", g.next_job_id));
-        g.next_job_id += 1;
-        g.jobs.insert(
-            job_id.0.clone(),
-            JobSpawnInfo {
-                child_id: shell_info.child_id.clone(),
-                pty_fd: None,
-            },
-        );
-        g.child_to_job.insert(shell_info.child_id, job_id.clone());
-        Ok(job_id)
+        // Build argv (own the strings so we can release the state lock
+        // before issuing the init RPC).
+        let argv: Vec<String> = opts
+            .argv
+            .clone()
+            .unwrap_or_else(|| vec!["/bin/bash".to_string()]);
+        let env = opts.env.clone();
+        let cwd = opts.cwd.clone();
+
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?)
+        };
+
+        match opts.pty {
+            None => {
+                // Pipes mode. Use OpenShell (the existing path) when argv is
+                // exactly the default; otherwise use Spawn { Pipes }.
+                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let shell_info = client
+                    .open_shell(&argv_refs, &env, cwd.as_deref())
+                    .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
+                let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+                let job_id = JobId(format!("j{}", g.next_job_id));
+                g.next_job_id += 1;
+                g.jobs.insert(
+                    job_id.0.clone(),
+                    JobSpawnInfo {
+                        child_id: shell_info.child_id.clone(),
+                        pty_fd: None,
+                    },
+                );
+                g.child_to_job.insert(shell_info.child_id, job_id.clone());
+                Ok(job_id)
+            }
+            Some((rows, cols)) => {
+                let (info, master_fd) = client
+                    .spawn_pty(&argv, &env, cwd.as_deref(), rows, cols)
+                    .map_err(|e| Error::other(format!("init spawn_pty failed: {e}")))?;
+                // Dup the master fd for the host-side reader thread; the
+                // original lives in JobSpawnInfo so write_stdin can use it.
+                let dup_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };
+                if dup_raw < 0 {
+                    return Err(Error::other(format!(
+                        "dup pty master fd: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                // SAFETY: dup_raw is a freshly allocated fd we own.
+                let reader_fd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+
+                let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+                let job_id = JobId(format!("j{}", g.next_job_id));
+                g.next_job_id += 1;
+                g.jobs.insert(
+                    job_id.0.clone(),
+                    JobSpawnInfo {
+                        child_id: info.child_id.clone(),
+                        pty_fd: Some(master_fd),
+                    },
+                );
+                g.child_to_job.insert(info.child_id.clone(), job_id.clone());
+                drop(g);
+
+                // Spawn host-side reader thread.
+                let pump_state = SyncStatePtr(&self.state as *const Mutex<BackendState>);
+                let job_for_thread = job_id.clone();
+                thread::Builder::new()
+                    .name("tokimo-pty-reader".into())
+                    .spawn(move || pty_reader_loop(reader_fd, job_for_thread, pump_state))
+                    .map_err(|e| Error::other(format!("spawn pty reader: {e}")))?;
+
+                Ok(job_id)
+            }
+        }
+    }
+
+    fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
+        self.ensure_running()?;
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?;
+        let job = g
+            .jobs
+            .get(id.as_str())
+            .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
+        if job.pty_fd.is_none() {
+            return Err(Error::other(format!(
+                "resize_shell: {} is not a PTY shell",
+                id.as_str()
+            )));
+        }
+        let child_id = job.child_id.clone();
+        client
+            .resize(&child_id, rows, cols)
+            .map_err(|e| Error::other(format!("resize_shell: {e}")))
     }
 
     fn close_shell(&self, id: &JobId) -> Result<()> {
@@ -547,11 +626,15 @@ impl SandboxBackend for LinuxBackend {
             .get(id.as_str())
             .ok_or_else(|| Error::other(format!("unknown job: {}", id.as_str())))?;
         let child_id = job.child_id.clone();
+        // Drop the master fd first (if PTY): closes the master, slave gets
+        // EOF, the reader thread observes EOF and exits, and the child
+        // exits naturally. We still send SIGTERM as a fallback.
+        let mut removed = g.jobs.remove(id.as_str());
+        if let Some(ref mut job) = removed {
+            job.pty_fd.take();
+        }
         // Send SIGTERM to the shell's process group.
         let _ = client.signal(&child_id, 15, true);
-        // Remove bookkeeping. The pump will still drain any final stdout
-        // and emit Event::Exit when init reports it.
-        g.jobs.remove(id.as_str());
         g.child_to_job.remove(&child_id);
         if g.shell_job_id.as_ref() == Some(id) {
             g.shell_job_id = None;
@@ -711,6 +794,7 @@ impl SandboxBackend for LinuxBackend {
 /// thread (we join on stop_vm before dropping).
 struct SyncStatePtr(*const Mutex<BackendState>);
 unsafe impl Send for SyncStatePtr {}
+unsafe impl Sync for SyncStatePtr {}
 
 fn event_pump_loop(client: Arc<InitClient>, stop: Arc<AtomicBool>, state_ptr: SyncStatePtr) {
     loop {
@@ -769,6 +853,42 @@ fn event_pump_loop(client: Arc<InitClient>, stop: Arc<AtomicBool>, state_ptr: Sy
                     }
                 }
             }
+        }
+    }
+}
+
+/// Drain a PTY master fd and broadcast each chunk as `Event::Stdout` for
+/// `job`. Spawned by `spawn_shell` when `opts.pty` is `Some`. Exits on
+/// EOF / read error / job removal.
+fn pty_reader_loop(reader_fd: OwnedFd, job: JobId, state_ptr: SyncStatePtr) {
+    use std::io::Read;
+    // SAFETY: reader_fd is a freshly dup'd OwnedFd; converting to File
+    // takes ownership and closes it on drop.
+    let mut file = std::fs::File::from(reader_fd);
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // SAFETY: see SyncStatePtr.
+                let state = unsafe { &*state_ptr.0 };
+                let mut g = match state.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                // Stop pumping once the job has been removed (close_shell).
+                if !g.jobs.contains_key(job.as_str()) {
+                    return;
+                }
+                LinuxBackend::broadcast_event(
+                    &mut g,
+                    Event::Stdout {
+                        id: job.clone(),
+                        data: buf[..n].to_vec(),
+                    },
+                );
+            }
+            Err(_) => break,
         }
     }
 }

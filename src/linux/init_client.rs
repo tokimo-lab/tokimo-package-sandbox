@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-use crate::protocol::types::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, default_features};
+use crate::protocol::types::{ErrorReply, Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
 use crate::{Error, Result};
 
@@ -38,6 +38,10 @@ struct Shared {
     children: HashMap<String, ChildEvents>,
     /// Reply id → Reply. Reader inserts on arrival.
     replies: HashMap<String, Reply>,
+    /// Reply id → ancillary OwnedFd attached to the reply (for PTY spawn
+    /// SCM_RIGHTS). Pulled out atomically with the reply by
+    /// [`InitClient::send_op_sync_with_fd`].
+    reply_fds: HashMap<String, OwnedFd>,
     /// True when the reader thread observed EOF or a fatal error.
     eof: bool,
 }
@@ -215,6 +219,60 @@ impl InitClient {
         self.ack_op(&id, op)
     }
 
+    /// Spawn a PTY-mode child. Init replies with the PTY master fd
+    /// attached as `SCM_RIGHTS`; the host owns the fd thereafter.
+    pub fn spawn_pty(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(SpawnInfo, OwnedFd)> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Spawn {
+            id: id.clone(),
+            argv: argv.to_vec(),
+            env_overlay: env.to_vec(),
+            cwd: cwd.map(str::to_string),
+            stdio: StdioMode::Pty { rows, cols },
+            inherit_from_child: None,
+        };
+        let (reply, fd) = self.send_op_sync_with_fd(&id, op, Duration::from_secs(10))?;
+        match reply {
+            Reply::Spawn {
+                ok, child_id, error, ..
+            } => {
+                if !ok {
+                    return Err(Error::exec(format!(
+                        "spawn pty failed: {:?}",
+                        error.map(|e| e.message)
+                    )));
+                }
+                let fd = fd.ok_or_else(|| Error::exec("PTY spawn reply missing master fd"))?;
+                Ok((
+                    SpawnInfo {
+                        child_id: child_id.unwrap_or_default(),
+                    },
+                    fd,
+                ))
+            }
+            other => Err(Error::exec(format!("unexpected reply: {other:?}"))),
+        }
+    }
+
+    /// Resize a PTY child: ioctl(master, TIOCSWINSZ) + killpg(SIGWINCH).
+    pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Resize {
+            id: id.clone(),
+            child_id: child_id.into(),
+            rows,
+            cols,
+        };
+        self.ack_op(&id, op)
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::Shutdown {
@@ -239,6 +297,16 @@ impl InitClient {
     }
 
     fn send_op_sync(&self, id: &str, op: Op, timeout: Duration) -> Result<Reply> {
+        let (reply, _fd) = self.send_op_sync_with_fd(id, op, timeout)?;
+        Ok(reply)
+    }
+
+    fn send_op_sync_with_fd(
+        &self,
+        id: &str,
+        op: Op,
+        timeout: Duration,
+    ) -> Result<(Reply, Option<OwnedFd>)> {
         // Send the op while holding send_lock (kernel atomicity for SEQPACKET
         // is per-packet, but we still need to serialize JSON build + sendmsg).
         {
@@ -256,7 +324,8 @@ impl InitClient {
         let mut g = lock.lock().map_err(|_| Error::exec("client state poisoned"))?;
         loop {
             if let Some(r) = g.replies.remove(id) {
-                return Ok(r);
+                let fd = g.reply_fds.remove(id);
+                return Ok((r, fd));
             }
             if g.eof {
                 return Err(Error::exec("init connection closed before reply"));
@@ -368,7 +437,7 @@ fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
     loop {
         match recv_frame_seqpacket(bf) {
             Ok(None) => break,
-            Ok(Some((frame, _fd))) => {
+            Ok(Some((frame, fd))) => {
                 let (lock, cv) = &*state;
                 let mut g = match lock.lock() {
                     Ok(g) => g,
@@ -377,6 +446,9 @@ fn reader_loop(sock_fd: i32, state: Arc<(Mutex<Shared>, Condvar)>) {
                 match frame {
                     Frame::Reply(r) => {
                         let id = reply_id(&r);
+                        if let Some(fd) = fd {
+                            g.reply_fds.insert(id.clone(), fd);
+                        }
                         g.replies.insert(id, r);
                     }
                     Frame::Event(e) => match e {

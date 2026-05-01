@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -26,7 +26,9 @@ pub trait SandboxBackend: Send + Sync + 'static {
     /// JobId. Each shell has independent stdin/stdout/stderr streams
     /// (events are tagged with this JobId). Errors if the VM isn't
     /// running.
-    fn spawn_shell(&self) -> Result<JobId>;
+    fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId>;
+    /// Resize a PTY shell. Errors if the shell was spawned in pipes mode.
+    fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()>;
     /// Terminate a shell previously returned by `shell_id()` or
     /// `spawn_shell()`. Sends SIGTERM and removes the bookkeeping.
     fn close_shell(&self, id: &JobId) -> Result<()>;

@@ -204,6 +204,42 @@ impl VsockInitClient {
         self.ack_op(&id, op)
     }
 
+    /// Spawn (PTY mode). VSOCK has no SCM_RIGHTS, so the master fd stays
+    /// inside the guest; init streams its stdout via `Reply::Stdout`
+    /// events the same way pipe-mode children do.
+    pub fn spawn_pty(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<SpawnInfo> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Spawn {
+            id: id.clone(),
+            argv: argv.to_vec(),
+            env_overlay: env.to_vec(),
+            cwd: cwd.map(str::to_string),
+            stdio: StdioMode::Pty { rows, cols },
+            inherit_from_child: None,
+        };
+        self.spawn_ack(&id, op)
+    }
+
+    /// Resize a PTY child: ioctl(master, TIOCSWINSZ) + killpg(SIGWINCH)
+    /// inside the guest.
+    pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Resize {
+            id: id.clone(),
+            child_id: child_id.into(),
+            rows,
+            cols,
+        };
+        self.ack_op(&id, op)
+    }
+
     pub fn close_child(&self, child_id: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::Close {

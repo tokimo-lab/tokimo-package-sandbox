@@ -25,7 +25,7 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -405,16 +405,26 @@ SH
         }
     }
 
-    fn spawn_shell(&self) -> Result<JobId> {
+    fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
         let mut state = self.state.lock().unwrap();
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
         };
-        let shell_info = rs
-            .init
-            .open_shell(&["/bin/sh".to_string()], &[], None)
-            .map_err(|e| Error::other(format!("open_shell: {e}")))?;
+        let argv = opts
+            .argv
+            .clone()
+            .unwrap_or_else(|| vec!["/bin/sh".to_string()]);
+        let shell_info = match opts.pty {
+            None => rs
+                .init
+                .open_shell(&argv, &opts.env, opts.cwd.as_deref())
+                .map_err(|e| Error::other(format!("open_shell: {e}")))?,
+            Some((rows, cols)) => rs
+                .init
+                .spawn_pty(&argv, &opts.env, opts.cwd.as_deref(), rows, cols)
+                .map_err(|e| Error::other(format!("spawn_pty: {e}")))?,
+        };
         rs.shells.insert(shell_info.child_id.clone());
         Ok(JobId(shell_info.child_id))
     }
@@ -461,6 +471,17 @@ SH
             }
         };
         init.signal(id.as_str(), sig, true)
+    }
+
+    fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
+        let init = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => rs.init.clone(),
+                _ => return Err(Error::VmNotRunning),
+            }
+        };
+        init.resize(id.as_str(), rows, cols)
     }
 
     fn subscribe(&self) -> Result<Receiver<Event>> {

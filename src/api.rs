@@ -131,6 +131,26 @@ fn default_cpu_count() -> u32 {
     4
 }
 
+/// Options for [`Sandbox::spawn_shell`]. `Default` produces a pipes-mode
+/// shell with the backend's default boot-shell argv (matching the
+/// behaviour of the previous zero-arg `spawn_shell()`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShellOpts {
+    /// `Some((rows, cols))` → allocate a PTY pair and use the slave as
+    /// the child's controlling terminal. `None` → pipes mode.
+    #[serde(default)]
+    pub pty: Option<(u16, u16)>,
+    /// Optional argv override. `None` → backend-default login shell.
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// Env overlay applied on top of the session-wide environment.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Optional initial cwd; backend default is `/work`.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
 /// Opaque guest-side child process identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(pub String);
@@ -270,8 +290,15 @@ impl Sandbox {
     /// (events from this shell are tagged with the returned id). Allows
     /// API-level concurrency: multiple shells can run in parallel and be
     /// individually written to / signalled / closed.
-    pub fn spawn_shell(&self) -> Result<JobId> {
-        self.inner.spawn_shell()
+    pub fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
+        self.inner.spawn_shell(opts)
+    }
+
+    /// Resize a PTY shell's controlling terminal. Sends `TIOCSWINSZ` on
+    /// the master fd inside the guest and a `SIGWINCH` to the foreground
+    /// process group. Errors if `id` does not refer to a PTY-mode shell.
+    pub fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
+        self.inner.resize_shell(id, rows, cols)
     }
 
     /// Terminate a shell (sends SIGTERM and drops bookkeeping). Works on

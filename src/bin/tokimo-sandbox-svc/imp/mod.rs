@@ -52,8 +52,8 @@ use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
     AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, RemovePlan9ShareParams, RootfsSpec, RpcError, SignalShellParams, WriteStdinParams, encode_frame,
-    method,
+    PROTOCOL_VERSION, RemovePlan9ShareParams, ResizeShellParams, RootfsSpec, RpcError, SignalShellParams,
+    SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
@@ -728,10 +728,11 @@ fn dispatch(
 
         method::WRITE_STDIN => handle_write_stdin(conn, params, sessions),
         method::SHELL_ID => handle_shell_id(conn, sessions),
-        method::SPAWN_SHELL => handle_spawn_shell(conn, sessions),
+        method::SPAWN_SHELL => handle_spawn_shell(conn, params, sessions),
         method::CLOSE_SHELL => handle_close_shell(conn, params, sessions),
         method::LIST_SHELLS => handle_list_shells(conn, sessions),
         method::SIGNAL_SHELL => handle_signal_shell(conn, params, sessions),
+        method::RESIZE_SHELL => handle_resize_shell(conn, params, sessions),
 
         method::SUBSCRIBE => Ok(json!({})),
 
@@ -1099,11 +1100,31 @@ fn handle_signal_shell(conn: &Arc<Connection>, params: Value, sessions: &Windows
     Ok(json!({}))
 }
 
-fn handle_spawn_shell(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+fn handle_spawn_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    // SpawnShellParams was added in PROTOCOL_VERSION 4. Older clients
+    // (and the simple `{}` body sent by spawnShell with default opts)
+    // deserialize cleanly because every field has `#[serde(default)]`.
+    let p: SpawnShellParams = if params.is_null() {
+        SpawnShellParams::default()
+    } else {
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("spawn_shell: {e}")))?
+    };
     let init = require_init(conn, sessions)?;
-    let shell_info = init
-        .open_shell(&["/bin/bash"], &[], None)
-        .map_err(|e| RpcError::new("open_shell", e.to_string()))?;
+
+    let argv: Vec<String> = p.argv.unwrap_or_else(|| vec!["/bin/bash".to_string()]);
+    let env = p.env;
+    let cwd = p.cwd;
+
+    let shell_info = match (p.pty_rows, p.pty_cols) {
+        (Some(rows), Some(cols)) => init
+            .spawn_pty(&argv, &env, cwd.as_deref(), rows, cols)
+            .map_err(|e| RpcError::new("spawn_pty", e.to_string()))?,
+        _ => {
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            init.spawn_pipes(&argv_refs, &env, cwd.as_deref())
+                .map_err(|e| RpcError::new("spawn_pipes", e.to_string()))?
+        }
+    };
     let child_id = shell_info.child_id;
 
     // Spawn the per-child poller so stdout/stderr/exit flow back to subscribers.
@@ -1128,6 +1149,22 @@ fn handle_spawn_shell(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Res
         );
     }
     Ok(serde_json::to_value(JobIdResult { id: child_id }).unwrap())
+}
+
+fn handle_resize_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let p: ResizeShellParams =
+        serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", format!("resize_shell: {e}")))?;
+    let init = require_init(conn, sessions)?;
+    {
+        let shared = get_session(conn, sessions)?;
+        let st = shared.state.lock().unwrap();
+        if !st.children.contains_key(&p.id) {
+            return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
+        }
+    }
+    init.resize(&p.id, p.rows, p.cols)
+        .map_err(|e| RpcError::new("resize", e.to_string()))?;
+    Ok(json!({}))
 }
 
 fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {

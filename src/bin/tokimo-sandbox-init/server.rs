@@ -1383,6 +1383,17 @@ fn spawn_child_inner(
                         return;
                     }
                     let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                    // O_NONBLOCK is REQUIRED: the mio drain loop calls
+                    // libc::read in a tight loop and breaks only on n<=0.
+                    // A blocking master fd would hang inside drain_pipe
+                    // after exhausting available bytes, freezing the
+                    // single-threaded init request loop.
+                    unsafe {
+                        let flags = libc::fcntl(dup_fd, libc::F_GETFL);
+                        if flags >= 0 {
+                            libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
+                    }
                     // Use master as stdin so Write ops go to PTY input.
                     let mfd_dup2 = unsafe { libc::dup(mfd.as_raw_fd()) };
                     let stdin_owned = if mfd_dup2 >= 0 {

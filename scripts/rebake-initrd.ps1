@@ -69,9 +69,10 @@ $baseW = To-Wsl $BaseInitrd
 $initW = To-Wsl $initBinPath
 $outW  = To-Wsl $outImg
 $scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm-image\scripts\rebake-initrd.sh")
+$initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-image\init.sh")
 
-Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --out $outW" -ForegroundColor Cyan
-& wsl bash $scriptW --base $baseW --init-bin $initW --out $outW
+Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --init-sh $initShW --out $outW" -ForegroundColor Cyan
+& wsl bash $scriptW --base $baseW --init-bin $initW --init-sh $initShW --out $outW
 if ($LASTEXITCODE -ne 0) { throw "rebake failed" }
 
 Write-Host "==> rebaked initrd: $outImg ($([math]::Round((Get-Item $outImg).Length/1MB,2)) MB)" -ForegroundColor Green

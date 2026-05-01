@@ -190,6 +190,41 @@ impl WinInitClient {
         self.spawn_ack(&id, op)
     }
 
+    /// Spawn (PTY mode). The master fd lives inside the guest; init streams
+    /// the slave's output via `Reply::Stdout` events the same way pipe
+    /// children do.
+    pub fn spawn_pty(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<SpawnInfo> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Spawn {
+            id: id.clone(),
+            argv: argv.to_vec(),
+            env_overlay: env.to_vec(),
+            cwd: cwd.map(str::to_string),
+            stdio: StdioMode::Pty { rows, cols },
+            inherit_from_child: None,
+        };
+        self.spawn_ack(&id, op)
+    }
+
+    /// Resize a PTY child (TIOCSWINSZ + SIGWINCH inside the guest).
+    pub fn resize(&self, child_id: &str, rows: u16, cols: u16) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::Resize {
+            id: id.clone(),
+            child_id: child_id.into(),
+            rows,
+            cols,
+        };
+        self.ack_op(&id, op)
+    }
+
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
         let reply = self.send_op_sync(id, op, Duration::from_secs(15))?;
         match reply {

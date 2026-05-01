@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use tokimo_package_sandbox::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, Sandbox};
+use tokimo_package_sandbox::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, Sandbox, ShellOpts};
 
 // Counter to make per-test session_id unique within a single test process.
 static N: AtomicU32 = AtomicU32::new(0);
@@ -520,7 +520,7 @@ fn multi_shell_isolated_streams() {
     sb.start_vm().expect("start_vm");
 
     let shell_a = sb.shell_id().expect("shell_id (boot shell = A)");
-    let shell_b = sb.spawn_shell().expect("spawn_shell B");
+    let shell_b = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell B");
     assert_ne!(shell_a, shell_b, "spawn_shell must yield a fresh JobId");
 
     // Send distinct markers to each shell. Stdout streams MUST be tagged
@@ -565,7 +565,7 @@ fn multi_shell_independent_signals() {
     sb.start_vm().expect("start_vm");
 
     let shell_a = sb.shell_id().expect("shell_id");
-    let shell_b = sb.spawn_shell().expect("spawn_shell");
+    let shell_b = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell");
 
     // Park A in a long sleep; B will stay idle.
     sb.write_stdin(&shell_a, b"sleep 60\n").unwrap();
@@ -614,8 +614,8 @@ fn list_shells_tracks_lifecycle() {
     assert_eq!(initial.len(), 1, "expected only the boot shell, got {initial:?}");
     assert!(initial.contains(&boot), "boot shell missing from initial list: {initial:?}");
 
-    let extra1 = sb.spawn_shell().expect("spawn_shell #1");
-    let extra2 = sb.spawn_shell().expect("spawn_shell #2");
+    let extra1 = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell #1");
+    let extra2 = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell #2");
 
     let after_spawn = sb.list_shells().expect("list_shells (after spawn)");
     assert_eq!(after_spawn.len(), 3, "expected 3 shells, got {after_spawn:?}");
@@ -635,3 +635,139 @@ fn list_shells_tracks_lifecycle() {
     sb.close_shell(&extra2).ok();
     sb.stop_vm().ok();
 }
+
+
+// =========================================================================
+// PTY tests (PROTOCOL_VERSION 4)
+// =========================================================================
+
+/// Byte-exact drain. Collects raw stdout bytes for `target` until either
+/// `needle` (as bytes) appears or the timeout elapses.
+fn drain_bytes_until(rx: &Receiver<Event>, target: &JobId, needle: &[u8], timeout: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Event::Stdout { id, data }) if &id == target => {
+                buf.extend_from_slice(&data);
+                if buf.windows(needle.len()).any(|w| w == needle) {
+                    return buf;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    buf
+}
+
+#[test]
+fn pty_shell_reports_correct_size() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("pty-size")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell = sb
+        .spawn_shell(ShellOpts {
+            pty: Some((40, 132)),
+            ..Default::default()
+        })
+        .expect("spawn pty shell");
+    sb.write_stdin(&shell, b"stty size\n").expect("write_stdin");
+
+    let captured = drain_until_for_id(&rx, &shell, "40 132", Duration::from_secs(15));
+    sb.close_shell(&shell).ok();
+    sb.stop_vm().ok();
+
+    assert!(captured.contains("40 132"), "stty size missing '40 132': {captured:?}");
+}
+
+#[test]
+fn pty_shell_resize_propagates() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("pty-resize")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell = sb
+        .spawn_shell(ShellOpts {
+            pty: Some((24, 80)),
+            ..Default::default()
+        })
+        .expect("spawn pty shell");
+    sb.write_stdin(&shell, b"stty size\n").unwrap();
+    let first = drain_until_for_id(&rx, &shell, "24 80", Duration::from_secs(15));
+    assert!(first.contains("24 80"), "initial stty size missing '24 80': {first:?}");
+
+    sb.resize_shell(&shell, 50, 120).expect("resize_shell");
+    sb.write_stdin(&shell, b"stty size\n").unwrap();
+    let second = drain_until_for_id(&rx, &shell, "50 120", Duration::from_secs(15));
+    sb.close_shell(&shell).ok();
+    sb.stop_vm().ok();
+
+    assert!(
+        second.contains("50 120"),
+        "post-resize stty size missing '50 120': {second:?}"
+    );
+}
+
+#[test]
+fn pty_shell_ctrl_c_does_not_kill_shell() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("pty-ctrlc")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell = sb
+        .spawn_shell(ShellOpts {
+            pty: Some((24, 80)),
+            ..Default::default()
+        })
+        .expect("spawn pty shell");
+
+    // Park the shell in a long sleep, then deliver Ctrl-C as a slave-side
+    // byte. In a PTY the line discipline turns this into SIGINT delivered
+    // ONLY to the foreground process group (sleep), not the shell itself.
+    sb.write_stdin(&shell, b"sleep 60\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    sb.write_stdin(&shell, b"\x03").unwrap();
+
+    sb.write_stdin(&shell, b"echo ALIVE\n").unwrap();
+    let captured = drain_until_for_id(&rx, &shell, "ALIVE", Duration::from_secs(15));
+    sb.close_shell(&shell).ok();
+    sb.stop_vm().ok();
+
+    assert!(
+        captured.contains("ALIVE"),
+        "shell unresponsive after Ctrl-C — slave-side ^C must NOT kill the shell. captured: {captured:?}"
+    );
+}
+
+#[test]
+fn pty_shell_color_escape_codes_pass_through() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("pty-color")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let shell = sb
+        .spawn_shell(ShellOpts {
+            pty: Some((24, 80)),
+            ..Default::default()
+        })
+        .expect("spawn pty shell");
+    sb.write_stdin(&shell, b"printf '\\e[31mRED\\e[0m\\n'\n").unwrap();
+
+    let needle: &[u8] = b"\x1b[31mRED\x1b[0m";
+    let captured = drain_bytes_until(&rx, &shell, needle, Duration::from_secs(15));
+    sb.close_shell(&shell).ok();
+    sb.stop_vm().ok();
+
+    assert!(
+        captured.windows(needle.len()).any(|w| w == needle),
+        "color escape sequence missing — captured bytes: {:?}",
+        String::from_utf8_lossy(&captured)
+    );
+}
+

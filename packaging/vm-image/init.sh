@@ -184,6 +184,16 @@ fi
 /bin/busybox mount --bind /proc /newroot/proc 2>/dev/null || /bin/busybox mount -t proc proc /newroot/proc
 /bin/busybox mount --bind /sys  /newroot/sys  2>/dev/null || /bin/busybox mount -t sysfs sys /newroot/sys
 /bin/busybox mount --bind /dev  /newroot/dev  2>/dev/null || /bin/busybox mount -t devtmpfs dev /newroot/dev
+# UNIX98 pseudo-terminals: bare devtmpfs has no /dev/pts, and many minimal
+# kernels don't expose /dev/ptmx as a static node — `posix_openpt` then
+# returns ENOENT. Mount devpts with ptmxmode so /dev/pts/ptmx is usable
+# and provide a /dev/ptmx symlink as a fallback for callers using the
+# legacy path.
+/bin/busybox mkdir -p /newroot/dev/pts 2>/dev/null || true
+/bin/busybox mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts /newroot/dev/pts 2>/dev/null || true
+if ! [ -e /newroot/dev/ptmx ]; then
+    /bin/busybox ln -sf /dev/pts/ptmx /newroot/dev/ptmx 2>/dev/null || true
+fi
 /bin/busybox mount -t tmpfs tmpfs /newroot/tmp 2>/dev/null || true
 /bin/busybox mount -t tmpfs tmpfs /newroot/run 2>/dev/null || true
 

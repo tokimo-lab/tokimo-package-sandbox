@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One frame on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +98,7 @@ pub mod method {
     pub const CLOSE_SHELL: &str = "closeShell";
     pub const LIST_SHELLS: &str = "listShells";
     pub const SIGNAL_SHELL: &str = "signalShell";
+    pub const RESIZE_SHELL: &str = "resizeShell";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const CREATE_DISK_IMAGE: &str = "createDiskImage";
     pub const SET_DEBUG_LOGGING: &str = "setDebugLogging";
@@ -175,6 +176,37 @@ pub struct SignalShellParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdParams {
     pub id: String,
+}
+
+/// Parameters for `spawnShell` (PROTOCOL_VERSION 4). All fields are
+/// optional; absent fields preserve the v3 default behaviour (pipes-mode
+/// boot shell with the service's default argv/env/cwd).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpawnShellParams {
+    /// PTY rows. When both `pty_rows` and `pty_cols` are `Some`, the
+    /// service spawns the shell with a controlling PTY of that size.
+    #[serde(default)]
+    pub pty_rows: Option<u16>,
+    /// PTY cols. See `pty_rows`.
+    #[serde(default)]
+    pub pty_cols: Option<u16>,
+    /// argv override. `None` → service default (`/bin/bash`).
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// Env overlay applied on top of the session-wide env.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Initial cwd override. `None` → service default.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// Parameters for `resizeShell`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizeShellParams {
+    pub id: String,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

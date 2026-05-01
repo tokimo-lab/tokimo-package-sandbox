@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share};
+use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
     AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, RemovePlan9ShareParams,
-    SignalShellParams, WriteStdinParams, method,
+    ResizeShellParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -99,8 +99,15 @@ impl SandboxBackend for WindowsBackend {
         Ok(JobId(r.id))
     }
 
-    fn spawn_shell(&self) -> Result<JobId> {
-        let v = self.call(method::SPAWN_SHELL, json!({}), SHORT_CALL_TIMEOUT)?;
+    fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
+        let p = SpawnShellParams {
+            pty_rows: opts.pty.map(|(r, _)| r),
+            pty_cols: opts.pty.map(|(_, c)| c),
+            argv: opts.argv,
+            env: opts.env,
+            cwd: opts.cwd,
+        };
+        let v = self.call(method::SPAWN_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         let r: JobIdResult = serde_json::from_value(v)?;
         Ok(JobId(r.id))
     }
@@ -129,6 +136,16 @@ impl SandboxBackend for WindowsBackend {
     fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
         let p = SignalShellParams { id: id.0.clone(), sig };
         self.call(method::SIGNAL_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
+        let p = ResizeShellParams {
+            id: id.0.clone(),
+            rows,
+            cols,
+        };
+        self.call(method::RESIZE_SHELL, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
         Ok(())
     }
 

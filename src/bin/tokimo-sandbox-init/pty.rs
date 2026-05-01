@@ -4,8 +4,9 @@ use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// Allocate a UNIX98 pseudo-terminal pair via posix_openpt + grantpt + unlockpt.
-/// Returns the master fd (CLOEXEC, non-blocking will be set later) and the
-/// resolved slave path (e.g., `/dev/pts/3`).
+/// Returns the master fd (CLOEXEC; callers must add O_NONBLOCK on any dup
+/// they hand to the mio drain loop) and the resolved slave path
+/// (e.g., `/dev/pts/3`).
 pub fn open_pty() -> Result<(OwnedFd, String), String> {
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
