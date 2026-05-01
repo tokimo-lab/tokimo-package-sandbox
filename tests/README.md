@@ -79,7 +79,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 | 9 | `plan9_dynamic_add_remove` | `add_plan9_share` after start exposes content; `remove_plan9_share` retracts it |
 | 10 | `signal_shell_delivers_sigint` | `signal_shell(boot, 2)` produces `Event::Exit { signal: Some(2) }` for the boot shell |
 | 11 | `network_blocked_only_loopback` | `NetworkPolicy::Blocked` → `/sys/class/net/` only `lo`; bash `/dev/tcp/1.1.1.1/53` times out |
-| 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC has HCN-assigned IPv4 in `192.168.127.0/24` (link + IP-layer invariants only; public-internet egress not asserted — env-dependent) |
+| 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC enumerated **and** `bash exec 3<>/dev/tcp/1.1.1.1/53` succeeds (cross-platform egress capability check; the previous Windows-only HCN 192.168.127.0/24 subnet assertion was dropped so Linux bwrap + macOS VZ pass without backend-specific carve-outs) |
 | 13 | `concurrent_commands_in_single_shell` | `(sleep 2; echo A) & (sleep 5; echo B) & wait` finishes in <7 s wall (parallel, not sequential) and both stdout markers appear |
 | 14 | `multi_shell_isolated_streams` | `spawn_shell()` yields a fresh `JobId`; `write_stdin` to two shells produces stdout events tagged correctly — neither stream leaks the other's marker |
 | 15 | `multi_shell_independent_signals` | `signal_shell(A, SIGINT)` kills only A; B remains responsive (`echo` round-trip) until `close_shell(B)` |
@@ -90,12 +90,15 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 The file uses only public API types. Caveats per backend:
 
 - **`Plan9Share`**: on Windows this maps to plan9-over-vsock (real shared
-  filesystem). Linux (bwrap) and macOS (virtio-fs) have different mount
-  semantics — when porting, audit `Plan9Share { name, host_path, guest_path }`
-  and confirm `host_path` actually appears at `guest_path` for tests 6 and 9.
-- **`NetworkPolicy::AllowAll`**: Windows uses HCN NAT (gateway 192.168.127.1).
-  Linux/macOS will need a comparable egress path; the `1.1.1.1:53` TCP probe
-  is generic.
+  filesystem). Linux (bwrap) uses `--bind host_path guest_path` (or a
+  runtime `AddMountFd` for dynamic shares); macOS (virtio-fs) is similar
+  in spirit. All three backends honor the same `Plan9Share { name,
+  host_path, guest_path }` contract — tests 6 and 9 are written against
+  observable behavior, not a specific transport.
+- **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
+  path (Windows HCN NAT, Linux shared host netns, macOS bridged NAT
+  via vmnet). Test 12 only asserts capability — link enumeration plus
+  outbound TCP to `1.1.1.1:53`.
 - **`NetworkPolicy::Blocked`**: Windows simply omits the `NetworkAdapter`
   device from the HCS schema — kernel sees no NIC. Linux (bwrap with
   `--unshare-net`) and macOS will need their own enforcement.
@@ -105,12 +108,64 @@ The file uses only public API types. Caveats per backend:
 
 ## Linux
 
-_TODO: add `scripts/test-integration.sh` (bwrap + seccomp). When written, document here:_
+### Hard requirements
 
-- Required capabilities (`CAP_SYS_ADMIN` for user-namespace setup, etc.)
-- Whether root is required
-- How to invoke (`bash scripts/test-integration.sh`)
-- Test inventory subset (some tests, e.g. plan9 dynamic add/remove, may need bind-mount equivalents)
+| Requirement | Why |
+|---|---|
+| **`bwrap`** in `$PATH` | The Linux backend wraps `bubblewrap`. `apt install bubblewrap` (Debian/Ubuntu) or `dnf install bubblewrap` (Fedora). |
+| **Unprivileged user namespaces enabled** | Most distros default to enabled. If `unshare -U true` fails, set `kernel.unprivileged_userns_clone=1` and on Ubuntu 24.04+ make sure AppArmor doesn't block it. |
+| **`tokimo-sandbox-init` binary on PATH** | The host backend execs it as PID 2 inside bwrap. The test invocation below puts `target/debug/` on PATH so a normal `cargo build` is enough. |
+| **No service / no admin** | Unlike Windows, the Linux backend is library-only — `Sandbox::connect()` is a no-op handshake. No SCM, no daemon. |
+
+### Run
+
+```bash
+# From repo root.
+cargo build --bin tokimo-sandbox-init
+PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+```
+
+`--test-threads=1` is recommended (each test spawns its own bwrap +
+init pair; the bwrap default user-namespace creation rate is
+self-throttling under heavy parallelism).
+
+### Backend implementation notes
+
+The Linux backend lives in `src/linux/`. Cross-cutting decisions worth
+knowing when porting tests or debugging:
+
+- **Mount story.** Plan9 / virtio-fs are unavailable outside a VM, so
+  `Plan9Share { host_path, guest_path }` is implemented as a `bwrap`
+  bind mount (`--bind host_path guest_path`). Capabilities and tests
+  6 / 9 (host file visible in guest, dynamic add/remove) work because
+  init holds `CAP_SYS_ADMIN` over the user-namespace and can issue
+  runtime `mount(2)` calls via the `AddMountFd` op. Same observable
+  semantics as Windows plan9, different mechanism.
+- **`/sys` is policy-aware.**
+  * `AllowAll` → host `/sys` is bind-mounted read-only (the netns is
+    shared, so the host NIC list is the correct view).
+  * `Blocked`  → bwrap creates an empty `/sys` and init mounts a
+    fresh `sysfs` from inside the new netns. A bind mount cannot
+    replace this: sysfs filtering of `/sys/class/net` is per-mount,
+    not per-task. Init keys off `TOKIMO_SANDBOX_MOUNT_SYSFS=1` set
+    by the host.
+- **Network policy.**
+  * `AllowAll` → no `--unshare-net`; full host network access. Egress
+    test 12 hits `1.1.1.1:53` directly.
+  * `Blocked`  → `--unshare-net`; init brings up `lo` (the
+    `SIOCSIFFLAGS Operation not permitted` warning is benign, `lo`
+    exists in a fresh netns regardless of explicit ifup).
+- **Init transport.** Linux uses Unix `SOCK_SEQPACKET` over
+  `socketpair`; bwrap inherits the child end (`pre_exec` clears
+  `CLOEXEC`). `TOKIMO_SANDBOX_CONTROL_FD=<n>` tells init which fd to
+  read from. macOS / Windows use VSOCK streams instead.
+- **PID-1 quirk.** Init runs as PID 2 (bwrap is PID 1). The strict
+  PID-1 check in `InitClient::hello()` is bypassed via
+  `TOKIMO_SANDBOX_ALLOW_NON_PID1=1`, set unconditionally by the
+  Linux backend. The check is meaningful only for VM-mode backends.
+- **`SAFEBOX_DISABLE=1`.** Bypasses the sandbox entirely and runs
+  natively. Useful for triaging "is it the test or the sandbox?"
+  failures locally; never set in CI.
 
 ## macOS
 

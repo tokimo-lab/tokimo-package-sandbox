@@ -46,6 +46,39 @@ Guest-side: `tokimo-sandbox-init` (`src/bin/tokimo-sandbox-init/`) runs as PID 1
 
 Wire protocol: `src/protocol/` (shared host ↔ init), `src/svc_protocol.rs` (host ↔ Windows service).
 
+## Architecture (Linux)
+
+```
+Sandbox client (library, in-process)
+        │
+        ├─ socketpair(AF_UNIX, SOCK_SEQPACKET)
+        │       child end → bwrap (CLOEXEC cleared in pre_exec)
+        │
+        └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
+                       [--unshare-net for Blocked]
+                       --bind / staging
+                       --cap-add CAP_SYS_ADMIN
+                       --setenv TOKIMO_SANDBOX_CONTROL_FD=<n>
+                       -- /path/to/tokimo-sandbox-init
+                                         │
+                                         └─ runs as PID 2 (bwrap is PID 1)
+                                            speaks the same protocol as the
+                                            VM-mode init binary
+```
+
+No service, no daemon, no admin: the Linux backend is library-only and
+each `Sandbox` owns its own bwrap+init pair. Plan9 / virtio-fs are not
+available outside a VM, so `Plan9Share` is implemented via `--bind`
+(static) and runtime `AddMountFd` ops (dynamic add/remove). API and
+observable behavior match the Windows backend; the mount mechanism
+differs.
+
+`/sys` handling is policy-aware:
+- **AllowAll** → bind-mount host `/sys` (shared netns, host NIC view).
+- **Blocked**  → empty `/sys` mount point + init mounts a fresh `sysfs`
+  inside the new netns. A bind mount cannot replace this because sysfs
+  filtering of `/sys/class/net` is per-mount, not per-task.
+
 ## Deployment modes (Windows)
 
 - **MSIX** (`packaging/windows/`, `scripts/build-msix.ps1`): recommended for production — registers service name `TokimoSandboxSvc` via `desktop6:Service`.
@@ -188,6 +221,8 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 ## Build & test
 
 ```powershell
+# --- Windows ---
+
 # Build everything
 cargo build
 
@@ -207,12 +242,31 @@ cargo test --bin tokimo-sandbox-svc --lib
 pwsh ./scripts/build-msix.ps1
 ```
 
+```bash
+# --- Linux ---
+
+# One-time
+sudo apt install bubblewrap
+
+# Build init binary so bwrap can exec it
+cargo build --bin tokimo-sandbox-init
+
+# Full integration suite (16 tests, ~8 s). --test-threads=1 keeps bwrap
+# user-namespace creation rate sane and avoids cross-test PATH races.
+PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+```
+
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
 | `SAFEBOX_DISABLE=1` | Bypass sandbox entirely, run natively (debug escape hatch) |
-| `TOKIMO_VERIFY_CALLER=1` | Enforce Authenticode verification of pipe clients |
+| `TOKIMO_VERIFY_CALLER=1` | Enforce Authenticode verification of pipe clients (Windows service) |
+| `TOKIMO_SANDBOX_CONTROL_FD=<n>` | Linux/bwrap: tells init which inherited fd is the SEQPACKET control socket |
+| `TOKIMO_SANDBOX_ALLOW_NON_PID1=1` | Linux/bwrap: bypass the strict PID-1 handshake check (init runs as PID 2 because bwrap is PID 1) |
+| `TOKIMO_SANDBOX_BRINGUP_LO=1` | Linux/bwrap Blocked policy: have init bring up `lo` after entering the new netns |
+| `TOKIMO_SANDBOX_MOUNT_SYSFS=1` | Linux/bwrap Blocked policy: have init mount a fresh `sysfs` at `/sys` so `/sys/class/net` is filtered by the new netns |
+| `TOKIMO_SANDBOX_PRE_CHROOTED=1` | VM modes: skip init's mount/chroot setup because `init.sh` already did it |
 
 ## Windows VM artifacts
 

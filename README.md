@@ -450,9 +450,26 @@ cargo test --test sandbox_integration multi_shell_isolated_streams -- --nocaptur
 
 See [`tests/README.md`](tests/README.md) for the full test inventory and debug-artefact paths.
 
-### Linux & macOS integration
+### Linux integration tests
 
-Linux (bwrap) and macOS (VZ) integration runners are not yet ported — see the TODO sections in [`tests/README.md`](tests/README.md). Only the Sandbox `--lib` / `--bin --lib` unit suites run cross-platform today.
+The same 16-test suite passes on Linux against the bwrap backend. No service, no admin, no VM artifacts — just `bubblewrap` on `$PATH` and unprivileged user namespaces enabled (the default on most distros).
+
+```bash
+sudo apt install bubblewrap            # one-time
+cargo build --bin tokimo-sandbox-init
+PATH="$PWD/target/debug:$PATH" \
+    cargo test --test sandbox_integration -- --test-threads=1
+```
+
+Notable Linux-specific behaviors documented in [`tests/README.md`](tests/README.md):
+
+- `Plan9Share` is implemented as a bwrap bind mount (or runtime `AddMountFd` for dynamic shares). Same `host_path → guest_path` contract as Windows plan9-over-vsock; different mechanism.
+- `/sys` mounting is policy-aware: `AllowAll` bind-mounts the host `/sys` (shared netns view), while `Blocked` mounts a fresh `sysfs` from inside the new netns so `/sys/class/net` is correctly filtered to `lo`. A bind mount cannot do this — sysfs filtering is per-mount, not per-task.
+- Egress test 12 (`network_allow_all_has_nic`) uses a cross-platform `bash exec 3<>/dev/tcp/1.1.1.1/53` probe; the Windows-only HCN `192.168.127.0/24` subnet assertion has been retired.
+
+### macOS integration
+
+macOS (VZ) integration runner is not yet ported — see the TODO section in [`tests/README.md`](tests/README.md). Only the Sandbox `--lib` / `--bin --lib` unit suites run on macOS today.
 
 ## Init control protocol (v1, Linux)
 
