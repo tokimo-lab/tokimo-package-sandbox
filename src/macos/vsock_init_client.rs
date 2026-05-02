@@ -148,6 +148,7 @@ impl VsockInitClient {
     }
 
     /// Spawn (Pipes mode).
+    #[allow(dead_code)] // exposed for future spawn_pipes RPC; kept for API parity with bwrap backend
     pub fn spawn_pipes(
         &self,
         argv: &[String],
@@ -307,6 +308,7 @@ impl VsockInitClient {
         self.ack_op(&id, op)
     }
 
+    #[allow(dead_code)] // future close_child RPC
     pub fn close_child(&self, child_id: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::Close {
@@ -349,7 +351,7 @@ impl VsockInitClient {
                 .write_fd
                 .lock()
                 .map_err(|_| Error::other("sock lock poisoned"))?;
-            let mut writer = FdWriter(&mut *sock_guard);
+            let mut writer = FdWriter(&mut sock_guard);
             send_frame_stream(&mut writer, &Frame::Op(op))?;
         }
 
@@ -392,6 +394,7 @@ impl VsockInitClient {
     /// Block until the reader has data (stdout/stderr/exit) for `child_id`
     /// or `deadline` is reached. Returns `true` if there is something to
     /// read, `false` on timeout.
+    #[allow(dead_code)] // diagnostic helper used by tests/manual probes
     pub fn wait_for_event(&self, child_id: &str, deadline: Instant) -> bool {
         let (lock, cv) = &*self.inner.state;
         let mut g = lock.lock().expect("client state");
@@ -436,6 +439,7 @@ impl VsockInitClient {
     ///
     /// On timeout: SIGKILLs the process group and returns whatever was
     /// captured plus exit_code = 124 (matching coreutils `timeout`).
+    #[allow(dead_code)] // future Exec(oneshot) RPC
     pub fn run_oneshot(
         &self,
         argv: &[String],

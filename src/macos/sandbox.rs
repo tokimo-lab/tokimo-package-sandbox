@@ -3,15 +3,15 @@
 //!
 //! Lifecycle:
 //!  * `configure` stores params (allowed Empty → Configured, Configured →
-//!     Configured, Stopped → Configured).
+//!    Configured, Stopped → Configured).
 //!  * `start_vm` boots the VM, runs the init Hello handshake, starts the
-//!     in-process NFSv3 server (see `src/macos/nfs.rs`), registers each
-//!     `ConfigureParams.mounts` entry with it, asks the guest to
-//!     `mount(2) -t nfs` each one, and opens the long-lived shell.
+//!    in-process NFSv3 server (see `src/macos/nfs.rs`), registers each
+//!    `ConfigureParams.mounts` entry with it, asks the guest to
+//!    `mount(2) -t nfs` each one, and opens the long-lived shell.
 //!  * `stop_vm` shuts down the VM and the NFS server.
 //!  * `add_mount` / `remove_mount` register / tombstone mounts in the
-//!     in-process NFS server and drive the guest `MountNfs` / `UnmountNfs`
-//!     ops to mount / unmount via the smoltcp gateway.
+//!    in-process NFS server and drive the guest `MountNfs` / `UnmountNfs`
+//!    ops to mount / unmount via the smoltcp gateway.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -50,6 +50,7 @@ pub struct MacosBackend {
     debug_logging: Mutex<bool>,
 }
 
+#[allow(clippy::large_enum_variant)] // RunningState already boxed; ConfigureParams is the next biggest variant and is short-lived
 enum State {
     Empty,
     Configured { params: ConfigureParams },
@@ -213,15 +214,16 @@ impl SandboxBackend for MacosBackend {
             // `create_host_dir` is honoured here because virtio-fs used to
             // require the host directory to exist; NFS doesn't strictly,
             // but downstream code (and tests) rely on it.
-            if share.create_host_dir && !share.host_path.exists() {
-                if let Err(e) = std::fs::create_dir_all(&share.host_path) {
-                    let _ = init.shutdown();
-                    let _ = runtime.block_on(vm.stop());
-                    return Err(Error::other(format!(
-                        "create_host_dir {}: {e}",
-                        share.host_path.display()
-                    )));
-                }
+            if share.create_host_dir
+                && !share.host_path.exists()
+                && let Err(e) = std::fs::create_dir_all(&share.host_path)
+            {
+                let _ = init.shutdown();
+                let _ = runtime.block_on(vm.stop());
+                return Err(Error::other(format!(
+                    "create_host_dir {}: {e}",
+                    share.host_path.display()
+                )));
             }
             if let Err(e) = nfs.add_mount(&share.name, share.host_path.clone(), share.read_only) {
                 let _ = init.shutdown();
@@ -306,7 +308,7 @@ impl SandboxBackend for MacosBackend {
                 // Apple's VZVirtualMachine.stop() asserts when invoked off
                 // its dispatch queue. Use request_stop (fire-and-forget),
                 // wait briefly, then let Drop tear down the rest.
-                let _ = runtime.block_on(async {
+                runtime.block_on(async {
                     let _ = vm.request_stop();
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 });
@@ -614,17 +616,17 @@ fn event_pump_loop(init: Arc<VsockInitClient>, event_senders: Arc<Mutex<Vec<Send
                 let mut senders = event_senders.lock().unwrap();
                 senders.retain(|tx| tx.send(event.clone()).is_ok());
             }
-            if !seen_exit.contains(&child_id) {
-                if let Some((code, sig)) = init.take_exit(&child_id) {
-                    let event = Event::Exit {
-                        id: JobId(child_id.clone()),
-                        exit_code: code,
-                        signal: sig,
-                    };
-                    let mut senders = event_senders.lock().unwrap();
-                    senders.retain(|tx| tx.send(event.clone()).is_ok());
-                    seen_exit.insert(child_id);
-                }
+            if !seen_exit.contains(&child_id)
+                && let Some((code, sig)) = init.take_exit(&child_id)
+            {
+                let event = Event::Exit {
+                    id: JobId(child_id.clone()),
+                    exit_code: code,
+                    signal: sig,
+                };
+                let mut senders = event_senders.lock().unwrap();
+                senders.retain(|tx| tx.send(event.clone()).is_ok());
+                seen_exit.insert(child_id);
             }
         }
 

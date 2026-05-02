@@ -125,10 +125,8 @@ impl RouteCtx {
     fn resolve_tcp(&self, dst_ip: IpAddress, dst_port: u16) -> Option<SocketAddr> {
         let is_gateway = matches!(dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
             || matches!(dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
-        if is_gateway {
-            if let Some(svc) = self.local_services.iter().find(|s| s.host_port == dst_port) {
-                return Some(svc.local_addr);
-            }
+        if is_gateway && let Some(svc) = self.local_services.iter().find(|s| s.host_port == dst_port) {
+            return Some(svc.local_addr);
         }
         match self.egress {
             EgressPolicy::AllowAll => Some(SocketAddr::new(ipaddr_to_std(dst_ip), dst_port)),

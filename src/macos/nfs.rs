@@ -291,9 +291,10 @@ fn fattr_from_metadata(id: fileid3, meta: &std::fs::Metadata) -> fattr3 {
         ftype3::NF3DIR
     } else if ft.is_symlink() {
         ftype3::NF3LNK
-    } else if ft.is_file() {
-        ftype3::NF3REG
     } else {
+        // Treat regular files and anything else (sockets/fifos/chardev/blkdev
+        // exposed by the host) as regular files — nfsserve only models the
+        // NFSv3 file types we need.
         ftype3::NF3REG
     };
     let to_t = |t: SystemTime| -> nfstime3 {
@@ -306,7 +307,7 @@ fn fattr_from_metadata(id: fileid3, meta: &std::fs::Metadata) -> fattr3 {
     };
     fattr3 {
         ftype: kind,
-        mode: (meta.mode() & 0o7777) as u32,
+        mode: meta.mode() & 0o7777,
         nlink: meta.nlink() as u32,
         uid: meta.uid(),
         gid: meta.gid(),
@@ -393,7 +394,7 @@ impl NFSFileSystem for RouterFs {
         let name_path = validate_filename(filename)?;
         let (mount_idx, host_dir) = self.resolve(dirid)?;
         let candidate = host_dir.join(name_path);
-        if !candidate.symlink_metadata().is_ok() {
+        if candidate.symlink_metadata().is_err() {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
         // Build the new relative path = parent_rel + name.
@@ -456,14 +457,13 @@ impl NFSFileSystem for RouterFs {
             }
         }
         // size (truncate / extend)
-        if let set_size3::size(sz) = setattr.size {
-            if let Err(e) = std::fs::OpenOptions::new()
+        if let set_size3::size(sz) = setattr.size
+            && let Err(e) = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&host_path)
                 .and_then(|f| f.set_len(sz))
-            {
-                return Err(nfsstat_from_io(&e));
-            }
+        {
+            return Err(nfsstat_from_io(&e));
         }
         // atime / mtime — best-effort (we don't carry the filetime crate
         // ourselves; let the next stat reflect whatever the OS sets).
@@ -545,10 +545,10 @@ impl NFSFileSystem for RouterFs {
             .mode(mode)
             .open(&target)
             .map_err(|e| nfsstat_from_io(&e))?;
-        if let set_size3::size(sz) = attr.size {
-            if let Err(e) = _f.set_len(sz) {
-                return Err(nfsstat_from_io(&e));
-            }
+        if let set_size3::size(sz) = attr.size
+            && let Err(e) = _f.set_len(sz)
+        {
+            return Err(nfsstat_from_io(&e));
         }
         let parent_rel = self.rel_path_of(dirid)?;
         let id = self.intern_child(dirid, &parent_rel, name_path.as_os_str());
