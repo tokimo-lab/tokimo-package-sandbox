@@ -256,6 +256,10 @@ KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_f
 if [ "$ARCH" = "arm64" ]; then
     KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
 fi
+# NFS client (used by macOS dynamic mounts over the smoltcp gateway).
+# resolve_deps will pull in lockd/sunrpc/auth_rpcgss/grace/nfs_acl
+# transitively, but listing them explicitly keeps the intent obvious.
+KMOD_LIST="$KMOD_LIST sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3"
 resolve_deps() {
     local mod="$1" seen="$2"
     case " $seen " in *" $mod "*) echo "$seen"; return 0;; esac

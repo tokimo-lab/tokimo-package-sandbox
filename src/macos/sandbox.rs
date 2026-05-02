@@ -4,18 +4,17 @@
 //! Lifecycle:
 //!  * `configure` stores params (allowed Empty → Configured, Configured →
 //!     Configured, Stopped → Configured).
-//!  * `start_vm` boots the VM (one virtiofs share per pre-declared
-//!     Mount, plus a per-session "dynamic share" pool used for runtime
-//!     `add_mount`), runs the init Hello handshake, asks the guest to
-//!     mount each share, and opens the long-lived shell.
-//!  * `stop_vm` shuts down the VM and tears down the per-session host dir.
-//!  * `add_mount` / `remove_mount` materialise dynamic shares
-//!     by APFS-cloning into the dynamic-share pool and bind-mounting on the
-//!     guest (Apple's VZ does not support virtio-fs hot-plug).
+//!  * `start_vm` boots the VM, runs the init Hello handshake, starts the
+//!     in-process NFSv3 server (see `src/macos/nfs.rs`), registers each
+//!     `ConfigureParams.mounts` entry with it, asks the guest to
+//!     `mount(2) -t nfs` each one, and opens the long-lived shell.
+//!  * `stop_vm` shuts down the VM and the NFS server.
+//!  * `add_mount` / `remove_mount` register / tombstone mounts in the
+//!     in-process NFS server and drive the guest `MountNfs` / `UnmountNfs`
+//!     ops to mount / unmount via the smoltcp gateway.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -25,12 +24,21 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
-use super::vm::{BootedVm, DYN_SHARE_GUEST_PATH, DYN_SHARE_TAG, VmConfig, boot_vm};
+use super::nfs::NfsServer;
+use super::vm::{BootedVm, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
+
+/// Guest-visible TCP port the in-process NFS server is dialed at via the
+/// smoltcp gateway IP (`HOST_IP = 192.168.127.1`). The host-side listener
+/// is on an ephemeral `127.0.0.1:N`; the gateway splices the two via a
+/// `LocalService`.
+const NFS_GUEST_PORT: u16 = 2049;
+/// Gateway IP (matches `crate::netstack::HOST_IP`).
+const NFS_GUEST_IP: &str = "192.168.127.1";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -52,21 +60,27 @@ enum State {
 struct RunningState {
     vm: VirtualMachine,
     init: Arc<VsockInitClient>,
+    /// In-process NFSv3 server backing all user mounts. Dropped before
+    /// `vm` so any in-flight client connections through the netstack
+    /// gateway tear down cleanly first.
+    nfs: Option<NfsServer>,
     /// Long-lived boot-time shell child id.
     shell_id: String,
     /// All shells active in this session: the boot shell + any returned
     /// from `spawn_shell`. `close_shell` removes from the set.
     shells: HashSet<String>,
-    /// Tokio runtime that drove `vm.start()` and the VSOCK connect; **must**
-    /// outlive the VM, otherwise the underlying Objective-C completion
-    /// handlers and dispatch queues are released and the VSOCK fd dies.
+    /// Tokio runtime that drove `vm.start()`, the VSOCK connect, and the
+    /// NFS server. **must** outlive the VM, otherwise the underlying
+    /// Objective-C completion handlers and dispatch queues are released
+    /// and the VSOCK fd dies.
     runtime: Arc<Runtime>,
-    /// Per-session host directory that backs the dynamic-share pool.
-    session_dir: PathBuf,
     /// Names of shares declared at boot time (cannot be removed at runtime).
     boot_share_names: HashSet<String>,
-    /// Currently active runtime-added Plan9 shares (name → share).
-    dyn_shares: HashMap<String, Mount>,
+    /// All NFS-backed mounts currently registered (boot + runtime).
+    nfs_mount_names: HashSet<String>,
+    /// Shutdown flag for the netstack thread. Setting true causes the
+    /// reader/writer threads to exit at their next iteration.
+    netstack_shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MacosBackend {
@@ -83,63 +97,6 @@ impl MacosBackend {
         let mut senders = self.event_senders.lock().unwrap();
         senders.retain(|tx| tx.send(event.clone()).is_ok());
     }
-}
-
-fn session_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".tokimo").join("sessions")
-}
-
-/// `cp -c -R src dst` (APFS clone), falling back to `cp -R` if cloning is
-/// unsupported (e.g. cross-volume).
-fn apfs_clone(src: &Path, dst: &Path) -> Result<()> {
-    let cloned = Command::new("cp").arg("-c").arg("-R").arg(src).arg(dst).status();
-    if matches!(&cloned, Ok(s) if s.success()) {
-        return Ok(());
-    }
-
-    let status = Command::new("cp")
-        .arg("-R")
-        .arg(src)
-        .arg(dst)
-        .status()
-        .map_err(|e| Error::other(format!("cp -R: {e}")))?;
-    if !status.success() {
-        return Err(Error::other(format!(
-            "cp -R failed (status {status}) copying {} → {}",
-            src.display(),
-            dst.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Run a one-shot shell command in the guest and return an error if it
-/// exits non-zero.
-fn guest_sh(init: &VsockInitClient, script: &str) -> Result<()> {
-    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()];
-    let (stdout, stderr, code) = init.run_oneshot(&argv, &[], None, Duration::from_secs(30))?;
-    if code != 0 {
-        return Err(Error::other(format!(
-            "guest sh failed (exit {code}): {script}\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        )));
-    }
-    Ok(())
-}
-
-/// Mount a virtiofs share inside the guest at `guest_path`. Init is
-/// already chrooted to the rootfs share so we just call mount(8) directly.
-fn guest_mount_virtiofs(init: &VsockInitClient, tag: &str, guest_path: &str, read_only: bool) -> Result<()> {
-    let opts = if read_only { ",ro" } else { "" };
-    let script = format!(
-        "set -e; mkdir -p '{p}'; mount -t virtiofs -o defaults{opts} '{tag}' '{p}'",
-        p = guest_path,
-    );
-    guest_sh(init, &script)
 }
 
 impl SandboxBackend for MacosBackend {
@@ -168,51 +125,24 @@ impl SandboxBackend for MacosBackend {
             State::Stopped => return Err(Error::other("backend is stopped, please reconfigure")),
         };
 
-        // ---- Per-session host directory --------------------------------
-        // session_dir must be unique per Sandbox handle even within the
-        // same process: tests run multiple `Sandbox::connect()` instances
-        // simultaneously with the same `user_data_name`, so we mix in the
-        // caller-supplied `session_id` and a monotonic counter as a fallback.
-        let sanitize = |s: &str| -> String {
-            s.chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .take(32)
-                .collect()
-        };
-        let label = sanitize(&params.user_data_name);
-        let sid = sanitize(&params.session_id);
-        let counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let session_id = if sid.is_empty() {
-            format!("{label}-{}-{counter}", std::process::id())
-        } else {
-            format!("{label}-{sid}-{}-{counter}", std::process::id())
-        };
-        let session_dir = session_root().join(&session_id);
-        let dyn_root = session_dir.join("dyn-root");
-        std::fs::create_dir_all(&dyn_root)
-            .map_err(|e| Error::other(format!("create session dir {}: {e}", dyn_root.display())))?;
+        // Used for debug logs / future per-session diagnostics. The dynamic
+        // mount pool used to live under `~/.tokimo/sessions/<sid>/` but
+        // host directories are now exposed directly through the NFS server.
+        let _session_counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // ---- Boot VM ---------------------------------------------------
         let vm_config = VmConfig {
             memory_mb: params.memory_mb,
             cpu_count: params.cpu_count,
-            mounts: params.mounts.clone(),
             network: params.network,
-            dyn_root: dyn_root.clone(),
         };
 
         let BootedVm {
             vm,
             vsock,
-            netstack_listener,
+            netstack_listener: mut listener,
             runtime,
-        } = match boot_vm(&vm_config) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&session_dir);
-                return Err(e);
-            }
-        };
+        } = boot_vm(&vm_config)?;
 
         let init = Arc::new(VsockInitClient::new(vsock)?);
 
@@ -220,77 +150,100 @@ impl SandboxBackend for MacosBackend {
         if let Err(e) = init.hello() {
             let _ = init.shutdown();
             let _ = runtime.block_on(vm.stop());
-            let _ = std::fs::remove_dir_all(&session_dir);
             return Err(e);
         }
 
-        // ---- Network: userspace netstack (AllowAll) ---------------------
-        // The guest's `tokimo-tun-pump` (started by init.sh) connects to
-        // our vsock listener. We hand the connection to `netstack::spawn`
-        // which runs smoltcp on the host side. NetworkPolicy::Blocked has
-        // no listener and no NIC at all.
-        let _netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> =
-            if let Some(mut listener) = netstack_listener {
-                let accept =
-                    runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), listener.accept()).await });
-                match accept {
-                    Ok(Ok(conn)) => {
-                        // Take ownership of the raw fd, then duplicate for
-                        // the writer half so netstack can hold separate
-                        // Read/Write trait objects.
-                        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-                        let read_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
-                        let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
-                        if dup_raw < 0 {
-                            tracing::warn!("netstack dup fd failed; skipping");
-                            None
-                        } else {
-                            let write_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
-                            let read_file = std::fs::File::from(read_fd);
-                            let write_file = std::fs::File::from(write_fd);
-                            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                            let _ = crate::netstack::spawn(
-                                Box::new(read_file),
-                                Box::new(write_file),
-                                Arc::clone(&shutdown),
-                                crate::netstack::EgressPolicy::AllowAll,
-                                Vec::new(),
-                            );
-                            Some(shutdown)
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("netstack accept error: {e}");
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!("netstack accept timeout");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-        // ---- Mount the dynamic-share pool -------------------------------
-        if let Err(e) = guest_mount_virtiofs(&init, DYN_SHARE_TAG, DYN_SHARE_GUEST_PATH, false) {
-            let _ = init.shutdown();
-            let _ = runtime.block_on(vm.stop());
-            let _ = std::fs::remove_dir_all(&session_dir);
-            return Err(e);
-        }
-
-        // ---- Mount each boot-time Plan9 share ---------------------------
-        let mut boot_share_names = HashSet::new();
-        for share in &params.mounts {
-            let guest = share.guest_path.to_string_lossy().into_owned();
-            if let Err(e) = guest_mount_virtiofs(&init, &share.name, &guest, share.read_only) {
+        // ---- NFS server ------------------------------------------------
+        // Spawn the per-session NFSv3 server BEFORE the netstack so we
+        // know the local port to register as a `LocalService`.
+        let nfs = match NfsServer::start(runtime.clone()) {
+            Ok(s) => s,
+            Err(e) => {
                 let _ = init.shutdown();
                 let _ = runtime.block_on(vm.stop());
-                let _ = std::fs::remove_dir_all(&session_dir);
+                return Err(e);
+            }
+        };
+
+        // ---- Network: always-on userspace netstack ---------------------
+        // The smoltcp gateway runs regardless of `NetworkPolicy`. The
+        // policy becomes an `EgressPolicy` filter inside the gateway:
+        // `Blocked` only routes registered `LocalService` flows (the NFS
+        // server). `AllowAll` additionally splices arbitrary upstream
+        // connect attempts.
+        let egress = match params.network {
+            NetworkPolicy::AllowAll => crate::netstack::EgressPolicy::AllowAll,
+            NetworkPolicy::Blocked => crate::netstack::EgressPolicy::Blocked,
+        };
+        let local_services = vec![crate::netstack::LocalService {
+            host_port: NFS_GUEST_PORT,
+            local_addr: format!("127.0.0.1:{}", nfs.local_port).parse().unwrap(),
+        }];
+
+        let accept = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), listener.accept()).await });
+        let netstack_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match accept {
+            Ok(Ok(conn)) => {
+                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                let read_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
+                let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
+                if dup_raw < 0 {
+                    tracing::warn!("netstack dup fd failed; netstack disabled this session");
+                } else {
+                    let write_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+                    let read_file = std::fs::File::from(read_fd);
+                    let write_file = std::fs::File::from(write_fd);
+                    let _ = crate::netstack::spawn(
+                        Box::new(read_file),
+                        Box::new(write_file),
+                        Arc::clone(&netstack_shutdown),
+                        egress,
+                        local_services,
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::warn!("netstack accept error: {e}"),
+            Err(_) => tracing::warn!("netstack accept timeout"),
+        }
+
+        // ---- Mount each boot-time share via NFS ------------------------
+        let mut boot_share_names = HashSet::new();
+        let mut nfs_mount_names = HashSet::new();
+        for share in &params.mounts {
+            // `create_host_dir` is honoured here because virtio-fs used to
+            // require the host directory to exist; NFS doesn't strictly,
+            // but downstream code (and tests) rely on it.
+            if share.create_host_dir && !share.host_path.exists() {
+                if let Err(e) = std::fs::create_dir_all(&share.host_path) {
+                    let _ = init.shutdown();
+                    let _ = runtime.block_on(vm.stop());
+                    return Err(Error::other(format!(
+                        "create_host_dir {}: {e}",
+                        share.host_path.display()
+                    )));
+                }
+            }
+            if let Err(e) = nfs.add_mount(&share.name, share.host_path.clone(), share.read_only) {
+                let _ = init.shutdown();
+                let _ = runtime.block_on(vm.stop());
+                return Err(e);
+            }
+            let guest = share.guest_path.to_string_lossy().into_owned();
+            let export = format!("/{}", share.name);
+            if let Err(e) = init.mount_nfs(
+                &share.name,
+                NFS_GUEST_IP,
+                NFS_GUEST_PORT,
+                &export,
+                &guest,
+                share.read_only,
+            ) {
+                let _ = init.shutdown();
+                let _ = runtime.block_on(vm.stop());
                 return Err(e);
             }
             boot_share_names.insert(share.name.clone());
+            nfs_mount_names.insert(share.name.clone());
         }
 
         // ---- Open long-lived shell --------------------------------------
@@ -300,7 +253,6 @@ impl SandboxBackend for MacosBackend {
             Err(e) => {
                 let _ = init.shutdown();
                 let _ = runtime.block_on(vm.stop());
-                let _ = std::fs::remove_dir_all(&session_dir);
                 return Err(e);
             }
         };
@@ -322,12 +274,13 @@ impl SandboxBackend for MacosBackend {
         *state = State::Running(Box::new(RunningState {
             vm,
             init,
+            nfs: Some(nfs),
             shell_id,
             shells,
             runtime,
-            session_dir,
             boot_share_names,
-            dyn_shares: HashMap::new(),
+            nfs_mount_names,
+            netstack_shutdown,
         }));
 
         Ok(())
@@ -342,23 +295,23 @@ impl SandboxBackend for MacosBackend {
                     init,
                     vm,
                     runtime,
-                    session_dir,
+                    nfs,
+                    netstack_shutdown,
                     ..
                 } = *rs;
+                netstack_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = init.shutdown();
                 drop(init);
+                drop(nfs); // tear down NFS server task before dropping the runtime
                 // Apple's VZVirtualMachine.stop() asserts when invoked off
-                // its dispatch queue (we're on the main test thread, not the
-                // queue arcbox-vz built the VM on). Use request_stop (which
-                // is fire-and-forget / dispatches internally), wait briefly,
-                // and let Drop tear down the rest.
+                // its dispatch queue. Use request_stop (fire-and-forget),
+                // wait briefly, then let Drop tear down the rest.
                 let _ = runtime.block_on(async {
                     let _ = vm.request_stop();
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 });
                 drop(vm);
                 drop(runtime);
-                let _ = std::fs::remove_dir_all(&session_dir);
                 self.emit_event(Event::GuestConnected { connected: false });
                 Ok(())
             }
@@ -520,11 +473,15 @@ impl SandboxBackend for MacosBackend {
                 share.name
             )));
         }
-        if rs.dyn_shares.contains_key(&share.name) {
+        if rs.nfs_mount_names.contains(&share.name) {
             return Err(Error::validation(format!("share '{}' is already mounted", share.name)));
         }
-        if share.name == "work" || share.name == DYN_SHARE_TAG || share.name.is_empty() || share.name.contains('/') {
+        if share.name == "work" || share.name.is_empty() || share.name.contains('/') {
             return Err(Error::validation(format!("invalid share name: '{}'", share.name)));
+        }
+        if share.create_host_dir && !share.host_path.exists() {
+            std::fs::create_dir_all(&share.host_path)
+                .map_err(|e| Error::other(format!("create_host_dir {}: {e}", share.host_path.display())))?;
         }
         if !share.host_path.exists() {
             return Err(Error::validation(format!(
@@ -533,34 +490,27 @@ impl SandboxBackend for MacosBackend {
             )));
         }
 
-        // 1. APFS-clone host_path into the dynamic-share pool.
-        let host_dst = rs.session_dir.join("dyn-root").join(&share.name);
-        if host_dst.exists() {
-            std::fs::remove_dir_all(&host_dst).ok();
-        }
-        if let Some(parent) = host_dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::other(format!("create dyn-root: {e}")))?;
-        }
-        apfs_clone(&share.host_path, &host_dst)?;
+        // 1. Register with the in-process NFS server.
+        let nfs = rs.nfs.as_ref().ok_or_else(|| Error::other("nfs server not running"))?;
+        nfs.add_mount(&share.name, share.host_path.clone(), share.read_only)?;
 
-        // 2. Bind-mount inside the guest.
+        // 2. Ask the guest to `mount(2) -t nfs` it through the gateway.
         let guest = share.guest_path.to_string_lossy().into_owned();
-        let ro_remount = if share.read_only {
-            format!("; mount -o remount,bind,ro '{guest}'")
-        } else {
-            String::new()
-        };
-        let script = format!(
-            "set -e; mkdir -p '{guest}'; mount --bind '{src}' '{guest}'{ro}",
-            src = format!("{DYN_SHARE_GUEST_PATH}/{}", share.name),
-            ro = ro_remount,
-        );
-        if let Err(e) = guest_sh(&rs.init, &script) {
-            let _ = std::fs::remove_dir_all(&host_dst);
+        let export = format!("/{}", share.name);
+        if let Err(e) = rs.init.mount_nfs(
+            &share.name,
+            NFS_GUEST_IP,
+            NFS_GUEST_PORT,
+            &export,
+            &guest,
+            share.read_only,
+        ) {
+            // Roll back the host-side registration so a retry can succeed.
+            let _ = nfs.remove_mount(&share.name);
             return Err(e);
         }
 
-        rs.dyn_shares.insert(share.name.clone(), share);
+        rs.nfs_mount_names.insert(share.name.clone());
         Ok(())
     }
 
@@ -576,17 +526,19 @@ impl SandboxBackend for MacosBackend {
                 "share '{name}' was declared at boot time and cannot be removed at runtime"
             )));
         }
-        let share = rs
-            .dyn_shares
-            .remove(name)
-            .ok_or_else(|| Error::validation(format!("no such share '{name}'")))?;
+        if !rs.nfs_mount_names.remove(name) {
+            return Err(Error::validation(format!("no such share '{name}'")));
+        }
 
-        let guest = share.guest_path.to_string_lossy().into_owned();
-        let script = format!("umount '{guest}' 2>/dev/null || true; rmdir '{guest}' 2>/dev/null || true");
-        let _ = guest_sh(&rs.init, &script);
-
-        let host_dst = rs.session_dir.join("dyn-root").join(&share.name);
-        let _ = std::fs::remove_dir_all(&host_dst);
+        // Unmount in the guest first; if that fails we still tombstone
+        // the host registration so a re-add of the same name succeeds.
+        let unmount_err = rs.init.unmount_nfs(name).err();
+        if let Some(nfs) = rs.nfs.as_ref() {
+            let _ = nfs.remove_mount(name);
+        }
+        if let Some(e) = unmount_err {
+            return Err(e);
+        }
         Ok(())
     }
 

@@ -55,6 +55,19 @@ TUN_PATH=$(find "$EXTRACT" -path '*/modules/*' -name 'tun.ko*' | head -1)
 echo "==> tun module: $TUN_PATH"
 cp "$TUN_PATH" "$EXTRAS/"
 
+# NFS client modules (for macOS NFSv3 dynamic mount). The chain is:
+#   sunrpc -> auth_rpcgss -> lockd -> nfs -> nfsv3
+# We tolerate misses (some kernels build these in).
+for mod in sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3; do
+    P=$(find "$EXTRACT" -path '*/modules/*' -name "${mod}.ko*" | head -1 || true)
+    if [ -n "$P" ]; then
+        echo "==> nfs module: $P"
+        cp "$P" "$EXTRAS/"
+    else
+        echo "==> nfs module: ${mod}.ko NOT FOUND (may be built-in)"
+    fi
+done
+
 # --- 4. Rebake initrd -------------------------------------------------
 echo "==> rebake initrd"
 bash /src/packaging/vm/scripts/rebake-initrd.sh \

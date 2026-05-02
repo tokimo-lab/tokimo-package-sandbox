@@ -4,6 +4,18 @@
 //! rootfs as a virtiofs share with tag `work` (the init binary picks this up
 //! and `chroot`s into it), and connects to the guest's vsock listener on
 //! port 1.
+//!
+//! Networking is **always-on**: a single virtio-vsock listener carries
+//! the guest's `tokimo-tun-pump` traffic into the host-side smoltcp
+//! gateway. `NetworkPolicy` becomes an `EgressPolicy` filter inside the
+//! gateway (see `src/netstack/`); under `Blocked`, only `LocalService`
+//! flows (the in-process NFSv3 server) are spliced through. There is no
+//! `tokimo.net=blocked` cmdline branch any more.
+//!
+//! User mounts (boot-time and runtime) are no longer per-mount virtio-fs
+//! shares — they all flow through the in-process NFS server (see
+//! `src/macos/nfs.rs`). The only directory share that remains is `work`
+//! (the rootfs / chroot base).
 
 use std::env;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -19,25 +31,19 @@ use arcbox_vz::{
 };
 use tokio::runtime::Runtime;
 
-use crate::api::{Mount, NetworkPolicy};
+use crate::api::NetworkPolicy;
 use crate::error::{Error, Result};
 
 /// Vsock port the guest's `tokimo-sandbox-init` listens on.
 pub(crate) const INIT_VSOCK_PORT: u32 = 2222;
 
 /// Vsock port the host listens on for the guest's `tokimo-tun-pump`
-/// netstack data channel (NetworkPolicy::AllowAll only).
+/// netstack data channel. Always allocated regardless of `NetworkPolicy`.
 pub(crate) const NETSTACK_VSOCK_PORT: u32 = 4444;
 
 /// Tag used for the rootfs virtiofs share. Must match the hard-coded value
 /// in `tokimo-sandbox-init/main.rs` which mounts `work` at `/mnt/work`.
 const ROOTFS_TAG: &str = "work";
-
-/// Tag used for the per-session "dynamic share" pool — a single empty
-/// directory that we APFS-clone into to add Plan9 shares at runtime.
-pub(crate) const DYN_SHARE_TAG: &str = "tokimo_dyn";
-/// Mount point inside the guest for the dynamic share pool.
-pub(crate) const DYN_SHARE_GUEST_PATH: &str = "/__tokimo_dyn";
 
 /// Result of `boot_vm`: a started `VirtualMachine`, the connected vsock fd
 /// to the guest's init listener, and the tokio runtime that ran (and must
@@ -45,10 +51,9 @@ pub(crate) const DYN_SHARE_GUEST_PATH: &str = "/__tokimo_dyn";
 pub struct BootedVm {
     pub vm: VirtualMachine,
     pub vsock: OwnedFd,
-    /// Listener for the guest-initiated netstack connection. Present iff
-    /// `NetworkPolicy::AllowAll`. Caller is expected to `.accept()` once
-    /// after the init handshake completes.
-    pub netstack_listener: Option<VirtioSocketListener>,
+    /// Listener for the guest-initiated netstack connection. Always
+    /// allocated; caller `.accept()`s once after the init handshake.
+    pub netstack_listener: VirtioSocketListener,
     pub runtime: Arc<Runtime>,
 }
 
@@ -57,10 +62,7 @@ pub struct BootedVm {
 pub struct VmConfig {
     pub memory_mb: u64,
     pub cpu_count: u32,
-    pub mounts: Vec<Mount>,
     pub network: NetworkPolicy,
-    /// Host-side directory mounted as the dynamic-share pool.
-    pub dyn_root: PathBuf,
 }
 
 /// Locate the VM artifacts: vmlinuz (file), initrd.img (file), rootfs/ (dir).
@@ -153,7 +155,6 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     let kernel_s = kernel.to_string_lossy().into_owned();
     let initrd_s = initrd.to_string_lossy().into_owned();
     let rootfs_s = rootfs.to_string_lossy().into_owned();
-    let dyn_root_s = config.dyn_root.to_string_lossy().into_owned();
 
     // 0 = no limit: use large values so VZ clamps to host capacity.
     let memory_mb = if config.memory_mb == 0 {
@@ -167,32 +168,31 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         config.cpu_count as usize
     };
 
-    let plan9 = config.mounts.clone();
     let network = config.network;
 
-    // Cmdline picks netstack mode for AllowAll, no kernel NIC otherwise.
-    let cmdline = match network {
-        NetworkPolicy::AllowAll => format!(
-            "console=hvc0 earlyprintk=hvc0 \
-             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
-             tokimo.net=netstack tokimo.netstack_port={} \
-             net.ifnames=0 biosdevname=0 \
-             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-             HOME=/root TERM=xterm-256color LANG=C.UTF-8",
-            NETSTACK_VSOCK_PORT
-        ),
-        NetworkPolicy::Blocked => "console=hvc0 earlyprintk=hvc0 \
-             tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
-             tokimo.net=blocked \
-             net.ifnames=0 biosdevname=0 \
-             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-             HOME=/root TERM=xterm-256color LANG=C.UTF-8"
-            .to_string(),
+    // Cmdline is the same for AllowAll and Blocked: the netstack runs
+    // unconditionally on the host side. The host-side smoltcp gateway
+    // gates upstream egress (see `EgressPolicy` in src/netstack/). DNS
+    // and the IPv4/IPv6 default routes inside the guest are gated by
+    // `tokimo.netdns=on|off` so /etc/resolv.conf doesn't lie under
+    // Blocked.
+    let dns_flag = match network {
+        NetworkPolicy::AllowAll => "tokimo.netdns=on",
+        NetworkPolicy::Blocked => "tokimo.netdns=off",
     };
+    let cmdline = format!(
+        "console=hvc0 earlyprintk=hvc0 \
+         tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
+         tokimo.net=netstack tokimo.netstack_port={NETSTACK_VSOCK_PORT} {dns_flag} \
+         net.ifnames=0 biosdevname=0 \
+         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+         HOME=/root TERM=xterm-256color LANG=C.UTF-8"
+    );
 
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .enable_io()
             .enable_time()
             .build()
             .map_err(|e| Error::other(format!("tokio runtime: {e}")))?,
@@ -234,7 +234,9 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         // same code path with cmdline `tokimo.net=blocked` so init.sh skips
         // the netstack setup.
 
-        // Rootfs (tag "work").
+        // Rootfs (tag "work"). This is the **only** virtio-fs share —
+        // user mounts go through the in-process NFS server (see
+        // `src/macos/nfs.rs` and `LocalService` in `src/netstack/`).
         let rootfs_dir = SharedDirectory::new(&rootfs_s, false)
             .map_err(|e| Error::other(format!("rootfs SharedDirectory: {e}")))?;
         let rootfs_share = SingleDirectoryShare::new(rootfs_dir)
@@ -243,30 +245,6 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
             .map_err(|e| Error::other(format!("rootfs VirtioFs: {e}")))?;
         rootfs_fs.set_share(rootfs_share);
         vm_cfg.add_directory_share(rootfs_fs);
-
-        // Boot-time Plan9 shares — one virtiofs device per share.
-        for share in &plan9 {
-            let host_path = share.host_path.to_string_lossy().into_owned();
-            let dir = SharedDirectory::new(&host_path, share.read_only)
-                .map_err(|e| Error::other(format!("share {} SharedDirectory: {e}", share.name)))?;
-            let single = SingleDirectoryShare::new(dir).map_err(|e| {
-                Error::other(format!("share {} SingleDirectoryShare: {e}", share.name))
-            })?;
-            let mut fs = VirtioFileSystemDeviceConfiguration::new(&share.name)
-                .map_err(|e| Error::other(format!("share {} VirtioFs: {e}", share.name)))?;
-            fs.set_share(single);
-            vm_cfg.add_directory_share(fs);
-        }
-
-        // Dynamic-share pool (always present, even with no shares yet).
-        let dyn_dir = SharedDirectory::new(&dyn_root_s, false)
-            .map_err(|e| Error::other(format!("dyn-root SharedDirectory: {e}")))?;
-        let dyn_share = SingleDirectoryShare::new(dyn_dir)
-            .map_err(|e| Error::other(format!("dyn-root SingleDirectoryShare: {e}")))?;
-        let mut dyn_fs = VirtioFileSystemDeviceConfiguration::new(DYN_SHARE_TAG)
-            .map_err(|e| Error::other(format!("dyn-root VirtioFs: {e}")))?;
-        dyn_fs.set_share(dyn_share);
-        vm_cfg.add_directory_share(dyn_fs);
 
         vm_cfg
             .validate()
@@ -297,15 +275,12 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
 
         // Set up the netstack listener BEFORE the init handshake so that
         // tokimo-tun-pump (started early in init.sh) can connect on its
-        // first try. NetworkPolicy::Blocked skips this entirely.
-        let netstack_listener = match network {
-            NetworkPolicy::AllowAll => Some(
-                socket_dev
-                    .listen(NETSTACK_VSOCK_PORT)
-                    .map_err(|e| Error::other(format!("netstack listen: {e}")))?,
-            ),
-            NetworkPolicy::Blocked => None,
-        };
+        // first try. Always allocated; egress filtering happens in the
+        // host-side smoltcp gateway via `EgressPolicy`.
+        let netstack_listener = socket_dev
+            .listen(NETSTACK_VSOCK_PORT)
+            .map_err(|e| Error::other(format!("netstack listen: {e}")))?;
+        let _ = network; // used only to derive cmdline above
 
         let connect_timeout = Duration::from_secs(30);
         let deadline = Instant::now() + connect_timeout;

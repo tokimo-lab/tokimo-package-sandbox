@@ -30,7 +30,7 @@ SESSION_MODE=0
 INIT_PORT=50003
 NETSTACK_PORT=""
 GUEST_LISTENS=0
-NET_MODE=static
+NETDNS=on
 for arg in $CMDLINE; do
     case "$arg" in
         run=*)                       CMD_B64="${arg#run=}" ;;
@@ -40,7 +40,7 @@ for arg in $CMDLINE; do
         tokimo.init_port=*)          INIT_PORT="${arg#tokimo.init_port=}" ;;
         tokimo.netstack_port=*)      NETSTACK_PORT="${arg#tokimo.netstack_port=}" ;;
         tokimo.guest_listens=1)      GUEST_LISTENS=1 ;;
-        tokimo.net=*)                NET_MODE="${arg#tokimo.net=}" ;;
+        tokimo.netdns=*)             NETDNS="${arg#tokimo.netdns=}" ;;
     esac
 done
 
@@ -107,6 +107,16 @@ if [ -d /modules ]; then
     load_mod jbd2
     load_mod mbcache
     load_mod ext4
+    # NFS client (for macOS dynamic mount via in-process NFSv3 server).
+    # Chain: sunrpc -> auth_rpcgss -> lockd -> nfs -> nfsv3.
+    # `grace` is a dep of lockd on some kernels; load_mod no-ops if absent.
+    load_mod sunrpc
+    load_mod auth_rpcgss
+    load_mod grace
+    load_mod lockd
+    load_mod nfs_acl
+    load_mod nfs
+    load_mod nfsv3
     echo "tokimo-init: modules loaded" >/dev/kmsg 2>/dev/null || true
 fi
 
@@ -213,21 +223,18 @@ if [ "$SESSION_MODE" = 1 ]; then
     # ---------------------------------------------------------------------------
     # Network bring-up.
     #
-    # When NetworkPolicy::AllowAll is configured, the host adds a Hyper-V
-    # NetworkAdapter to the VM bound to an HCN NAT endpoint with subnet
-    # 192.168.127.0/24 (gateway .1). We assign a static IP within that
-    # subnet because no DHCP client is bundled in the initrd. The gateway
-    # itself does the NAT.
-    #
-    # When NetworkPolicy::Blocked, no NIC is attached → /sys/class/net/eth0
-    # does not exist and this block becomes a no-op.
+    # The userspace netstack (host-side smoltcp) is **always-on**: the
+    # host runs a smoltcp gateway over a vsock-bridged TAP device `tk0`
+    # regardless of `NetworkPolicy`. Egress filtering happens on the host
+    # via `EgressPolicy`. `tokimo.netdns=on` is set when upstream DNS /
+    # default routes should also be configured inside the guest;
+    # `tokimo.netdns=off` (NetworkPolicy::Blocked) leaves /etc/resolv.conf
+    # alone and skips the default routes so the guest cannot resolve or
+    # dial anything outside the gateway IPs.
     # ---------------------------------------------------------------------------
     /bin/busybox ip link set lo up 2>/dev/null || true
-    if [ "$NET_MODE" = "netstack" ] && [ -n "$NETSTACK_PORT" ]; then
-        # Userspace netstack: host runs smoltcp on its end of an hvsock
-        # and we tunnel raw Ethernet frames over a vsock connection
-        # bridged to a TAP device `tk0`. See `imp::netstack` on the host.
-        echo "tokimo-init: configuring tk0 via userspace netstack (vsock port $NETSTACK_PORT)" \
+    if [ -n "$NETSTACK_PORT" ]; then
+        echo "tokimo-init: configuring tk0 via userspace netstack (vsock port $NETSTACK_PORT, dns=$NETDNS)" \
             >/dev/kmsg 2>/dev/null || true
 
         load_mod tun || true
@@ -257,39 +264,30 @@ if [ "$SESSION_MODE" = 1 ]; then
             /bin/busybox ip link set tk0 address 02:00:00:00:00:02 2>/dev/null || true
             /bin/busybox ip addr add 192.168.127.2/24 dev tk0 2>/dev/null || true
             /bin/busybox ip link set tk0 up 2>/dev/null || true
-            /bin/busybox ip route add default via 192.168.127.1 dev tk0 2>/dev/null || true
-            # IPv6: enable on tk0, assign ULA, default route via host gateway.
-            # Disable DAD/RA BEFORE assigning the address — DAD would otherwise
-            # delay the address ~1 s in "tentative" state and the first packet
-            # from a freshly-started VM would silently fail. We are the only
-            # node on this synthetic L2 so DAD has nothing to detect.
+            # IPv6: enable on tk0, assign ULA. Disable DAD/RA BEFORE
+            # assigning the address — DAD would otherwise delay the
+            # address ~1 s in "tentative" state.
             echo 0 > /proc/sys/net/ipv6/conf/tk0/disable_ipv6 2>/dev/null || true
             echo 0 > /proc/sys/net/ipv6/conf/tk0/accept_dad 2>/dev/null || true
             echo 0 > /proc/sys/net/ipv6/conf/tk0/dad_transmits 2>/dev/null || true
             echo 0 > /proc/sys/net/ipv6/conf/tk0/accept_ra 2>/dev/null || true
             /bin/busybox ip -6 addr add fd00:7f::2/64 dev tk0 2>/dev/null || true
-            /bin/busybox ip -6 route add default via fd00:7f::1 dev tk0 2>/dev/null || true
-            echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
-            echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
+
+            if [ "$NETDNS" = "on" ]; then
+                /bin/busybox ip route add default via 192.168.127.1 dev tk0 2>/dev/null || true
+                /bin/busybox ip -6 route add default via fd00:7f::1 dev tk0 2>/dev/null || true
+                echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
+                echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
+            fi
+            # Even with NETDNS=off, we still need a route for the gateway
+            # itself so the in-process NFS server (LocalService at
+            # 192.168.127.1:2049) is reachable. The /24 directly-attached
+            # route from `ip addr add` covers that.
         else
             echo "tokimo-init: tk0 did not appear" >/dev/kmsg 2>/dev/null || true
         fi
-    elif [ -d /sys/class/net/eth0 ]; then
-        /bin/busybox ip link set eth0 up 2>/dev/null || true
-        if [ "$NET_MODE" = "dhcp" ]; then
-            echo "tokimo-init: configuring eth0 via DHCP (udhcpc)" >/dev/kmsg 2>/dev/null || true
-            /bin/busybox udhcpc -i eth0 -t 8 -T 1 -A 1 -n -q -s /etc/udhcpc/default.script >/dev/kmsg 2>&1 || \
-                echo "tokimo-init: udhcpc failed" >/dev/kmsg 2>/dev/null || true
-        else
-            echo "tokimo-init: configuring eth0 (static 192.168.127.2/24)" >/dev/kmsg 2>/dev/null || true
-            /bin/busybox ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-            /bin/busybox ip route add default via 192.168.127.1 2>/dev/null || true
-        fi
-        # Resolver — propagate into the chrooted rootfs too.
-        echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
-        echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
     else
-        echo "tokimo-init: no eth0 (NetworkPolicy::Blocked or NIC driver missing)" >/dev/kmsg 2>/dev/null || true
+        echo "tokimo-init: NETSTACK_PORT unset — no network" >/dev/kmsg 2>/dev/null || true
     fi
 
     # Always copy a fresh tokimo-sandbox-init from initramfs into the rootfs
