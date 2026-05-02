@@ -94,14 +94,31 @@ the initrd is stale — re-run `rebake-initrd.ps1 -InstallToVm`.
 #### Pre-test cleanup (always)
 
 Leftover Hyper-V VMs from previous runs hold `vm/initrd.img` open and
-will block both the rebake step and the next test run. Before any test
-session, kill them (admin pwsh):
+will block both the rebake step and the next test run. Each test
+session leaks a VM if the service is killed without `stopVm`. After a
+few rounds you can have dozens of orphan VMs consuming gigabytes of RAM.
+
+**Check what's running** (admin pwsh):
+
+```powershell
+hcsdiag.exe list            # shows all HCS compute systems
+(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB  # free GB
+```
+
+**Kill all tokimo VMs** (admin pwsh — `hcsdiag kill` takes the compute
+system **name**, not the GUID):
 
 ```powershell
 hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
-    if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+    if ($_ -match '(tokimo-sess-\S+)') { hcsdiag.exe kill $Matches[1] }
 }
 Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+**Verify** (should show 0 tokimo VMs):
+
+```powershell
+hcsdiag.exe list | Select-String 'tokimo-sess'
 ```
 
 #### Run order
@@ -113,7 +130,7 @@ Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -For
    ```powershell
    # Kill leftover VMs first if Copy-Item fails with "cannot access".
    hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
-       if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+       if ($_ -match '(tokimo-sess-\S+)') { hcsdiag.exe kill $Matches[1] }
    }
    Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
    pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm
