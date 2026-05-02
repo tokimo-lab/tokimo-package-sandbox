@@ -1009,3 +1009,163 @@ fn pty_shell_color_escape_codes_pass_through() {
         String::from_utf8_lossy(&captured)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Session sharing — `SharedBackend` registry semantics
+// ---------------------------------------------------------------------------
+//
+// These tests verify that two `Sandbox::connect()` handles that supply
+// the same `session_id` end up driving the **same** VM, mirroring the
+// Windows service's behaviour on Linux/macOS via the in-process
+// registry.  See `src/shared_backend.rs`.
+
+#[test]
+fn shared_session_two_handles_see_same_shell() {
+    let cfg = config("share_same");
+
+    let sb1 = Sandbox::connect().expect("connect 1");
+    sb1.configure(cfg.clone()).expect("configure 1");
+    sb1.start_vm().expect("start_vm");
+    let shell_a = sb1.shell_id().expect("shell_id 1");
+
+    // Second connect with the same session_id MUST observe the running
+    // VM and return the same boot-shell JobId.
+    let sb2 = Sandbox::connect().expect("connect 2");
+    sb2.configure(cfg.clone()).expect("configure 2 idempotent");
+    assert!(sb2.is_running().expect("is_running 2"));
+    let shell_b = sb2.shell_id().expect("shell_id 2");
+    assert_eq!(shell_a, shell_b, "same session_id must share the boot shell");
+
+    // start_vm on the second handle must also be idempotent.
+    sb2.start_vm().expect("start_vm 2 idempotent");
+
+    sb1.stop_vm().expect("stop_vm");
+    // After teardown, the second handle observes the VM as not running.
+    assert!(!sb2.is_running().unwrap_or(true));
+}
+
+#[test]
+fn shared_session_writes_visible_via_other_handle() {
+    let cfg = config("share_io");
+
+    let sb1 = Sandbox::connect().expect("connect 1");
+    sb1.configure(cfg.clone()).expect("configure 1");
+    let rx = sb1.subscribe().expect("subscribe");
+    sb1.start_vm().expect("start_vm");
+    let shell = sb1.shell_id().expect("shell_id");
+
+    // Drive stdin from the *second* handle, observe events on the first.
+    let sb2 = Sandbox::connect().expect("connect 2");
+    sb2.configure(cfg.clone()).expect("configure 2");
+
+    const TOKEN: &str = "SHARED_OK_8E1A";
+    sb2.write_stdin(&shell, format!("echo {TOKEN}\n").as_bytes())
+        .expect("write_stdin via sb2");
+
+    let captured = drain_until(&rx, &shell, TOKEN, Duration::from_secs(20));
+    assert!(
+        captured.contains(TOKEN),
+        "stdout from shared session not seen, got: {captured:?}"
+    );
+
+    sb1.stop_vm().expect("stop_vm");
+}
+
+#[test]
+fn distinct_session_ids_get_distinct_vms() {
+    // Two configs with **different** session_ids → two separate VMs.
+    // Proof: writes into VM A only show up on A's event stream; B's
+    // stream sees only B's writes.  (JobId values are not a proxy
+    // for distinctness — each VM numbers shells locally.)
+    let cfg_a = config("distinct_a");
+    let cfg_b = config("distinct_b");
+
+    let sb_a = Sandbox::connect().expect("connect a");
+    sb_a.configure(cfg_a).expect("configure a");
+    let rx_a = sb_a.subscribe().expect("subscribe a");
+    sb_a.start_vm().expect("start_vm a");
+    let shell_a = sb_a.shell_id().expect("shell_id a");
+
+    let sb_b = Sandbox::connect().expect("connect b");
+    sb_b.configure(cfg_b).expect("configure b");
+    let rx_b = sb_b.subscribe().expect("subscribe b");
+    sb_b.start_vm().expect("start_vm b");
+    let shell_b = sb_b.shell_id().expect("shell_id b");
+
+    const TOK_A: &str = "DISTINCT_A_4F1C";
+    const TOK_B: &str = "DISTINCT_B_4F1C";
+    sb_a.write_stdin(&shell_a, format!("echo {TOK_A}\n").as_bytes())
+        .expect("write a");
+    sb_b.write_stdin(&shell_b, format!("echo {TOK_B}\n").as_bytes())
+        .expect("write b");
+
+    let out_a = drain_until(&rx_a, &shell_a, TOK_A, Duration::from_secs(20));
+    let out_b = drain_until(&rx_b, &shell_b, TOK_B, Duration::from_secs(20));
+    assert!(out_a.contains(TOK_A) && !out_a.contains(TOK_B), "A leaked B's output");
+    assert!(out_b.contains(TOK_B) && !out_b.contains(TOK_A), "B leaked A's output");
+
+    // Stopping A must not affect B.
+    sb_a.stop_vm().expect("stop_vm a");
+    assert!(
+        sb_b.is_running().expect("is_running b after stop a"),
+        "stopping VM A must not affect VM B"
+    );
+    sb_b.stop_vm().expect("stop_vm b");
+}
+
+#[test]
+fn stop_from_one_handle_tears_down_for_others() {
+    let cfg = config("share_stop");
+
+    let sb1 = Sandbox::connect().expect("connect 1");
+    sb1.configure(cfg.clone()).expect("configure 1");
+    sb1.start_vm().expect("start_vm");
+
+    let sb2 = Sandbox::connect().expect("connect 2");
+    sb2.configure(cfg.clone()).expect("configure 2");
+    assert!(sb2.is_running().expect("is_running 2"));
+
+    // Stop from sb2.
+    sb2.stop_vm().expect("stop_vm via sb2");
+
+    // sb1's view is now also "not running".
+    assert!(!sb1.is_running().unwrap_or(true), "stop must affect all handles");
+    // shell_id on sb1 should now error (VmNotRunning).
+    assert!(sb1.shell_id().is_err(), "shell_id after shared stop must error");
+}
+
+#[test]
+fn empty_session_id_is_not_shared() {
+    // Empty session_id → untracked, fresh backend per handle. Two
+    // such handles must NOT share a VM.  Proof: writes are isolated
+    // to each handle's event stream.
+    let mut cfg_a = config("empty_a");
+    cfg_a.session_id = String::new();
+    let mut cfg_b = config("empty_b");
+    cfg_b.session_id = String::new();
+
+    let sb1 = Sandbox::connect().expect("connect 1");
+    sb1.configure(cfg_a).expect("configure 1");
+    let rx1 = sb1.subscribe().expect("subscribe 1");
+    sb1.start_vm().expect("start_vm 1");
+    let shell_1 = sb1.shell_id().expect("shell_id 1");
+
+    let sb2 = Sandbox::connect().expect("connect 2");
+    sb2.configure(cfg_b).expect("configure 2");
+    let rx2 = sb2.subscribe().expect("subscribe 2");
+    sb2.start_vm().expect("start_vm 2");
+    let shell_2 = sb2.shell_id().expect("shell_id 2");
+
+    const TOK1: &str = "EMPTY_ONE_DA32";
+    const TOK2: &str = "EMPTY_TWO_DA32";
+    sb1.write_stdin(&shell_1, format!("echo {TOK1}\n").as_bytes()).unwrap();
+    sb2.write_stdin(&shell_2, format!("echo {TOK2}\n").as_bytes()).unwrap();
+
+    let o1 = drain_until(&rx1, &shell_1, TOK1, Duration::from_secs(20));
+    let o2 = drain_until(&rx2, &shell_2, TOK2, Duration::from_secs(20));
+    assert!(o1.contains(TOK1) && !o1.contains(TOK2), "VM1 saw VM2 output");
+    assert!(o2.contains(TOK2) && !o2.contains(TOK1), "VM2 saw VM1 output");
+
+    sb1.stop_vm().ok();
+    sb2.stop_vm().ok();
+}

@@ -25,6 +25,8 @@ mod backend;
 mod error;
 mod platform;
 pub mod session_registry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod shared_backend;
 
 pub mod protocol;
 pub mod svc_protocol;
