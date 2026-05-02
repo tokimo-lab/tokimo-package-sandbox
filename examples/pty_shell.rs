@@ -115,7 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(windows)]
 fn terminal_size() -> (u16, u16) {
-    use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo};
+    use windows::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
     unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap_or_default();
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
@@ -135,10 +137,7 @@ fn terminal_size() -> (u16, u16) {
 
 #[cfg(windows)]
 fn enable_raw_mode() {
-    use windows::Win32::System::Console::{
-        GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
-        ENABLE_PROCESSED_INPUT,
-    };
+    use windows::Win32::System::Console::{ENABLE_PROCESSED_INPUT, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode};
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
         // Disable line buffering and echo
@@ -149,8 +148,7 @@ fn enable_raw_mode() {
 #[cfg(windows)]
 fn disable_raw_mode() {
     use windows::Win32::System::Console::{
-        GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
-        ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
     };
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
