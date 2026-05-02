@@ -116,7 +116,7 @@ pub(crate) fn send_echo_v4(target: Ipv4Addr, payload: &[u8], timeout: Duration) 
         let data = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, n) };
         // macOS SOCK_DGRAM ICMP returns the full IPv4 packet (header + ICMP).
         // Skip the IPv4 header — IHL is the low nibble of byte 0 in 32-bit words.
-        let icmp = if data.len() >= 1 && (data[0] >> 4) == 4 {
+        let icmp = if !data.is_empty() && (data[0] >> 4) == 4 {
             let ihl = ((data[0] & 0x0f) as usize) * 4;
             if data.len() < ihl {
                 continue;

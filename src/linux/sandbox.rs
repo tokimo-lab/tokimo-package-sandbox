@@ -65,6 +65,7 @@ struct JobSpawnInfo {
     pty_fd: Option<OwnedFd>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for BackendState {
     fn default() -> Self {
         Self {
@@ -151,7 +152,7 @@ impl SandboxBackend for LinuxBackend {
             return Err(Error::VmAlreadyRunning);
         }
 
-        let config = g.config.as_ref().ok_or_else(|| Error::NotConfigured)?.clone();
+        let config = g.config.as_ref().ok_or(Error::NotConfigured)?.clone();
 
         // 1. socketpair(SEQPACKET) for the init control channel. The host
         //    side stays CLOEXEC; the child side has CLOEXEC cleared in
@@ -597,7 +598,7 @@ impl SandboxBackend for LinuxBackend {
     fn is_process_running(&self, id: &JobId) -> Result<bool> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g.init_client.as_ref().ok_or_else(|| Error::VmNotRunning)?;
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?;
         let job = g
             .jobs
             .get(id.as_str())
@@ -610,7 +611,7 @@ impl SandboxBackend for LinuxBackend {
 
     fn shell_id(&self) -> Result<JobId> {
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        g.shell_job_id.clone().ok_or_else(|| Error::VmNotRunning)
+        g.shell_job_id.clone().ok_or(Error::VmNotRunning)
     }
 
     fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
@@ -745,7 +746,7 @@ impl SandboxBackend for LinuxBackend {
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        let client = g.init_client.as_ref().ok_or_else(|| Error::VmNotRunning)?;
+        let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?;
         let job = g
             .jobs
             .get(id.as_str())
@@ -757,7 +758,7 @@ impl SandboxBackend for LinuxBackend {
             let mut written = 0usize;
             while written < data.len() {
                 match nix::unistd::write(bf, &data[written..]) {
-                    Ok(n) if n == 0 => return Err(Error::other("write_stdin: pty write returned 0")),
+                    Ok(0) => return Err(Error::other("write_stdin: pty write returned 0")),
                     Ok(n) => written += n,
                     Err(nix::errno::Errno::EINTR) => continue,
                     Err(e) => return Err(Error::other(format!("write_stdin pty: {e}"))),
@@ -1019,12 +1020,12 @@ fn find_init_binary() -> Result<PathBuf> {
     }
 
     // 2. Check relative to current_exe (for dev builds).
-    if let Ok(exe) = env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("tokimo-sandbox-init");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
+    if let Ok(exe) = env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join("tokimo-sandbox-init");
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
 
