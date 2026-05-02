@@ -7,8 +7,8 @@ set -eu
 BIN="$1"
 shift
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ENT="$REPO_DIR/vz.entitlements"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ENT="$REPO_DIR/packaging/macos/vz.entitlements"
 
 if [ -f "$ENT" ] && [ -x "$BIN" ]; then
     codesign --force --sign - --entitlements "$ENT" "$BIN" >/dev/null 2>&1 || true

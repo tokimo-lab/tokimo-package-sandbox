@@ -59,8 +59,11 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools zstd cpio gzip qemu-utils zip
 
-      - name: Build tokimo-sandbox-init (musl static)
-        run: cargo build --release --target ${{ matrix.rust_target }} --bin tokimo-sandbox-init
+      - name: Build tokimo-sandbox-init + tokimo-tun-pump (musl static)
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} \
+            --bin tokimo-sandbox-init \
+            --bin tokimo-tun-pump
 
       - name: Resolve base_tag
         id: base
@@ -115,12 +118,14 @@ jobs:
           tar -xf work/kernel.tar -C work
           ls -lh work/
 
-      - name: Rebake initrd with tokimo-sandbox-init
+      - name: Rebake initrd with tokimo-sandbox-init + tokimo-tun-pump + latest init.sh
         run: |
           bash packaging/vm/scripts/rebake-initrd.sh \
-            --base     work/initrd.img \
-            --init-bin target/${{ matrix.rust_target }}/release/tokimo-sandbox-init \
-            --out      work/initrd.img.rebaked
+            --base         work/initrd.img \
+            --init-bin     target/${{ matrix.rust_target }}/release/tokimo-sandbox-init \
+            --tun-pump-bin target/${{ matrix.rust_target }}/release/tokimo-tun-pump \
+            --init-sh      packaging/vm-base/init.sh \
+            --out          work/initrd.img.rebaked
           mv work/initrd.img.rebaked work/initrd.img
 
       - name: Repackage kernel bundle
