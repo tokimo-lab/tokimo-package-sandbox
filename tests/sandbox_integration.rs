@@ -416,7 +416,13 @@ fn network_blocked_only_loopback() {
     let shell = sb.shell_id().expect("shell_id");
 
     let n = link_count(&rx, &sb, &shell);
-    assert_eq!(n, 1, "Blocked policy must yield exactly 1 link (lo), got {n}");
+    // Under the always-on netstack design (since macOS-NFS-mount), the
+    // guest always has tk0 in its netns regardless of policy — Blocked
+    // just gates egress at the smoltcp gateway. The only egress that
+    // survives Blocked is registered LocalServices (e.g. NFS). So we
+    // expect 2 links here: lo + tk0. The egress probe below proves
+    // external traffic is still blocked.
+    assert_eq!(n, 2, "Blocked policy must yield 2 links (lo + tk0), got {n}");
 
     // Egress probe MUST fail under Blocked.
     sb.write_stdin(
@@ -932,13 +938,6 @@ fn add_user_sets_user_and_home_env() {
 // the host reads the same bytes back from its local path.
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "Apple VZ virtio-fs cannot expose host->guest mounts bidirectionally \
-              after vm.start(); macOS add_mount is forward-only via APFS clone. \
-              See docs/macos-testing.md (\"Reverse-mount limitation\") and \
-              tests/README.md."
-)]
 fn add_user_with_reverse_mount_writes_to_host() {
     const SENTINEL: &str = "BOB_WROTE_THIS_F3A2";
 
@@ -1285,4 +1284,54 @@ fn empty_session_id_is_not_shared() {
 
     sb1.stop_vm().ok();
     sb2.stop_vm().ok();
+}
+
+// ---------------------------------------------------------------------------
+// macOS: dynamic NFS-backed mount → guest writes visible on the host.
+// ---------------------------------------------------------------------------
+//
+// On macOS, `add_mount` registers the host directory with the in-process
+// NFSv3 server (see src/macos/nfs.rs) and asks the guest to mount it via
+// the smoltcp gateway. This is the bidirectional replacement for the old
+// virtio-fs APFS-clone hack.
+
+#[test]
+#[cfg(target_os = "macos")]
+fn nfs_dynamic_mount_writes_to_host() {
+    const SENTINEL: &str = "NFS_DYN_WROTE_F19C";
+
+    let label = "nfs-dyn";
+    let host = workspace_dir(&format!("{label}-share"));
+    let _ = std::fs::remove_file(host.join("hello.txt"));
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config(label)).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    sb.add_mount(Mount {
+        name: "share1".into(),
+        host_path: host.clone(),
+        guest_path: "/mnt/share1".into(),
+        read_only: false,
+        create_host_dir: true,
+    })
+    .expect("add_mount");
+
+    let shell = sb.shell_id().expect("shell_id");
+    sb.write_stdin(
+        &shell,
+        format!("echo {SENTINEL} > /mnt/share1/hello.txt; echo NFS_DONE_4F8\n").as_bytes(),
+    )
+    .unwrap();
+    let _ = drain_until(&rx, &shell, "NFS_DONE_4F8", Duration::from_secs(30));
+
+    let read = std::fs::read_to_string(host.join("hello.txt")).unwrap_or_default();
+    assert!(
+        read.contains(SENTINEL),
+        "host did not see guest write through NFS mount: got {read:?}"
+    );
+
+    sb.remove_mount("share1").ok();
+    sb.stop_vm().ok();
 }

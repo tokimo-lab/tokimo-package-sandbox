@@ -3,7 +3,7 @@
 Cross-platform native sandbox for running arbitrary commands in isolated environments.
 
 - **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer
-- **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, virtio-fs work share, virtio-vsock control plane
+- **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, in-process NFSv3 server over the always-on smoltcp gateway for boot/runtime mounts, virtio-vsock control plane
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 
 ## Public API
@@ -88,21 +88,23 @@ Sandbox client (library, in-process)
         ├─ arcbox-vz → Apple Virtualization.framework (VZVirtualMachine)
         │       │
         │       ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
-        │       ├─ VZVirtioFileSystemDevice  tag="work"      ← rootfs (read-only host-shared)
-        │       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn" ← dynamic mount pool
-        │       ├─ VZVirtioSocketDevice (vsock CID/port 2222) ← init control plane
-        │       ├─ VZNetworkDeviceConfiguration::nat()        ← AllowAll: vmnet NAT
-        │       └─ VZSerialPortConfiguration                  ← guest console (debug)
+        │       ├─ VZVirtioSocketDevice (vsock CID/port 2222)         ← init control plane
+        │       ├─ VZVirtioNetworkDevice + tk0/tap                    ← always-on smoltcp gateway
+        │       └─ VZSerialPortConfiguration                          ← guest console (debug)
+        │
+        ├─ in-process NFSv3 server (nfsserve, bound 127.0.0.1:ephemeral)
+        │     └─ reachable from guest as 192.168.127.1:2049 via netstack LocalService splice
         │
         └─ in-guest:
               tokimo-sandbox-init (PID 1) over virtio-vsock port 2222
                 ├─ Hello / handshake
-                ├─ mount the dynamic pool at /__tokimo_dyn
-                ├─ AllowAll → run busybox udhcpc inside guest to apply
-                │   the actual VZ NAT lease (vmnet picks ~192.168.64.x at
-                │   runtime, NOT the Hyper-V 192.168.127.x baked into init.sh)
+                ├─ for each ConfigureParams.mount and runtime add_mount:
+                │     mount -t nfs -o nolock,vers=3,proto=tcp,hard
+                │           192.168.127.1:/<name> /<guest_path>
+                ├─ EgressPolicy::Blocked still blocks upstream egress;
+                │   LocalServices (NFS) are exempt by design
                 ├─ OpenShell / Spawn / Exec
-                └─ add_mount / remove_mount → bind dyn-pool subdirs at runtime
+                └─ remove_mount → umount2(MNT_DETACH) + tombstone host slot
 ```
 
 **Process-wide invariants:**
