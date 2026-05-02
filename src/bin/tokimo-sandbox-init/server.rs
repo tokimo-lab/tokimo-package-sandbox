@@ -1425,10 +1425,10 @@ fn handle_mount_fuse(
                 format!("fuse mount {name:?} already exists"),
             ));
         }
-        if let Err(e) = std::fs::create_dir_all(&target) {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {target}: {e}")));
-            }
+        if let Err(e) = std::fs::create_dir_all(&target)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {target}: {e}")));
         }
         let exe = if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
             "/bin/tokimo-sandbox-fuse".to_string()

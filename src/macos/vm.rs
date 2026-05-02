@@ -8,14 +8,12 @@
 //! Networking is **always-on**: a single virtio-vsock listener carries
 //! the guest's `tokimo-tun-pump` traffic into the host-side smoltcp
 //! gateway. `NetworkPolicy` becomes an `EgressPolicy` filter inside the
-//! gateway (see `src/netstack/`); under `Blocked`, only `LocalService`
-//! flows (the in-process NFSv3 server) are spliced through. There is no
-//! `tokimo.net=blocked` cmdline branch any more.
+//! gateway (see `src/netstack/`). There is no `tokimo.net=blocked`
+//! cmdline branch any more.
 //!
-//! User mounts (boot-time and runtime) are no longer per-mount virtio-fs
-//! shares — they all flow through the in-process NFS server (see
-//! `src/macos/nfs.rs`). The only directory share that remains is `work`
-//! (the rootfs / chroot base).
+//! User mounts (boot-time and runtime) flow through FUSE-over-vsock
+//! (see `src/vfs_host/`). The only directory share that remains as
+//! virtio-fs is `work` (the rootfs / chroot base).
 
 use std::env;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -245,8 +243,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         // the netstack setup.
 
         // Rootfs (tag "work"). This is the **only** virtio-fs share —
-        // user mounts go through the in-process NFS server (see
-        // `src/macos/nfs.rs` and `LocalService` in `src/netstack/`).
+        // user mounts go through FUSE-over-vsock (see `src/vfs_host/`).
         let rootfs_dir = SharedDirectory::new(&rootfs_s, false)
             .map_err(|e| Error::other(format!("rootfs SharedDirectory: {e}")))?;
         let rootfs_share = SingleDirectoryShare::new(rootfs_dir)

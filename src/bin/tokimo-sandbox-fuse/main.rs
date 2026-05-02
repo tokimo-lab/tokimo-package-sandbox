@@ -49,9 +49,8 @@ fn main() -> std::process::ExitCode {
 mod linux {
     use std::collections::HashMap;
     use std::ffi::OsStr;
-    use std::io::{self, Read, Write};
+    use std::io;
     use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,7 +85,6 @@ mod linux {
 
     fn parse_args() -> Result<Args, String> {
         let mut argv = std::env::args().skip(1);
-        let mut transport: Option<Transport> = None;
         let mut transport_kind: Option<String> = None;
         let mut port: Option<u32> = None;
         let mut fd: Option<i32> = None;
@@ -110,20 +108,20 @@ mod linux {
                 other => return Err(format!("unknown arg: {other}")),
             }
         }
-        match transport_kind.as_deref() {
+        let transport = match transport_kind.as_deref() {
             Some("vsock") => {
                 let p = port.ok_or("--transport vsock requires --port")?;
-                transport = Some(Transport::Vsock { port: p });
+                Transport::Vsock { port: p }
             }
             Some("unix-fd") => {
                 let f = fd.ok_or("--transport unix-fd requires --fd")?;
-                transport = Some(Transport::UnixFd { fd: f });
+                Transport::UnixFd { fd: f }
             }
             Some(other) => return Err(format!("unknown transport: {other}")),
             None => return Err("missing --transport".into()),
-        }
+        };
         Ok(Args {
-            transport: transport.unwrap(),
+            transport,
             mount_name: mount_name.ok_or("missing --mount-name")?,
             target: target.ok_or("missing --target")?,
             read_only,
@@ -192,11 +190,11 @@ mod linux {
         }
 
         // Make sure mountpoint exists.
-        if let Err(e) = std::fs::create_dir_all(&args.target) {
-            if e.kind() != io::ErrorKind::AlreadyExists {
-                eprintln!("[tokimo-fuse] create mountpoint {}: {e}", args.target.display());
-                return ExitCode::from(5);
-            }
+        if let Err(e) = std::fs::create_dir_all(&args.target)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            eprintln!("[tokimo-fuse] create mountpoint {}: {e}", args.target.display());
+            return ExitCode::from(5);
         }
 
         match fuser::mount2(fs, &args.target, &opts) {
@@ -540,7 +538,7 @@ mod linux {
             crtime: to_st(a.mtime),
             kind,
             perm: (a.mode & 0o7777) as u16,
-            nlink: a.nlink as u32,
+            nlink: a.nlink,
             uid: a.uid,
             gid: a.gid,
             rdev: 0,
