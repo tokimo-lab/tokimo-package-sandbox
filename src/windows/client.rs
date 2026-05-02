@@ -103,6 +103,12 @@ struct Inner {
     counter: AtomicU64,
     /// Set to true once the reader thread sees EOF/error.
     dead: AtomicBool,
+    /// Set to true once the reader thread observes the server's `Hello`.
+    /// Lets `wait_for_server_hello` return as soon as the handshake is
+    /// actually complete instead of always burning the full timeout.
+    hello_received: AtomicBool,
+    hello_cv: Condvar,
+    hello_lock: Mutex<()>,
 }
 
 impl PipeClient {
@@ -116,6 +122,9 @@ impl PipeClient {
 
         let inner = Arc::new(Inner {
             write: Mutex::new(Box::new(pipe)),
+            hello_received: AtomicBool::new(false),
+            hello_cv: Condvar::new(),
+            hello_lock: Mutex::new(()),
             shared: Mutex::new(Shared {
                 pending: HashMap::new(),
                 subscribers: Vec::new(),
@@ -154,26 +163,39 @@ impl PipeClient {
     }
 
     fn wait_for_server_hello(&self, timeout: Duration) -> Result<()> {
-        // The reader thread doesn't surface Hello frames as responses; it
-        // just logs them. So we sleep a tick — by the time we issue the
-        // first `ping` the handshake will have completed or the reader
-        // will have marked the connection dead.
+        // Block until the reader thread sees the server's `Hello`,
+        // the connection dies, or the timeout elapses. The reader
+        // signals via `hello_cv` (notify_all) when Hello arrives.
         let deadline = Instant::now() + timeout;
-        // Best-effort: don't busy-spin; the reader signals via Condvar
-        // through Pending. Since Hello has no oneshot, just sleep.
-        // We'll catch protocol errors on the first real request.
-        while Instant::now() < deadline {
+        let mut g = self
+            .inner
+            .hello_lock
+            .lock()
+            .map_err(|_| Error::other("hello lock poisoned"))?;
+        loop {
+            if self.inner.hello_received.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if self.inner.dead.load(Ordering::Relaxed) {
-                let g = self.inner.shared.lock().expect("shared lock");
+                let s = self.inner.shared.lock().expect("shared lock");
                 return Err(Error::protocol(
-                    g.fatal
+                    s.fatal
                         .clone()
                         .unwrap_or_else(|| "service closed during handshake".into()),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let now = Instant::now();
+            if now >= deadline {
+                // Don't fail — protocol mismatches surface on first call.
+                return Ok(());
+            }
+            let (g2, _) = self
+                .inner
+                .hello_cv
+                .wait_timeout(g, deadline - now)
+                .map_err(|_| Error::other("hello lock poisoned"))?;
+            g = g2;
         }
-        Ok(())
     }
 
     /// Issue a JSON-RPC request and block until response.
@@ -262,8 +284,12 @@ fn reader_loop<R: Read>(mut r: R, inner: Arc<Inner>) {
         };
         match frame {
             Frame::Hello { .. } => {
-                // Handshake reply. Nothing to do — `connect()` returned
-                // optimistically; protocol mismatches surface on first call.
+                // Handshake reply. Signal `wait_for_server_hello` so it
+                // can return immediately instead of sleeping out its
+                // full timeout.
+                inner.hello_received.store(true, Ordering::Release);
+                let _g = inner.hello_lock.lock().expect("hello lock");
+                inner.hello_cv.notify_all();
             }
             Frame::Response { id, result, error } => {
                 let pending = {
