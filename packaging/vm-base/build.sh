@@ -37,6 +37,7 @@ BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 i
 # expects this binary in session-mode (Windows HCS). If unset, the boot
 # bundle will be one-shot capable only.
 TOKIMO_INIT_BIN="${TOKIMO_INIT_BIN:-}"
+TOKIMO_TUN_PUMP_BIN="${TOKIMO_TUN_PUMP_BIN:-}"
 
 echo "==> [1/6] Cleaning old build..."
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
