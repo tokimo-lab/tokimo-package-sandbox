@@ -12,9 +12,9 @@ mod imp_windows;
 #[cfg(target_os = "windows")]
 pub(crate) use imp_windows::{send_echo_v4, send_echo_v6};
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 mod imp_unix;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub(crate) use imp_unix::{send_echo_v4, send_echo_v6};
 
 // Type re-exports so call sites don't need their own imports.

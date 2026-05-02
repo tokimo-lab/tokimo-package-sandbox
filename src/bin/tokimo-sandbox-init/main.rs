@@ -16,6 +16,8 @@ mod child;
 #[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]
+mod pump;
+#[cfg(target_os = "linux")]
 mod server;
 
 #[cfg(target_os = "linux")]
@@ -126,6 +128,10 @@ struct BwrapCli {
     control_fd: Option<i32>,
     bringup_lo: bool,
     mount_sysfs: bool,
+    /// File descriptor of the stream socket connected to the host's
+    /// userspace netstack. When present, init creates `tk0` inside the
+    /// new netns and pumps Ethernet frames between `tk0` and this fd.
+    net_fd: Option<i32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -138,6 +144,8 @@ fn parse_bwrap_cli() -> Option<BwrapCli> {
     for a in &args[2..] {
         if let Some(v) = a.strip_prefix("--control-fd=") {
             cli.control_fd = Some(v.parse().ok()?);
+        } else if let Some(v) = a.strip_prefix("--net-fd=") {
+            cli.net_fd = Some(v.parse().ok()?);
         } else if a == "--bringup-lo" {
             cli.bringup_lo = true;
         } else if a == "--mount-sysfs" {
@@ -300,6 +308,20 @@ fn run() -> Result<(), String> {
         if cli.bringup_lo {
             if let Err(e) = bringup_lo() {
                 eprintln!("[tokimo-sandbox-init] WARN bringup_lo: {e}");
+            }
+        }
+
+        // Userspace-netstack pump: when host hands us a connected stream
+        // socket, create tk0 inside this netns and pump Ethernet frames
+        // through `pump.rs`. The host runs smoltcp on the other end.
+        if let Some(net_fd) = cli.net_fd {
+            match pump::spawn_pump(net_fd) {
+                Ok(_handle) => {
+                    eprintln!("[tokimo-sandbox-init] netstack pump up (fd {net_fd})");
+                }
+                Err(e) => {
+                    eprintln!("[tokimo-sandbox-init] WARN netstack pump: {e}");
+                }
             }
         }
 
@@ -649,9 +671,7 @@ fn bringup_lo() -> Result<(), String> {
     for (i, &b) in name.iter().enumerate() {
         ifr.ifr_name[i] = b as libc::c_char;
     }
-    unsafe {
-        ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-    }
+    ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
     let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
     let res = if rc != 0 {
         Err(format!(

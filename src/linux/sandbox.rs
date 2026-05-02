@@ -54,6 +54,10 @@ struct BackendState {
     next_job_id: u64,
     /// Debug logging flag.
     debug_logging: bool,
+    /// Per-VM netstack shutdown flag (None when policy is Blocked, since
+    /// no smoltcp thread is spawned). Setting to true makes the netstack
+    /// reader/writer threads exit on their next loop iteration.
+    netstack_shutdown: Option<Arc<AtomicBool>>,
 }
 
 struct JobSpawnInfo {
@@ -76,6 +80,7 @@ impl Default for BackendState {
             subscribers: Vec::new(),
             next_job_id: 0,
             debug_logging: false,
+            netstack_shutdown: None,
         }
     }
 }
@@ -159,6 +164,25 @@ impl SandboxBackend for LinuxBackend {
         )
         .map_err(|e| Error::other(format!("socketpair(SEQPACKET): {e}")))?;
         let child_fd_raw = child_end.as_raw_fd();
+
+        // 1b. Optional second socketpair (STREAM) for the userspace
+        //     netstack. Allocated only when policy is AllowAll. The
+        //     guest end is handed to init via `--net-fd=N`; the host
+        //     end is duplicated and fed to `netstack::spawn`.
+        let (net_host_end, net_child_end): (Option<OwnedFd>, Option<OwnedFd>) =
+            if matches!(config.network, NetworkPolicy::AllowAll) {
+                let (h, c) = socketpair(
+                    nix::sys::socket::AddressFamily::Unix,
+                    nix::sys::socket::SockType::Stream,
+                    None,
+                    SockFlag::SOCK_CLOEXEC,
+                )
+                .map_err(|e| Error::other(format!("socketpair(STREAM,net): {e}")))?;
+                (Some(h), Some(c))
+            } else {
+                (None, None)
+            };
+        let net_child_fd_raw = net_child_end.as_ref().map(|f| f.as_raw_fd());
 
         // 2. Find the init binary.
         let init_path = find_init_binary()?;
@@ -273,6 +297,24 @@ impl SandboxBackend for LinuxBackend {
                 // for runtime-added Plan9 shares.
                 "--cap-add",
                 "CAP_SYS_ADMIN",
+                // CAP_NET_ADMIN: needed inside the new netns to bring up
+                // `lo` (SIOCSIFFLAGS) and to open /dev/net/tun + TUNSETIFF
+                // for the userspace netstack TAP. bwrap drops all caps by
+                // default in unprivileged user_ns mode.
+                "--cap-add",
+                "CAP_NET_ADMIN",
+                // CAP_NET_RAW: required for `ping`'s SOCK_RAW fallback
+                // when the host's net.ipv4.ping_group_range disables
+                // unprivileged ICMP (DGRAM). Smoltcp ingests the raw
+                // ICMP frame via tk0 regardless, so this is purely a
+                // guest-side capability concern.
+                "--cap-add",
+                "CAP_NET_RAW",
+                // CAP_MKNOD: pump.rs falls back to mknod(/dev/net/tun)
+                // inside the sandbox if the host node wasn't bind-mounted
+                // (e.g. some hardened distros).
+                "--cap-add",
+                "CAP_MKNOD",
             ]
             .iter()
             .map(|s| s.to_string()),
@@ -298,19 +340,33 @@ impl SandboxBackend for LinuxBackend {
         args.extend(["--bind".to_string(), "/".to_string(), "/.tps_host".to_string()]);
 
         // Network policy.
-        let mut mount_sysfs = false;
-        let mut bringup_lo = false;
-        match config.network {
-            NetworkPolicy::AllowAll => {
-                if Path::new("/sys").is_dir() {
-                    args.extend(["--ro-bind", "/sys", "/sys"].iter().map(|s| s.to_string()));
-                }
-            }
-            NetworkPolicy::Blocked => {
-                args.push("--unshare-net".to_string());
-                args.extend(["--dir", "/sys"].iter().map(|s| s.to_string()));
-                mount_sysfs = true;
-                bringup_lo = true;
+        // Both modes use --unshare-net + a fresh sysfs + lo bringup so the
+        // sandbox has zero default visibility into the host's network
+        // stack. AllowAll layers a userspace netstack (smoltcp) on top:
+        // the guest's tk0 TAP is bridged to the host's smoltcp Interface
+        // through a STREAM socketpair, mirroring the Windows/macOS VM
+        // backends. This gives one unified L4 interception/audit point.
+        args.push("--unshare-net".to_string());
+        args.extend(["--dir", "/sys"].iter().map(|s| s.to_string()));
+        let mount_sysfs = true;
+        let bringup_lo = true;
+        let want_netstack = matches!(config.network, NetworkPolicy::AllowAll);
+        if want_netstack {
+            // Make the TUN device node visible inside the sandbox. We
+            // already mounted /dev as tmpfs above, so a bind-mount of
+            // the host node into /dev/net/tun is the cleanest path.
+            // bwrap will create parent dirs for `--dev-bind-try`.
+            if Path::new("/dev/net/tun").exists() {
+                args.extend(
+                    ["--dev-bind-try", "/dev/net/tun", "/dev/net/tun"]
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+            } else {
+                eprintln!(
+                    "[linux/sandbox] WARN: /dev/net/tun not present on host; \
+                     init will mknod inside the sandbox (CAP_MKNOD)"
+                );
             }
         }
 
@@ -321,6 +377,9 @@ impl SandboxBackend for LinuxBackend {
         // numeric value via argv. See `tokimo-sandbox-init bwrap` parser.
         args.push("bwrap".to_string());
         args.push(format!("--control-fd={child_fd_raw}"));
+        if let Some(fd) = net_child_fd_raw {
+            args.push(format!("--net-fd={fd}"));
+        }
         if bringup_lo {
             args.push("--bringup-lo".to_string());
         }
@@ -337,6 +396,7 @@ impl SandboxBackend for LinuxBackend {
         // length (init_path + bwrap subcommand + flags) so we can splice
         // in --ro-bind without disturbing it.
         let tail_len = 1 /* init_path */ + 1 /* "bwrap" */ + 1 /* --control-fd */
+            + net_child_fd_raw.is_some() as usize
             + bringup_lo as usize + mount_sysfs as usize;
         // The `--` separator sits before the tail; insert --ro-bind in
         // front of it.
@@ -345,31 +405,67 @@ impl SandboxBackend for LinuxBackend {
         args.insert(insert_at + 1, init_dir.display().to_string());
         args.insert(insert_at + 2, init_dir.display().to_string());
 
-        // 4. Spawn bwrap. In pre_exec, clear CLOEXEC on the child end so
-        //    bwrap → init inherits it.
+        // 4. Spawn bwrap. In pre_exec, clear CLOEXEC on the child end(s)
+        //    so bwrap → init inherits them.
         let mut cmd = Command::new(bwrap_path);
         cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        let net_child_fd_for_pre_exec = net_child_fd_raw;
         unsafe {
             cmd.pre_exec(move || {
                 let r = libc::fcntl(child_fd_raw, libc::F_SETFD, 0);
                 if r == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if let Some(fd) = net_child_fd_for_pre_exec {
+                    let r = libc::fcntl(fd, libc::F_SETFD, 0);
+                    if r == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
         let child = cmd.spawn().map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
 
-        // 5. Drop our copy of the child end. host_end is the active control fd.
+        // 5. Drop our copy of the child ends. host_end is the active
+        //    control fd; net_host_end (if any) feeds the netstack thread.
         drop(child_end);
+        drop(net_child_end);
 
         let bwrap_pid = child.id();
         g.bwrap_child = Some(child);
         g.bwrap_pid = Some(bwrap_pid);
         drop(g);
+
+        // 5b. Userspace netstack (AllowAll only). The guest end of the
+        //     STREAM socketpair is now in init's process; we own
+        //     net_host_end. Duplicate it so smoltcp can hold separate
+        //     Read/Write trait objects, then spawn the netstack thread.
+        let netstack_shutdown = if let Some(host_fd) = net_host_end {
+            let read_fd: OwnedFd = host_fd;
+            let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
+            if dup_raw < 0 {
+                return Err(Error::other(format!(
+                    "netstack dup fd: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let write_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+            let read_file = std::fs::File::from(read_fd);
+            let write_file = std::fs::File::from(write_fd);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let _ = crate::netstack::spawn(
+                Box::new(read_file),
+                Box::new(write_file),
+                Arc::clone(&shutdown),
+            );
+            Some(shutdown)
+        } else {
+            None
+        };
 
         // 6. Wrap host_end as InitClient and handshake.
         // bwrap mode: init runs as PID 2 (bwrap is PID 1) — we
@@ -390,6 +486,7 @@ impl SandboxBackend for LinuxBackend {
         // 7. Update state.
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         g.init_client = Some(Arc::clone(&init_client));
+        g.netstack_shutdown = netstack_shutdown;
         g.shell_child_id = Some(shell_info.child_id.clone());
         let shell_job_id = JobId(format!("j{}", g.next_job_id));
         g.next_job_id += 1;
@@ -441,6 +538,12 @@ impl SandboxBackend for LinuxBackend {
         // 1. Signal pump to stop and shutdown init.
         self.pump_stop.store(true, Ordering::Relaxed);
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        // Stop the userspace netstack first so its threads exit before we
+        // tear down the bwrap process (which closes the socketpair under
+        // them and would otherwise produce a noisy EBADF on shutdown).
+        if let Some(s) = g.netstack_shutdown.take() {
+            s.store(true, Ordering::Relaxed);
+        }
         if let Some(ref client) = g.init_client {
             let _ = client.shutdown();
         }

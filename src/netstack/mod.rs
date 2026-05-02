@@ -18,8 +18,13 @@
 //!
 //! Wire framing on the underlying duplex stream: `u16-be length || ethernet
 //! frame`. Matches the framing the guest-side `tokimo-tun-pump` uses.
+//!
+//! On Linux the same module powers the bwrap backend's `AllowAll` mode: the
+//! guest end of the stream is a Unix `socketpair(STREAM)` whose child fd is
+//! handed through bwrap to `tokimo-sandbox-init`, which creates `tk0` inside
+//! the unshared netns and pumps frames itself (no `tokimo-tun-pump` exec).
 
-#![cfg(any(target_os = "windows", target_os = "macos"))]
+#![cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
