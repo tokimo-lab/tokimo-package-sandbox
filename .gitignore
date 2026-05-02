@@ -19,3 +19,6 @@ Cargo.lock
 /.vscode/
 .cargo-docker/
 .rustup-docker/
+
+# Ephemeral rootfs VHDX clones left by crashed/killed service
+.tokimo-rootfs-*.vhdx
