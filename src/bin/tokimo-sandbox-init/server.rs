@@ -1018,7 +1018,6 @@ fn ack(state: &State, client_fd: RawFd, id: String, res: Result<(), ErrorReply>)
     state.send_to_client(client_fd, &Frame::Reply(reply), None);
 }
 
-
 /// Handle `Op::MountFuse`: spawn `tokimo-sandbox-fuse` as a child
 /// process. The child connects to the host's FUSE listener and mounts
 /// itself at `target`. We don't wait for the mount to be "ready" — the
@@ -1101,9 +1100,10 @@ fn handle_mount_fuse(
         while std::time::Instant::now() < deadline {
             if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
                 // The mount entry contains the target path and "fuse" type.
-                if mounts.lines().any(|line| {
-                    line.contains(&target) && (line.contains(" fuse") || line.contains(" fuse."))
-                }) {
+                if mounts
+                    .lines()
+                    .any(|line| line.contains(&target) && (line.contains(" fuse") || line.contains(" fuse.")))
+                {
                     mounted = true;
                     break;
                 }
@@ -1121,9 +1121,7 @@ fn handle_mount_fuse(
         if mounted {
             eprintln!("[tokimo-init] mounted fuse: name={name} pid={pid} target={target}");
         } else {
-            eprintln!(
-                "[tokimo-init] fuse mount pending: name={name} pid={pid} target={target} (proceeding)"
-            );
+            eprintln!("[tokimo-init] fuse mount pending: name={name} pid={pid} target={target} (proceeding)");
         }
         Ok(())
     })();

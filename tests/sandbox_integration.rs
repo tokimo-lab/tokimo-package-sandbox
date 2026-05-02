@@ -418,7 +418,11 @@ fn signal_shell_delivers_sigint() {
 // AllowAll → HCN NAT endpoint attached → guest gets at least one extra NIC.
 
 fn link_count(rx: &Receiver<Event>, sb: &Sandbox, shell: &JobId) -> usize {
-    sb.write_stdin(shell, b"ls -1 /sys/class/net/ 2>&1 | wc -l; echo LC_DONE_X9F2\n")
+    // /proc/net/dev is netns-scoped (it resolves through /proc/self/net) and
+    // works regardless of whether /sys is mounted inside the sandbox. The
+    // first two lines are the column headers; subsequent lines are one per
+    // interface in the current netns.
+    sb.write_stdin(shell, b"awk 'NR>2 {print}' /proc/net/dev | wc -l; echo LC_DONE_X9F2\n")
         .unwrap();
     let captured = drain_until(rx, shell, "LC_DONE_X9F2", Duration::from_secs(20));
     // Find the first line that is purely a number — that's `wc -l`.

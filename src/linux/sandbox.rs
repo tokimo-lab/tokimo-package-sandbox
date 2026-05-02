@@ -260,8 +260,8 @@ impl SandboxBackend for LinuxBackend {
         // FUSE needs user_allow_other so any UID inside the sandbox can
         // access the mount (the guest shell may not run as root).
         let _fuse_conf_file = {
-            let mut tmp = tempfile::NamedTempFile::new()
-                .map_err(|e| Error::other(format!("create fuse.conf tmpfile: {e}")))?;
+            let mut tmp =
+                tempfile::NamedTempFile::new().map_err(|e| Error::other(format!("create fuse.conf tmpfile: {e}")))?;
             use std::io::Write;
             tmp.write_all(b"user_allow_other\n")
                 .map_err(|e| Error::other(format!("write fuse.conf: {e}")))?;
@@ -523,7 +523,8 @@ impl SandboxBackend for LinuxBackend {
         let mut boot_share_names = HashSet::new();
         let mut fuse_mount_names = HashSet::new();
         for share in &config.mounts {
-            if share.create_host_dir && !share.host_path.exists()
+            if share.create_host_dir
+                && !share.host_path.exists()
                 && let Err(e) = std::fs::create_dir_all(&share.host_path)
             {
                 return Err(Error::other(format!(
@@ -564,13 +565,8 @@ impl SandboxBackend for LinuxBackend {
                     }
                     // Convert OwnedFd → std UnixStream → tokio UnixStream.
                     // into_raw_fd() transfers ownership without closing.
-                    let std_stream = unsafe {
-                        std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd())
-                    };
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
+                    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd()) };
+                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                         Ok(rt) => {
                             // Enter the runtime context so tokio I/O
                             // registration (needed by UnixStream::from_std)
@@ -1021,13 +1017,8 @@ impl SandboxBackend for LinuxBackend {
                         let _ = libc::fcntl(host_fd_raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
                     }
                 }
-                let std_stream = unsafe {
-                    std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd())
-                };
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
+                let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd()) };
+                match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                     Ok(rt) => {
                         let _guard = rt.enter();
                         match tokio::net::UnixStream::from_std(std_stream) {
