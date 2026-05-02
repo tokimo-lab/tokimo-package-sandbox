@@ -21,6 +21,7 @@ BASE=""
 INIT_BIN=""
 INIT_SH=""
 TUN_PUMP_BIN=""
+FUSE_BIN=""
 EXTRAS_DIR=""
 OUT=""
 
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
         --init-bin)     INIT_BIN="$2";     shift 2 ;;
         --init-sh)      INIT_SH="$2";      shift 2 ;;
         --tun-pump-bin) TUN_PUMP_BIN="$2"; shift 2 ;;
+        --fuse-bin)     FUSE_BIN="$2";     shift 2 ;;
         --extras-dir)   EXTRAS_DIR="$2";   shift 2 ;;
         --out)          OUT="$2";          shift 2 ;;
         -h|--help)
@@ -50,6 +52,7 @@ done
 [ -x "$INIT_BIN" ] || { echo "rebake-initrd: init bin not executable: $INIT_BIN" >&2; exit 1; }
 [ -z "$INIT_SH" ]  || [ -f "$INIT_SH" ] || { echo "rebake-initrd: init.sh not found: $INIT_SH" >&2; exit 1; }
 [ -z "$TUN_PUMP_BIN" ] || [ -x "$TUN_PUMP_BIN" ] || { echo "rebake-initrd: tun-pump bin not executable: $TUN_PUMP_BIN" >&2; exit 1; }
+[ -z "$FUSE_BIN" ] || [ -x "$FUSE_BIN" ] || { echo "rebake-initrd: fuse bin not executable: $FUSE_BIN" >&2; exit 1; }
 
 for tool in cpio gzip gunzip find install xz; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -76,6 +79,11 @@ fi
 if [ -n "$TUN_PUMP_BIN" ]; then
     echo "==> rebake: installing tun-pump -> /bin/tokimo-tun-pump ($(stat -c%s "$TUN_PUMP_BIN") bytes)"
     install -m 0755 "$TUN_PUMP_BIN" "$TMP/bin/tokimo-tun-pump"
+fi
+
+if [ -n "$FUSE_BIN" ]; then
+    echo "==> rebake: installing fuse bin -> /bin/tokimo-sandbox-fuse ($(stat -c%s "$FUSE_BIN") bytes)"
+    install -m 0755 "$FUSE_BIN" "$TMP/bin/tokimo-sandbox-fuse"
 fi
 
 if [ -n "$EXTRAS_DIR" ] && [ -d "$EXTRAS_DIR" ]; then

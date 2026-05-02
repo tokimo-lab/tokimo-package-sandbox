@@ -277,6 +277,11 @@ impl FuseHost {
                 name,
                 mode: _,
             } => self.op_mkdir(mount_id, parent_nodeid, &name).await,
+            Req::Create {
+                parent_nodeid,
+                name,
+                mode: _,
+            } => self.op_create(mount_id, parent_nodeid, &name).await,
             Req::Rmdir { parent_nodeid, name } => self.op_rmdir(mount_id, parent_nodeid, &name).await,
             Req::Unlink { parent_nodeid, name } => self.op_unlink(mount_id, parent_nodeid, &name).await,
             Req::Rename {
@@ -718,6 +723,37 @@ impl FuseHost {
         };
         let path = Self::child_path(&parent, name);
         if let Err(e) = mk.mkdir(&path).await {
+            return Res::Error(errno_for(&e));
+        }
+        match mount.backend.stat(&path).await {
+            Ok(info) => {
+                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                Res::Entry(EntryOut {
+                    nodeid,
+                    generation: self.id_table.generation(),
+                    attr: attr_from(&info),
+                })
+            }
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
+
+    async fn op_create(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+        let parent = match self.resolve_path(mount_id, parent_nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        if mount.read_only {
+            return Res::Error(errno_for(&VfsError::PermissionDenied));
+        }
+        let Some(put) = mount.backend.as_put() else {
+            return Res::Error(errno_for(&VfsError::NotImplemented("create".into())));
+        };
+        let path = Self::child_path(&parent, name);
+        if let Err(e) = put.put(&path, Vec::new()).await {
             return Res::Error(errno_for(&e));
         }
         match mount.backend.stat(&path).await {

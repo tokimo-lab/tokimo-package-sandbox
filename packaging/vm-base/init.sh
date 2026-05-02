@@ -107,9 +107,14 @@ if [ -d /modules ]; then
     load_mod jbd2
     load_mod mbcache
     load_mod ext4
-    # NFS client (for macOS dynamic mount via in-process NFSv3 server).
+    # FUSE (for tokimo-sandbox-fuse over vsock — used by both Linux and
+    # macOS dynamic mounts). `fuse` is the core; some kernels split out
+    # `fuse_core` and require it to be loaded first.
+    load_mod fuse
+    # NFS client (LEGACY: previous macOS dynamic-mount transport. Kept for
+    # one release while FUSE soaks; safe to remove once we delete
+    # src/macos/nfs.rs).
     # Chain: sunrpc -> auth_rpcgss -> lockd -> nfs -> nfsv3.
-    # `grace` is a dep of lockd on some kernels; load_mod no-ops if absent.
     load_mod sunrpc
     load_mod auth_rpcgss
     load_mod grace
@@ -298,6 +303,14 @@ if [ "$SESSION_MODE" = 1 ]; then
     elif [ ! -x /newroot/bin/tokimo-sandbox-init ]; then
         echo "tokimo-init: tokimo-sandbox-init missing in initramfs and rootfs" >/dev/kmsg 2>/dev/null || true
         /bin/busybox poweroff -f
+    fi
+
+    # Same for tokimo-sandbox-fuse: tokimo-sandbox-init spawns it as
+    # /bin/tokimo-sandbox-fuse from inside the chroot, so it must be
+    # present under /newroot/bin/.
+    if [ -x /bin/tokimo-sandbox-fuse ]; then
+        /bin/busybox cp /bin/tokimo-sandbox-fuse /newroot/bin/tokimo-sandbox-fuse
+        /bin/busybox chmod +x /newroot/bin/tokimo-sandbox-fuse
     fi
 
     # The init binary listens on AF_VSOCK port $INIT_PORT for the

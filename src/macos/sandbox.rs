@@ -154,7 +154,7 @@ impl SandboxBackend for MacosBackend {
         // Hello handshake.
         if let Err(e) = init.hello() {
             let _ = init.shutdown();
-            let _ = runtime.block_on(vm.stop());
+            let _ = vm.request_stop();
             return Err(e);
         }
 
@@ -211,7 +211,7 @@ impl SandboxBackend for MacosBackend {
                 && let Err(e) = std::fs::create_dir_all(&share.host_path)
             {
                 let _ = init.shutdown();
-                let _ = runtime.block_on(vm.stop());
+                let _ = vm.request_stop();
                 return Err(Error::other(format!(
                     "create_host_dir {}: {e}",
                     share.host_path.display()
@@ -222,7 +222,7 @@ impl SandboxBackend for MacosBackend {
             let guest = share.guest_path.to_string_lossy().into_owned();
             if let Err(e) = init.mount_fuse(&share.name, FUSE_VSOCK_PORT, &guest, share.read_only) {
                 let _ = init.shutdown();
-                let _ = runtime.block_on(vm.stop());
+                let _ = vm.request_stop();
                 return Err(e);
             }
             boot_share_names.insert(share.name.clone());
@@ -235,7 +235,7 @@ impl SandboxBackend for MacosBackend {
             Ok(i) => i,
             Err(e) => {
                 let _ = init.shutdown();
-                let _ = runtime.block_on(vm.stop());
+                let _ = vm.request_stop();
                 return Err(e);
             }
         };

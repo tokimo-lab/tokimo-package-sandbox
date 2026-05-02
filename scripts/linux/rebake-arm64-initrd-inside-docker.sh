@@ -15,17 +15,19 @@ apt-get install -y -qq --no-install-recommends \
     musl-tools musl-dev cpio gzip xz-utils ca-certificates curl dpkg
 rustup target add aarch64-unknown-linux-musl
 
-# --- 2. Build init + tun-pump -----------------------------------------
+# --- 2. Build init + tun-pump + fuse ---------------------------------
 echo "==> cross-build aarch64-unknown-linux-musl"
 cd /src
 cargo build --release --target aarch64-unknown-linux-musl \
-    --bin tokimo-sandbox-init --bin tokimo-tun-pump
+    --bin tokimo-sandbox-init --bin tokimo-tun-pump --bin tokimo-sandbox-fuse
 
 INIT_BIN=${CARGO_TARGET_DIR:-/src/target}/aarch64-unknown-linux-musl/release/tokimo-sandbox-init
 PUMP_BIN=${CARGO_TARGET_DIR:-/src/target}/aarch64-unknown-linux-musl/release/tokimo-tun-pump
+FUSE_BIN=${CARGO_TARGET_DIR:-/src/target}/aarch64-unknown-linux-musl/release/tokimo-sandbox-fuse
 [ -x "$INIT_BIN" ] || { echo "init bin missing" >&2; exit 1; }
 [ -x "$PUMP_BIN" ] || { echo "pump bin missing" >&2; exit 1; }
-ls -la "$INIT_BIN" "$PUMP_BIN"
+[ -x "$FUSE_BIN" ] || { echo "fuse bin missing" >&2; exit 1; }
+ls -la "$INIT_BIN" "$PUMP_BIN" "$FUSE_BIN"
 
 # --- 3. Fetch tun.ko for the guest kernel -----------------------------
 EXTRAS=/tmp/extras
@@ -55,9 +57,7 @@ TUN_PATH=$(find "$EXTRACT" -path '*/modules/*' -name 'tun.ko*' | head -1)
 echo "==> tun module: $TUN_PATH"
 cp "$TUN_PATH" "$EXTRAS/"
 
-# NFS client modules (for macOS NFSv3 dynamic mount). The chain is:
-#   sunrpc -> auth_rpcgss -> lockd -> nfs -> nfsv3
-# We tolerate misses (some kernels build these in).
+# NFS client modules (LEGACY — kept for one release).
 for mod in sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3; do
     P=$(find "$EXTRACT" -path '*/modules/*' -name "${mod}.ko*" | head -1 || true)
     if [ -n "$P" ]; then
@@ -68,6 +68,17 @@ for mod in sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3; do
     fi
 done
 
+# FUSE module (for tokimo-sandbox-fuse — current dynamic-mount transport).
+for mod in fuse; do
+    P=$(find "$EXTRACT" -path '*/modules/*' -name "${mod}.ko*" | head -1 || true)
+    if [ -n "$P" ]; then
+        echo "==> fuse module: $P"
+        cp "$P" "$EXTRAS/"
+    else
+        echo "==> fuse module: ${mod}.ko NOT FOUND (may be built-in)"
+    fi
+done
+
 # --- 4. Rebake initrd -------------------------------------------------
 echo "==> rebake initrd"
 bash /src/packaging/vm/scripts/rebake-initrd.sh \
@@ -75,6 +86,7 @@ bash /src/packaging/vm/scripts/rebake-initrd.sh \
     --init-bin   "$INIT_BIN" \
     --init-sh    /src/packaging/vm-base/init.sh \
     --tun-pump-bin "$PUMP_BIN" \
+    --fuse-bin   "$FUSE_BIN" \
     --extras-dir "$EXTRAS" \
     --out        /src/packaging/vm-base/tokimo-os-arm64/initrd.img.new
 

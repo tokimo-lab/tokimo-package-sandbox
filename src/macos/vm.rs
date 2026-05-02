@@ -320,6 +320,19 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
             ))
         })?;
 
+        // Keep draining the serial console to TOKIMO_VM_CONSOLE (or
+        // stderr if that env var is set to "stderr") so post-handshake
+        // init/init.sh failures (e.g. tokimo-sandbox-fuse spawn) are
+        // visible. Anchored to a daemon thread; lives as long as the
+        // serial fd is open.
+        if let Some(fd) = serial_read_fd {
+            let dst = std::env::var("TOKIMO_VM_CONSOLE").ok();
+            std::thread::Builder::new()
+                .name("tokimo-vm-console".into())
+                .spawn(move || drain_serial_forever(fd, dst))
+                .ok();
+        }
+
         let vsock_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
         Ok::<_, Error>((vm, vsock_fd, netstack_listener, fuse_listener))
     })?;
@@ -346,6 +359,51 @@ fn drain_serial_into(fd: std::os::fd::RawFd, out: &mut String) {
                 break;
             }
             out.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+        }
+    }
+}
+
+/// Daemon-thread console drain: writes every byte arriving on the VM's
+/// hvc0 to either a file (`TOKIMO_VM_CONSOLE=/some/path`) or stderr
+/// (`TOKIMO_VM_CONSOLE=stderr` or unset+TOKIMO_VM_CONSOLE_STDERR=1).
+/// Disabled when no destination is selected, to avoid noisy CI output.
+fn drain_serial_forever(fd: std::os::fd::RawFd, dst: Option<String>) {
+    use std::io::Write;
+    let want_stderr =
+        matches!(dst.as_deref(), Some("stderr")) || std::env::var_os("TOKIMO_VM_CONSOLE_STDERR").is_some();
+    let mut file: Option<std::fs::File> = match dst.as_deref() {
+        Some(path) if path != "stderr" => std::fs::OpenOptions::new().create(true).append(true).open(path).ok(),
+        _ => None,
+    };
+    if file.is_none() && !want_stderr {
+        return;
+    }
+    // Ensure blocking mode so read() parks instead of spinning on EAGAIN.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            // EAGAIN on a blocking read shouldn't happen, but if it does,
+            // back off briefly so we don't busy-loop.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n as usize];
+        if let Some(f) = file.as_mut() {
+            let _ = f.write_all(chunk);
+            let _ = f.flush();
+        }
+        if want_stderr {
+            let _ = std::io::stderr().write_all(chunk);
         }
     }
 }

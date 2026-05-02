@@ -1588,10 +1588,7 @@ fn handle_mount_fuse(
         }
         if let Err(e) = std::fs::create_dir_all(&target) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(ErrorReply::new(
-                    ErrorCode::Internal,
-                    format!("mkdir {target}: {e}"),
-                ));
+                return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {target}: {e}")));
             }
         }
         let exe = if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
@@ -1609,9 +1606,9 @@ fn handle_mount_fuse(
         if read_only {
             cmd.arg("--read-only");
         }
-        let child = cmd.spawn().map_err(|e| {
-            ErrorReply::new(ErrorCode::Internal, format!("spawn {exe}: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("spawn {exe}: {e}")))?;
         let pid = child.id() as i32;
         std::mem::forget(child);
         state.fuse_mounts.insert(
@@ -1621,9 +1618,7 @@ fn handle_mount_fuse(
                 child_pid: pid,
             },
         );
-        eprintln!(
-            "[tokimo-init] spawned fuse: name={name} pid={pid} target={target} port={vsock_port}"
-        );
+        eprintln!("[tokimo-init] spawned fuse: name={name} pid={pid} target={target} port={vsock_port}");
         Ok(())
     })();
     ack(state, client_fd, id, res);
@@ -1694,6 +1689,10 @@ fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, _name: S
         Err(ErrorReply::new(ErrorCode::Internal, "UnmountFuse is Linux-only")),
     );
 }
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn handle_mount_nfs(
     state: &mut State,
     client_fd: RawFd,
     id: String,
@@ -2108,5 +2107,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::RemoveMountByName { .. } => "RemoveMountByName",
         Op::MountNfs { .. } => "MountNfs",
         Op::UnmountNfs { .. } => "UnmountNfs",
+        Op::MountFuse { .. } => "MountFuse",
+        Op::UnmountFuse { .. } => "UnmountFuse",
     }
 }

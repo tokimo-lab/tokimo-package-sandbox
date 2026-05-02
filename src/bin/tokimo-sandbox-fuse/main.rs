@@ -355,7 +355,8 @@ mod linux {
     // ---------- Dispatcher: serialise wire writes, route responses by req_id ----------
 
     struct Dispatcher {
-        write_lock: Mutex<WireConn>,
+        write_fd: Mutex<OwnedFd>,
+        read_fd: Mutex<Option<OwnedFd>>,
         next_req_id: AtomicU64,
         pending: Mutex<HashMap<u64, mpsc::Sender<Res>>>,
         bound_mount_id: u32,
@@ -363,8 +364,20 @@ mod linux {
 
     impl Dispatcher {
         fn new(conn: WireConn, bound_mount_id: u32) -> Self {
+            // Dup the fd so the reader thread can park in `read(2)`
+            // without holding the writer's lock. vsock + unix-stream
+            // both support concurrent r/w on the same fd, but using
+            // separate fds keeps the locking rules trivial.
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&conn.fd);
+            let dup_fd = unsafe { libc::dup(raw) };
+            let read_owned = if dup_fd >= 0 {
+                Some(unsafe { OwnedFd::from_raw_fd(dup_fd) })
+            } else {
+                None
+            };
             Self {
-                write_lock: Mutex::new(conn),
+                write_fd: Mutex::new(conn.fd),
+                read_fd: Mutex::new(read_owned),
                 next_req_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 bound_mount_id,
@@ -373,24 +386,44 @@ mod linux {
 
         /// Spawn the reader thread that demuxes frames from the host.
         fn spawn_reader(self: Arc<Self>) -> thread::JoinHandle<()> {
-            // Duplicate the fd so reader and writer can coexist safely
-            // (vsock supports concurrent read/write on the same fd, but
-            // we keep them separate to avoid relying on it).
             let me = self;
             thread::spawn(move || {
+                let read_fd = match me.read_fd.lock().unwrap().take() {
+                    Some(fd) => fd,
+                    None => {
+                        eprintln!("[tokimo-fuse] reader: dup failed, no read fd");
+                        return;
+                    }
+                };
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&read_fd);
                 loop {
-                    let frame = {
-                        let mut guard = me.write_lock.lock().unwrap();
-                        match guard.recv() {
-                            Ok(Some(f)) => f,
-                            Ok(None) => {
-                                eprintln!("[tokimo-fuse] host closed connection");
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("[tokimo-fuse] reader error: {e}");
-                                break;
-                            }
+                    let mut len_buf = [0u8; 4];
+                    match read_exact_fd(raw, &mut len_buf) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            eprintln!("[tokimo-fuse] host closed connection");
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[tokimo-fuse] reader error: {e}");
+                            break;
+                        }
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    if len == 0 || len > 8 * 1024 * 1024 {
+                        eprintln!("[tokimo-fuse] bad frame length {len}");
+                        break;
+                    }
+                    let mut buf = vec![0u8; len];
+                    if let Err(e) = read_exact_fd(raw, &mut buf) {
+                        eprintln!("[tokimo-fuse] reader body: {e}");
+                        break;
+                    }
+                    let frame: Frame = match postcard::from_bytes(&buf) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("[tokimo-fuse] decode: {e}");
+                            break;
                         }
                     };
                     match frame {
@@ -402,9 +435,7 @@ mod linux {
                                 eprintln!("[tokimo-fuse] orphan response req_id={req_id}");
                             }
                         }
-                        Frame::Notify(_) => {
-                            // Ignored for now.
-                        }
+                        Frame::Notify(_) => {}
                         other => {
                             eprintln!("[tokimo-fuse] unexpected frame: {other:?}");
                         }
@@ -431,10 +462,23 @@ mod linux {
                 mount_id: self.bound_mount_id,
                 op,
             };
-            // Lock writer for the send.
+            // Encode + send under writer lock only.
+            let payload = match postcard::to_allocvec(&frame) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.pending.lock().unwrap().remove(&req_id);
+                    return Res::Error(WireError {
+                        errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
+                        message: format!("encode: {e}"),
+                    });
+                }
+            };
+            let mut hdr = (payload.len() as u32).to_le_bytes().to_vec();
+            hdr.extend_from_slice(&payload);
             {
-                let mut guard = self.write_lock.lock().unwrap();
-                if let Err(e) = guard.send(&frame) {
+                let guard = self.write_fd.lock().unwrap();
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&*guard);
+                if let Err(e) = write_all_fd(raw, &hdr) {
                     self.pending.lock().unwrap().remove(&req_id);
                     return Res::Error(WireError {
                         errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
@@ -490,10 +534,10 @@ mod linux {
             ino,
             size: a.size,
             blocks: a.size.div_ceil(512),
-            atime: to_st(a.atime),
+            atime: to_st(a.mtime),
             mtime: to_st(a.mtime),
-            ctime: to_st(a.ctime),
-            crtime: to_st(a.ctime),
+            ctime: to_st(a.mtime),
+            crtime: to_st(a.mtime),
             kind,
             perm: (a.mode & 0o7777) as u16,
             nlink: a.nlink as u32,
@@ -608,7 +652,7 @@ mod linux {
                             NodeKind::File => FileType::RegularFile,
                         };
                         // ReplyDirectory::add returns true if buffer full.
-                        if reply.add(e.nodeid, e.next_offset as i64, kind, e.name) {
+                        if reply.add(e.nodeid, e.offset as i64, kind, e.name) {
                             break;
                         }
                     }
@@ -836,17 +880,29 @@ mod linux {
                     }
                 }
                 Res::Error(_) => {
-                    // Not found: we need a backend put_stream + lookup.
-                    // Easiest: write empty file via put-then-lookup.
-                    // Actually our protocol's Open with O_CREAT bit will
-                    // have the host create the staging file; on Release
-                    // it gets drained to the backend.
-                    // We don't have a parent nodeid → path API here,
-                    // so we Mkdir-style: we add a no-op Open against a
-                    // "to-be-created" path. The host-side currently
-                    // doesn't support this — return ENOSYS so the kernel
-                    // falls back to mknod+open.
-                    reply.error(libc::ENOSYS);
+                    // Not found: ask the host to create an empty file,
+                    // then open it for the caller.
+                    match self.dispatcher.call(Req::Create {
+                        parent_nodeid: parent,
+                        name: n.clone(),
+                        mode,
+                    }) {
+                        Res::Entry(e) => {
+                            let nodeid = e.nodeid;
+                            let attr = entry_to_attr(&e);
+                            let gen_ = e.generation;
+                            match self.dispatcher.call(Req::Open {
+                                nodeid,
+                                flags: flags as u32,
+                            }) {
+                                Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
+                                Res::Error(we) => reply.error(errno_of(&we)),
+                                _ => reply.error(libc::EIO),
+                            }
+                        }
+                        Res::Error(we) => reply.error(errno_of(&we)),
+                        _ => reply.error(libc::EIO),
+                    }
                 }
                 _ => reply.error(libc::EIO),
             }

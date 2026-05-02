@@ -166,6 +166,15 @@ pub enum Req {
         name: String,
         mode: u32,
     },
+    /// Create an empty regular file. Returns an entry the guest can
+    /// immediately Open. Added in protocol v1.1 — host stubs that don't
+    /// support it should respond with `Errno::Enosys` so the kernel
+    /// falls back to `mknod` (which we don't implement).
+    Create {
+        parent_nodeid: u64,
+        name: String,
+        mode: u32,
+    },
     Rmdir {
         parent_nodeid: u64,
         name: String,
