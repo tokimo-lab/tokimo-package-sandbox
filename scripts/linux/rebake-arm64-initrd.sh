@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARM64_DIR="$REPO_ROOT/packaging/vm-base/tokimo-os-arm64"
 VMLINUZ="$ARM64_DIR/vmlinuz"
 

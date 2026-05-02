@@ -932,6 +932,13 @@ fn add_user_sets_user_and_home_env() {
 // the host reads the same bytes back from its local path.
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Apple VZ virtio-fs cannot expose host->guest mounts bidirectionally \
+              after vm.start(); macOS add_mount is forward-only via APFS clone. \
+              See docs/macos-testing.md (\"Reverse-mount limitation\") and \
+              tests/README.md."
+)]
 fn add_user_with_reverse_mount_writes_to_host() {
     const SENTINEL: &str = "BOB_WROTE_THIS_F3A2";
 
