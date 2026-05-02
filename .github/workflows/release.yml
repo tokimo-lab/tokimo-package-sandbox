@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - '!vm-v*'
+      - '!vm-base-v*'
 
 permissions:
   contents: write
