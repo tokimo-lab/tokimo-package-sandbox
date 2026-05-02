@@ -473,8 +473,12 @@ fn network_allow_all_has_nic() {
 
 // ---------------------------------------------------------------------------
 // 8.b ICMPv4 PING — verify the userspace netstack proxies ping echo replies.
+// Ignored by default: ICMP through smoltcp TAP is environment-sensitive
+// (GitHub Actions runners may block raw ICMP). Run manually:
+//   cargo test --test sandbox_integration network_allow_all_icmpv4_ping -- --ignored
 // ---------------------------------------------------------------------------
 #[test]
+#[ignore]
 fn network_allow_all_icmpv4_ping() {
     let mut cfg = config("net-ping4");
     cfg.network = NetworkPolicy::AllowAll;
