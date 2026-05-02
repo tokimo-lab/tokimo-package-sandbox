@@ -13,8 +13,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,7 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
-};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 // ─── Channel-backed Ethernet device ──────────────────────────────────────────
 
@@ -57,9 +55,10 @@ impl Device for ChannelDevice {
     type TxToken<'a> = ChanTxToken;
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(ChanRxToken, ChanTxToken)> {
-        self.rx.try_recv().ok().map(|frame| {
-            (ChanRxToken(frame), ChanTxToken(self.tx.clone()))
-        })
+        self.rx
+            .try_recv()
+            .ok()
+            .map(|frame| (ChanRxToken(frame), ChanTxToken(self.tx.clone())))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<ChanTxToken> {
@@ -79,21 +78,13 @@ fn make_device(rx: chan::Receiver<Vec<u8>>, tx: chan::Sender<Vec<u8>>) -> Channe
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn setup_iface(
-    device: &mut ChannelDevice,
-    mac: [u8; 6],
-    ip: [u8; 4],
-    cidr_prefix: u8,
-) -> Interface {
+fn setup_iface(device: &mut ChannelDevice, mac: [u8; 6], ip: [u8; 4], cidr_prefix: u8) -> Interface {
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = rand_u64();
     let mut iface = Interface::new(config, device, smolcp_now());
     iface.update_ip_addrs(|addrs| {
         addrs
-            .push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address::from(ip)),
-                cidr_prefix,
-            ))
+            .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(ip)), cidr_prefix))
             .unwrap();
     });
     iface
@@ -169,7 +160,13 @@ fn parse_dns_response(resp: &[u8]) -> Option<String> {
     let rdlen = u16::from_be_bytes([resp[pos], resp[pos + 1]]) as usize;
     pos += 2;
     if rtype == 1 && rdlen == 4 && pos + 4 <= resp.len() {
-        Some(format!("{}.{}.{}.{}", resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3]))
+        Some(format!(
+            "{}.{}.{}.{}",
+            resp[pos],
+            resp[pos + 1],
+            resp[pos + 2],
+            resp[pos + 3]
+        ))
     } else {
         None
     }
@@ -177,11 +174,7 @@ fn parse_dns_response(resp: &[u8]) -> Option<String> {
 
 // ─── Host side: TCP + UDP proxy ──────────────────────────────────────────────
 
-fn host_thread(
-    rx_from_vm: chan::Receiver<Vec<u8>>,
-    tx_to_vm: chan::Sender<Vec<u8>>,
-    done: Arc<AtomicBool>,
-) {
+fn host_thread(rx_from_vm: chan::Receiver<Vec<u8>>, tx_to_vm: chan::Sender<Vec<u8>>, done: Arc<AtomicBool>) {
     let mut device = make_device(rx_from_vm, tx_to_vm);
     let mut iface = setup_iface(&mut device, [0x02, 0, 0, 0, 0, 0x01], [192, 168, 127, 1], 24);
 
@@ -219,10 +212,7 @@ fn host_thread(
                 if !bytes.is_empty() {
                     request_buf.extend_from_slice(&bytes);
                     if request_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        println!(
-                            "[Host/TCP] Got request ({} bytes)",
-                            request_buf.len()
-                        );
+                        println!("[Host/TCP] Got request ({} bytes)", request_buf.len());
                         if let Ok(mut stream) =
                             TcpStream::connect_timeout(&"1.1.1.1:80".parse().unwrap(), Duration::from_secs(5))
                         {
@@ -294,11 +284,7 @@ fn host_thread(
 
 // ─── VM side: TCP HTTP + UDP DNS ─────────────────────────────────────────────
 
-fn vm_thread(
-    rx_from_host: chan::Receiver<Vec<u8>>,
-    tx_to_host: chan::Sender<Vec<u8>>,
-    done: Arc<AtomicBool>,
-) {
+fn vm_thread(rx_from_host: chan::Receiver<Vec<u8>>, tx_to_host: chan::Sender<Vec<u8>>, done: Arc<AtomicBool>) {
     let mut device = make_device(rx_from_host, tx_to_host);
     let mut iface = setup_iface(&mut device, [0x02, 0, 0, 0, 0, 0x02], [192, 168, 127, 2], 24);
     iface

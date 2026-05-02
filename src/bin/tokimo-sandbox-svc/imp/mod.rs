@@ -51,9 +51,9 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, RemovePlan9ShareParams, ResizeShellParams, RootfsSpec, RpcError, SignalShellParams,
-    SpawnShellParams, WriteStdinParams, encode_frame, method,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, RemovePlan9ShareParams, ResizeShellParams, RootfsSpec, RpcError,
+    SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
 
@@ -931,7 +931,6 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         netstack_port,
     );
 
-
     let api = hcs::HcsApi::init().map_err(|e| RpcError::new("hcs_init", e))?;
     let cs = api
         .create_compute_system(&vm_id, &cfg_json)
@@ -983,11 +982,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                 match net_sock.try_clone() {
                     Ok(writer) => {
                         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let _ = netstack::spawn(
-                            Box::new(net_sock),
-                            Box::new(writer),
-                            Arc::clone(&shutdown),
-                        );
+                        let _ = netstack::spawn(Box::new(net_sock), Box::new(writer), Arc::clone(&shutdown));
                         Some(shutdown)
                     }
                     Err(e) => {
@@ -1654,7 +1649,6 @@ fn verify_caller_required() -> bool {
     let _ = unsafe { RegCloseKey(hk) };
     r.is_ok() && data != 0
 }
-
 
 fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
     let mut pid: u32 = 0;

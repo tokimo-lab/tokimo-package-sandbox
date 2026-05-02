@@ -20,7 +20,7 @@ use serde_json::Value;
 use windows::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
 };
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::core::HSTRING;
@@ -163,7 +163,9 @@ impl PipeClient {
             if self.inner.dead.load(Ordering::Relaxed) {
                 let g = self.inner.shared.lock().expect("shared lock");
                 return Err(Error::protocol(
-                    g.fatal.clone().unwrap_or_else(|| "service closed during handshake".into()),
+                    g.fatal
+                        .clone()
+                        .unwrap_or_else(|| "service closed during handshake".into()),
                 ));
             }
             // Best-effort: don't busy-spin; the reader signals via Condvar
@@ -180,12 +182,7 @@ impl PipeClient {
     }
 
     /// Issue a JSON-RPC request and block until response.
-    pub fn call(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value> {
+    pub fn call(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         if self.inner.dead.load(Ordering::Relaxed) {
             return Err(Error::NotConnected);
         }
@@ -309,10 +306,7 @@ fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<()> {
     while off < buf.len() {
         let n = r.read(&mut buf[off..])?;
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "pipe closed",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pipe closed"));
         }
         off += n;
     }
@@ -347,11 +341,7 @@ fn decode_event(method: &str, params: &Value) -> Event {
     let bytes_of = |v: &Value| -> Vec<u8> {
         v.get("data")
             .and_then(|d| d.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_u64().map(|n| n as u8))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
             .unwrap_or_default()
     };
     match method {
@@ -366,18 +356,11 @@ fn decode_event(method: &str, params: &Value) -> Event {
         m::EV_EXIT => Event::Exit {
             id: id_of(params).unwrap_or_else(|| crate::api::JobId(String::new())),
             exit_code: params.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1) as i32,
-            signal: params
-                .get("signal")
-                .and_then(|x| x.as_i64())
-                .map(|n| n as i32),
+            signal: params.get("signal").and_then(|x| x.as_i64()).map(|n| n as i32),
         },
         m::EV_ERROR => Event::Error {
             id: id_of(params),
-            message: params
-                .get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_owned(),
+            message: params.get("message").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
             fatal: params.get("fatal").and_then(|x| x.as_bool()).unwrap_or(false),
         },
         m::EV_READY => Event::Ready,
@@ -386,17 +369,10 @@ fn decode_event(method: &str, params: &Value) -> Event {
         },
         m::EV_NETWORK_STATUS => Event::NetworkStatus {
             up: params.get("up").and_then(|x| x.as_bool()).unwrap_or(false),
-            message: params
-                .get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_owned(),
+            message: params.get("message").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
         },
         m::EV_API_REACHABILITY => Event::ApiReachability {
-            reachable: params
-                .get("reachable")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(false),
+            reachable: params.get("reachable").and_then(|x| x.as_bool()).unwrap_or(false),
             latency_ms: params.get("latency_ms").and_then(|x| x.as_u64()),
         },
         _ => Event::Raw {

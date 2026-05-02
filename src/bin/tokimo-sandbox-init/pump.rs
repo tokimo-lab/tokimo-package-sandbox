@@ -40,8 +40,10 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
     eprintln!("[init/pump] tk0 created (fd {})", tap.as_raw_fd());
 
     configure_link()?;
-    eprintln!("[init/pump] tk0 configured ({}.{}.{}.{}/{}, gw {}.{}.{}.{})",
-        IP4[0], IP4[1], IP4[2], IP4[3], IP4_PREFIX, GW4[0], GW4[1], GW4[2], GW4[3]);
+    eprintln!(
+        "[init/pump] tk0 configured ({}.{}.{}.{}/{}, gw {}.{}.{}.{})",
+        IP4[0], IP4[1], IP4[2], IP4[3], IP4_PREFIX, GW4[0], GW4[1], GW4[2], GW4[3]
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -210,7 +212,9 @@ impl Drop for CloseOnDrop {
         unsafe { libc::close(self.0) };
     }
 }
-fn scopeguard_close(fd: RawFd) -> CloseOnDrop { CloseOnDrop(fd) }
+fn scopeguard_close(fd: RawFd) -> CloseOnDrop {
+    CloseOnDrop(fd)
+}
 
 fn ifr_with_name(name: &str) -> libc::ifreq {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -398,7 +402,7 @@ fn add_ipv6_default_route(name: &str, gw: [u16; 8]) -> Result<(), String> {
         rtmsg_dst: [0; 16],
         rtmsg_src: [0; 16],
         rtmsg_gateway: gwb,
-        rtmsg_type: 1,      // RTN_UNICAST
+        rtmsg_type: 1, // RTN_UNICAST
         rtmsg_dst_len: 0,
         rtmsg_src_len: 0,
         rtmsg_metric: 1,

@@ -166,13 +166,7 @@ impl InitClient {
     /// `host_path` (absolute) relative to its long-lived staging fd and
     /// bind-mounts it at `target`. No SCM_RIGHTS needed — init resolves
     /// the path entirely on its own side.
-    pub fn add_mount_fd(
-        &self,
-        name: &str,
-        host_path: &str,
-        target: &str,
-        read_only: bool,
-    ) -> Result<()> {
+    pub fn add_mount_fd(&self, name: &str, host_path: &str, target: &str, read_only: bool) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::AddMountFd {
             id: id.clone(),
@@ -199,10 +193,7 @@ impl InitClient {
         let reply = self.send_op_sync(id, op, Duration::from_secs(10))?;
         match reply {
             Reply::Spawn {
-                ok,
-                child_id,
-                error,
-                ..
+                ok, child_id, error, ..
             } => {
                 if !ok {
                     return Err(Error::exec(format!("spawn failed: {:?}", error.map(|e| e.message))));
@@ -261,10 +252,7 @@ impl InitClient {
                 ok, child_id, error, ..
             } => {
                 if !ok {
-                    return Err(Error::exec(format!(
-                        "spawn pty failed: {:?}",
-                        error.map(|e| e.message)
-                    )));
+                    return Err(Error::exec(format!("spawn pty failed: {:?}", error.map(|e| e.message))));
                 }
                 let fd = fd.ok_or_else(|| Error::exec("PTY spawn reply missing master fd"))?;
                 Ok((
@@ -318,12 +306,7 @@ impl InitClient {
         Ok(reply)
     }
 
-    fn send_op_sync_with_fd(
-        &self,
-        id: &str,
-        op: Op,
-        timeout: Duration,
-    ) -> Result<(Reply, Option<OwnedFd>)> {
+    fn send_op_sync_with_fd(&self, id: &str, op: Op, timeout: Duration) -> Result<(Reply, Option<OwnedFd>)> {
         // Send the op while holding send_lock (kernel atomicity for SEQPACKET
         // is per-packet, but we still need to serialize JSON build + sendmsg).
         {
@@ -368,9 +351,10 @@ impl InitClient {
             if g.eof {
                 return true;
             }
-            let any = g.children.values().any(|c| {
-                !c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some()
-            });
+            let any = g
+                .children
+                .values()
+                .any(|c| !c.stdout.is_empty() || !c.stderr.is_empty() || c.exit.is_some());
             if any {
                 return true;
             }

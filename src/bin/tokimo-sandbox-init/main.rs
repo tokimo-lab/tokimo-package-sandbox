@@ -239,13 +239,7 @@ fn run() -> Result<(), String> {
     // user_ns (granted by `--cap-add CAP_SYS_ADMIN` on the host side).
     if bwrap_mode {
         let _ = std::fs::create_dir_all("/dev/pts");
-        match mount_fs(
-            "devpts",
-            "/dev/pts",
-            "devpts",
-            0,
-            "ptmxmode=666,mode=620",
-        ) {
+        match mount_fs("devpts", "/dev/pts", "devpts", 0, "ptmxmode=666,mode=620") {
             Ok(()) => {
                 // posix_openpt opens "/dev/ptmx"; with newinstance the real
                 // ptmx for this devpts instance is /dev/pts/ptmx. Symlink
@@ -329,8 +323,7 @@ fn run() -> Result<(), String> {
         let sigfd_owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(sigfd.as_raw_fd()) };
         std::mem::forget(sigfd);
         eprintln!("[tokimo-sandbox-init] READY (bwrap, inherited fd {raw})");
-        return server::run_loop_preconnected(client, sigfd_owned, base_env)
-            .map_err(|e| format!("event loop: {e}"));
+        return server::run_loop_preconnected(client, sigfd_owned, base_env).map_err(|e| format!("event loop: {e}"));
     }
 
     let (listener, write_fd, transport) = if env::var(ENV_SERIAL_MODE).is_ok() {
@@ -660,10 +653,7 @@ fn bringup_lo() -> Result<(), String> {
     // delivery vehicle for SIOCSIFFLAGS.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
-        return Err(format!(
-            "socket(AF_INET, DGRAM): {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("socket(AF_INET, DGRAM): {}", std::io::Error::last_os_error()));
     }
     // libc::ifreq layout: char ifr_name[IFNAMSIZ]; union { short ifru_flags; ... }
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -674,10 +664,7 @@ fn bringup_lo() -> Result<(), String> {
     ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
     let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
     let res = if rc != 0 {
-        Err(format!(
-            "ioctl(SIOCSIFFLAGS, lo): {}",
-            std::io::Error::last_os_error()
-        ))
+        Err(format!("ioctl(SIOCSIFFLAGS, lo): {}", std::io::Error::last_os_error()))
     } else {
         Ok(())
     };
