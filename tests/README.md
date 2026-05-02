@@ -388,6 +388,14 @@ and the egress path (vmnet NAT not HCN NAT).
 
 Conventions used by the existing suite:
 
+- **`SandboxGuard`**: every `start_vm()` call must be followed by
+  `let _guard = SandboxGuard(sb.clone());`. The guard calls
+  `stop_vm()` on drop, preventing VM leaks when a test panics. The
+  explicit `stop_vm()` in the test body is still fine — it's
+  idempotent. Without the guard, a panicked test leaves an orphan VM
+  running, consuming ~4 GB RAM until manually killed via `hcsdiag`.
+  See "Pre-test cleanup" above for how to kill orphans.
+
 - Helper `config(label)` builds a `ConfigureParams` with a unique
   `session_id = "{pid}-{label}-{counter}"` to avoid collisions when tests
   run in parallel.
