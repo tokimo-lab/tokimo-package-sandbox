@@ -381,8 +381,8 @@ mod tests {
     fn is_running_is_false_before_configure() {
         let reg = fresh_registry();
         let sb = SharedBackend::new(reg, make_fake);
-        assert_eq!(sb.is_running().unwrap(), false);
-        assert_eq!(sb.is_guest_connected().unwrap(), false);
+        assert!(!sb.is_running().unwrap());
+        assert!(!sb.is_guest_connected().unwrap());
     }
 
     #[test]
