@@ -53,11 +53,6 @@ nix = { version = "0.29", features = ["process", "signal", "socket", "poll", "ui
 libc = "0.2"
 arcbox-vz = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros"] }
-# In-process NFSv3 server for dynamic / boot-time host-shared mounts. The
-# guest dials this through the smoltcp gateway (see src/netstack/) and
-# mounts via mount(2) with fstype="nfs". Only macOS uses this — Linux
-# uses bwrap binds, Windows uses Plan9.
-nfsserve = "0.11"
 async-trait = "0.1"
 mio = { version = "1", features = ["os-poll", "os-ext"] }
 # Userspace network stack — same as Windows. See src/netstack/.

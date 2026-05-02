@@ -57,17 +57,6 @@ TUN_PATH=$(find "$EXTRACT" -path '*/modules/*' -name 'tun.ko*' | head -1)
 echo "==> tun module: $TUN_PATH"
 cp "$TUN_PATH" "$EXTRAS/"
 
-# NFS client modules (LEGACY — kept for one release).
-for mod in sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3; do
-    P=$(find "$EXTRACT" -path '*/modules/*' -name "${mod}.ko*" | head -1 || true)
-    if [ -n "$P" ]; then
-        echo "==> nfs module: $P"
-        cp "$P" "$EXTRAS/"
-    else
-        echo "==> nfs module: ${mod}.ko NOT FOUND (may be built-in)"
-    fi
-done
-
 # FUSE module (for tokimo-sandbox-fuse — current dynamic-mount transport).
 for mod in fuse; do
     P=$(find "$EXTRACT" -path '*/modules/*' -name "${mod}.ko*" | head -1 || true)

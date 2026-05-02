@@ -111,17 +111,6 @@ if [ -d /modules ]; then
     # macOS dynamic mounts). `fuse` is the core; some kernels split out
     # `fuse_core` and require it to be loaded first.
     load_mod fuse
-    # NFS client (LEGACY: previous macOS dynamic-mount transport. Kept for
-    # one release while FUSE soaks; safe to remove once we delete
-    # src/macos/nfs.rs).
-    # Chain: sunrpc -> auth_rpcgss -> lockd -> nfs -> nfsv3.
-    load_mod sunrpc
-    load_mod auth_rpcgss
-    load_mod grace
-    load_mod lockd
-    load_mod nfs_acl
-    load_mod nfs
-    load_mod nfsv3
     echo "tokimo-init: modules loaded" >/dev/kmsg 2>/dev/null || true
 fi
 
@@ -284,10 +273,8 @@ if [ "$SESSION_MODE" = 1 ]; then
                 echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
                 echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
             fi
-            # Even with NETDNS=off, we still need a route for the gateway
-            # itself so the in-process NFS server (LocalService at
-            # 192.168.127.1:2049) is reachable. The /24 directly-attached
-            # route from `ip addr add` covers that.
+            # Even with NETDNS=off, the /24 directly-attached route from
+            # `ip addr add` covers traffic to the gateway IP itself.
         else
             echo "tokimo-init: tk0 did not appear" >/dev/kmsg 2>/dev/null || true
         fi

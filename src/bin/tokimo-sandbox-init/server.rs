@@ -101,14 +101,6 @@ pub struct State {
     /// the host-supplied logical name. Tracks the mount target so
     /// `Op::RemoveMountByName` can `umount2(target, MNT_DETACH)` + rmdir.
     pub dynamic_mounts: HashMap<String, String>,
-    /// NFSv3 mounts (added via `Op::MountNfs`). Keyed by the host-supplied
-    /// logical name. Tracks the guest mountpoint so `Op::UnmountNfs` can
-    /// `umount2(target, MNT_DETACH)` + best-effort `rmdir` it.
-    /// macOS backend uses this for both boot-time and runtime mounts; on
-    /// Linux/Windows the field is unused today (kept platform-agnostic
-    /// because the protocol enum is shared).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub nfs_mounts: HashMap<String, String>,
     /// FUSE-over-vsock mounts (added via `Op::MountFuse`). Keyed by the
     /// host-supplied logical name. Tracks the guest mountpoint **and**
     /// the child `tokimo-sandbox-fuse` PID so `Op::UnmountFuse` can
@@ -227,7 +219,6 @@ fn run_loop_inner(
         transport,
         mount_fds: Vec::new(),
         dynamic_mounts: HashMap::new(),
-        nfs_mounts: HashMap::new(),
         fuse_mounts: HashMap::new(),
         host_root_fd: None,
     };
@@ -1051,30 +1042,6 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::RemoveMountByName { id, name } => {
             handle_remove_mount_by_name(state, client_fd, id, name);
         }
-        Op::MountNfs {
-            id,
-            name,
-            server_ip,
-            server_port,
-            export,
-            target,
-            read_only,
-        } => {
-            handle_mount_nfs(
-                state,
-                client_fd,
-                id,
-                name,
-                server_ip,
-                server_port,
-                export,
-                target,
-                read_only,
-            );
-        }
-        Op::UnmountNfs { id, name } => {
-            handle_unmount_nfs(state, client_fd, id, name);
-        }
         Op::MountFuse {
             id,
             name,
@@ -1433,134 +1400,6 @@ fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, 
     ack(state, client_fd, id, Ok(()));
 }
 
-/// Handle `Op::MountNfs`: create the target directory if missing, then
-/// `mount(2)` the share with `fstype="nfs"` and a canonical option string.
-/// The Linux kernel parses the option string itself when fstype="nfs"
-/// (since 2.6.32), so no userspace `mount.nfs` binary is required.
-///
-/// On success, register the mount in `state.nfs_mounts` so `UnmountNfs`
-/// can locate the target on teardown.
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn handle_mount_nfs(
-    state: &mut State,
-    client_fd: RawFd,
-    id: String,
-    name: String,
-    server_ip: String,
-    server_port: u16,
-    export: String,
-    target: String,
-    read_only: bool,
-) {
-    let res = (|| -> Result<(), ErrorReply> {
-        if name.is_empty() {
-            return Err(ErrorReply::new(ErrorCode::BadRequest, "empty mount name"));
-        }
-        if state.nfs_mounts.contains_key(&name) {
-            return Err(ErrorReply::new(
-                ErrorCode::BadRequest,
-                format!("nfs mount already exists: {name:?}"),
-            ));
-        }
-
-        // mkdir -p target. tolerate AlreadyExists.
-        if let Err(e) = std::fs::create_dir_all(&target)
-            && e.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir -p {target}: {e}")));
-        }
-
-        // Canonical conservative option set. `addr=` is mandatory because
-        // we bypass userspace DNS resolution (mount.nfs would normally add
-        // it). `nolock` is required: rpc.lockd is not running in the
-        // sandbox initrd. `hard,timeo=600,retrans=2` makes the client
-        // robust to transient host stalls. wsize/rsize=1MiB matches what
-        // OrbStack ships.
-        let opts = format!(
-            "nolock,vers=3,proto=tcp,port={port},mountport={port},addr={ip},\
-             hard,timeo=600,retrans=2,actimeo=120,wsize=1048576,rsize=1048576",
-            port = server_port,
-            ip = server_ip,
-        );
-        let source = format!("{server_ip}:{export}");
-
-        let src_c = std::ffi::CString::new(source.as_str())
-            .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("source: {e}")))?;
-        let tgt_c = std::ffi::CString::new(target.as_str())
-            .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("target: {e}")))?;
-        let fstype_c = std::ffi::CString::new("nfs").unwrap();
-        let opts_c = std::ffi::CString::new(opts.as_str())
-            .map_err(|e| ErrorReply::new(ErrorCode::BadRequest, format!("opts: {e}")))?;
-
-        let mut flags: libc::c_ulong = 0;
-        if read_only {
-            flags |= libc::MS_RDONLY;
-        }
-
-        let rc = unsafe {
-            libc::mount(
-                src_c.as_ptr(),
-                tgt_c.as_ptr(),
-                fstype_c.as_ptr(),
-                flags,
-                opts_c.as_ptr() as *const libc::c_void,
-            )
-        };
-        if rc != 0 {
-            return Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!(
-                    "mount(nfs) {source} -> {target}: {} (opts={opts})",
-                    std::io::Error::last_os_error()
-                ),
-            ));
-        }
-
-        state.nfs_mounts.insert(name, target);
-        Ok(())
-    })();
-    ack(state, client_fd, id, res);
-}
-
-/// Handle `Op::UnmountNfs`: look up the target by `name`, `umount2`
-/// it with `MNT_DETACH`, and best-effort `rmdir` the empty mountpoint.
-#[cfg(target_os = "linux")]
-fn handle_unmount_nfs(state: &mut State, client_fd: RawFd, id: String, name: String) {
-    let target = match state.nfs_mounts.remove(&name) {
-        Some(t) => t,
-        None => {
-            ack(
-                state,
-                client_fd,
-                id,
-                Err(ErrorReply::new(
-                    ErrorCode::BadRequest,
-                    format!("no such nfs mount: {name:?}"),
-                )),
-            );
-            return;
-        }
-    };
-    let target_c = std::ffi::CString::new(target.as_str()).unwrap_or_default();
-    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!("umount2({target}): {err}"),
-            )),
-        );
-        return;
-    }
-    let _ = std::fs::remove_dir(&target);
-    ack(state, client_fd, id, Ok(()));
-}
-
 /// Handle `Op::MountFuse`: spawn `tokimo-sandbox-fuse` as a child
 /// process. The child connects to the host's FUSE listener over vsock
 /// and mounts itself at `target`. We don't wait for the mount to be
@@ -1687,37 +1526,6 @@ fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, _name: S
         client_fd,
         id,
         Err(ErrorReply::new(ErrorCode::Internal, "UnmountFuse is Linux-only")),
-    );
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-fn handle_mount_nfs(
-    state: &mut State,
-    client_fd: RawFd,
-    id: String,
-    _name: String,
-    _server_ip: String,
-    _server_port: u16,
-    _export: String,
-    _target: String,
-    _read_only: bool,
-) {
-    ack(
-        state,
-        client_fd,
-        id,
-        Err(ErrorReply::new(ErrorCode::Internal, "MountNfs is Linux-only")),
-    );
-}
-
-#[cfg(not(target_os = "linux"))]
-fn handle_unmount_nfs(state: &mut State, client_fd: RawFd, id: String, _name: String) {
-    ack(
-        state,
-        client_fd,
-        id,
-        Err(ErrorReply::new(ErrorCode::Internal, "UnmountNfs is Linux-only")),
     );
 }
 
@@ -2105,8 +1913,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::RemoveMount { .. } => "RemoveMount",
         Op::AddMountFd { .. } => "AddMountFd",
         Op::RemoveMountByName { .. } => "RemoveMountByName",
-        Op::MountNfs { .. } => "MountNfs",
-        Op::UnmountNfs { .. } => "UnmountNfs",
         Op::MountFuse { .. } => "MountFuse",
         Op::UnmountFuse { .. } => "UnmountFuse",
     }

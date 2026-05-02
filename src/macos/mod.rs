@@ -4,7 +4,6 @@
 //! virtio-vsock with the guest's init binary.
 
 #[allow(dead_code)]
-pub(crate) mod nfs;
 pub(crate) mod sandbox;
 pub(crate) mod vm;
 pub(crate) mod vsock_init_client;

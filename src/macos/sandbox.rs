@@ -5,13 +5,13 @@
 //!  * `configure` stores params (allowed Empty → Configured, Configured →
 //!    Configured, Stopped → Configured).
 //!  * `start_vm` boots the VM, runs the init Hello handshake, starts the
-//!    in-process NFSv3 server (see `src/macos/nfs.rs`), registers each
-//!    `ConfigureParams.mounts` entry with it, asks the guest to
-//!    `mount(2) -t nfs` each one, and opens the long-lived shell.
-//!  * `stop_vm` shuts down the VM and the NFS server.
+//!    cross-platform `FuseHost` (see `src/vfs_host/`), registers each
+//!    `ConfigureParams.mounts` entry with it, asks the guest to mount
+//!    each one over FUSE-over-vsock, and opens the long-lived shell.
+//!  * `stop_vm` shuts down the VM and the FuseHost.
 //!  * `add_mount` / `remove_mount` register / tombstone mounts in the
-//!    in-process NFS server and drive the guest `MountNfs` / `UnmountNfs`
-//!    ops to mount / unmount via the smoltcp gateway.
+//!    `FuseHost` and drive the guest `MountFuse` / `UnmountFuse` ops to
+//!    mount / unmount via the dedicated FUSE vsock listener.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -28,17 +28,11 @@ use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolic
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
-use super::nfs::NfsServer;
 use super::vm::{BootedVm, FUSE_VSOCK_PORT, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
 
 use crate::vfs_host::FuseHost;
 use crate::vfs_impls::LocalDirVfs;
-
-#[allow(dead_code)] // retained for emergency rollback; no longer used
-const NFS_GUEST_PORT: u16 = 2049;
-#[allow(dead_code)]
-const NFS_GUEST_IP: &str = "192.168.127.1";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -64,17 +58,13 @@ struct RunningState {
     /// FUSE-over-vsock host. One per session; serves all dynamic mounts.
     /// Each `Mount` is registered as a [`LocalDirVfs`] backend.
     fuse_host: Arc<FuseHost>,
-    /// Legacy NFS server slot. Always `None` for new sessions; kept in
-    /// the struct for one release to ease emergency rollback.
-    #[allow(dead_code)]
-    nfs: Option<NfsServer>,
     /// Long-lived boot-time shell child id.
     shell_id: String,
     /// All shells active in this session: the boot shell + any returned
     /// from `spawn_shell`. `close_shell` removes from the set.
     shells: HashSet<String>,
     /// Tokio runtime that drove `vm.start()`, the VSOCK connect, and the
-    /// NFS server. **must** outlive the VM, otherwise the underlying
+    /// FuseHost. **must** outlive the VM, otherwise the underlying
     /// Objective-C completion handlers and dispatch queues are released
     /// and the VSOCK fd dies.
     runtime: Arc<Runtime>,
@@ -131,7 +121,7 @@ impl SandboxBackend for MacosBackend {
 
         // Used for debug logs / future per-session diagnostics. The dynamic
         // mount pool used to live under `~/.tokimo/sessions/<sid>/` but
-        // host directories are now exposed directly through the NFS server.
+        // host directories are now exposed directly through the FuseHost.
         let _session_counter = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // ---- Boot VM ---------------------------------------------------
@@ -258,7 +248,6 @@ impl SandboxBackend for MacosBackend {
             vm,
             init,
             fuse_host,
-            nfs: None,
             shell_id,
             shells,
             runtime,
@@ -279,7 +268,6 @@ impl SandboxBackend for MacosBackend {
                     init,
                     vm,
                     runtime,
-                    nfs,
                     fuse_host,
                     netstack_shutdown,
                     ..
@@ -287,7 +275,6 @@ impl SandboxBackend for MacosBackend {
                 netstack_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = init.shutdown();
                 drop(init);
-                drop(nfs); // tear down legacy NFS server slot (always None today)
                 drop(fuse_host); // tear down FuseHost; in-flight serve tasks see EOF
                 // Apple's VZVirtualMachine.stop() asserts when invoked off
                 // its dispatch queue. Use request_stop (fire-and-forget),

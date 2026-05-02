@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
 ///
 /// History:
-///   * v3 — added `MountNfs` / `UnmountNfs`. macOS backend uses these for
-///     dynamic and boot-time bidirectional mounts (replaces the old
+///   * v4 — replaced `MountNfs`/`UnmountNfs` with `MountFuse`/`UnmountFuse`.
+///     macOS backend now serves dynamic mounts via FUSE-over-vsock instead
+///     of in-process NFSv3 over smoltcp.
+///   * v3 — added `MountNfs` / `UnmountNfs`. macOS backend used these for
+///     dynamic and boot-time bidirectional mounts (replaced the old
 ///     virtio-fs `tokimo_dyn` pool + APFS-clone hack).
 ///   * v2 — initial public revision.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -195,46 +198,12 @@ pub enum Op {
     /// the empty mountpoint. Looked up by `name` against an init-side
     /// registry of dynamic mounts.
     RemoveMountByName { id: String, name: String },
-    /// Mount an NFSv3 export inside the container. Used by the macOS
-    /// backend for both boot-time and runtime mounts: the host runs a
-    /// per-session userspace NFSv3 server (`nfsserve` crate) reachable via
-    /// the smoltcp gateway at `192.168.127.1:server_port`. Init calls
-    /// `mount(2)` directly with `fstype="nfs"` and a canonical option
-    /// string (`addr=`, `vers=3`, `proto=tcp`, `port=`, `mountport=`,
-    /// `nolock`, `hard`, ...). No userspace `mount.nfs` binary is required.
-    ///
-    /// Init keeps a per-session `nfs_mounts: HashMap<String, PathBuf>`
-    /// registry keyed by `name` so `UnmountNfs` can locate the target on
-    /// teardown. `target` is `mkdir -p`'d before mounting.
-    MountNfs {
-        id: String,
-        /// Logical share id, used by `UnmountNfs` to look up the target.
-        name: String,
-        /// Server IP as seen by the guest. Always the smoltcp gateway IP
-        /// (`192.168.127.1`) for the in-process NFS server, but kept
-        /// explicit so future external NFS targets work too.
-        server_ip: String,
-        /// TCP port the guest dials. Constant 2049 by default; carried
-        /// per-op so each session can pick its own value if needed.
-        server_port: u16,
-        /// Server-side export path, e.g. `/<name>`.
-        export: String,
-        /// Guest-side mountpoint. Created if missing.
-        target: String,
-        read_only: bool,
-    },
-    /// Counterpart for `MountNfs`: `umount2(target, MNT_DETACH)` and
-    /// `rmdir target` (best-effort). `name` is looked up against the
-    /// init-side NFS registry.
-    UnmountNfs { id: String, name: String },
-
     /// Mount a FUSE-over-vsock filesystem inside the container. Replaces
-    /// `MountNfs` for backends that wire mounts through the cross-platform
-    /// `vfs_host::FuseHost`. Init spawns `tokimo-sandbox-fuse` as a child
-    /// process which connects to the host's FUSE listener at
-    /// `vsock://<host>:<vsock_port>` (host CID 2), performs the
-    /// VFS-protocol `Hello` handshake bound to `name`, then `mount(2)`s
-    /// FUSE at `target`.
+    /// the legacy NFS-over-smoltcp path. Init spawns
+    /// `tokimo-sandbox-fuse` as a child process which connects to the
+    /// host's FUSE listener at `vsock://<host>:<vsock_port>` (host
+    /// CID 2), performs the VFS-protocol `Hello` handshake bound to
+    /// `name`, then `mount(2)`s FUSE at `target`.
     ///
     /// The init binary keeps a per-session registry keyed by `name` so
     /// `UnmountFuse` can locate the child + target on teardown.
@@ -390,6 +359,6 @@ pub fn default_features() -> Vec<String> {
         "unmount".into(),
         "mount_manifest".into(),
         "dynamic_mount".into(),
-        "nfs_mount".into(),
+        "fuse_mount".into(),
     ]
 }
