@@ -31,6 +31,12 @@ pub(crate) mod shared_backend;
 pub mod protocol;
 pub mod svc_protocol;
 
+// FUSE-over-vsock VFS bridge (cross-platform). See
+// plan/cross-platform-fuse-vfs.md.
+pub mod vfs_backend;
+pub mod vfs_impls;
+pub mod vfs_protocol;
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub mod netstack;
 
