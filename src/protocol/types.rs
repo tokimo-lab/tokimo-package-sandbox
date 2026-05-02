@@ -11,7 +11,13 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol revision. Bumped on any breaking change to op / event
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// History:
+///   * v3 — added `MountNfs` / `UnmountNfs`. macOS backend uses these for
+///     dynamic and boot-time bidirectional mounts (replaces the old
+///     virtio-fs `tokimo_dyn` pool + APFS-clone hack).
+///   * v2 — initial public revision.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -189,6 +195,38 @@ pub enum Op {
     /// the empty mountpoint. Looked up by `name` against an init-side
     /// registry of dynamic mounts.
     RemoveMountByName { id: String, name: String },
+    /// Mount an NFSv3 export inside the container. Used by the macOS
+    /// backend for both boot-time and runtime mounts: the host runs a
+    /// per-session userspace NFSv3 server (`nfsserve` crate) reachable via
+    /// the smoltcp gateway at `192.168.127.1:server_port`. Init calls
+    /// `mount(2)` directly with `fstype="nfs"` and a canonical option
+    /// string (`addr=`, `vers=3`, `proto=tcp`, `port=`, `mountport=`,
+    /// `nolock`, `hard`, ...). No userspace `mount.nfs` binary is required.
+    ///
+    /// Init keeps a per-session `nfs_mounts: HashMap<String, PathBuf>`
+    /// registry keyed by `name` so `UnmountNfs` can locate the target on
+    /// teardown. `target` is `mkdir -p`'d before mounting.
+    MountNfs {
+        id: String,
+        /// Logical share id, used by `UnmountNfs` to look up the target.
+        name: String,
+        /// Server IP as seen by the guest. Always the smoltcp gateway IP
+        /// (`192.168.127.1`) for the in-process NFS server, but kept
+        /// explicit so future external NFS targets work too.
+        server_ip: String,
+        /// TCP port the guest dials. Constant 2049 by default; carried
+        /// per-op so each session can pick its own value if needed.
+        server_port: u16,
+        /// Server-side export path, e.g. `/<name>`.
+        export: String,
+        /// Guest-side mountpoint. Created if missing.
+        target: String,
+        read_only: bool,
+    },
+    /// Counterpart for `MountNfs`: `umount2(target, MNT_DETACH)` and
+    /// `rmdir target` (best-effort). `name` is looked up against the
+    /// init-side NFS registry.
+    UnmountNfs { id: String, name: String },
 }
 
 /// One Plan9-over-vsock mount the guest must perform during `MountManifest`.
@@ -328,5 +366,6 @@ pub fn default_features() -> Vec<String> {
         "unmount".into(),
         "mount_manifest".into(),
         "dynamic_mount".into(),
+        "nfs_mount".into(),
     ]
 }

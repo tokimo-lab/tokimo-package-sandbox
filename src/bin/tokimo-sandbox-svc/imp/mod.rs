@@ -853,13 +853,12 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             .ok_or_else(|| RpcError::new("not_configured", "configure() not called"))?
     };
 
-    // NetworkPolicy::AllowAll routes through the userspace netstack on a
-    // dedicated hvsock channel; HCN NAT is no longer used. See
-    // `imp::netstack` and `docs/cowork-networking-reverse-engineering.md`.
-    let netstack_port: Option<u32> = match cfg.network {
-        NetworkPolicy::Blocked => None,
-        NetworkPolicy::AllowAll => Some(vmconfig::alloc_session_init_port()),
-    };
+    // Userspace netstack is always-on: even under NetworkPolicy::Blocked
+    // the guest connects to the smoltcp gateway and `EgressPolicy` inside
+    // the gateway drops upstream traffic. This unifies the L4 audit path
+    // across all 3 backends and lets us route in-process LocalService
+    // entries (e.g. NFS) regardless of policy.
+    let netstack_port: Option<u32> = Some(vmconfig::alloc_session_init_port());
 
     let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg).map_err(|e| RpcError::new("bad_path", e))?;
 
@@ -904,8 +903,9 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     let init_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, init_svc_guid)
         .map_err(|e| RpcError::new("hvsock_listen", e.to_string()))?;
 
-    // Per-session netstack hvsock listener (only when AllowAll). Must be
-    // bound BEFORE HCS starts so the guest can connect immediately at boot.
+    // Per-session netstack hvsock listener. Always created (see
+    // netstack_port comment above). Must be bound BEFORE HCS starts so
+    // the guest can connect immediately at boot.
     let netstack_listener = if let Some(p) = netstack_port {
         let svc_id = vmconfig::hvsock_service_id(p);
         let svc_guid = parse_guid(&svc_id).map_err(|e| RpcError::new("guid", e))?;
@@ -981,9 +981,9 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         };
     init.hello().map_err(|e| RpcError::new("init_hello", e.to_string()))?;
 
-    // Accept the netstack connection (NetworkPolicy::AllowAll only). The
-    // guest-side `tokimo-tun-pump` connects from inside the VM after init.sh
-    // brings up tk0. We accept AFTER init.hello() so a slow netstack accept
+    // Accept the netstack connection. Always present now — the guest's
+    // `tokimo-tun-pump` connects from inside the VM after init.sh brings
+    // up tk0. We accept AFTER init.hello() so a slow netstack accept
     // doesn't block the init handshake; the pump retries connect for ~30s.
     let netstack_shutdown = if let Some(listener) = netstack_listener {
         match hvsock::accept_guest(&listener, Duration::from_secs(30)) {
@@ -992,7 +992,17 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                 match net_sock.try_clone() {
                     Ok(writer) => {
                         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let _ = netstack::spawn(Box::new(net_sock), Box::new(writer), Arc::clone(&shutdown));
+                        let policy = match cfg.network {
+                            NetworkPolicy::AllowAll => netstack::EgressPolicy::AllowAll,
+                            NetworkPolicy::Blocked => netstack::EgressPolicy::Blocked,
+                        };
+                        let _ = netstack::spawn(
+                            Box::new(net_sock),
+                            Box::new(writer),
+                            Arc::clone(&shutdown),
+                            policy,
+                            Vec::new(),
+                        );
                         Some(shutdown)
                     }
                     Err(e) => {

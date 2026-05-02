@@ -7,4 +7,4 @@
 //! to provide a stable in-binary path (`crate::imp::netstack::spawn`) for
 //! the rest of the svc binary.
 
-pub use tokimo_package_sandbox::netstack::spawn;
+pub use tokimo_package_sandbox::netstack::{EgressPolicy, spawn};

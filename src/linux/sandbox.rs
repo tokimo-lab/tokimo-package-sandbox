@@ -167,22 +167,23 @@ impl SandboxBackend for LinuxBackend {
         let child_fd_raw = child_end.as_raw_fd();
 
         // 1b. Optional second socketpair (STREAM) for the userspace
-        //     netstack. Allocated only when policy is AllowAll. The
-        //     guest end is handed to init via `--net-fd=N`; the host
-        //     end is duplicated and fed to `netstack::spawn`.
-        let (net_host_end, net_child_end): (Option<OwnedFd>, Option<OwnedFd>) =
-            if matches!(config.network, NetworkPolicy::AllowAll) {
-                let (h, c) = socketpair(
-                    nix::sys::socket::AddressFamily::Unix,
-                    nix::sys::socket::SockType::Stream,
-                    None,
-                    SockFlag::SOCK_CLOEXEC,
-                )
-                .map_err(|e| Error::other(format!("socketpair(STREAM,net): {e}")))?;
-                (Some(h), Some(c))
-            } else {
-                (None, None)
-            };
+        //     netstack. Always allocated regardless of policy: even
+        //     under Blocked we still want the userspace stack so we can
+        //     route LocalService entries (e.g. NFS) and have one uniform
+        //     filter point. The guest end is handed to init via
+        //     `--net-fd=N`; the host end is duplicated and fed to
+        //     `netstack::spawn` with `EgressPolicy::Blocked` to drop
+        //     upstream traffic.
+        let (net_host_end, net_child_end): (Option<OwnedFd>, Option<OwnedFd>) = {
+            let (h, c) = socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                SockFlag::SOCK_CLOEXEC,
+            )
+            .map_err(|e| Error::other(format!("socketpair(STREAM,net): {e}")))?;
+            (Some(h), Some(c))
+        };
         let net_child_fd_raw = net_child_end.as_ref().map(|f| f.as_raw_fd());
 
         // 2. Find the init binary.
@@ -341,17 +342,21 @@ impl SandboxBackend for LinuxBackend {
         args.extend(["--bind".to_string(), "/".to_string(), "/.tps_host".to_string()]);
 
         // Network policy.
-        // Both modes use --unshare-net + a fresh sysfs + lo bringup so the
+        // Always: --unshare-net + a fresh sysfs + lo bringup so the
         // sandbox has zero default visibility into the host's network
-        // stack. AllowAll layers a userspace netstack (smoltcp) on top:
-        // the guest's tk0 TAP is bridged to the host's smoltcp Interface
-        // through a STREAM socketpair, mirroring the Windows/macOS VM
-        // backends. This gives one unified L4 interception/audit point.
+        // stack. The userspace netstack (smoltcp) is layered on top in
+        // every mode: the guest's tk0 TAP is bridged to the host's
+        // smoltcp Interface through a STREAM socketpair. Egress is
+        // gated by `EgressPolicy` inside the netstack rather than by
+        // tearing down the bridge — this lets us route LocalService
+        // entries (NFS, future helpers) under Blocked while still
+        // dropping arbitrary upstream traffic. One unified L4
+        // interception/audit point across all 3 backends.
         args.push("--unshare-net".to_string());
         args.extend(["--dir", "/sys"].iter().map(|s| s.to_string()));
         let mount_sysfs = true;
         let bringup_lo = true;
-        let want_netstack = matches!(config.network, NetworkPolicy::AllowAll);
+        let want_netstack = true;
         if want_netstack {
             // Make the TUN device node visible inside the sandbox. We
             // already mounted /dev as tmpfs above, so a bind-mount of
@@ -441,10 +446,10 @@ impl SandboxBackend for LinuxBackend {
         g.bwrap_pid = Some(bwrap_pid);
         drop(g);
 
-        // 5b. Userspace netstack (AllowAll only). The guest end of the
-        //     STREAM socketpair is now in init's process; we own
-        //     net_host_end. Duplicate it so smoltcp can hold separate
-        //     Read/Write trait objects, then spawn the netstack thread.
+        // 5b. Userspace netstack — always spawn (see comment above
+        //     where net_host_end is allocated). Egress policy is
+        //     enforced inside the smoltcp gateway, not by skipping the
+        //     bridge.
         let netstack_shutdown = if let Some(host_fd) = net_host_end {
             let read_fd: OwnedFd = host_fd;
             let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
@@ -458,7 +463,17 @@ impl SandboxBackend for LinuxBackend {
             let read_file = std::fs::File::from(read_fd);
             let write_file = std::fs::File::from(write_fd);
             let shutdown = Arc::new(AtomicBool::new(false));
-            let _ = crate::netstack::spawn(Box::new(read_file), Box::new(write_file), Arc::clone(&shutdown));
+            let policy = match config.network {
+                NetworkPolicy::AllowAll => crate::netstack::EgressPolicy::AllowAll,
+                NetworkPolicy::Blocked => crate::netstack::EgressPolicy::Blocked,
+            };
+            let _ = crate::netstack::spawn(
+                Box::new(read_file),
+                Box::new(write_file),
+                Arc::clone(&shutdown),
+                policy,
+                Vec::new(),
+            );
             Some(shutdown)
         } else {
             None

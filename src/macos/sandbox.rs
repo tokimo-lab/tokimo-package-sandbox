@@ -229,44 +229,48 @@ impl SandboxBackend for MacosBackend {
         // our vsock listener. We hand the connection to `netstack::spawn`
         // which runs smoltcp on the host side. NetworkPolicy::Blocked has
         // no listener and no NIC at all.
-        let _netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = if let Some(mut listener) =
-            netstack_listener
-        {
-            let accept =
-                runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), listener.accept()).await });
-            match accept {
-                Ok(Ok(conn)) => {
-                    // Take ownership of the raw fd, then duplicate for
-                    // the writer half so netstack can hold separate
-                    // Read/Write trait objects.
-                    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-                    let read_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
-                    let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
-                    if dup_raw < 0 {
-                        tracing::warn!("netstack dup fd failed; skipping");
+        let _netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> =
+            if let Some(mut listener) = netstack_listener {
+                let accept =
+                    runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), listener.accept()).await });
+                match accept {
+                    Ok(Ok(conn)) => {
+                        // Take ownership of the raw fd, then duplicate for
+                        // the writer half so netstack can hold separate
+                        // Read/Write trait objects.
+                        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                        let read_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
+                        let dup_raw = unsafe { libc::dup(read_fd.as_raw_fd()) };
+                        if dup_raw < 0 {
+                            tracing::warn!("netstack dup fd failed; skipping");
+                            None
+                        } else {
+                            let write_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+                            let read_file = std::fs::File::from(read_fd);
+                            let write_file = std::fs::File::from(write_fd);
+                            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let _ = crate::netstack::spawn(
+                                Box::new(read_file),
+                                Box::new(write_file),
+                                Arc::clone(&shutdown),
+                                crate::netstack::EgressPolicy::AllowAll,
+                                Vec::new(),
+                            );
+                            Some(shutdown)
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("netstack accept error: {e}");
                         None
-                    } else {
-                        let write_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
-                        let read_file = std::fs::File::from(read_fd);
-                        let write_file = std::fs::File::from(write_fd);
-                        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let _ =
-                            crate::netstack::spawn(Box::new(read_file), Box::new(write_file), Arc::clone(&shutdown));
-                        Some(shutdown)
+                    }
+                    Err(_) => {
+                        tracing::warn!("netstack accept timeout");
+                        None
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("netstack accept error: {e}");
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!("netstack accept timeout");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // ---- Mount the dynamic-share pool -------------------------------
         if let Err(e) = guest_mount_virtiofs(&init, DYN_SHARE_TAG, DYN_SHARE_GUEST_PATH, false) {

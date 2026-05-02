@@ -1,7 +1,7 @@
-//! Userspace network stack — replaces in-kernel NAT for `NetworkPolicy::AllowAll`
-//! across Windows (HCS micro-VM via HvSocket) and macOS (Virtualization.framework
-//! via AF_VSOCK). Linux uses host-shared netns instead, so this module is
-//! unused there.
+//! Userspace network stack — always-on TCP/UDP/ICMP gateway between the
+//! sandboxed guest and the host process. Used by all three platforms
+//! (`Linux` via `socketpair(STREAM)` through bwrap; `macOS` via
+//! virtio-vsock; `Windows` via HvSocket).
 //!
 //! Architecture:
 //!
@@ -10,19 +10,33 @@
 //!     ↕ length-prefixed Ethernet frames over a duplex stream socket
 //!   Host gateway smoltcp Interface (192.168.127.1/24, any_ip=true)
 //!     - per-flow TCP socket created on demand on first SYN
-//!     - upstream connect via std::net::TcpStream
 //!     - per-flow UDP socket created on demand on first datagram
-//!     - upstream send/recv via std::net::UdpSocket
 //!     - ICMPv4/v6 echo proxied via OS-specific helpers (icmp::send_echo*)
 //! ```
 //!
-//! Wire framing on the underlying duplex stream: `u16-be length || ethernet
-//! frame`. Matches the framing the guest-side `tokimo-tun-pump` uses.
+//! ## Policy
 //!
-//! On Linux the same module powers the bwrap backend's `AllowAll` mode: the
-//! guest end of the stream is a Unix `socketpair(STREAM)` whose child fd is
-//! handed through bwrap to `tokimo-sandbox-init`, which creates `tk0` inside
-//! the unshared netns and pumps frames itself (no `tokimo-tun-pump` exec).
+//! The gateway is always running, even under `NetworkPolicy::Blocked`.
+//! `EgressPolicy` controls whether non-local-service flows are forwarded
+//! to the host kernel:
+//!
+//! - `AllowAll`: any guest TCP/UDP connect attempts to dial the original
+//!   destination via `std::net::TcpStream` / `UdpSocket`.
+//! - `Blocked`: only flows whose destination matches a registered
+//!   `LocalService` are spliced through; everything else is dropped (TCP
+//!   socket is never accepted → guest sees RST; UDP packets never get an
+//!   upstream socket; ICMP echo replies are not generated).
+//!
+//! ## Local services
+//!
+//! A `LocalService` redirects guest traffic destined to
+//! `(HOST_IP|HOST_IP6, port)` to a kernel-side `SocketAddr` (typically
+//! `127.0.0.1:N`). This is how the macOS backend exposes its in-process
+//! NFSv3 server to the guest while keeping `EgressPolicy::Blocked` enforced
+//! for everything else.
+//!
+//! Wire framing on the underlying duplex stream: `u16-be length || ethernet
+//! frame`. Matches what the guest-side `tokimo-tun-pump` produces.
 
 #![cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 
@@ -67,6 +81,67 @@ pub const HOST_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0
 #[allow(dead_code)]
 pub const GUEST_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0002);
 pub const SUBNET6_PREFIX: u8 = 64;
+
+// ─── Egress policy & local-service routing ──────────────────────────────
+
+/// Whether non-local-service flows are forwarded to the host kernel.
+/// Independent of `LocalService` registration: a `Blocked` gateway with
+/// registered local services still routes those services, only the
+/// arbitrary-destination upstream connect path is suppressed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EgressPolicy {
+    /// Original behavior: open kernel sockets to the actual L4 destination.
+    AllowAll,
+    /// Drop everything except registered `LocalService` traffic.
+    Blocked,
+}
+
+/// Redirect guest traffic destined to `(HOST_IP|HOST_IP6, host_port)` to
+/// a kernel-side `SocketAddr`. Used to expose in-process services (NFS,
+/// future: docker registry mirror, etc.) to the guest without leaking
+/// them onto the host's real network namespace.
+#[derive(Clone, Debug)]
+pub struct LocalService {
+    /// TCP port the guest dials at the gateway IP.
+    pub host_port: u16,
+    /// Where to splice incoming flows on the host side. Typically
+    /// `127.0.0.1:<ephemeral>`.
+    pub local_addr: SocketAddr,
+}
+
+/// Routing context plumbed through the dispatch chain. Cheap to clone
+/// (small Vec).
+#[derive(Clone, Debug)]
+struct RouteCtx {
+    egress: EgressPolicy,
+    local_services: Vec<LocalService>,
+}
+
+impl RouteCtx {
+    /// Look up a TCP destination. Returns `Some(addr)` if traffic should be
+    /// forwarded (either to the redirected local service or, under
+    /// AllowAll, to the original destination). `None` means the flow must
+    /// not be registered (Blocked + non-local destination).
+    fn resolve_tcp(&self, dst_ip: IpAddress, dst_port: u16) -> Option<SocketAddr> {
+        let is_gateway = matches!(dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
+            || matches!(dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
+        if is_gateway {
+            if let Some(svc) = self.local_services.iter().find(|s| s.host_port == dst_port) {
+                return Some(svc.local_addr);
+            }
+        }
+        match self.egress {
+            EgressPolicy::AllowAll => Some(SocketAddr::new(ipaddr_to_std(dst_ip), dst_port)),
+            EgressPolicy::Blocked => None,
+        }
+    }
+
+    /// UDP/ICMP have no local-service routing today; only AllowAll
+    /// permits upstream forwarding.
+    fn allows_upstream(&self) -> bool {
+        matches!(self.egress, EgressPolicy::AllowAll)
+    }
+}
 
 // ─── Stream-backed Device ────────────────────────────────────────────────────
 
@@ -179,15 +254,22 @@ struct UdpFlow {
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 /// Spawn the netstack on a fresh thread bound to the given duplex stream.
+///
+/// `egress` controls whether non-local-service flows hit the host kernel.
+/// `local_services` registers in-process service redirects (e.g. the
+/// macOS NFSv3 server reachable at `192.168.127.1:2049`).
 pub fn spawn(
     read_half: Box<dyn Read + Send>,
     write_half: Box<dyn Write + Send>,
     shutdown: Arc<AtomicBool>,
+    egress: EgressPolicy,
+    local_services: Vec<LocalService>,
 ) -> thread::JoinHandle<()> {
+    let ctx = RouteCtx { egress, local_services };
     thread::Builder::new()
         .name("tokimo-netstack".into())
         .spawn(move || {
-            if let Err(e) = run(read_half, write_half, shutdown) {
+            if let Err(e) = run(read_half, write_half, shutdown, ctx) {
                 eprintln!("[netstack] fatal: {e}");
             }
         })
@@ -198,6 +280,7 @@ fn run(
     mut read_half: Box<dyn Read + Send>,
     write_half: Box<dyn Write + Send>,
     shutdown: Arc<AtomicBool>,
+    ctx: RouteCtx,
 ) -> std::io::Result<()> {
     let (rx_in_tx, rx_in_rx) = chan::bounded::<Vec<u8>>(256);
     let (tx_out_tx, tx_out_rx) = chan::bounded::<Vec<u8>>(256);
@@ -256,8 +339,15 @@ fn run(
     let mut udp_flows: HashMap<u16, UdpFlow> = HashMap::new();
 
     eprintln!(
-        "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready",
-        HOST_IP, SUBNET_PREFIX, HOST_IP6, SUBNET6_PREFIX, GUEST_IP, SUBNET_PREFIX
+        "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready (egress={:?}, local_services={})",
+        HOST_IP,
+        SUBNET_PREFIX,
+        HOST_IP6,
+        SUBNET6_PREFIX,
+        GUEST_IP,
+        SUBNET_PREFIX,
+        ctx.egress,
+        ctx.local_services.len()
     );
 
     let idle_timeout = Duration::from_secs(120);
@@ -265,7 +355,7 @@ fn run(
     while !shutdown.load(Ordering::Relaxed) {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         while let Ok(frame) = rx_in_rx.try_recv() {
-            inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx);
+            inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
             staged.push(frame);
         }
         if !staged.is_empty() {
@@ -425,6 +515,7 @@ fn inspect_and_register(
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
     udp_flows: &mut HashMap<u16, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
+    ctx: &RouteCtx,
 ) {
     let eth = match EthernetFrame::new_checked(frame) {
         Ok(e) => e,
@@ -447,6 +538,7 @@ fn inspect_and_register(
                 tcp_flows,
                 udp_flows,
                 tx_out_tx,
+                ctx,
             );
         }
         EthernetProtocol::Ipv6 => {
@@ -462,7 +554,7 @@ fn inspect_and_register(
                 None => return,
             };
             dispatch_l4(
-                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx,
+                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx, ctx,
             );
         }
         _ => {}
@@ -519,6 +611,7 @@ fn dispatch_l4(
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
     udp_flows: &mut HashMap<u16, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
+    ctx: &RouteCtx,
 ) {
     match proto {
         IpProtocol::Tcp => {
@@ -538,9 +631,25 @@ fn dispatch_l4(
             if tcp_flows.contains_key(&key) {
                 return;
             }
-            register_tcp_flow(key, sockets, tcp_flows);
+            // Resolve upstream destination per egress + local-service rules.
+            // Blocked + non-local destination → drop the SYN; smoltcp never
+            // listens, guest sees connection timeout / RST.
+            let upstream = match ctx.resolve_tcp(key.dst_ip, key.dst_port) {
+                Some(addr) => addr,
+                None => {
+                    eprintln!(
+                        "[netstack] tcp drop (egress=blocked, no local-service match): {} → {}:{}",
+                        key.src_port, key.dst_ip, key.dst_port,
+                    );
+                    return;
+                }
+            };
+            register_tcp_flow(key, upstream, sockets, tcp_flows);
         }
         IpProtocol::Udp => {
+            if !ctx.allows_upstream() {
+                return;
+            }
             let udp = match UdpPacket::new_checked(payload) {
                 Ok(p) => p,
                 Err(_) => return,
@@ -561,16 +670,27 @@ fn dispatch_l4(
             let _ = tx_out_tx;
         }
         IpProtocol::Icmp => {
+            if !ctx.allows_upstream() {
+                return;
+            }
             handle_icmpv4_echo(payload, src_ip, dst_ip, tx_out_tx);
         }
         IpProtocol::Icmpv6 => {
+            if !ctx.allows_upstream() {
+                return;
+            }
             handle_icmpv6_echo(payload, src_ip, dst_ip, tx_out_tx);
         }
         _ => {}
     }
 }
 
-fn register_tcp_flow(key: TcpKey, sockets: &mut SocketSet<'_>, tcp_flows: &mut HashMap<TcpKey, TcpFlow>) {
+fn register_tcp_flow(
+    key: TcpKey,
+    upstream: SocketAddr,
+    sockets: &mut SocketSet<'_>,
+    tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
+) {
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
@@ -591,10 +711,9 @@ fn register_tcp_flow(key: TcpKey, sockets: &mut SocketSet<'_>, tcp_flows: &mut H
     let upstream_closed = Arc::new(AtomicBool::new(false));
     let upstream_closed2 = Arc::clone(&upstream_closed);
 
-    let dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
     thread::Builder::new()
         .name(format!("net-tcp-{}-{}", key.dst_ip, key.dst_port))
-        .spawn(move || tcp_proxy(dst, u2g_tx, g2u_rx, upstream_closed2))
+        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2))
         .ok();
 
     tcp_flows.insert(
@@ -608,7 +727,7 @@ fn register_tcp_flow(key: TcpKey, sockets: &mut SocketSet<'_>, tcp_flows: &mut H
             closed: false,
         },
     );
-    eprintln!("[netstack] tcp flow opened {} → {}", key.src_port, dst);
+    eprintln!("[netstack] tcp flow opened {} → {}", key.src_port, upstream);
 }
 
 fn tcp_proxy(
