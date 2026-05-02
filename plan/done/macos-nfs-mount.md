@@ -1,5 +1,11 @@
 # macOS dynamic mount → NFSv3 + cross-platform always-on netstack
 
+> **SUPERSEDED** by [plan/cross-platform-fuse-vfs.md](../cross-platform-fuse-vfs.md).
+> The NFSv3 path was implemented end-to-end and worked, but was replaced
+> by FUSE-over-vsock to share the mount transport across all three
+> platforms. NFS code, modules, modprobe chain, and the `nfsserve`
+> dependency were removed in commit `86c7d5f`.
+
 ## Status
 
 - [x] User approved scope (2026-05-02, revised)

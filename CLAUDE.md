@@ -3,7 +3,7 @@
 Cross-platform native sandbox for running arbitrary commands in isolated environments.
 
 - **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer
-- **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, in-process NFSv3 server over the always-on smoltcp gateway for boot/runtime mounts, virtio-vsock control plane
+- **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, in-process FUSE-over-vsock host (`vfs_host::FuseHost`) for boot/runtime mounts, virtio-vsock control plane
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 
 ## Public API
@@ -89,22 +89,27 @@ Sandbox client (library, in-process)
         │       │
         │       ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
         │       ├─ VZVirtioSocketDevice (vsock CID/port 2222)         ← init control plane
+        │       ├─ VZVirtioSocketDevice (vsock CID/port 5555)         ← FUSE-over-vsock host
         │       ├─ VZVirtioNetworkDevice + tk0/tap                    ← always-on smoltcp gateway
         │       └─ VZSerialPortConfiguration                          ← guest console (debug)
         │
-        ├─ in-process NFSv3 server (nfsserve, bound 127.0.0.1:ephemeral)
-        │     └─ reachable from guest as 192.168.127.1:2049 via netstack LocalService splice
+        ├─ in-process FuseHost (src/vfs_host/) listens on vsock port 5555
+        │     └─ each registered share is bound to a logical name; one
+        │        connection (one tokimo-sandbox-fuse child) per mount
         │
         └─ in-guest:
               tokimo-sandbox-init (PID 1) over virtio-vsock port 2222
                 ├─ Hello / handshake
                 ├─ for each ConfigureParams.mount and runtime add_mount:
-                │     mount -t nfs -o nolock,vers=3,proto=tcp,hard
-                │           192.168.127.1:/<name> /<guest_path>
-                ├─ EgressPolicy::Blocked still blocks upstream egress;
-                │   LocalServices (NFS) are exempt by design
+                │     spawn /bin/tokimo-sandbox-fuse --transport vsock
+                │           --port 5555 --mount-name <name> --target /<guest_path>
+                │     child speaks VFS-protocol Hello bound to <name>
+                │     and mount(2)s FUSE at the target
+                ├─ EgressPolicy::Blocked blocks upstream egress; FUSE
+                │   runs over vsock so it is unaffected by the netstack
                 ├─ OpenShell / Spawn / Exec
-                └─ remove_mount → umount2(MNT_DETACH) + tombstone host slot
+                └─ remove_mount → umount2(MNT_DETACH) + SIGTERM/reap
+                                  the fuse child + tombstone host slot
 ```
 
 **Process-wide invariants:**

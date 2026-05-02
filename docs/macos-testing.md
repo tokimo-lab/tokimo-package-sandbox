@@ -57,25 +57,25 @@ cargo test --test sandbox_integration -- --test-threads=1
 queue does not tolerate parallel `vm.start()` calls from a single process,
 and the integration suite shares one process.
 
-## Dynamic mounts use NFSv3, not virtio-fs
+## Dynamic mounts use FUSE-over-vsock, not virtio-fs
 
-As of the macOS-NFS-mount rewrite, both boot-time and runtime
-`add_mount` shares are exposed to the guest over a single in-process
-NFSv3 server (`nfsserve` crate) bound to `127.0.0.1`. The guest reaches
-it through the always-on smoltcp gateway at `192.168.127.1:2049`, which
-the netstack splices to the loopback NFS port via a registered
-`LocalService`.
+Both boot-time and runtime `add_mount` shares are exposed to the guest
+through a cross-platform `FuseHost` (see `src/vfs_host/`). The host
+listens on a dedicated virtio-vsock port (5555). For each mount, the
+guest spawns a small `tokimo-sandbox-fuse` child that connects back over
+vsock, performs the VFS-protocol `Hello` handshake bound to the share
+name, and `mount(2)`s a FUSE filesystem at the requested guest path.
+Each mount has its own connection and child process.
 
-Each share is a virtual subtree under the export root; the guest mounts
-them as `192.168.127.1:/<name> -> /<guest_path>` with
-`nolock,vers=3,proto=tcp,hard`. `remove_mount` issues `umount2(MNT_DETACH)`
-in the guest and tombstones the slot host-side.
+`remove_mount` issues `umount2(MNT_DETACH)` in the guest, then SIGTERM +
+reaps the fuse child. The shared name is tombstoned host-side.
 
-This replaces the previous virtio-fs + APFS-clone approach. **Reverse
-mounts now work bidirectionally on macOS**: guest writes to a
-`rw` share land directly in the host path, just like Linux/Windows. The
-integration test `add_user_with_reverse_mount_writes_to_host` is no
-longer ignored on macOS.
+This replaces the previous virtio-fs + APFS-clone approach as well as
+the short-lived NFSv3-over-smoltcp transport. **Reverse mounts work
+bidirectionally on macOS**: guest writes to a `rw` share land directly
+in the host path, just like Linux/Windows. The integration test
+`add_user_with_reverse_mount_writes_to_host` is not ignored on macOS.
 
-`EgressPolicy::Blocked` still blocks all upstream traffic; the netstack's
-`LocalService` table is exempt so NFS keeps working under either policy.
+`EgressPolicy::Blocked` blocks all upstream traffic; the FUSE channel
+runs over vsock and is independent of the netstack's
+`EgressPolicy`/`LocalService` plumbing entirely.

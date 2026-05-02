@@ -9,8 +9,8 @@
   - Host 端 trait 形状对齐 [`tokimo-package-vfs`](https://github.com/) 的 `Driver` / `Reader` / `Mkdir` / `DeleteFile` / `DeleteDir` / `Rename` / `MoveFile` / `CopyFile` / `PutFile` / `PutStream` / `ResolveLocal`，**但定义在 sandbox crate 内部**，不引入 cargo 依赖
   - 用户在自己代码里写 ~30 行 adapter 把真正的 `tokimo-vfs::Driver` 包成 sandbox 的 `VfsBackend`
   - FUSE 默认缓存：`attr_timeout=1s` / `entry_timeout=1s` / 关 `writeback_cache`（写直通，外部修改 1 秒内可见）
-- [ ] Plan reviewed
-- [ ] Implementation
+- [x] Plan reviewed
+- [x] Implementation (commits `a7f4a0c..86c7d5f`, macOS sandbox_integration 31/31 ✅)
 
 ---
 
