@@ -15,6 +15,20 @@ use tokimo_package_sandbox::{AddUserOpts, ConfigureParams, Event, JobId, Mount, 
 // Counter to make per-test session_id unique within a single test process.
 static N: AtomicU32 = AtomicU32::new(0);
 
+/// RAII guard that calls `stop_vm()` on drop. Prevents VM leaks when a
+/// test panics before reaching its explicit `stop_vm()` call.
+///
+/// Usage: `let _guard = SandboxGuard(sb.clone());` after `start_vm()`.
+/// The guard's `stop_vm()` is idempotent — calling it again in the test
+/// body is harmless.
+struct SandboxGuard(Sandbox);
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        self.0.stop_vm().ok();
+    }
+}
+
 fn workspace_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("tokimo-test-{label}"));
     std::fs::create_dir_all(&dir).ok();
@@ -70,6 +84,7 @@ fn lifecycle_start_and_stop() {
     let sb = Sandbox::connect().expect("connect");
     sb.configure(config("basic")).expect("configure");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb.shell_id().expect("shell_id");
     assert!(!shell.as_str().is_empty(), "shell id must not be empty");
@@ -90,6 +105,7 @@ fn shell_id_after_stop_is_error() {
     let sb = Sandbox::connect().expect("connect");
     sb.configure(config("after_stop")).expect("configure");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     sb.shell_id().expect("shell_id during run");
     sb.stop_vm().expect("stop_vm");
     assert!(sb.shell_id().is_err(), "shell_id after stop must fail");
@@ -112,6 +128,7 @@ fn shell_env_does_not_leak_init_control_vars() {
     sb.configure(config("envleak")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     sb.write_stdin(&shell, b"env | grep -c '^TOKIMO_SANDBOX_' || true\n")
@@ -141,6 +158,7 @@ fn shell_stdout_echo() {
     sb.configure(config("echo")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb.shell_id().expect("shell_id");
     sb.write_stdin(&shell, format!("echo {MARKER}\n").as_bytes())
@@ -163,6 +181,7 @@ fn shell_runs_multiple_commands() {
     sb.configure(config("multicmd")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     sb.write_stdin(&shell, b"pwd\n").unwrap();
@@ -197,6 +216,7 @@ fn fuse_host_file_visible_in_guest() {
     sb.configure(config(label)).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     sb.write_stdin(&shell, format!("cat /work/{FNAME}\n").as_bytes())
@@ -221,6 +241,7 @@ fn status_rpcs_during_blocking_shell() {
     let sb = Sandbox::connect().expect("connect");
     sb.configure(config("async")).expect("configure");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     // bash is now blocked in `sleep 3`. write_stdin returns as soon as the
@@ -264,6 +285,7 @@ fn run_marker_session(label: &str, marker: &str) {
     sb.configure(config(label)).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
     sb.write_stdin(&shell, format!("echo {marker}\n").as_bytes()).unwrap();
 
@@ -293,6 +315,7 @@ fn fuse_dynamic_add_remove() {
     sb.configure(config(label)).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     // 1. Before add: /extra is empty / nonexistent.
@@ -355,6 +378,7 @@ fn signal_shell_delivers_sigint() {
     sb.configure(config("sigint")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     // Park bash inside a long sleep so SIGINT has something to interrupt.
@@ -413,6 +437,7 @@ fn network_blocked_only_loopback() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     let n = link_count(&rx, &sb, &shell);
@@ -454,6 +479,7 @@ fn network_allow_all_has_nic() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     let n = link_count(&rx, &sb, &shell);
@@ -495,6 +521,7 @@ fn network_allow_all_icmpv4_ping() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     sb.write_stdin(
@@ -522,6 +549,7 @@ fn network_allow_all_ipv6_tcp() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     // Cloudflare v6 DNS over TCP.
@@ -556,6 +584,7 @@ fn network_allow_all_icmpv6_ping() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     sb.write_stdin(
@@ -596,6 +625,7 @@ fn network_allow_all_ipv6_diag() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     let cmds = b"echo === V6-ADDR ===\n\
@@ -634,6 +664,7 @@ fn network_allow_all_diag() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     let cmds = b"echo === LINKS ===\n\
@@ -682,6 +713,7 @@ fn concurrent_commands_in_single_shell() {
     sb.configure(cfg).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
     // Two background jobs: A sleeps 2s, B sleeps 5s. With wall clock between
@@ -740,6 +772,7 @@ fn multi_shell_isolated_streams() {
     sb.configure(config("multi-shell")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell_a = sb.shell_id().expect("shell_id (boot shell = A)");
     let shell_b = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell B");
@@ -797,6 +830,7 @@ fn multi_shell_independent_signals() {
     sb.configure(config("multi-sig")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell_a = sb.shell_id().expect("shell_id");
     let shell_b = sb.spawn_shell(ShellOpts::default()).expect("spawn_shell");
@@ -846,6 +880,7 @@ fn list_shells_tracks_lifecycle() {
     let sb = Sandbox::connect().expect("connect");
     sb.configure(config("list-shells")).expect("configure");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let boot = sb.shell_id().expect("shell_id");
     let initial = sb.list_shells().expect("list_shells (initial)");
@@ -901,6 +936,7 @@ fn add_user_sets_user_and_home_env() {
     sb.configure(config("adduser")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let alice = sb
         .add_user(
@@ -951,6 +987,7 @@ fn add_user_with_reverse_mount_writes_to_host() {
     sb.configure(config(label)).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     sb.add_mount(Mount {
         name: "bob-home".into(),
@@ -1022,6 +1059,7 @@ fn pty_shell_reports_correct_size() {
     sb.configure(config("pty-size")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb
         .spawn_shell(ShellOpts {
@@ -1044,6 +1082,7 @@ fn pty_shell_resize_propagates() {
     sb.configure(config("pty-resize")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb
         .spawn_shell(ShellOpts {
@@ -1073,6 +1112,7 @@ fn pty_shell_ctrl_c_does_not_kill_shell() {
     sb.configure(config("pty-ctrlc")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb
         .spawn_shell(ShellOpts {
@@ -1105,6 +1145,7 @@ fn pty_shell_color_escape_codes_pass_through() {
     sb.configure(config("pty-color")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     let shell = sb
         .spawn_shell(ShellOpts {
@@ -1142,6 +1183,7 @@ fn shared_session_two_handles_see_same_shell() {
     let sb1 = Sandbox::connect().expect("connect 1");
     sb1.configure(cfg.clone()).expect("configure 1");
     sb1.start_vm().expect("start_vm");
+    let _guard1 = SandboxGuard(sb1.clone());
     let shell_a = sb1.shell_id().expect("shell_id 1");
 
     // Second connect with the same session_id MUST observe the running
@@ -1154,6 +1196,7 @@ fn shared_session_two_handles_see_same_shell() {
 
     // start_vm on the second handle must also be idempotent.
     sb2.start_vm().expect("start_vm 2 idempotent");
+    let _guard2 = SandboxGuard(sb2.clone());
 
     sb1.stop_vm().expect("stop_vm");
     // After teardown, the second handle observes the VM as not running.
@@ -1168,6 +1211,7 @@ fn shared_session_writes_visible_via_other_handle() {
     sb1.configure(cfg.clone()).expect("configure 1");
     let rx = sb1.subscribe().expect("subscribe");
     sb1.start_vm().expect("start_vm");
+    let _guard1 = SandboxGuard(sb1.clone());
     let shell = sb1.shell_id().expect("shell_id");
 
     // Drive stdin from the *second* handle, observe events on the first.
@@ -1200,12 +1244,14 @@ fn distinct_session_ids_get_distinct_vms() {
     sb_a.configure(cfg_a).expect("configure a");
     let rx_a = sb_a.subscribe().expect("subscribe a");
     sb_a.start_vm().expect("start_vm a");
+    let _guard_a = SandboxGuard(sb_a.clone());
     let shell_a = sb_a.shell_id().expect("shell_id a");
 
     let sb_b = Sandbox::connect().expect("connect b");
     sb_b.configure(cfg_b).expect("configure b");
     let rx_b = sb_b.subscribe().expect("subscribe b");
     sb_b.start_vm().expect("start_vm b");
+    let _guard_b = SandboxGuard(sb_b.clone());
     let shell_b = sb_b.shell_id().expect("shell_id b");
 
     const TOK_A: &str = "DISTINCT_A_4F1C";
@@ -1236,6 +1282,7 @@ fn stop_from_one_handle_tears_down_for_others() {
     let sb1 = Sandbox::connect().expect("connect 1");
     sb1.configure(cfg.clone()).expect("configure 1");
     sb1.start_vm().expect("start_vm");
+    let _guard1 = SandboxGuard(sb1.clone());
 
     let sb2 = Sandbox::connect().expect("connect 2");
     sb2.configure(cfg.clone()).expect("configure 2");
@@ -1264,12 +1311,14 @@ fn empty_session_id_is_not_shared() {
     sb1.configure(cfg_a).expect("configure 1");
     let rx1 = sb1.subscribe().expect("subscribe 1");
     sb1.start_vm().expect("start_vm 1");
+    let _guard1 = SandboxGuard(sb1.clone());
     let shell_1 = sb1.shell_id().expect("shell_id 1");
 
     let sb2 = Sandbox::connect().expect("connect 2");
     sb2.configure(cfg_b).expect("configure 2");
     let rx2 = sb2.subscribe().expect("subscribe 2");
     sb2.start_vm().expect("start_vm 2");
+    let _guard2 = SandboxGuard(sb2.clone());
     let shell_2 = sb2.shell_id().expect("shell_id 2");
 
     const TOK1: &str = "EMPTY_ONE_DA32";
@@ -1308,6 +1357,7 @@ fn nfs_dynamic_mount_writes_to_host() {
     sb.configure(config(label)).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
     sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
 
     sb.add_mount(Mount {
         name: "share1".into(),

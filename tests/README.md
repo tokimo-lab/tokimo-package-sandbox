@@ -94,14 +94,31 @@ the initrd is stale — re-run `rebake-initrd.ps1 -InstallToVm`.
 #### Pre-test cleanup (always)
 
 Leftover Hyper-V VMs from previous runs hold `vm/initrd.img` open and
-will block both the rebake step and the next test run. Before any test
-session, kill them (admin pwsh):
+will block both the rebake step and the next test run. Each test
+session leaks a VM if the service is killed without `stopVm`. After a
+few rounds you can have dozens of orphan VMs consuming gigabytes of RAM.
+
+**Check what's running** (admin pwsh):
+
+```powershell
+hcsdiag.exe list            # shows all HCS compute systems
+(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB  # free GB
+```
+
+**Kill all tokimo VMs** (admin pwsh — `hcsdiag kill` takes the compute
+system **name**, not the GUID):
 
 ```powershell
 hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
-    if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+    if ($_ -match '(tokimo-sess-\S+)') { hcsdiag.exe kill $Matches[1] }
 }
 Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+**Verify** (should show 0 tokimo VMs):
+
+```powershell
+hcsdiag.exe list | Select-String 'tokimo-sess'
 ```
 
 #### Run order
@@ -113,7 +130,7 @@ Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -For
    ```powershell
    # Kill leftover VMs first if Copy-Item fails with "cannot access".
    hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
-       if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+       if ($_ -match '(tokimo-sess-\S+)') { hcsdiag.exe kill $Matches[1] }
    }
    Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
    pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm
@@ -370,6 +387,14 @@ and the egress path (vmnet NAT not HCN NAT).
 ## Editing tests
 
 Conventions used by the existing suite:
+
+- **`SandboxGuard`**: every `start_vm()` call must be followed by
+  `let _guard = SandboxGuard(sb.clone());`. The guard calls
+  `stop_vm()` on drop, preventing VM leaks when a test panics. The
+  explicit `stop_vm()` in the test body is still fine — it's
+  idempotent. Without the guard, a panicked test leaves an orphan VM
+  running, consuming ~4 GB RAM until manually killed via `hcsdiag`.
+  See "Pre-test cleanup" above for how to kill orphans.
 
 - Helper `config(label)` builds a `ConfigureParams` with a unique
   `session_id = "{pid}-{label}-{counter}"` to avoid collisions when tests
