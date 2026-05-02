@@ -48,7 +48,7 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -249,6 +249,14 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
     fn remove_mount(&self, name: &str) -> Result<()> {
         self.get()?.remove_mount(name)
     }
+
+    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
+        self.get()?.add_user(user_id, opts)
+    }
+
+    fn remove_user(&self, user_id: &str) -> Result<()> {
+        self.get()?.remove_user(user_id)
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +357,12 @@ mod tests {
             Ok(())
         }
         fn remove_mount(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn add_user(&self, _u: &str, _o: AddUserOpts) -> Result<JobId> {
+            Err(Error::not_implemented("fake"))
+        }
+        fn remove_user(&self, _u: &str) -> Result<()> {
             Ok(())
         }
     }

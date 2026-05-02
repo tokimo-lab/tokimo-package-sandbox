@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use tokimo_package_sandbox::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, ShellOpts};
+use tokimo_package_sandbox::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, ShellOpts};
 
 // Counter to make per-test session_id unique within a single test process.
 static N: AtomicU32 = AtomicU32::new(0);
@@ -31,6 +31,7 @@ fn config(label: &str) -> ConfigureParams {
             host_path: workspace_dir(label),
             guest_path: "/work".into(),
             read_only: false,
+            create_host_dir: false,
         }],
         network: NetworkPolicy::Blocked,
         session_id: format!("{}-{}-{}", std::process::id(), label, N.fetch_add(1, Ordering::Relaxed)),
@@ -309,6 +310,7 @@ fn plan9_dynamic_add_remove() {
         host_path: extra.clone(),
         guest_path: "/extra".into(),
         read_only: false,
+        create_host_dir: false,
     })
     .expect("add_mount");
     sb.write_stdin(&shell, format!("cat /extra/{FNAME}; echo POST_ADD_2CD\n").as_bytes())
@@ -873,6 +875,114 @@ fn list_shells_tracks_lifecycle() {
     assert!(after_close.contains(&extra2), "extra2 vanished: {after_close:?}");
 
     sb.close_shell(&extra2).ok();
+    sb.stop_vm().ok();
+}
+
+// ---------------------------------------------------------------------------
+// add_user — real-login path (VM modes) / env-fallback (Linux bwrap)
+// ---------------------------------------------------------------------------
+//
+// Asserts the shell returned by `add_user` reports the requested user_id
+// and HOME. On macOS VZ / Windows HCS the script in init runs `useradd`
+// + `runuser -l`, so `whoami` returns the real account. On Linux bwrap
+// the user-namespace fake-root cannot write /etc/passwd, so the script
+// falls back to root + injected env; in that case `whoami` may say
+// `root` but `$USER` / `$HOME` still match.
+
+#[test]
+fn add_user_sets_user_and_home_env() {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config("adduser")).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    let alice = sb
+        .add_user(
+            "alice",
+            AddUserOpts {
+                home: "/home/alice".into(),
+                ..Default::default()
+            },
+        )
+        .expect("add_user(alice)");
+
+    sb.write_stdin(
+        &alice,
+        b"echo USER=$USER; echo HOME=$HOME; echo PWD=$(pwd); echo DONE_AU_71\n",
+    )
+    .unwrap();
+    let out = drain_until(&rx, &alice, "DONE_AU_71", Duration::from_secs(30));
+
+    assert!(out.contains("USER=alice"), "USER not set to alice: {out:?}");
+    assert!(out.contains("HOME=/home/alice"), "HOME not set: {out:?}");
+    assert!(out.contains("PWD=/home/alice"), "cwd not HOME: {out:?}");
+
+    sb.remove_user("alice").ok();
+    sb.stop_vm().ok();
+}
+
+// ---------------------------------------------------------------------------
+// add_user + reverse-mount: guest writes inside HOME → host sees the file.
+// ---------------------------------------------------------------------------
+//
+// This is the canonical "give a user an isolated home backed by a host
+// directory" use case from the API rustdoc. The host pre-creates a
+// directory, mounts it at /home/bob, then add_user("bob") with
+// home=/home/bob. The shell writes to $HOME/note.txt inside the guest;
+// the host reads the same bytes back from its local path.
+
+#[test]
+fn add_user_with_reverse_mount_writes_to_host() {
+    const SENTINEL: &str = "BOB_WROTE_THIS_F3A2";
+
+    let label = "adduser-rev";
+    let bob_host = workspace_dir(&format!("{label}-bobhome"));
+    // Make sure we start clean — file from a prior run would defeat the
+    // assertion.
+    let _ = std::fs::remove_file(bob_host.join("note.txt"));
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config(label)).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+
+    sb.add_mount(Mount {
+        name: "bob-home".into(),
+        host_path: bob_host.clone(),
+        guest_path: "/home/bob".into(),
+        read_only: false,
+        create_host_dir: true,
+    })
+    .expect("add_mount");
+
+    let bob = sb
+        .add_user(
+            "bob",
+            AddUserOpts {
+                home: "/home/bob".into(),
+                ..Default::default()
+            },
+        )
+        .expect("add_user(bob)");
+
+    sb.write_stdin(
+        &bob,
+        format!("echo {SENTINEL} > $HOME/note.txt; echo DONE_REV_88\n").as_bytes(),
+    )
+    .unwrap();
+    let _ = drain_until(&rx, &bob, "DONE_REV_88", Duration::from_secs(30));
+
+    // Host-side readback: the bytes written from inside the guest must
+    // be visible on the host without any explicit sync — virtio-fs /
+    // plan9 / bwrap-bind all give us coherent shared storage.
+    let host_path = bob_host.join("note.txt");
+    let read = std::fs::read_to_string(&host_path).unwrap_or_default();
+    assert!(
+        read.contains(SENTINEL),
+        "host did not see guest write at {host_path:?}, got {read:?}"
+    );
+
+    sb.remove_user("bob").ok();
     sb.stop_vm().ok();
 }
 

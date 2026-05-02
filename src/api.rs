@@ -57,6 +57,12 @@ pub struct Mount {
     /// Mount read-only.
     #[serde(default)]
     pub read_only: bool,
+    /// If `true` and `host_path` does not exist, [`Sandbox::add_mount`]
+    /// (and the boot-time mount setup) will `create_dir_all` it before
+    /// handing off to the backend. Default `false` (the strictest, and
+    /// the historical behaviour).
+    #[serde(default)]
+    pub create_host_dir: bool,
 }
 
 /// Configuration passed to [`Sandbox::configure`]. All non-Windows fields
@@ -167,6 +173,50 @@ impl From<String> for JobId {
     fn from(s: String) -> Self {
         JobId(s)
     }
+}
+
+/// Options for [`Sandbox::add_user`].
+///
+/// `home` is the only required field. Init treats it as both the user's
+/// `HOME` and the default starting cwd. If the directory does not exist
+/// it is created (idempotent), so callers may pre-mount a host directory
+/// at the same path via [`Sandbox::add_mount`] to make whatever the user
+/// writes during their session land directly on the host filesystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddUserOpts {
+    /// Absolute guest-side HOME directory.
+    pub home: PathBuf,
+    /// Override starting cwd. Defaults to `home`.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Extra environment variables, applied last (highest precedence).
+    /// Layered on top of the per-user defaults USER, LOGNAME, HOME, PS1,
+    /// MAIL.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// If `true` (default), init runs `useradd -M -d <home> -s /bin/bash
+    /// -g 1000 -N <user_id>` (idempotent) and execs the shell as that
+    /// uid in shared group `tokimo-users` (gid 1000) via `runuser`. On
+    /// failure init falls back to running as root with USER/LOGNAME env
+    /// set. If `false`, the shell always runs as root and only the env
+    /// vars distinguish the user.
+    #[serde(default = "default_true")]
+    pub real_user: bool,
+}
+
+impl Default for AddUserOpts {
+    fn default() -> Self {
+        Self {
+            home: PathBuf::new(),
+            cwd: None,
+            env: Vec::new(),
+            real_user: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Asynchronous events delivered via [`Sandbox::subscribe`].
@@ -386,6 +436,14 @@ impl Sandbox {
         if mount.name.is_empty() {
             return Err(Error::validation("mount name must not be empty"));
         }
+        if mount.create_host_dir
+            && let Err(e) = std::fs::create_dir_all(&mount.host_path)
+        {
+            return Err(Error::other(format!(
+                "create_dir_all({}): {e}",
+                mount.host_path.display()
+            )));
+        }
         self.inner.add_mount(mount)
     }
 
@@ -396,6 +454,72 @@ impl Sandbox {
             return Err(Error::validation("mount name must not be empty"));
         }
         self.inner.remove_mount(name)
+    }
+
+    // ---- User management ----------------------------------------------
+
+    /// Register a named user inside the running guest and start a bash
+    /// shell scoped to that identity. Returns the shell's [`JobId`].
+    ///
+    /// The guest creates `opts.home` (if missing), exports the per-user
+    /// env vars (`USER`, `LOGNAME`, `HOME`, `PS1`, `MAIL`) and — when
+    /// `opts.real_user` is `true` — `useradd`s the account and execs the
+    /// shell with that uid via `runuser`. See [`AddUserOpts`] for the
+    /// fallback behaviour.
+    ///
+    /// The standard recipe for "guest writes go directly to host disk":
+    ///
+    /// ```ignore
+    /// use std::path::PathBuf;
+    /// use tokimo_package_sandbox::{Sandbox, Mount, AddUserOpts};
+    ///
+    /// let sb = Sandbox::connect()?;
+    /// // ... configure / start_vm ...
+    /// sb.add_mount(Mount {
+    ///     name: "alice-home".into(),
+    ///     host_path: PathBuf::from("/host/data/alice"),
+    ///     guest_path: PathBuf::from("/home/alice"),
+    ///     read_only: false,
+    ///     create_host_dir: true,
+    /// })?;
+    /// let shell = sb.add_user("alice", AddUserOpts {
+    ///     home: PathBuf::from("/home/alice"),
+    ///     ..Default::default()
+    /// })?;
+    /// # Ok::<_, tokimo_package_sandbox::Error>(())
+    /// ```
+    pub fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
+        validate_user_id(user_id)?;
+        if opts.home.as_os_str().is_empty() {
+            return Err(Error::validation("AddUserOpts.home must not be empty"));
+        }
+        // home is a *guest* (Linux) path. Don't use Path::is_absolute()
+        // because on Windows hosts that requires a drive letter, which
+        // would (incorrectly) reject `/home/alice`. Just check the
+        // POSIX leading-slash convention.
+        let home_str = opts.home.to_string_lossy();
+        if !home_str.starts_with('/') {
+            return Err(Error::validation(
+                "AddUserOpts.home must be a POSIX absolute path (start with '/')",
+            ));
+        }
+        if let Some(cwd) = &opts.cwd
+            && !cwd.to_string_lossy().starts_with('/')
+        {
+            return Err(Error::validation(
+                "AddUserOpts.cwd must be a POSIX absolute path (start with '/')",
+            ));
+        }
+        self.inner.add_user(user_id, opts)
+    }
+
+    /// Counterpart to [`Sandbox::add_user`]: SIGKILLs every shell owned
+    /// by the requesting client and (if the account was created via
+    /// `real_user=true`) `userdel`s it. Best-effort; succeeds even if
+    /// the user was never registered.
+    pub fn remove_user(&self, user_id: &str) -> Result<()> {
+        validate_user_id(user_id)?;
+        self.inner.remove_user(user_id)
     }
 }
 
@@ -428,6 +552,21 @@ fn validate_configure(p: &ConfigureParams) -> Result<()> {
                 m.guest_path.display()
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate a `user_id` for [`Sandbox::add_user`] / [`Sandbox::remove_user`].
+/// Mirrors the init-side check (`is_valid_user_id`).
+fn validate_user_id(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(Error::validation("user_id must not be empty"));
+    }
+    if s.len() > 32 {
+        return Err(Error::validation("user_id must be <= 32 chars"));
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(Error::validation("user_id must match [A-Za-z0-9_-]+"));
     }
     Ok(())
 }

@@ -51,9 +51,9 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddMountParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, RemoveMountParams, ResizeShellParams, RootfsSpec, RpcError, SignalShellParams, SpawnShellParams,
-    WriteStdinParams, encode_frame, method,
+    AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult,
+    JobIdResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams, ResizeShellParams, RootfsSpec,
+    RpcError, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::{ConfigureParams, Mount, NetworkPolicy};
 
@@ -769,6 +769,16 @@ fn dispatch(
                 serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             handle_remove_mount(conn, p, sessions)
         }
+        method::ADD_USER => {
+            let p: AddUserParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_add_user(conn, p, sessions)
+        }
+        method::REMOVE_USER => {
+            let p: RemoveUserParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_remove_user(conn, p, sessions)
+        }
 
         other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
     }
@@ -831,7 +841,12 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     let cfg = {
         let st = shared.state.lock().unwrap();
         if st.running {
-            return Err(RpcError::new("already_running", "VM is already running"));
+            // Idempotent: a second handle that joined this session via
+            // configure() may legitimately call start_vm again. The VM
+            // is already up, the boot shell already exists. Match the
+            // SharedBackend (Linux/macOS) semantics — see
+            // `tests::shared_session_two_handles_see_same_shell`.
+            return Ok(json!({}));
         }
         st.config
             .clone()
@@ -1401,6 +1416,64 @@ fn handle_remove_mount(
         st.active_shares.remove(&name);
     }
 
+    Ok(json!({}))
+}
+
+fn handle_add_user(conn: &Arc<Connection>, p: AddUserParams, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let AddUserParams { user_id, opts } = p;
+    let init = require_init(conn, sessions)?;
+
+    let home = opts
+        .home
+        .to_str()
+        .ok_or_else(|| RpcError::new("bad_params", format!("non-UTF-8 home: {:?}", opts.home)))?
+        .to_string();
+    let cwd = opts
+        .cwd
+        .as_ref()
+        .map(|p| {
+            p.to_str()
+                .ok_or_else(|| RpcError::new("bad_params", format!("non-UTF-8 cwd: {p:?}")))
+                .map(str::to_string)
+        })
+        .transpose()?;
+
+    let info = init
+        .add_user(&user_id, &home, cwd.as_deref(), &opts.env, opts.real_user)
+        .map_err(|e| RpcError::new("add_user", e.to_string()))?;
+    let child_id = info.child_id;
+
+    // Per-child poller so stdout/stderr/exit flow back to subscribers.
+    let finished = Arc::new(AtomicBool::new(false));
+    let joiner = {
+        let conn_w = Arc::clone(conn);
+        let init_w = Arc::clone(&init);
+        let id_w = child_id.clone();
+        let fin_w = Arc::clone(&finished);
+        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
+    };
+    {
+        let shared = get_session(conn, sessions)?;
+        let mut st = shared.state.lock().unwrap();
+        st.children.insert(
+            child_id.clone(),
+            ChildEntry {
+                _joiner: joiner,
+                finished,
+            },
+        );
+    }
+    Ok(serde_json::to_value(AddUserResult { job_id: child_id }).unwrap())
+}
+
+fn handle_remove_user(
+    conn: &Arc<Connection>,
+    p: RemoveUserParams,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    init.remove_user(&p.user_id)
+        .map_err(|e| RpcError::new("remove_user", e.to_string()))?;
     Ok(json!({}))
 }
 

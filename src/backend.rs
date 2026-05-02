@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -53,4 +53,8 @@ pub trait SandboxBackend: Send + Sync + 'static {
     // -- Dynamic mount management -------------------------------------
     fn add_mount(&self, mount: Mount) -> Result<()>;
     fn remove_mount(&self, name: &str) -> Result<()>;
+
+    // -- User management ----------------------------------------------
+    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId>;
+    fn remove_user(&self, user_id: &str) -> Result<()>;
 }

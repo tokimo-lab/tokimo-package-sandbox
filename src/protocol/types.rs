@@ -109,20 +109,41 @@ pub enum Op {
         #[serde(default = "default_true")]
         kill_all: bool,
     },
-    /// Create a per-user isolated workspace inside the shared init container.
-    /// Init creates `/tmp/<user_id>` and `/work/<user_id>`, merges env with
-    /// `TMPDIR`/`HOME` pointed at the per-user paths, then spawns a bash
-    /// shell. The reply includes the shell's `child_id`.
+    /// Register a named identity inside the shared init container and
+    /// spawn a bash shell scoped to that identity.
+    ///
+    /// `home` is the absolute guest-side directory used as the user's
+    /// HOME (and default cwd). Init `mkdir -p`s it; if it already exists
+    /// (e.g. a host directory was pre-mounted there via `add_mount`), the
+    /// existing mount point is reused.
+    ///
+    /// Injected env (in order, lowest precedence first):
+    ///   * USER, LOGNAME = `user_id`
+    ///   * HOME = `home`
+    ///   * PS1 = `\u@tokimo:\w$ `
+    ///   * MAIL = /var/mail/`user_id`
+    ///   * `env_overlay` (highest precedence; user-supplied)
+    ///
+    /// If `real_user` is true, init runs `useradd -M -d <home> -s
+    /// /bin/bash <user_id>` (idempotent) and execs the shell as that
+    /// uid in shared group `tokimo-users` (gid 1000). On `useradd`
+    /// failure init falls back to root with USER/LOGNAME env set, and
+    /// reports the warning via stderr.
+    ///
+    /// The reply is `Reply::Spawn` carrying the shell's `child_id`.
     AddUser {
         id: String,
         user_id: String,
+        home: String,
         #[serde(default)]
         cwd: Option<String>,
         #[serde(default)]
         env_overlay: Vec<(String, String)>,
+        #[serde(default = "default_true")]
+        real_user: bool,
     },
-    /// Remove a user: SIGKILL all children owned by the requesting client,
-    /// then (eventually) clean up /tmp/<user_id>.
+    /// Remove a previously-added user: SIGKILL all shells owned by
+    /// `user_id` and (if `real_user` was used) `userdel` the account.
     RemoveUser { id: String, user_id: String },
     /// Dynamic bind mount inside the container. `source` must be a path
     /// already visible inside the container (e.g., pre-mounted host dir).

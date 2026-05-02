@@ -25,7 +25,7 @@ use std::{env, thread};
 
 use nix::sys::socket::{SockFlag, socketpair};
 
-use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::linux::init_client::{DrainedEvent, InitClient};
@@ -863,6 +863,56 @@ impl SandboxBackend for LinuxBackend {
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         g.dynamic_shares.remove(name);
         Ok(())
+    }
+
+    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
+        self.ensure_running()?;
+        let home = opts
+            .home
+            .to_str()
+            .ok_or_else(|| Error::other(format!("non-UTF-8 home: {:?}", opts.home)))?
+            .to_string();
+        let cwd = opts
+            .cwd
+            .as_ref()
+            .map(|p| {
+                p.to_str()
+                    .ok_or_else(|| Error::other(format!("non-UTF-8 cwd: {p:?}")))
+                    .map(str::to_string)
+            })
+            .transpose()?;
+        let env_overlay = opts.env.clone();
+        let real_user = opts.real_user;
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?)
+        };
+        let info = client
+            .add_user(user_id, &home, cwd.as_deref(), &env_overlay, real_user)
+            .map_err(|e| Error::other(format!("init add_user failed: {e}")))?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let job_id = JobId(format!("j{}", g.next_job_id));
+        g.next_job_id += 1;
+        g.jobs.insert(
+            job_id.0.clone(),
+            JobSpawnInfo {
+                child_id: info.child_id.clone(),
+                pty_fd: None,
+            },
+        );
+        g.child_to_job.insert(info.child_id, job_id.clone());
+        Ok(job_id)
+    }
+
+    fn remove_user(&self, user_id: &str) -> Result<()> {
+        self.ensure_running()?;
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?)
+        };
+        client
+            .remove_user(user_id)
+            .map_err(|e| Error::other(format!("init remove_user failed: {e}")))
     }
 }
 

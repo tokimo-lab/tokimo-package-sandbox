@@ -834,39 +834,102 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::AddUser {
             id,
             user_id,
+            home,
             cwd,
             env_overlay,
+            real_user,
         } => {
-            // Ensure per-user directories exist.
-            let tmpdir = format!("/tmp/{}", user_id);
-            let workdir = format!("/work/{}", user_id);
-            let _ = std::fs::create_dir_all(&tmpdir);
-            let _ = std::fs::create_dir_all(&workdir);
+            // Validate user_id — must not contain shell metacharacters
+            // because we splice it into a sh -c script when real_user.
+            if !is_valid_user_id(&user_id) {
+                ack(
+                    state,
+                    client_fd,
+                    id,
+                    Err(ErrorReply::new(
+                        ErrorCode::BadRequest,
+                        format!("invalid user_id {user_id:?}: must match [A-Za-z0-9_-]+, len 1..=32"),
+                    )),
+                );
+                return;
+            }
 
-            // Build per-user env with TMPDIR + HOME isolation.
-            // We must bypass `merge_env`'s PROTECTED_ENV filter here
-            // because TMPDIR and HOME *are* the isolation boundary.
-            let mut env = merge_env(&state.base_env, &env_overlay);
-            // Override TMPDIR and HOME directly (they would be dropped by merge_env).
-            env.retain(|(k, _)| k != "TMPDIR" && k != "HOME");
-            env.push(("TMPDIR".into(), tmpdir));
-            env.push(("HOME".into(), format!("/home/{}", user_id)));
+            // Ensure HOME exists. Idempotent: if a host directory was
+            // pre-mounted here via add_mount the existing mount point
+            // stays as-is.
+            let _ = std::fs::create_dir_all(&home);
 
-            let effective_cwd = cwd.unwrap_or(workdir);
+            // Base env for the wrapping `sh` process. We do NOT preset
+            // USER/LOGNAME/HOME/PS1/MAIL here:
+            //   * VM path → `runuser -l` derives them from /etc/passwd.
+            //   * bwrap fallback path → the sh script `export`s them
+            //     before exec'ing bash.
+            // env_overlay is included so the fallback path inherits it
+            // automatically; the login path re-exports it inside the
+            // -c snippet because `runuser -l` clears env.
+            let env = merge_env(&state.base_env, &env_overlay);
+            let effective_cwd = cwd.unwrap_or_else(|| home.clone());
+
+            // real_user=true: hybrid script. Try real account creation
+            // + `runuser -l` (works on macOS VZ / Windows HCS where the
+            // VM has a real root). If that fails (Linux bwrap: user ns
+            // fake-root cannot write /etc/passwd), fall back to plain
+            // bash with manually-injected env (USER/HOME/PS1 etc.).
+            let argv = if real_user {
+                // Re-export env_overlay across the runuser -l boundary
+                // (login clears env). Fallback path doesn't need this
+                // because env is already in the sh process's env.
+                let exports: String = env_overlay
+                    .iter()
+                    .map(|(k, v)| format!("export {}={}; ", k, shell_quote(v)))
+                    .collect();
+                let home_q = shell_quote(&home);
+                let cwd_q = shell_quote(&effective_cwd);
+                let inner = format!("{exports}cd {cwd_q} 2>/dev/null || true; exec bash");
+                let inner_q = shell_quote(&inner);
+                // user_id is validated [A-Za-z0-9_-]+ so direct splice is safe.
+                let script = format!(
+                    "if ! getent passwd {uid} >/dev/null 2>&1; then \
+                         useradd -M -d {home_q} -s /bin/bash -g 1000 -N {uid} 2>/dev/null \
+                         || adduser -D -H -h {home_q} -s /bin/bash -G users {uid} 2>/dev/null \
+                         || true; \
+                     fi; \
+                     if getent passwd {uid} >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then \
+                         exec runuser -l {uid} -c {inner_q}; \
+                     fi; \
+                     export USER={uid} LOGNAME={uid} HOME={home_q} \
+                            PS1='\\u@tokimo:\\w\\$ ' MAIL=/var/mail/{uid}; \
+                     cd {cwd_q} 2>/dev/null || true; \
+                     exec /bin/bash --noprofile --norc",
+                    uid = user_id,
+                    home_q = home_q,
+                    cwd_q = cwd_q,
+                    inner_q = inner_q,
+                );
+                vec!["/bin/sh".into(), "-c".into(), script]
+            } else {
+                vec!["/bin/bash".into(), "--noprofile".into(), "--norc".into()]
+            };
+
             spawn_child_inner(
                 client_fd,
                 state,
                 registry,
                 id,
-                vec!["/bin/bash".into(), "--noprofile".into(), "--norc".into()],
+                argv,
                 env,
                 Some(effective_cwd),
                 StdioMode::Pipes,
                 ChildKind::Shell,
             );
         }
-        Op::RemoveUser { id, user_id: _user_id } => {
-            // Kill all children owned by this client.
+        Op::RemoveUser { id, user_id } => {
+            // Best-effort: SIGKILL every shell whose argv mentions this
+            // user_id (we don't track per-user ownership in init state),
+            // plus userdel if the account exists. The host already knows
+            // which child_ids belong to which user via add_user replies,
+            // so the canonical cleanup path is host-driven Op::Signal +
+            // RemoveUser; this op is the safety net.
             let child_ids: Vec<String> = state
                 .children
                 .iter()
@@ -879,6 +942,16 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 {
                     let _ = killpg(Pid::from_raw(rec.pgid), Signal::SIGKILL);
                 }
+            }
+            // Best-effort userdel — ignore errors (account may not have
+            // been created in env-only mode).
+            if is_valid_user_id(&user_id) {
+                let _ = std::process::Command::new("/usr/sbin/userdel")
+                    .arg("-f")
+                    .arg(&user_id)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
             ack(state, client_fd, id, Ok(()));
         }
@@ -1535,6 +1608,29 @@ fn spawn_child_inner(
             state.send_to_client(client_fd, &Frame::Reply(reply), send_fd);
         }
     }
+}
+
+/// Validate `user_id`: only ASCII letters, digits, underscore, and dash;
+/// length 1..=32. Used by `Op::AddUser`/`Op::RemoveUser` because the id
+/// is interpolated into a `sh -c` script.
+fn is_valid_user_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// POSIX single-quote escape, used for splicing untrusted paths into a
+/// `sh -c` script body.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn merge_env(base: &[(String, String)], overlay: &[(String, String)]) -> Vec<(String, String)> {

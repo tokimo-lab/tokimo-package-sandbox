@@ -44,6 +44,50 @@ From a non-admin shell (Claude Code, CI, etc.):
 Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\test-integration.ps1' -Verb RunAs -Wait
 ```
 
+### Correct end-to-end procedure (after editing source)
+
+The integration suite spans **three** build artifacts; if any of them is
+stale, tests run against old code and fail mysteriously. Always do these
+in order from a non-admin shell, then run the elevated script:
+
+| Edited file path | Required rebuild step | Why |
+|---|---|---|
+| `src/lib.rs`, `src/api.rs`, `src/windows/**`, `src/svc_protocol.rs`, `src/shared_backend.rs`, `src/bin/tokimo-sandbox-svc/**`, `tests/**` | (none — `test-integration.ps1` rebuilds these) | The wrapper script invokes `cargo build` and `cargo test` which produce `target/debug/tokimo-sandbox-svc.exe` + the test binary. |
+| `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`, `packaging/vm-base/init.sh` | **`pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm`** | The init binary runs **inside the guest VM**, not on Windows. It must be cross-compiled to `x86_64-unknown-linux-musl` and packed into `vm/initrd.img`. `cargo build` alone does not do this. |
+| Anything else in `src/` (lib code shared by both sides) | Both of the above | The lib is linked into both `tokimo-sandbox-svc.exe` (host) and `tokimo-sandbox-init` (guest). |
+
+#### Pre-test cleanup (always)
+
+Leftover Hyper-V VMs from previous runs hold `vm/initrd.img` open and
+will block both the rebake step and the next test run. Before any test
+session, kill them (admin pwsh):
+
+```powershell
+hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
+    if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+}
+Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+#### Run order
+
+1. **Edit source.**
+2. **If you touched `src/bin/tokimo-sandbox-init/**` or `src/protocol/**`:** rebake.
+   ```powershell
+   pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm
+   ```
+   (If `Copy-Item ... cannot access ... initrd.img` — leftover VMs are
+   still open. Run the cleanup snippet above, then retry.)
+3. **Run the elevated wrapper** (do NOT pass `-SkipBuild`; cargo test
+   will trigger a relink that races with the running svc.exe if its
+   binary on disk is older than the lib).
+   ```powershell
+   Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\windows\test-integration.ps1' -Verb RunAs -Wait
+   ```
+4. **Read results** from `target/integration/test.log` (the wrapper's
+   own console output is lost when its window closes; capture it with
+   `-Command "Start-Transcript ...; & ...; Stop-Transcript"` if needed).
+
 Direct invocation (skip the wrapper, e.g. when you already have the service
 running and an elevated terminal):
 

@@ -204,6 +204,37 @@ impl VsockInitClient {
         self.ack_op(&id, op)
     }
 
+    /// AddUser → returns child_id of the per-user bash shell.
+    pub fn add_user(
+        &self,
+        user_id: &str,
+        home: &str,
+        cwd: Option<&str>,
+        env_overlay: &[(String, String)],
+        real_user: bool,
+    ) -> Result<SpawnInfo> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+            home: home.into(),
+            cwd: cwd.map(str::to_string),
+            env_overlay: env_overlay.to_vec(),
+            real_user,
+        };
+        self.spawn_ack(&id, op)
+    }
+
+    /// RemoveUser — best-effort SIGKILL + userdel inside the guest.
+    pub fn remove_user(&self, user_id: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveUser {
+            id: id.clone(),
+            user_id: user_id.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
     /// Spawn (PTY mode). VSOCK has no SCM_RIGHTS, so the master fd stays
     /// inside the guest; init streams its stdout via `Reply::Stdout`
     /// events the same way pipe-mode children do.

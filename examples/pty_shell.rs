@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host_path: cwd,
             guest_path: "/work".into(),
             read_only: false,
+            create_host_dir: false,
         }],
         ..Default::default()
     })?;
