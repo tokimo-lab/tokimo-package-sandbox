@@ -56,6 +56,41 @@ in order from a non-admin shell, then run the elevated script:
 | `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`, `packaging/vm-base/init.sh` | **`pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm`** | The init binary runs **inside the guest VM**, not on Windows. It must be cross-compiled to `x86_64-unknown-linux-musl` and packed into `vm/initrd.img`. `cargo build` alone does not do this. |
 | Anything else in `src/` (lib code shared by both sides) | Both of the above | The lib is linked into both `tokimo-sandbox-svc.exe` (host) and `tokimo-sandbox-init` (guest). |
 
+#### Binary lock: `cargo build --tests` vs running service
+
+`cargo build --tests` triggers a relink of **all** binaries that depend
+on the library, including `tokimo-sandbox-svc.exe`. If the service is
+already running, Windows holds an exclusive lock on the `.exe` and the
+relink fails with `Access is denied (os error 5)`. The
+`test-integration.ps1` script kills the service before building, but if
+you run `cargo build` or `cargo test` manually while the service is up,
+you will hit this.
+
+**Safe manual workflow:**
+
+```powershell
+# 1. Kill service + leftover VMs (admin).
+Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
+hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
+    if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+}
+
+# 2. Build everything (service is not running, so relink succeeds).
+cargo build --tests
+
+# 3. Launch service + run tests (-SkipBuild skips the redundant rebuild).
+scripts\windows\test-integration.ps1 -SkipBuild
+```
+
+#### `tokimo-sandbox-fuse` in the initrd
+
+The FUSE-over-vsock mount channel requires the `tokimo-sandbox-fuse`
+binary to be present inside the guest VM at `/bin/tokimo-sandbox-fuse`.
+The `rebake-initrd.ps1` script cross-compiles and installs it
+automatically (via `--fuse-bin`). If you see
+`spawn tokimo-sandbox-fuse: No such file or directory` in test output,
+the initrd is stale — re-run `rebake-initrd.ps1 -InstallToVm`.
+
 #### Pre-test cleanup (always)
 
 Leftover Hyper-V VMs from previous runs hold `vm/initrd.img` open and
@@ -72,12 +107,17 @@ Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -For
 #### Run order
 
 1. **Edit source.**
-2. **If you touched `src/bin/tokimo-sandbox-init/**` or `src/protocol/**`:** rebake.
+2. **If you touched `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`,
+   or `packaging/vm-base/init.sh`:** rebake (admin required to release
+   `vm/initrd.img` lock from leftover VMs).
    ```powershell
+   # Kill leftover VMs first if Copy-Item fails with "cannot access".
+   hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
+       if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
+   }
+   Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
    pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm
    ```
-   (If `Copy-Item ... cannot access ... initrd.img` — leftover VMs are
-   still open. Run the cleanup snippet above, then retry.)
 3. **Run the elevated wrapper** (do NOT pass `-SkipBuild`; cargo test
    will trigger a relink that races with the running svc.exe if its
    binary on disk is older than the lib).
@@ -101,6 +141,11 @@ To run a single test:
 cargo test --test sandbox_integration <test_name> -- --nocapture
 ```
 
+**Important:** `cargo test` rebuilds the lib and relinks all dependent
+binaries. If `tokimo-sandbox-svc.exe` is currently running, the relink
+will fail with `Access is denied`. Kill the service first, or use
+`-SkipBuild` with the wrapper script. See "Binary lock" section above.
+
 ### Debug artefacts
 
 | Path | Content |
@@ -112,7 +157,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 
 ### Test inventory
 
-16 tests, all currently green (~45 s wall):
+16 tests (+ platform-specific), all currently green (~98 s wall):
 
 | # | Name | What it asserts |
 |---|------|-----------------|
@@ -121,10 +166,10 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 | 3 | `shell_id_after_stop_is_error` | `shell_id()` errors after `stop_vm` |
 | 4 | `shell_stdout_echo` | `write_stdin("echo X\n")` → guest emits `X` on the event stream |
 | 5 | `shell_runs_multiple_commands` | `pwd` / `uname -a` / `id` output captured |
-| 6 | `plan9_host_file_visible_in_guest` | Host writes sentinel file → guest `cat` returns same bytes (real I/O) |
+| 6 | `fuse_host_file_visible_in_guest` | Host writes sentinel file → guest `cat` returns same bytes (real I/O) |
 | 7 | `status_rpcs_during_blocking_shell` | `status()` returns under load (5 calls in <2 s while shell is busy) |
 | 8 | `multi_session_concurrent` | Two parallel sessions each run a marker — no cross-talk |
-| 9 | `plan9_dynamic_add_remove` | `add_mount` after start exposes content; `remove_mount` retracts it |
+| 9 | `fuse_dynamic_add_remove` | `add_mount` after start exposes content; `remove_mount` retracts it |
 | 10 | `signal_shell_delivers_sigint` | `signal_shell(boot, 2)` produces `Event::Exit { signal: Some(2) }` for the boot shell |
 | 11 | `network_blocked_only_loopback` | `NetworkPolicy::Blocked` → `/sys/class/net/` only `lo`; bash `/dev/tcp/1.1.1.1/53` times out |
 | 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC enumerated **and** `bash exec 3<>/dev/tcp/1.1.1.1/53` succeeds (cross-platform egress capability check; the previous Windows-only HCN 192.168.127.0/24 subnet assertion was dropped so Linux bwrap + macOS VZ pass without backend-specific carve-outs) |
@@ -137,11 +182,10 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 
 The file uses only public API types. Caveats per backend:
 
-- **`Mount`**: on Windows this maps to plan9-over-vsock (real shared
+- **`Mount`**: on Windows this maps to FUSE-over-vsock (real shared
   filesystem). Linux (bwrap) uses `--bind host_path guest_path` (or a
-  runtime `AddMountFd` for dynamic shares). macOS uses two virtio-fs
-  share devices (a static `work` tag and a dynamic `tokimo_dyn` pool
-  bind-mounted inside the guest). All three backends honor the same
+  runtime `AddMountFd` for dynamic shares). macOS uses FUSE-over-vsock
+  (same mechanism as Windows). All three backends honor the same
   `Mount { name, host_path, guest_path }` contract — tests 6 and
   9 are written against observable behavior, not a specific transport.
 - **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
@@ -185,13 +229,13 @@ self-throttling under heavy parallelism).
 The Linux backend lives in `src/linux/`. Cross-cutting decisions worth
 knowing when porting tests or debugging:
 
-- **Mount story.** Plan9 / virtio-fs are unavailable outside a VM, so
+- **Mount story.** FUSE / virtio-fs are unavailable outside a VM, so
   `Mount { host_path, guest_path }` is implemented as a `bwrap`
   bind mount (`--bind host_path guest_path`). Capabilities and tests
   6 / 9 (host file visible in guest, dynamic add/remove) work because
   init holds `CAP_SYS_ADMIN` over the user-namespace and can issue
   runtime `mount(2)` calls via the `AddMountFd` op. Same observable
-  semantics as Windows plan9, different mechanism.
+  semantics as Windows FUSE-over-vsock, different mechanism.
 - **`/sys` is policy-aware.**
   * `AllowAll` → host `/sys` is bind-mounted read-only (the netns is
     shared, so the host NIC list is the correct view).
@@ -277,15 +321,15 @@ The macOS backend lives in `src/macos/`. Cross-cutting decisions worth
 knowing when porting tests or debugging:
 
 - **Mount story.** `Mount { host_path, guest_path }` is **not**
-  implemented over Plan9. macOS uses two virtio-fs share devices:
+  implemented over FUSE-over-vsock. macOS uses FUSE-over-vsock:
   - `tag="work"` — read-only host workspace tree (the per-Sandbox
     `session_dir` lives under `~/.tokimo/sessions/...`).
   - `tag="tokimo_dyn"` — a per-session dynamic pool mounted at
     `/__tokimo_dyn` inside the guest. `add_mount` /
     `remove_mount` create/destroy bind mounts inside this pool
     via init RPCs, exposing the same `host_path → guest_path` contract
-    as the Windows Plan9-over-vsock backend. The transport differs
-    (virtio-fs vs Plan9), but tests 6 and 9 pass because they target
+    as the Windows FUSE-over-vsock backend. The transport differs
+    (virtio-fs vs FUSE), but tests 6 and 9 pass because they target
     observable behavior.
 - **Network policy.**
   * `AllowAll` → `VZNetworkDeviceConfiguration::nat()` (vmnet-backed).
@@ -320,7 +364,7 @@ knowing when porting tests or debugging:
 
 All 16 tests pass (~25 s wall on M-series, single-threaded). The
 inventory is identical to the Windows table above; behavioral
-differences are limited to the mount mechanism (virtio-fs not Plan9)
+differences are limited to the mount mechanism (virtio-fs not FUSE)
 and the egress path (vmnet NAT not HCN NAT).
 
 ## Editing tests

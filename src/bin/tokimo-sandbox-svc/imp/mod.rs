@@ -47,14 +47,17 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use std::collections::HashSet;
+
 use tokimo_package_sandbox::canonicalize_safe;
-use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
     AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult,
     JobIdResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams, ResizeShellParams, RootfsSpec,
     RpcError, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
+use tokimo_package_sandbox::vfs_host::FuseHost;
+use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
 use tokimo_package_sandbox::{ConfigureParams, Mount, NetworkPolicy};
 
 mod hcs;
@@ -62,6 +65,38 @@ mod hvsock;
 mod netstack;
 mod vhdx_pool;
 mod vmconfig;
+
+/// Convert an [`hvsock::HvSock`] to a [`tokio::net::TcpStream`].
+///
+/// HvSocket uses Winsock2 `SOCK_STREAM` sockets. Tokio's reactor on
+/// Windows uses IOCP which works with any Winsock socket regardless of
+/// address family. We set the socket to non-blocking via `ioctlsocket`,
+/// wrap it as a `std::net::TcpStream`, and let tokio register it with
+/// IOCP.
+///
+/// **Must be called from within a tokio runtime context** (e.g. inside
+/// `block_on` or an async task) so that `from_std` can register with
+/// the reactor.
+fn hvsock_to_tokio_stream(sock: hvsock::HvSock) -> std::io::Result<tokio::net::TcpStream> {
+    use std::os::windows::io::{FromRawSocket, RawSocket};
+    use windows::Win32::Networking::WinSock::{FIONBIO, SOCKET, ioctlsocket};
+
+    let raw = sock.raw_socket();
+    // Prevent the HvSock Drop from closing the socket — ownership moves
+    // to the TcpStream.
+    std::mem::forget(sock);
+
+    // Set non-blocking via Winsock ioctlsocket so tokio's reactor can
+    // drive it via IOCP.
+    let mut mode: u32 = 1; // non-blocking
+    let rc = unsafe { ioctlsocket(SOCKET(raw), FIONBIO, &mut mode) };
+    if rc != 0 {
+        return Err(std::io::Error::other("ioctlsocket FIONBIO failed"));
+    }
+
+    let std_stream = unsafe { std::net::TcpStream::from_raw_socket(raw as RawSocket) };
+    tokio::net::TcpStream::from_std(std_stream)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -411,24 +446,22 @@ struct SessionState {
     /// Child ID of the auto-started shell (set by startVm).
     shell_child_id: Option<String>,
     children: HashMap<String, ChildEntry>,
-    /// Plan9 shares currently attached to the VM. Keyed by share `name`.
-    /// Includes both boot-time shares (immutable) and dynamically-added
-    /// shares; only the latter are removable.
-    active_shares: HashMap<String, ActiveShare>,
+    /// FUSE-over-vsock host serving all user mounts.
+    fuse_host: Option<Arc<FuseHost>>,
+    /// Vsock port the FUSE listener accepts connections on.
+    fuse_port: u32,
+    /// Map of mount name → FUSE mount_id for currently registered mounts.
+    fuse_mount_names: HashMap<String, u32>,
+    /// Names of mounts declared at boot time (immutable; cannot be removed).
+    boot_mount_names: HashSet<String>,
+    /// Dedicated tokio runtime driving FuseHost serve tasks.
+    fuse_rt: Option<tokio::runtime::Runtime>,
     /// Userspace netstack handle (None when NetworkPolicy::Blocked). The
     /// AtomicBool is the shutdown flag; setting it makes the netstack
     /// thread stop within ~50ms. The thread itself is detached.
     netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     running: bool,
     guest_connected: bool,
-}
-
-struct ActiveShare {
-    port: u32,
-    /// True for shares attached at boot-time via `build_session_v2`; the
-    /// dispatcher refuses `removeMount` for these because the HCS
-    /// schema rejects `Remove` on shares declared in the original config.
-    boot_time: bool,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -441,7 +474,11 @@ impl Default for SessionState {
             vhdx: None,
             shell_child_id: None,
             children: HashMap::new(),
-            active_shares: HashMap::new(),
+            fuse_host: None,
+            fuse_port: 0,
+            fuse_mount_names: HashMap::new(),
+            boot_mount_names: HashSet::new(),
+            fuse_rt: None,
             netstack_shutdown: None,
             running: false,
             guest_connected: false,
@@ -917,27 +954,17 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         None
     };
 
-    let share_ports: Vec<u32> = (0..canon_shares.len()).map(|_| vmconfig::alloc_share_port()).collect();
-    let v2_shares: Vec<vmconfig::V2Share<'_>> = canon_shares
-        .iter()
-        .zip(share_ports.iter())
-        .map(|((host_path, spec), port)| vmconfig::V2Share {
-            host_path: host_path.as_path(),
-            name: spec.name.as_str(),
-            port: *port,
-            read_only: spec.read_only,
-        })
-        .collect();
+    let fuse_port = vmconfig::alloc_fuse_port();
 
     let cfg_json = vmconfig::build_session_v2_ex(
         &vm_id,
         &kernel,
         &initrd,
         lease.path(),
-        &v2_shares,
         cfg.memory_mb,
         cfg.cpu_count as usize,
         init_port,
+        fuse_port,
         netstack_port,
     );
 
@@ -1020,19 +1047,78 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         None
     };
 
-    // Send mount manifest so guest-side init can mount each Plan9 share.
-    let manifest: Vec<MountEntry> = canon_shares
-        .iter()
-        .zip(share_ports.iter())
-        .map(|((_host, spec), port)| MountEntry {
-            vsock_port: *port,
-            guest_path: spec.guest_path.to_string_lossy().into_owned(),
-            aname: spec.name.clone(),
-            read_only: spec.read_only,
-        })
-        .collect();
-    init.send_mount_manifest(manifest)
-        .map_err(|e| RpcError::new("mount_manifest", e.to_string()))?;
+    // Set up FUSE-over-vsock host for user mounts.
+    let fuse_host: Arc<FuseHost> = Arc::new(FuseHost::new());
+    let fuse_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| RpcError::new("tokio_rt", e.to_string()))?;
+
+    // Spawn an HvSocket accept loop for FUSE connections in a
+    // background thread. Each accepted connection gets its own
+    // dedicated tokio runtime (single-threaded) so that
+    // TcpStream::from_std has a reactor available.
+    {
+        let fuse_host = fuse_host.clone();
+        thread::spawn(move || {
+            loop {
+                match hvsock::listen_and_accept_on_port(fuse_port) {
+                    Ok(hv) => {
+                        let host = fuse_host.clone();
+                        thread::spawn(move || {
+                            // Create a dedicated single-threaded tokio
+                            // runtime for this connection. This ensures
+                            // from_std() has a reactor available.
+                            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                                Ok(rt) => rt,
+                                Err(e) => {
+                                    eprintln!("[fuse] runtime build: {e}");
+                                    return;
+                                }
+                            };
+                            rt.block_on(async move {
+                                let stream = match hvsock_to_tokio_stream(hv) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("[fuse] hvsock_to_tokio: {e}");
+                                        return;
+                                    }
+                                };
+                                if let Err(e) = host.serve(stream).await {
+                                    eprintln!("[fuse] serve: {e}");
+                                }
+                            });
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[fuse] accept error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Register boot-time mounts with FuseHost and tell the guest to
+    // mount them via FUSE.
+    let mut fuse_mount_names = HashMap::new();
+    let mut boot_mount_names = HashSet::new();
+    for (canon_path, spec) in canon_shares.iter() {
+        let backend = LocalDirVfs::arc(canon_path.clone());
+        let mount_id = fuse_host.register_mount(&spec.name, backend, spec.read_only);
+        if let Err(e) = init.mount_fuse(
+            &spec.name,
+            fuse_port,
+            &spec.guest_path.to_string_lossy(),
+            spec.read_only,
+        ) {
+            fuse_host.remove_mount(mount_id);
+            return Err(RpcError::new("mount_fuse", e.to_string()));
+        }
+        fuse_mount_names.insert(spec.name.clone(), mount_id);
+        boot_mount_names.insert(spec.name.clone());
+    }
 
     // Auto-start a shell inside the VM.
     let shell_info = init
@@ -1070,18 +1156,11 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         st.netstack_shutdown = netstack_shutdown;
         st.running = true;
         st.guest_connected = true;
-        // Record boot-time shares so dynamic add/remove can validate
-        // name uniqueness and reject removal of the immutable ones.
-        st.active_shares.clear();
-        for ((_host, spec), port) in canon_shares.iter().zip(share_ports.iter()) {
-            st.active_shares.insert(
-                spec.name.clone(),
-                ActiveShare {
-                    port: *port,
-                    boot_time: true,
-                },
-            );
-        }
+        st.fuse_host = Some(fuse_host);
+        st.fuse_port = fuse_port;
+        st.fuse_mount_names = fuse_mount_names;
+        st.boot_mount_names = boot_mount_names;
+        st.fuse_rt = Some(fuse_rt);
     }
 
     // Emit Ready + GuestConnected events.
@@ -1108,7 +1187,14 @@ fn teardown_session(st: &mut SessionState) {
     }
     st.shell_child_id = None;
     st.children.clear();
-    st.active_shares.clear();
+    // Drop FuseHost first (causes in-flight serve tasks to see EOF),
+    // then shut down the tokio runtime.
+    st.fuse_host = None;
+    if let Some(rt) = st.fuse_rt.take() {
+        drop(rt);
+    }
+    st.fuse_mount_names.clear();
+    st.boot_mount_names.clear();
     st.vhdx = None;
     // Stop the userspace netstack thread before tearing down HCS so it
     // can flush in-flight frames cleanly.
@@ -1304,10 +1390,8 @@ fn handle_add_mount(conn: &Arc<Connection>, p: AddMountParams, sessions: &Window
     if share.name.is_empty() {
         return Err(RpcError::new("validation", "share name must not be empty"));
     }
-    // Snapshot what we need under the lock; release before long blocking
-    // calls (HCS modify, init RPC).
     let shared = get_session(conn, sessions)?;
-    let (api, cs, init) = {
+    let (fuse_host, fuse_port, init) = {
         let st = shared.state.lock().unwrap();
         if !st.running {
             return Err(RpcError::new(
@@ -1315,52 +1399,41 @@ fn handle_add_mount(conn: &Arc<Connection>, p: AddMountParams, sessions: &Window
                 "VM is not running; call startVm() first",
             ));
         }
-        if st.active_shares.contains_key(&share.name) {
+        if st.fuse_mount_names.contains_key(&share.name) {
             return Err(RpcError::new(
                 "duplicate_share",
                 format!("share {:?} already attached", share.name),
             ));
         }
-        let (api, cs, _id) = st
-            .hcs
-            .as_ref()
-            .ok_or_else(|| RpcError::new("vm_not_running", "no live HCS handle"))?
-            .clone();
+        let fuse_host = st
+            .fuse_host
+            .clone()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no FuseHost"))?;
         let init = st
             .init
             .clone()
             .ok_or_else(|| RpcError::new("vm_not_running", "no init client"))?;
-        (api, cs, init)
+        (fuse_host, st.fuse_port, init)
     };
 
     let canon = canonicalize_safe(&share.host_path)
         .map_err(|e| RpcError::new("bad_path", format!("host_path ({}): {e}", share.host_path.display())))?;
 
-    let port = vmconfig::alloc_plan9_port();
-    let req_json = vmconfig::plan9_modify_request(&share.name, &canon, port, "Add");
-
-    api.modify_compute_system(cs, &req_json)
-        .map_err(|e| RpcError::new("hcs_modify", e))?;
-
-    // Tell the guest to dial + mount the new share.
-    let entry = MountEntry {
-        vsock_port: port,
-        guest_path: share.guest_path.to_string_lossy().into_owned(),
-        aname: share.name.clone(),
-        read_only: share.read_only,
-    };
-    if let Err(e) = init.add_mount(entry) {
-        // Best-effort rollback: detach the share from the VM so the
-        // host doesn't leak the Plan9 endpoint.
-        let rollback = vmconfig::plan9_modify_request(&share.name, &canon, port, "Remove");
-        let _ = api.modify_compute_system(cs, &rollback);
+    let backend = LocalDirVfs::arc(canon);
+    let mount_id = fuse_host.register_mount(&share.name, backend, share.read_only);
+    if let Err(e) = init.mount_fuse(
+        &share.name,
+        fuse_port,
+        &share.guest_path.to_string_lossy(),
+        share.read_only,
+    ) {
+        fuse_host.remove_mount(mount_id);
         return Err(RpcError::new("guest_mount", e.to_string()));
     }
 
     {
         let mut st = shared.state.lock().unwrap();
-        st.active_shares
-            .insert(share.name.clone(), ActiveShare { port, boot_time: false });
+        st.fuse_mount_names.insert(share.name.clone(), mount_id);
     }
 
     Ok(json!({}))
@@ -1377,7 +1450,7 @@ fn handle_remove_mount(
     }
 
     let shared = get_session(conn, sessions)?;
-    let (api, cs, init, port) = {
+    let (fuse_host, init) = {
         let st = shared.state.lock().unwrap();
         if !st.running {
             return Err(RpcError::new(
@@ -1385,45 +1458,39 @@ fn handle_remove_mount(
                 "VM is not running; call startVm() first",
             ));
         }
-        let entry = st
-            .active_shares
-            .get(&name)
-            .ok_or_else(|| RpcError::new("unknown_share", format!("no share named {name:?}")))?;
-        if entry.boot_time {
+        if st.boot_mount_names.contains(&name) {
             return Err(RpcError::new(
                 "immutable_share",
                 format!("share {name:?} was attached at boot and cannot be removed"),
             ));
         }
-        let port = entry.port;
-        let (api, cs, _id) = st
-            .hcs
-            .as_ref()
-            .ok_or_else(|| RpcError::new("vm_not_running", "no live HCS handle"))?
-            .clone();
+        if !st.fuse_mount_names.contains_key(&name) {
+            return Err(RpcError::new("unknown_share", format!("no share named {name:?}")));
+        }
+        let fuse_host = st
+            .fuse_host
+            .clone()
+            .ok_or_else(|| RpcError::new("vm_not_running", "no FuseHost"))?;
         let init = st
             .init
             .clone()
             .ok_or_else(|| RpcError::new("vm_not_running", "no init client"))?;
-        (api, cs, init, port)
+        (fuse_host, init)
     };
 
-    // Unmount guest-side first so the kernel releases the 9p fd before
-    // we tell HCS to tear down the host endpoint.
-    if let Err(e) = init.remove_mount(&name) {
+    // Unmount guest-side first (umount + SIGTERM fuse child).
+    if let Err(e) = init.unmount_fuse(&name) {
         return Err(RpcError::new("guest_unmount", e.to_string()));
     }
 
-    // Path is irrelevant for Remove (HCS keys off Name+Port); pass an
-    // empty placeholder.
-    let req_json = vmconfig::plan9_modify_request(&name, std::path::Path::new(""), port, "Remove");
-    if let Err(e) = api.modify_compute_system(cs, &req_json) {
-        return Err(RpcError::new("hcs_modify", e));
+    // Deregister the backend from FuseHost.
+    if let Some(mount_id) = fuse_host.mount_id_by_name(&name) {
+        fuse_host.remove_mount(mount_id);
     }
 
     {
         let mut st = shared.state.lock().unwrap();
-        st.active_shares.remove(&name);
+        st.fuse_mount_names.remove(&name);
     }
 
     Ok(json!({}))
@@ -1920,7 +1987,8 @@ mod tests {
         assert!(st.hcs.is_none());
         assert!(st.init.is_none());
         assert!(st.children.is_empty());
-        assert!(st.active_shares.is_empty());
+        assert!(st.fuse_mount_names.is_empty());
+        assert!(st.boot_mount_names.is_empty());
     }
 
     #[test]

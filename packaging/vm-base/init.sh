@@ -4,11 +4,10 @@
 # Boot model:
 #   * macOS VZ:  workspace_dir is mounted as `work` via virtio-fs and
 #                also serves as the rootfs (chroot target). Single share.
-#   * Windows HCS: TWO Plan9-over-vsock shares:
-#       - rootshare (port from tokimo.rootshare_port=) → Debian rootfs
-#       - work      (port from tokimo.work_port=)      → workspace
-#     The guest mounts rootshare at /newroot, work at /newroot/mnt/work,
-#     bind-mounts /proc /sys /dev /run, then switch_root and exec.
+#   * Windows HCS: SCSI VHDX rootfs + FUSE-over-vsock for user mounts.
+#     The guest mounts the VHDX at /newroot, bind-mounts /proc /sys /dev
+#     /run, then switch_root and exec. User mounts are handled at runtime
+#     by tokimo-sandbox-init via MountFuse ops.
 #
 # Output goes to /mnt/work/.vz_{stdout,stderr,exit_code} (relative to the
 # rootfs after switch_root). The host reads them after the VM powers off.
@@ -24,8 +23,6 @@ echo "tokimo-init: cmdline=$CMDLINE" >/dev/kmsg 2>/dev/null || true
 
 # Parse kernel cmdline.
 CMD_B64=""
-ROOTSHARE_PORT=""
-WORK_PORT=""
 SESSION_MODE=0
 INIT_PORT=50003
 NETSTACK_PORT=""
@@ -34,8 +31,6 @@ NETDNS=on
 for arg in $CMDLINE; do
     case "$arg" in
         run=*)                       CMD_B64="${arg#run=}" ;;
-        tokimo.rootshare_port=*)     ROOTSHARE_PORT="${arg#tokimo.rootshare_port=}" ;;
-        tokimo.work_port=*)          WORK_PORT="${arg#tokimo.work_port=}" ;;
         tokimo.session=1)            SESSION_MODE=1 ;;
         tokimo.init_port=*)          INIT_PORT="${arg#tokimo.init_port=}" ;;
         tokimo.netstack_port=*)      NETSTACK_PORT="${arg#tokimo.netstack_port=}" ;;
@@ -52,8 +47,8 @@ fi
 /bin/busybox mkdir -p /mnt/work /newroot
 
 # ---------------------------------------------------------------------------
-# Load kernel modules from /modules (Hyper-V vsock + 9p stack).
-# Order matters: hv_vmbus first, then vsock + hv_sock + 9pnet stack.
+# Load kernel modules from /modules (Hyper-V vsock + FUSE stack).
+# Order matters: hv_vmbus first, then vsock + hv_sock + FUSE.
 # ---------------------------------------------------------------------------
 load_mod() {
     local m="/modules/$1.ko"
@@ -84,11 +79,6 @@ if [ -d /modules ]; then
     load_mod scsi_transport_fc
     load_mod hv_storvsc
     load_mod sd_mod
-    # 9p stack (9p needs netfs since 6.x).
-    load_mod netfs
-    load_mod 9pnet
-    load_mod 9pnet_fd
-    load_mod 9p
     # Hyper-V network virtual service client (synthetic NIC).
     # Optional: only present when the initrd was rebaked with networking
     # support. failover/net_failover are pulled in by netvsc when SR-IOV
@@ -146,34 +136,9 @@ if [ "$MOUNTED_ROOT" = 0 ] && [ -n "$ROOT_DEVICE" ] && [ -b "$ROOT_DEVICE" ]; th
     if /bin/busybox mount -t "$ROOTFSTYPE" -o rw "$ROOT_DEVICE" /newroot 2>/dev/null; then
         echo "tokimo-init: SCSI rootfs mounted from $ROOT_DEVICE ($ROOTFSTYPE)" >/dev/kmsg 2>/dev/null || true
         /bin/busybox mkdir -p /newroot/mnt/work
-        # Mount work share if port is available.
-        if [ -n "$WORK_PORT" ] && [ -x /bin/vsock9p ]; then
-            /bin/busybox mkdir -p /newroot/mnt/work
-            /bin/vsock9p /newroot/mnt/work "$WORK_PORT" work 2>/dev/null || true
-        fi
         MOUNTED_ROOT=1
     else
         echo "tokimo-init: SCSI mount $ROOT_DEVICE failed" >/dev/kmsg 2>/dev/null || true
-    fi
-fi
-
-# Windows HCS path: two Plan9-over-vsock shares.
-if [ "$MOUNTED_ROOT" = 0 ] && [ -n "$ROOTSHARE_PORT" ] && [ -n "$WORK_PORT" ]; then
-    if [ -x /bin/vsock9p ]; then
-        if /bin/vsock9p /newroot "$ROOTSHARE_PORT" rootshare; then
-            echo "tokimo-init: rootshare mounted on vsock port $ROOTSHARE_PORT" >/dev/kmsg 2>/dev/null || true
-            /bin/busybox mkdir -p /newroot/mnt/work
-            if /bin/vsock9p /newroot/mnt/work "$WORK_PORT" work; then
-                echo "tokimo-init: work share mounted on vsock port $WORK_PORT" >/dev/kmsg 2>/dev/null || true
-                MOUNTED_ROOT=1
-            else
-                echo "tokimo-init: work share mount failed" >/dev/kmsg 2>/dev/null || true
-            fi
-        else
-            echo "tokimo-init: rootshare mount failed" >/dev/kmsg 2>/dev/null || true
-        fi
-    else
-        echo "tokimo-init: /bin/vsock9p missing" >/dev/kmsg 2>/dev/null || true
     fi
 fi
 

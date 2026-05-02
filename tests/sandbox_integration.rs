@@ -178,11 +178,11 @@ fn shell_runs_multiple_commands() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Plan9 mount visibility
+// 3. FUSE mount visibility
 // ---------------------------------------------------------------------------
 
 #[test]
-fn plan9_host_file_visible_in_guest() {
+fn fuse_host_file_visible_in_guest() {
     const FNAME: &str = "tokimo_sentinel.txt";
     const BODY: &str = "SENTINEL_FROM_HOST_5C9D";
 
@@ -277,11 +277,11 @@ fn run_marker_session(label: &str, marker: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Plan9 dynamic add / remove
+// 6. FUSE dynamic add / remove
 // ---------------------------------------------------------------------------
 
 #[test]
-fn plan9_dynamic_add_remove() {
+fn fuse_dynamic_add_remove() {
     const FNAME: &str = "extra_sentinel.txt";
     const BODY: &str = "DYNAMIC_5E7C_HOST";
 
@@ -980,7 +980,7 @@ fn add_user_with_reverse_mount_writes_to_host() {
 
     // Host-side readback: the bytes written from inside the guest must
     // be visible on the host without any explicit sync — virtio-fs /
-    // plan9 / bwrap-bind all give us coherent shared storage.
+    // fuse / bwrap-bind all give us coherent shared storage.
     let host_path = bob_host.join("note.txt");
     let read = std::fs::read_to_string(&host_path).unwrap_or_default();
     assert!(

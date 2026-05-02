@@ -38,7 +38,7 @@ Sandbox client (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (Loc
                                                 └─ smoltcp userspace netstack ──▶ NAT (AllowAll)
 ```
 
-The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using JSON-RPC over length-prefixed frames (`src/svc_protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, runs a userspace netstack (smoltcp) for NAT, mounts the workspace over Plan9/vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
+The library (`src/windows/`) connects to the SYSTEM service over `\\.\pipe\tokimo-sandbox-svc` using JSON-RPC over length-prefixed frames (`src/svc_protocol.rs`). The service (`src/bin/tokimo-sandbox-svc/`) boots a Linux kernel+initrd (with a per-session VHDX clone for rootfs isolation) via HCS Schema 2.x, runs a userspace netstack (smoltcp) for NAT, mounts user directories over FUSE-over-vsock, and bridges the init control protocol over AF_HYPERV/HvSocket back to the library.
 
 Guest-side: `tokimo-sandbox-init` (`src/bin/tokimo-sandbox-init/`) runs as PID 1 inside the sandbox container. It supports two transports:
 - **Unix SEQPACKET** — for Linux bwrap backend
@@ -68,7 +68,7 @@ Sandbox client (library, in-process)
 ```
 
 No service, no daemon, no admin: the Linux backend is library-only and
-each `Sandbox` owns its own bwrap+init pair. Plan9 / virtio-fs are not
+each `Sandbox` owns its own bwrap+init pair. FUSE / virtio-fs are not
 available outside a VM, so `Mount` is implemented via `--bind`
 (static) and runtime `AddMountFd` ops (dynamic add/remove). API and
 observable behavior match the Windows backend; the mount mechanism

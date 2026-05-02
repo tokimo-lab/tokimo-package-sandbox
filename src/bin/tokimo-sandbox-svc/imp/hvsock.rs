@@ -185,6 +185,13 @@ pub struct HvSock {
 }
 
 impl HvSock {
+    /// Return the underlying Winsock2 SOCKET handle. The caller takes
+    /// ownership — call `std::mem::forget(sock)` to prevent `Drop` from
+    /// closing the socket.
+    pub fn raw_socket(&self) -> usize {
+        self.s.0
+    }
+
     pub fn try_clone(&self) -> io::Result<HvSock> {
         // Use WSADuplicateSocket-like approach via DuplicateHandle on the
         // SOCKET handle. Easier: call WSADuplicateSocket then WSASocket on
@@ -253,3 +260,18 @@ impl Drop for HvSock {
 
 unsafe impl Send for HvSock {}
 unsafe impl Sync for HvSock {}
+
+/// Convenience: bind an HvSocket listener on `port` and accept one
+/// guest connection (blocking). Used by the per-session FUSE accept
+/// loop thread.
+pub fn listen_and_accept_on_port(port: u32) -> io::Result<HvSock> {
+    use super::vmconfig::hvsock_service_id;
+    use windows::core::GUID;
+
+    let svc_guid_str = hvsock_service_id(port);
+    let svc_guid = GUID::try_from(svc_guid_str.as_str())
+        .map_err(|e| io::Error::other(format!("parse fuse service GUID: {e:?}")))?;
+    let listener = listen_for_guest(HV_GUID_WILDCARD, svc_guid)?;
+    // No timeout — the FUSE listener blocks until the guest connects.
+    accept_guest(&listener, Duration::from_secs(60))
+}

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
-use crate::protocol::types::{Event, Frame, MountEntry, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
+use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::protocol::wire::{recv_frame_stream, send_frame_stream};
 use crate::{Error, Result};
 
@@ -316,85 +316,30 @@ impl WinInitClient {
         self.ack_op(&id, op)
     }
 
-    /// Send a `MountManifest` op listing every share the guest must dial
-    /// and 9p-mount. Sent after `Hello` and before any `OpenShell`. The
-    /// service has already created an AF_HYPERV listener for each port
-    /// before booting the VM, so the guest can dial them without races.
-    /// The mount fds live forever inside init's `State` so the kernel
-    /// keeps the channels alive — there is no `Unmount` reply path for
-    /// shares; tearing the session down tears the mounts down.
-    pub fn send_mount_manifest(&self, entries: Vec<MountEntry>) -> Result<()> {
+    /// Tell the guest to mount a FUSE-over-vsock share. The host must
+    /// have already registered the mount name with `FuseHost` and started
+    /// the FUSE accept loop on `vsock_port`.
+    pub fn mount_fuse(&self, name: &str, vsock_port: u32, target: &str, read_only: bool) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::MountManifest {
+        let op = Op::MountFuse {
             id: id.clone(),
-            entries,
+            name: name.into(),
+            vsock_port,
+            target: target.into(),
+            read_only,
         };
-        // Mounting is a blocking operation in the guest (one vsock dial
-        // + one mount(2) per entry); allow plenty of time for slow boots
-        // / many shares before declaring the session dead.
-        let reply = self.send_op_sync(&id, op, Duration::from_secs(60))?;
-        match reply {
-            Reply::MountManifest {
-                ok,
-                failing_index,
-                error,
-                ..
-            } => {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(Error::exec(format!(
-                        "MountManifest failed at entry {:?}: {:?}",
-                        failing_index,
-                        error.map(|e| e.message),
-                    )))
-                }
-            }
-            other => Err(Error::exec(format!("expected MountManifest reply, got {other:?}"))),
-        }
+        self.ack_op(&id, op)
     }
 
-    /// Dynamically add one Plan9-over-vsock share at runtime. The host
-    /// must have already attached the share to the live VM via
-    /// `HcsModifyComputeSystem` so the guest's vsock dial succeeds.
-    pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
+    /// Tell the guest to unmount a FUSE-over-vsock share by name.
+    /// The guest will `umount2(MNT_DETACH)` and SIGTERM the fuse child.
+    pub fn unmount_fuse(&self, name: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::AddMount { id: id.clone(), entry };
-        // mount(2) inside the guest can take a moment for slow boots.
-        let reply = self.send_op_sync(&id, op, Duration::from_secs(30))?;
-        match reply {
-            Reply::Ack { ok, error, .. } => {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(Error::exec(format!("AddMount failed: {:?}", error.map(|e| e.message))))
-                }
-            }
-            other => Err(Error::exec(format!("expected Ack reply, got {other:?}"))),
-        }
-    }
-
-    /// Dynamically remove a Plan9 share by 9p tag (`aname`).
-    pub fn remove_mount(&self, name: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::RemoveMount {
+        let op = Op::UnmountFuse {
             id: id.clone(),
-            name: name.to_string(),
+            name: name.into(),
         };
-        let reply = self.send_op_sync(&id, op, Duration::from_secs(30))?;
-        match reply {
-            Reply::Ack { ok, error, .. } => {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(Error::exec(format!(
-                        "RemoveMount failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
-                }
-            }
-            other => Err(Error::exec(format!("expected Ack reply, got {other:?}"))),
-        }
+        self.ack_op(&id, op)
     }
 
     // -- Event drain --------------------------------------------------------
@@ -586,9 +531,7 @@ pub struct SpawnInfo {
 
 fn reply_id(r: &Reply) -> String {
     match r {
-        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } | Reply::MountManifest { id, .. } => {
-            id.clone()
-        }
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
     }
 }
 

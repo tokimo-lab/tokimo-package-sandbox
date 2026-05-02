@@ -44,8 +44,8 @@ impl Default for NetworkPolicy {
     }
 }
 
-/// A host directory exposed to the guest (Plan9 on Windows, virtiofs on
-/// macOS, bind mount on Linux).
+/// A host directory exposed to the guest (FUSE-over-vsock on Windows,
+/// virtiofs on macOS, bind mount on Linux).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mount {
     /// Logical mount name (used as the 9p tag / virtiofs tag).
@@ -431,7 +431,7 @@ impl Sandbox {
         self.inner.passthrough(method, params)
     }
 
-    // ---- Dynamic Plan9 share management --------------------------------
+    // ---- Dynamic mount management ----------------------------------------
 
     /// Mount a host directory into the running guest at runtime. Must be
     /// called after [`Sandbox::start_vm`]. The mount name must not collide

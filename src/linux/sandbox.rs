@@ -296,7 +296,7 @@ impl SandboxBackend for LinuxBackend {
                 // Required for AddMountFd dynamic mounts: bwrap drops all
                 // caps by default in unprivileged user_ns mode; we need
                 // CAP_SYS_ADMIN inside the user_ns to call mount(MS_BIND)
-                // for runtime-added Plan9 shares.
+                // for runtime-added dynamic shares.
                 "--cap-add",
                 "CAP_SYS_ADMIN",
                 // CAP_NET_ADMIN: needed inside the new netns to bring up
@@ -322,7 +322,7 @@ impl SandboxBackend for LinuxBackend {
             .map(|s| s.to_string()),
         );
 
-        // Boot-time Plan9-style binds.
+        // Boot-time bind mounts.
         for share in &config.mounts {
             let flag = if share.read_only { "--ro-bind" } else { "--bind" };
             args.push(flag.into());

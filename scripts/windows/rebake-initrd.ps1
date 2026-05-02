@@ -29,6 +29,7 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $rustTarget = if ($Arch -eq "amd64") { "x86_64-unknown-linux-musl" } else { "aarch64-unknown-linux-musl" }
 $initBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-sandbox-init"
 $tunPumpBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-tun-pump"
+$fuseBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-sandbox-fuse"
 
 if (-not $BaseInitrd) {
     $BaseInitrd = Join-Path $repoRoot "vm\initrd.img"
@@ -44,10 +45,10 @@ if (-not $wsl) {
 }
 
 if (-not $SkipBuild) {
-    Write-Host "==> cargo build --release --target $rustTarget --bins (init + tun-pump)" -ForegroundColor Cyan
+    Write-Host "==> cargo build --release --target $rustTarget --bins (init + tun-pump + fuse)" -ForegroundColor Cyan
     Push-Location $repoRoot
     try {
-        & wsl bash -c "cd `"`$(wslpath -a '$($repoRoot -replace '\\','/')')`" && cargo build --release --target $rustTarget --bin tokimo-sandbox-init --bin tokimo-tun-pump"
+        & wsl bash -c "cd `"`$(wslpath -a '$($repoRoot -replace '\\','/')')`" && cargo build --release --target $rustTarget --bin tokimo-sandbox-init --bin tokimo-tun-pump --bin tokimo-sandbox-fuse"
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     } finally {
         Pop-Location
@@ -59,6 +60,9 @@ if (-not (Test-Path $initBinPath)) {
 }
 if (-not (Test-Path $tunPumpBinPath)) {
     throw "tun-pump binary not found after build: $tunPumpBinPath"
+}
+if (-not (Test-Path $fuseBinPath)) {
+    throw "fuse binary not found after build: $fuseBinPath"
 }
 
 $outDir = Join-Path $repoRoot "target\vm-rebake"
@@ -72,6 +76,7 @@ function To-Wsl([string]$p) {
 $baseW = To-Wsl $BaseInitrd
 $initW = To-Wsl $initBinPath
 $tunW  = To-Wsl $tunPumpBinPath
+$fuseW = To-Wsl $fuseBinPath
 $outW  = To-Wsl $outImg
 $scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm\scripts\rebake-initrd.sh")
 $initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-base\init.sh")
@@ -82,8 +87,8 @@ if (Test-Path $extrasDir) {
     $extrasArgs = @("--extras-dir", $extrasW)
 }
 
-Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --tun-pump-bin $tunW --init-sh $initShW $($extrasArgs -join ' ') --out $outW" -ForegroundColor Cyan
-& wsl bash $scriptW --base $baseW --init-bin $initW --tun-pump-bin $tunW --init-sh $initShW @extrasArgs --out $outW
+Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW $($extrasArgs -join ' ') --out $outW" -ForegroundColor Cyan
+& wsl bash $scriptW --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW @extrasArgs --out $outW
 if ($LASTEXITCODE -ne 0) { throw "rebake failed" }
 
 Write-Host "==> rebaked initrd: $outImg ($([math]::Round((Get-Item $outImg).Length/1MB,2)) MB)" -ForegroundColor Green

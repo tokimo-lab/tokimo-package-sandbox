@@ -2,17 +2,17 @@
 //!
 //! Layout:
 //! * Boot disk: SCSI controller 0 attachment 0 = `rootfs.vhdx` (ext4)
-//! * Workspace: zero or more Plan9-over-vsock shares (one per
-//!   `Plan9Share` in `ConfigureParams`)
+//! * User mounts: FUSE-over-vsock (host FuseHost ↔ guest
+//!   `tokimo-sandbox-fuse`), port allocated by [`alloc_fuse_port`]
 //! * Control: AF_HYPERV/HvSocket, per-session vsock port allocated by
 //!   [`alloc_session_init_port`]
 //! * Console: COM2 named pipe (kernel kmsg dump)
 //!
 //! The kernel cmdline tells initramfs-tools to mount `/dev/sda` as the
 //! ext4 rootfs. The custom `/sbin/init` shim (built into rootfs.vhdx)
-//! takes over PID 1 after switch_root, learns about every share via the
-//! `MountManifest` control op, and serves shell sessions over the init
-//! channel.
+//! takes over PID 1 after switch_root, learns about every share via
+//! `MountFuse` ops on the init vsock channel, and serves shell sessions
+//! over the init channel.
 
 #![cfg(target_os = "windows")]
 
@@ -42,17 +42,16 @@ pub fn alloc_session_init_port() -> u32 {
     0x4000_0000 | (n & 0x00FF_FFFF)
 }
 
-/// Allocate a unique vsock port for a per-session Plan9 share. We stay
-/// in the same low decimal range as `PORT_WORK` (50002) because HCS's
-/// internal Plan9 implementation rejects very high port values during
-/// `HcsCreateComputeSystem` (`0x8037010D` "Construct" failure).
-pub fn alloc_share_port() -> u32 {
+/// Allocate a unique vsock port for the per-session FUSE-over-vsock
+/// listener. Uses a high range (like `alloc_session_init_port`) to avoid
+/// collision with well-known ports. The port is registered in the HCS
+/// HvSocket service table so the guest can connect to it.
+pub fn alloc_fuse_port() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // 50100..=58291 — well clear of PORT_WORK (50002) and PORT_INIT_CONTROL,
-    // small enough for HCS Plan9 to accept.
-    50100 + (n % 8192)
+    // 0x50000000 .. 0x50FFFFFF — distinct from init_port (0x40xxxxxx).
+    0x5000_0000 | (n & 0x00FF_FFFF)
 }
 
 /// Build the HvSocket service GUID for a given vsock port.
@@ -62,23 +61,15 @@ pub fn hvsock_service_id(port: u32) -> String {
     format!("{:08X}-FACB-11E6-BD58-64006A7986D3", port)
 }
 
-/// One share for a V2 multi-share session config.
-pub struct V2Share<'a> {
-    pub host_path: &'a Path,
-    pub name: &'a str,
-    pub port: u32,
-    pub read_only: bool,
-}
-
-/// Build an HCS Schema 2.x JSON config for **session mode V2** with an
-/// arbitrary list of Plan9-over-vsock shares and an explicit rootfs
-/// VHDX. The rootfs is mounted on SCSI controller 0 attachment 0
-/// (`/dev/sda`) read-write — persistent vs ephemeral lifecycle is
-/// managed at a higher layer (`vhdx_pool`).
+/// Build an HCS Schema 2.x JSON config for **session mode** with
+/// FUSE-over-vsock user mounts and an explicit rootfs VHDX. The rootfs
+/// is mounted on SCSI controller 0 attachment 0 (`/dev/sda`) read-write
+/// — persistent vs ephemeral lifecycle is managed at a higher layer
+/// (`vhdx_pool`).
 ///
-/// The kernel cmdline carries only `tokimo.init_port=`; the V2 init
-/// learns about every share through a `MountManifest` op on the init
-/// vsock channel after `Hello` and before any shells are spawned.
+/// The kernel cmdline carries `tokimo.init_port=` and
+/// `tokimo.fuse_port=`. The guest init learns about every share through
+/// `MountFuse` ops on the init vsock channel after `Hello`.
 ///
 /// When `netstack_port` is `Some(port)` a SECOND HvSocket service GUID is
 /// registered for the userspace network stack control plane. The guest's
@@ -93,10 +84,10 @@ pub fn build_session_v2_ex(
     kernel: &Path,
     initrd: &Path,
     rootfs_vhdx: &Path,
-    shares: &[V2Share<'_>],
     memory_mb: u64,
     cpu_count: usize,
     init_port: u32,
+    fuse_port: u32,
     netstack_port: Option<u32>,
 ) -> String {
     let kernel_s = strip_extended_prefix(kernel);
@@ -115,42 +106,20 @@ pub fn build_session_v2_ex(
         }
     });
 
-    let plan9_shares: Vec<serde_json::Value> = shares
-        .iter()
-        .map(|s| {
-            // NOTE: do NOT add a `ReadOnly` field here — HCS schema 2.5
-            // rejects Plan9.Shares entries containing it with `0x8037010D`
-            // ("Construct" failure). RO is enforced guest-side via the
-            // mount manifest's `MS_RDONLY` flag.
-            let _ = s.read_only;
-            serde_json::json!({
-                "Name": s.name,
-                "AccessName": s.name,
-                "Path": strip_extended_prefix(s.host_path),
-                "Port": s.port
-            })
-        })
-        .collect();
-    let plan9 = serde_json::json!({ "Shares": plan9_shares });
-
     let mut devices = serde_json::Map::new();
     devices.insert("Scsi".into(), scsi);
-    devices.insert("Plan9".into(), plan9);
 
-    // Register the per-session init-control HvSocket service GUID so the
-    // WILDCARD-bound listener on the host is reachable from this VM.
-    //
-    // Plan9 share ports are NOT added to this table — HCS provides the
-    // 9p server internally for each `Plan9.Shares[i]` entry and owns the
-    // host-side endpoint on `Port`. Adding them here (or binding our own
-    // listener) would race HCS's listener for the same vsock service GUID.
+    // Register HvSocket service GUIDs for init control, FUSE listener,
+    // and optionally netstack. The guest connects to these from inside
+    // the VM via vsock.
     let mut svc_table = serde_json::Map::new();
     let entry = serde_json::json!({
         "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
         "ConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
         "AllowWildcardBinds": true
     });
-    svc_table.insert(hvsock_service_id(init_port), entry);
+    svc_table.insert(hvsock_service_id(init_port), entry.clone());
+    svc_table.insert(hvsock_service_id(fuse_port), entry);
     if let Some(p) = netstack_port {
         let net_entry = serde_json::json!({
             "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
@@ -159,7 +128,6 @@ pub fn build_session_v2_ex(
         });
         svc_table.insert(hvsock_service_id(p), net_entry);
     }
-    let _ = shares; // ports referenced via Plan9.Shares above
     devices.insert(
         "HvSocket".into(),
         serde_json::json!({
@@ -187,11 +155,13 @@ pub fn build_session_v2_ex(
         Some(p) => format!(
             "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
              tokimo.session=1 tokimo.init_port={init_port} \
+             tokimo.fuse_port={fuse_port} \
              tokimo.net=netstack tokimo.netstack_port={p}"
         ),
         None => format!(
             "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
-             tokimo.session=1 tokimo.init_port={init_port}"
+             tokimo.session=1 tokimo.init_port={init_port} \
+             tokimo.fuse_port={fuse_port}"
         ),
     };
 
@@ -224,39 +194,6 @@ pub fn build_session_v2_ex(
     top.to_string()
 }
 
-/// Build a ModifySettingRequest JSON for adding/removing a single
-/// Plan9 share at runtime via `HcsModifyComputeSystem`.
-///
-/// Schema 2.x format:
-/// `{"ResourceUri":"VirtualMachine/Devices/Plan9/Shares",
-///   "Settings":{"Name":..,"AccessName":..,"Path":..,"Port":..},
-///   "RequestType":"Add"|"Remove"}`
-///
-/// As with [`build_session_v2`], no `ReadOnly` field is emitted —
-/// HCS Plan9 rejects it; read-only is enforced guest-side via the
-/// 9p mount flags carried over the AddMount op.
-pub fn plan9_modify_request(name: &str, host_path: &Path, port: u32, request_type: &str) -> String {
-    let settings = serde_json::json!({
-        "Name": name,
-        "AccessName": name,
-        "Path": strip_extended_prefix(host_path),
-        "Port": port,
-    });
-    serde_json::json!({
-        "ResourcePath": "VirtualMachine/Devices/Plan9/Shares",
-        "Settings": settings,
-        "RequestType": request_type,
-    })
-    .to_string()
-}
-
-/// Allocate a Plan9 share port for a runtime-added share. Currently a
-/// thin alias of [`alloc_share_port`] so the boot-time and runtime
-/// allocators stay in lock-step.
-pub fn alloc_plan9_port() -> u32 {
-    alloc_share_port()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,25 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_multi_share_schema_and_cmdline() {
+    fn v2_schema_and_cmdline() {
         let (k, i, rootfs) = dummy_paths();
-        let work = PathBuf::from(r"C:\work");
-        let ro = PathBuf::from(r"C:\readonly");
-        let shares = [
-            V2Share {
-                host_path: &work,
-                name: "s0",
-                port: alloc_share_port(),
-                read_only: false,
-            },
-            V2Share {
-                host_path: &ro,
-                name: "s1",
-                port: alloc_share_port(),
-                read_only: true,
-            },
-        ];
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, &shares, 1024, 2, 0x4000_0001, None);
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, 1024, 2, 0x4000_0001, 0x5000_0001, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // SCSI carries the persistent rootfs path.
@@ -298,56 +219,37 @@ mod tests {
             r"C:\persist.vhdx"
         );
 
-        // Plan9 has both shares, in order. RO flag is enforced guest-side
-        // via the mount manifest — HCS schema 2.5 rejects any `ReadOnly`
-        // field on Plan9.Shares with `0x8037010D`.
-        let arr = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["Name"], "s0");
-        assert!(arr[0].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
-        assert_eq!(arr[1]["Name"], "s1");
-        assert!(arr[1].get("ReadOnly").is_none(), "Plan9 share must NOT carry ReadOnly");
-        let port = arr[1]["Port"].as_u64().unwrap();
+        // No Plan9 device.
         assert!(
-            (50100..58292).contains(&(port as u32)),
-            "share port {port} out of HCS-Plan9 range"
+            v["VirtualMachine"]["Devices"].get("Plan9").is_none(),
+            "Plan9 must not be present"
         );
 
-        // HvSocket service table registers ONLY the init port.
+        // HvSocket service table registers init + fuse ports.
         let table = v["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
             .as_object()
             .unwrap();
         assert!(table.contains_key(&hvsock_service_id(0x4000_0001)));
-        let sp0 = arr[0]["Port"].as_u64().unwrap() as u32;
-        let sp1 = arr[1]["Port"].as_u64().unwrap() as u32;
-        assert!(!table.contains_key(&hvsock_service_id(sp0)));
-        assert!(!table.contains_key(&hvsock_service_id(sp1)));
+        assert!(table.contains_key(&hvsock_service_id(0x5000_0001)));
 
         let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
             .as_str()
             .unwrap();
         assert!(cmdline.contains("tokimo.init_port=1073741825"));
+        assert!(cmdline.contains("tokimo.fuse_port=1342177281"));
         assert!(cmdline.contains("root=/dev/sda"));
         assert!(cmdline.contains("rootfstype=ext4"));
         assert!(cmdline.contains("console=ttyS1"));
-        // The legacy single-share work_port must not leak into v2 cmdline.
-        assert!(
-            !cmdline.contains("tokimo.work_port="),
-            "v2 cmdline must not carry tokimo.work_port=, got: {cmdline}"
-        );
     }
 
     #[test]
-    fn v2_zero_shares_and_topology() {
+    fn v2_topology_and_comports() {
         let (k, i, rootfs) = dummy_paths();
-        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, &[], 4096, 8, 0x4000_00AB, None);
+        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, 4096, 8, 0x4000_00AB, 0x5000_00AB, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Memory"]["SizeInMB"], 4096);
         assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Processor"]["Count"], 8);
-
-        let arr = v["VirtualMachine"]["Devices"]["Plan9"]["Shares"].as_array().unwrap();
-        assert!(arr.is_empty(), "no shares means empty array");
 
         // COM2 named pipe carries the vm_id.
         let pipe = v["VirtualMachine"]["Devices"]["ComPorts"]["1"]["NamedPipe"]
@@ -367,7 +269,7 @@ mod tests {
     fn v2_with_netstack_port() {
         let (k, i, rootfs) = dummy_paths();
         let port: u32 = 0x4000_00CD;
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, &[], 1024, 2, 0x4000_0002, Some(port));
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, 1024, 2, 0x4000_0002, 0x5000_0002, Some(port));
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // Cmdline must select netstack mode and carry the port.
@@ -401,14 +303,21 @@ mod tests {
     }
 
     #[test]
-    fn share_port_allocator_distinct_from_init() {
-        let i1 = alloc_session_init_port();
-        let s1 = alloc_share_port();
-        let s2 = alloc_share_port();
-        assert_ne!(i1, s1);
-        assert_ne!(s1, s2);
-        assert_eq!(i1 & 0xFF00_0000, 0x4000_0000);
-        assert!((50100..58292).contains(&s1));
-        assert!((50100..58292).contains(&s2));
+    fn alloc_fuse_port_is_in_range_and_unique() {
+        let a = alloc_fuse_port();
+        let b = alloc_fuse_port();
+        assert_ne!(a, b);
+        for p in [a, b] {
+            assert_eq!(p & 0xFF00_0000, 0x5000_0000, "fuse port {p:#x} out of range");
+        }
+    }
+
+    #[test]
+    fn port_allocators_distinct_ranges() {
+        let init = alloc_session_init_port();
+        let fuse = alloc_fuse_port();
+        assert_ne!(init, fuse);
+        assert_eq!(init & 0xFF00_0000, 0x4000_0000);
+        assert_eq!(fuse & 0xFF00_0000, 0x5000_0000);
     }
 }
