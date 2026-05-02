@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 postcard = { version = "1", features = ["use-std"] }
 slab = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "io-util", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "io-util", "macros", "fs", "net"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["process", "signal", "socket", "fs", "event", "ioctl", "term", "uio", "poll"] }

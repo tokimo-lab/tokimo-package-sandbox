@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -162,27 +162,64 @@ impl InitClient {
         self.spawn_ack(&id, op)
     }
 
-    /// Add a runtime bind mount in the bwrap container. Init opens
-    /// `host_path` (absolute) relative to its long-lived staging fd and
-    /// bind-mounts it at `target`. No SCM_RIGHTS needed — init resolves
-    /// the path entirely on its own side.
-    pub fn add_mount_fd(&self, name: &str, host_path: &str, target: &str, read_only: bool) -> Result<()> {
+    /// Spawn `tokimo-sandbox-fuse` inside the guest using a pre-created
+    /// socketpair fd (passed via SCM_RIGHTS). The guest fuse child
+    /// inherits the fd and uses `--transport unix-fd --fd <N>`.
+    pub fn mount_fuse_with_fd(&self, name: &str, fuse_fd: RawFd, target: &str, read_only: bool) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::AddMountFd {
+        let op = Op::MountFuse {
             id: id.clone(),
             name: name.into(),
-            host_path: host_path.into(),
+            vsock_port: 0, // unused when fd is attached via SCM_RIGHTS
             target: target.into(),
             read_only,
         };
-        self.ack_op(&id, op)
+        let _guard = self
+            .inner
+            .send_lock
+            .lock()
+            .map_err(|_| Error::exec("send lock poisoned"))?;
+        let bf = unsafe { BorrowedFd::borrow_raw(self.inner.sock.as_raw_fd()) };
+        send_frame_seqpacket(bf, &Frame::Op(op), Some(fuse_fd))?;
+        drop(_guard);
+        // Wait for ack.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (lock, cv) = &*self.inner.state;
+        let mut g = lock.lock().map_err(|_| Error::exec("client state poisoned"))?;
+        loop {
+            if let Some(r) = g.replies.remove(&id) {
+                match r {
+                    Reply::Ack { ok, error, .. } => {
+                        if !ok {
+                            return Err(Error::exec(format!(
+                                "mount_fuse_with_fd failed: {:?}",
+                                error.map(|e| e.message)
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    other => return Err(Error::exec(format!("unexpected reply: {other:?}"))),
+                }
+            }
+            if g.eof {
+                return Err(Error::exec("init connection closed before reply"));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::exec(format!("mount_fuse_with_fd {name:?} timed out")));
+            }
+            let (g2, _) = cv
+                .wait_timeout(g, deadline - now)
+                .map_err(|_| Error::exec("client state poisoned"))?;
+            g = g2;
+        }
     }
 
-    /// Counterpart to [`add_mount_fd`]: ask init to umount + rmdir a
-    /// previously-added dynamic mount, looked up by `name`.
-    pub fn remove_mount_by_name(&self, name: &str) -> Result<()> {
+    /// Ask init to `umount2(target, MNT_DETACH)` and SIGTERM + reap the
+    /// `tokimo-sandbox-fuse` child for the given mount name.
+    pub fn unmount_fuse(&self, name: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::RemoveMountByName {
+        let op = Op::UnmountFuse {
             id: id.clone(),
             name: name.into(),
         };

@@ -870,14 +870,23 @@ fn attr_from(info: &VfsFileInfo) -> AttrOut {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // On Linux the FuseHost runs in-process (bwrap path) so the calling
+    // UID matches the host user — return real uid/gid so DefaultPermissions
+    // allows writes. On macOS/Windows the FuseHost serves a Linux VM
+    // where processes run as root — return 0/0 so root-owned files are
+    // writable inside the guest.
+    #[cfg(target_os = "linux")]
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    #[cfg(not(target_os = "linux"))]
+    let (uid, gid) = (0u32, 0u32);
     AttrOut {
         size: info.size,
         blocks: info.size.div_ceil(512),
         mtime,
         mode,
         nlink: 1,
-        uid: 0,
-        gid: 0,
+        uid,
+        gid,
         kind,
     }
 }

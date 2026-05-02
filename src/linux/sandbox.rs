@@ -14,7 +14,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,6 +29,8 @@ use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolic
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::linux::init_client::{DrainedEvent, InitClient};
+use crate::vfs_host::FuseHost;
+use crate::vfs_impls::LocalDirVfs;
 
 /// Shared mutable state for the Linux backend.
 struct BackendState {
@@ -44,10 +46,18 @@ struct BackendState {
     jobs: HashMap<String, JobSpawnInfo>,
     /// Reverse map: init child_id → JobId, for the event pump.
     child_to_job: HashMap<String, JobId>,
-    /// Names of dynamically added shares (via `add_mount` after
-    /// start_vm). Boot-time shares are NOT in this set so they cannot be
-    /// removed via `remove_mount`.
-    dynamic_shares: HashSet<String>,
+    /// Host-side FUSE server for this session. One per Sandbox; serves
+    /// all mount connections (boot-time + runtime).
+    fuse_host: Option<Arc<FuseHost>>,
+    /// Host-end socketpair fds kept alive for the session lifetime.
+    /// Each mount gets its own socketpair; dropping the host end would
+    /// tear down the FUSE connection.
+    fuse_sockets: Vec<OwnedFd>,
+    /// Names of FUSE-backed mounts declared at boot time (cannot be
+    /// removed at runtime).
+    boot_share_names: HashSet<String>,
+    /// All FUSE-backed mounts currently registered (boot + runtime).
+    fuse_mount_names: HashSet<String>,
     /// Event subscribers (each gets a clone of incoming events).
     subscribers: Vec<std::sync::mpsc::Sender<Event>>,
     /// Next job id sequence.
@@ -77,7 +87,10 @@ impl Default for BackendState {
             bwrap_pid: None,
             jobs: HashMap::new(),
             child_to_job: HashMap::new(),
-            dynamic_shares: HashSet::new(),
+            fuse_host: None,
+            fuse_sockets: Vec::new(),
+            boot_share_names: HashSet::new(),
+            fuse_mount_names: HashSet::new(),
             subscribers: Vec::new(),
             next_job_id: 0,
             debug_logging: false,
@@ -236,20 +249,37 @@ impl SandboxBackend for LinuxBackend {
             "/etc/ssl",
             "/etc/ca-certificates",
             "/etc/pki",
+            // fusermount3 needs /etc/passwd for username lookup.
+            "/etc/passwd",
+            "/etc/group",
         ] {
             if Path::new(p).exists() {
                 args.extend(["--ro-bind".to_string(), p.into(), p.into()]);
             }
         }
+        // FUSE needs user_allow_other so any UID inside the sandbox can
+        // access the mount (the guest shell may not run as root).
+        let _fuse_conf_file = {
+            let mut tmp = tempfile::NamedTempFile::new()
+                .map_err(|e| Error::other(format!("create fuse.conf tmpfile: {e}")))?;
+            use std::io::Write;
+            tmp.write_all(b"user_allow_other\n")
+                .map_err(|e| Error::other(format!("write fuse.conf: {e}")))?;
+            args.extend([
+                "--ro-bind".to_string(),
+                tmp.path().to_string_lossy().into_owned(),
+                "/etc/fuse.conf".to_string(),
+            ]);
+            tmp
+        };
         args.extend(
             [
                 "--proc",
                 "/proc",
                 // NOTE: Avoid `--dev /dev` — bwrap's devtmpfs setup forces a
                 // nested user_ns (uid_map "1000 0 1") in which init no longer
-                // has CAP_SYS_ADMIN over outer-userns mounts, breaking
-                // dynamic AddMountFd binds. Stage /dev as tmpfs + bind the
-                // standard device nodes individually.
+                // has CAP_SYS_ADMIN over outer-userns mounts. Stage /dev as
+                // tmpfs + bind the standard device nodes individually.
                 "--tmpfs",
                 "/dev",
                 "--dev-bind",
@@ -270,6 +300,17 @@ impl SandboxBackend for LinuxBackend {
                 "--dev-bind",
                 "/dev/tty",
                 "/dev/tty",
+                // FUSE device — required for FUSE-over-socketpair mounts.
+                // --dev-bind-try silently skips if the host doesn't have it.
+                "--dev-bind-try",
+                "/dev/fuse",
+                "/dev/fuse",
+                // fusermount3 needs /etc/mtab (→ /proc/self/mounts) and
+                // /etc/passwd (for username lookup). /proc is mounted
+                // below, so the symlink resolves correctly.
+                "--symlink",
+                "/proc/self/mounts",
+                "/etc/mtab",
                 "--symlink",
                 "/proc/self/fd",
                 "/dev/fd",
@@ -290,13 +331,11 @@ impl SandboxBackend for LinuxBackend {
                 "--die-with-parent",
                 // (Intentionally NOT using --as-pid-1: it creates a nested
                 // user_ns where init no longer has CAP_SYS_ADMIN over the
-                // mounts created by the outer bwrap user_ns, which breaks
-                // dynamic AddMountFd binds. bwrap will sit at PID 1 and
-                // init will be PID 2 inside the new pid_ns; that's fine.)
-                // Required for AddMountFd dynamic mounts: bwrap drops all
-                // caps by default in unprivileged user_ns mode; we need
-                // CAP_SYS_ADMIN inside the user_ns to call mount(MS_BIND)
-                // for runtime-added Plan9 shares.
+                // mounts created by the outer bwrap user_ns. bwrap will sit
+                // at PID 1 and init will be PID 2 inside the new pid_ns;
+                // that's fine.)
+                // Required for FUSE mounts: fusermount3's mount(2) syscall
+                // needs CAP_SYS_ADMIN inside the user namespace.
                 "--cap-add",
                 "CAP_SYS_ADMIN",
                 // CAP_NET_ADMIN: needed inside the new netns to bring up
@@ -322,24 +361,9 @@ impl SandboxBackend for LinuxBackend {
             .map(|s| s.to_string()),
         );
 
-        // Boot-time Plan9-style binds.
-        for share in &config.mounts {
-            let flag = if share.read_only { "--ro-bind" } else { "--bind" };
-            args.push(flag.into());
-            args.push(share.host_path.display().to_string());
-            args.push(share.guest_path.display().to_string());
-        }
-
-        // Dynamic-mount staging: pre-bind host root **rw** at a hidden
-        // path so init can open arbitrary host paths via openat() into
-        // a mount that lives in our user_ns (kernel mount-source
-        // requirement). We use `--bind` (not `--ro-bind`) so the
-        // resulting dynamic mounts can be writable; bwrap does not
-        // expose a way to remount the staging path RO afterwards, so
-        // `/.tps_host` remains a writable view of the host fs from
-        // inside the sandbox. This is a known leak for the bwrap
-        // backend; the dot-prefix hides it from default `ls /` listings.
-        args.extend(["--bind".to_string(), "/".to_string(), "/.tps_host".to_string()]);
+        // Boot-time mounts are now handled via FUSE-over-socketpair
+        // (after the Hello handshake), not bwrap --bind. See the
+        // post-handshake mount loop below.
 
         // Network policy.
         // Always: --unshare-net + a fresh sysfs + lo bringup so the
@@ -489,6 +513,107 @@ impl SandboxBackend for LinuxBackend {
         init_client
             .hello()
             .map_err(|e| Error::other(format!("init hello failed: {e}")))?;
+
+        // 6b. FUSE host — register backends and send MountFuse for each
+        //     boot-time share. Each mount gets its own socketpair:
+        //     host end → FuseHost::serve (in background thread),
+        //     guest end → init → fuse child (via SCM_RIGHTS).
+        let fuse_host: Arc<FuseHost> = Arc::new(FuseHost::new());
+        let mut fuse_threads: Vec<thread::JoinHandle<()>> = Vec::new();
+        let mut boot_share_names = HashSet::new();
+        let mut fuse_mount_names = HashSet::new();
+        for share in &config.mounts {
+            if share.create_host_dir && !share.host_path.exists()
+                && let Err(e) = std::fs::create_dir_all(&share.host_path)
+            {
+                return Err(Error::other(format!(
+                    "create_host_dir {}: {e}",
+                    share.host_path.display()
+                )));
+            }
+            let backend = LocalDirVfs::arc(share.host_path.clone());
+            fuse_host.register_mount(share.name.clone(), backend, share.read_only);
+
+            let (host_end, guest_end) = socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                SockFlag::SOCK_CLOEXEC,
+            )
+            .map_err(|e| Error::other(format!("socketpair(STREAM,fuse): {e}")))?;
+
+            // Serve the host end in a background thread. FuseHost::serve
+            // is async; we bridge it via a blocking thread with a
+            // single-threaded tokio runtime.
+            let fh = fuse_host.clone();
+            let sname = share.name.clone();
+            // host_end moves into the thread — do NOT extract raw fd
+            // here, or the OwnedFd drop in the main thread closes it.
+            let t = thread::Builder::new()
+                .name(format!("tokimo-fuse-{}", share.name))
+                .spawn(move || {
+                    // SAFETY: host_end is exclusively owned by this thread.
+                    let host_fd_raw = host_end.as_raw_fd();
+                    eprintln!("[linux/fuse] thread {sname}: host_fd={host_fd_raw}");
+                    // Set non-blocking for tokio.
+                    unsafe {
+                        let flags = libc::fcntl(host_fd_raw, libc::F_GETFL);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(host_fd_raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
+                    }
+                    // Convert OwnedFd → std UnixStream → tokio UnixStream.
+                    // into_raw_fd() transfers ownership without closing.
+                    let std_stream = unsafe {
+                        std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd())
+                    };
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => {
+                            // Enter the runtime context so tokio I/O
+                            // registration (needed by UnixStream::from_std)
+                            // uses *this* runtime, not an outer one.
+                            let _guard = rt.enter();
+                            match tokio::net::UnixStream::from_std(std_stream) {
+                                Ok(stream) => {
+                                    drop(_guard);
+                                    eprintln!("[linux/fuse] thread {sname}: entering serve loop");
+                                    rt.block_on(async {
+                                        if let Err(e) = fh.serve(stream).await {
+                                            eprintln!("[linux/fuse] serve {sname}: {e}");
+                                        }
+                                        eprintln!("[linux/fuse] thread {sname}: serve loop exited");
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("[linux/fuse] from_std {sname}: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[linux/fuse] tokio runtime {sname}: {e}");
+                        }
+                    }
+                })
+                .map_err(|e| Error::other(format!("spawn fuse serve thread: {e}")))?;
+            fuse_threads.push(t);
+
+            // Send MountFuse to init with the guest-end fd via SCM_RIGHTS.
+            let guest = share.guest_path.to_string_lossy().into_owned();
+            let guest_fd_raw = guest_end.as_raw_fd();
+            init_client
+                .mount_fuse_with_fd(&share.name, guest_fd_raw, &guest, share.read_only)
+                .map_err(|e| Error::other(format!("mount_fuse {}: {e}", share.name)))?;
+
+            // Drop our copy of the guest end — init inherited it via
+            // SCM_RIGHTS.
+            drop(guest_end);
+            boot_share_names.insert(share.name.clone());
+            fuse_mount_names.insert(share.name.clone());
+        }
+
         let shell_info = init_client
             .open_shell(&["/bin/bash"], &[], None)
             .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
@@ -499,6 +624,9 @@ impl SandboxBackend for LinuxBackend {
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         g.init_client = Some(Arc::clone(&init_client));
         g.netstack_shutdown = netstack_shutdown;
+        g.fuse_host = Some(fuse_host);
+        g.boot_share_names = boot_share_names;
+        g.fuse_mount_names = fuse_mount_names;
         g.shell_child_id = Some(shell_info.child_id.clone());
         let shell_job_id = JobId(format!("j{}", g.next_job_id));
         g.next_job_id += 1;
@@ -588,7 +716,10 @@ impl SandboxBackend for LinuxBackend {
         g.bwrap_pid = None;
         g.jobs.clear();
         g.child_to_job.clear();
-        g.dynamic_shares.clear();
+        g.fuse_host = None;
+        g.fuse_sockets.clear();
+        g.boot_share_names.clear();
+        g.fuse_mount_names.clear();
 
         drop(g);
         self.running.store(false, Ordering::Relaxed);
@@ -833,50 +964,133 @@ impl SandboxBackend for LinuxBackend {
 
     fn add_mount(&self, share: Mount) -> Result<()> {
         self.ensure_running()?;
-        let host_path = share
-            .host_path
-            .canonicalize()
-            .map_err(|e| Error::other(format!("canonicalize {:?}: {e}", share.host_path)))?;
-        if !host_path.is_dir() {
-            return Err(Error::other(format!("{host_path:?} is not a directory")));
-        }
-        let host_path_str = host_path
-            .to_str()
-            .ok_or_else(|| Error::other(format!("non-UTF-8 host path: {host_path:?}")))?
-            .to_string();
 
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        if g.dynamic_shares.contains(&share.name) {
-            return Err(Error::other(format!("share {:?} already exists", share.name)));
-        }
+        let rs_fuse_host = g.fuse_host.as_ref().ok_or(Error::VmNotRunning)?.clone();
         let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?.clone();
+
+        if g.boot_share_names.contains(&share.name) {
+            return Err(Error::validation(format!(
+                "share name '{}' is reserved by a boot-time share",
+                share.name
+            )));
+        }
+        if g.fuse_mount_names.contains(&share.name) {
+            return Err(Error::validation(format!("share '{}' is already mounted", share.name)));
+        }
+        if share.name == "work" || share.name.is_empty() || share.name.contains('/') {
+            return Err(Error::validation(format!("invalid share name: '{}'", share.name)));
+        }
         drop(g);
 
-        let target = share.guest_path.display().to_string();
-        client
-            .add_mount_fd(&share.name, &host_path_str, &target, share.read_only)
-            .map_err(|e| Error::other(format!("add_mount_fd: {e}")))?;
+        if share.create_host_dir && !share.host_path.exists() {
+            std::fs::create_dir_all(&share.host_path)
+                .map_err(|e| Error::other(format!("create_host_dir {}: {e}", share.host_path.display())))?;
+        }
+        if !share.host_path.exists() {
+            return Err(Error::validation(format!(
+                "host_path does not exist: {}",
+                share.host_path.display()
+            )));
+        }
+
+        // 1. Register the FUSE backend.
+        let backend = LocalDirVfs::arc(share.host_path.clone());
+        let mount_id = rs_fuse_host.register_mount(share.name.clone(), backend, share.read_only);
+
+        // 2. Create socketpair for this mount.
+        let (host_end, guest_end) = socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .map_err(|e| Error::other(format!("socketpair(STREAM,fuse): {e}")))?;
+
+        // 3. Serve the host end in a background thread.
+        let fh = rs_fuse_host.clone();
+        let sname = share.name.clone();
+        // host_end moves into the thread — do NOT extract raw fd here.
+        thread::Builder::new()
+            .name(format!("tokimo-fuse-{}", share.name))
+            .spawn(move || {
+                let host_fd_raw = host_end.as_raw_fd();
+                unsafe {
+                    let flags = libc::fcntl(host_fd_raw, libc::F_GETFL);
+                    if flags >= 0 {
+                        let _ = libc::fcntl(host_fd_raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+                let std_stream = unsafe {
+                    std::os::unix::net::UnixStream::from_raw_fd(host_end.into_raw_fd())
+                };
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        let _guard = rt.enter();
+                        match tokio::net::UnixStream::from_std(std_stream) {
+                            Ok(stream) => {
+                                drop(_guard);
+                                rt.block_on(async {
+                                    if let Err(e) = fh.serve(stream).await {
+                                        eprintln!("[linux/fuse] serve {sname}: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("[linux/fuse] from_std {sname}: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[linux/fuse] tokio runtime {sname}: {e}");
+                    }
+                }
+            })
+            .map_err(|e| Error::other(format!("spawn fuse serve thread: {e}")))?;
+
+        // 4. Send MountFuse to init with the guest-end fd via SCM_RIGHTS.
+        let guest = share.guest_path.to_string_lossy().into_owned();
+        let guest_fd_raw = guest_end.as_raw_fd();
+        if let Err(e) = client.mount_fuse_with_fd(&share.name, guest_fd_raw, &guest, share.read_only) {
+            // Roll back: remove the FUSE mount registration.
+            let _ = rs_fuse_host.remove_mount(mount_id);
+            drop(guest_end);
+            return Err(e);
+        }
+        drop(guest_end);
 
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        g.dynamic_shares.insert(share.name);
+        g.fuse_mount_names.insert(share.name);
         Ok(())
     }
 
     fn remove_mount(&self, name: &str) -> Result<()> {
         self.ensure_running()?;
-        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        if !g.dynamic_shares.contains(name) {
-            return Err(Error::other(format!(
-                "no such dynamic share: {name:?} (boot-time shares cannot be removed)"
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        if g.boot_share_names.contains(name) {
+            return Err(Error::validation(format!(
+                "share '{name}' was declared at boot time and cannot be removed at runtime"
             )));
         }
+        if !g.fuse_mount_names.remove(name) {
+            return Err(Error::validation(format!("no such share '{name}'")));
+        }
         let client = g.init_client.as_ref().ok_or(Error::VmNotRunning)?.clone();
+        let fuse_host = g.fuse_host.as_ref().ok_or(Error::VmNotRunning)?.clone();
         drop(g);
-        client
-            .remove_mount_by_name(name)
-            .map_err(|e| Error::other(format!("remove_mount_by_name: {e}")))?;
-        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
-        g.dynamic_shares.remove(name);
+
+        // Ask init to umount + reap the fuse child.
+        let unmount_err = client.unmount_fuse(name).err();
+        // Remove from host-side FuseHost.
+        if let Some(mount_id) = fuse_host.mount_id_by_name(name) {
+            let _ = fuse_host.remove_mount(mount_id);
+        }
+        if let Some(e) = unmount_err {
+            return Err(e);
+        }
         Ok(())
     }
 

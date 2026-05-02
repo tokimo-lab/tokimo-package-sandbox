@@ -97,25 +97,12 @@ pub struct State {
     /// and umount a previously-attached share.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub mount_fds: Vec<MountedShare>,
-    /// Bwrap-mode dynamic mounts (added via `Op::AddMountFd`). Keyed by
-    /// the host-supplied logical name. Tracks the mount target so
-    /// `Op::RemoveMountByName` can `umount2(target, MNT_DETACH)` + rmdir.
-    pub dynamic_mounts: HashMap<String, String>,
     /// FUSE-over-vsock mounts (added via `Op::MountFuse`). Keyed by the
     /// host-supplied logical name. Tracks the guest mountpoint **and**
     /// the child `tokimo-sandbox-fuse` PID so `Op::UnmountFuse` can
     /// `umount2(target, MNT_DETACH)` and signal+reap the child.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fuse_mounts: HashMap<String, FuseMount>,
-    /// Long-lived O_PATH/O_DIRECTORY fd into the bwrap-staged
-    /// `/.tps_host` (host root). Opened during init startup, before
-    /// `/.tps_host` is umounted+rmdir'd. Used as the dirfd for
-    /// `openat()` when handling `Op::AddMountFd` so that the fd we then
-    /// bind-mount belongs to a mount inside our user_ns (kernel
-    /// requirement; an init_user_ns fd passed via SCM_RIGHTS would
-    /// otherwise EPERM in `mount(MS_BIND)`).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub host_root_fd: Option<OwnedFd>,
 }
 
 #[allow(dead_code)]
@@ -218,35 +205,8 @@ fn run_loop_inner(
         client_slots: Vec::new(),
         transport,
         mount_fds: Vec::new(),
-        dynamic_mounts: HashMap::new(),
         fuse_mounts: HashMap::new(),
-        host_root_fd: None,
     };
-
-    // Bwrap mode: open a long-lived O_PATH fd on `/.tps_host` (the
-    // pre-bound host root) so we can later openat() arbitrary host
-    // paths whose resulting fd lives in our user_ns mount. Then
-    // umount2 + rmdir `/.tps_host` so it leaves no observable trace
-    // for sandboxed processes.
-    #[cfg(target_os = "linux")]
-    if preconnected_seqpacket {
-        let cstr = std::ffi::CString::new("/.tps_host").unwrap();
-        let raw = unsafe { libc::open(cstr.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        if raw < 0 {
-            eprintln!(
-                "[init] open(/.tps_host) failed: {} (dynamic mounts will not work)",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            state.host_root_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
-            // We cannot umount /.tps_host here: locked-rec mounts inherited
-            // from bwrap's `--ro-bind /` cannot be released without
-            // CAP_SYS_ADMIN over the parent user_ns. The staging path
-            // remains visible at `/.tps_host` (dot-prefix hides it from
-            // default `ls`); the held O_PATH fd is what matters for
-            // future `openat()` resolutions.
-        }
-    }
 
     let mut shutdown = false;
 
@@ -1029,18 +989,27 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::RemoveMount { id, name } => {
             handle_remove_mount(state, client_fd, id, name);
         }
-        Op::AddMountFd {
-            id,
-            name,
-            host_path,
-            target,
-            read_only,
-        } => {
-            handle_add_mount_fd(state, client_fd, id, name, host_path, target, read_only);
-            let _ = attached_fd;
+        Op::AddMountFd { id, .. } => {
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::Internal,
+                    "AddMountFd is deprecated; use MountFuse instead",
+                )),
+            );
         }
-        Op::RemoveMountByName { id, name } => {
-            handle_remove_mount_by_name(state, client_fd, id, name);
+        Op::RemoveMountByName { id, .. } => {
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::Internal,
+                    "RemoveMountByName is deprecated; use UnmountFuse instead",
+                )),
+            );
         }
         Op::MountFuse {
             id,
@@ -1049,7 +1018,7 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             target,
             read_only,
         } => {
-            handle_mount_fuse(state, client_fd, id, name, vsock_port, target, read_only);
+            handle_mount_fuse(state, client_fd, id, name, vsock_port, target, read_only, attached_fd);
         }
         Op::UnmountFuse { id, name } => {
             handle_unmount_fuse(state, client_fd, id, name);
@@ -1214,196 +1183,14 @@ fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, _name: S
     );
 }
 
-#[cfg(target_os = "linux")]
-fn handle_add_mount_fd(
-    state: &mut State,
-    client_fd: RawFd,
-    id: String,
-    name: String,
-    host_path: String,
-    target: String,
-    read_only: bool,
-) {
-    if state.dynamic_mounts.contains_key(&name) {
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::BadRequest,
-                format!("dynamic mount {name:?} already exists"),
-            )),
-        );
-        return;
-    }
-    let host_root = match state.host_root_fd.as_ref() {
-        Some(f) => f.as_raw_fd(),
-        None => {
-            ack(
-                state,
-                client_fd,
-                id,
-                Err(ErrorReply::new(
-                    ErrorCode::Internal,
-                    "host_root_fd unavailable (init started without /.tps_host)",
-                )),
-            );
-            return;
-        }
-    };
-    // Strip leading '/'s so openat() treats the path as relative.
-    let rel = host_path.trim_start_matches('/');
-    let rel_for_open: &str = if rel.is_empty() { "." } else { rel };
-    let rel_c = match std::ffi::CString::new(rel_for_open) {
-        Ok(c) => c,
-        Err(e) => {
-            ack(
-                state,
-                client_fd,
-                id,
-                Err(ErrorReply::new(ErrorCode::BadRequest, format!("host_path NUL: {e}"))),
-            );
-            return;
-        }
-    };
-    let src_fd = unsafe {
-        libc::openat(
-            host_root,
-            rel_c.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if src_fd < 0 {
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!(
-                    "openat(host_root, {rel_for_open:?}): {}",
-                    std::io::Error::last_os_error()
-                ),
-            )),
-        );
-        return;
-    }
-    let src_owned = unsafe { OwnedFd::from_raw_fd(src_fd) };
-
-    if let Err(e) = std::fs::create_dir_all(&target) {
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!("create_dir_all {target}: {e}"),
-            )),
-        );
-        return;
-    }
-    let src_proc = format!("/proc/self/fd/{}", src_owned.as_raw_fd());
-    let src_c = std::ffi::CString::new(src_proc.as_str()).unwrap();
-    let tgt_c = std::ffi::CString::new(target.as_str()).unwrap();
-    let none_c = std::ffi::CString::new("").unwrap();
-    // Source mount is the bwrap-staged `--bind /` (rw). Locked flags
-    // inherited from the user_ns staging are MS_NOSUID|MS_NODEV (bwrap
-    // applies these to all binds), so we must include them. The bind
-    // itself is rw; we remount-RO afterward if the caller asked for it.
-    let base_flags = libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV;
-    let flags = base_flags as libc::c_ulong;
-    let rc = unsafe {
-        libc::mount(
-            src_c.as_ptr(),
-            tgt_c.as_ptr(),
-            std::ptr::null(),
-            flags,
-            std::ptr::null(),
-        )
-    };
-    if rc != 0 {
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!("mount(bind) {src_proc}->{target}: {}", std::io::Error::last_os_error()),
-            )),
-        );
-        return;
-    }
-    drop(src_owned);
-    if read_only {
-        let remount_flags =
-            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RDONLY) as libc::c_ulong;
-        let rc = unsafe {
-            libc::mount(
-                none_c.as_ptr(),
-                tgt_c.as_ptr(),
-                std::ptr::null(),
-                remount_flags,
-                std::ptr::null(),
-            )
-        };
-        if rc != 0 {
-            let _ = unsafe { libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH) };
-            ack(
-                state,
-                client_fd,
-                id,
-                Err(ErrorReply::new(
-                    ErrorCode::Internal,
-                    format!("remount-ro {target}: {}", std::io::Error::last_os_error()),
-                )),
-            );
-            return;
-        }
-    }
-    state.dynamic_mounts.insert(name, target);
-    ack(state, client_fd, id, Ok(()));
-}
-
-#[cfg(target_os = "linux")]
-fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, name: String) {
-    let target = match state.dynamic_mounts.remove(&name) {
-        Some(t) => t,
-        None => {
-            ack(
-                state,
-                client_fd,
-                id,
-                Err(ErrorReply::new(
-                    ErrorCode::BadRequest,
-                    format!("no such dynamic mount: {name:?}"),
-                )),
-            );
-            return;
-        }
-    };
-    let target_c = std::ffi::CString::new(target.as_str()).unwrap_or_default();
-    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        ack(
-            state,
-            client_fd,
-            id,
-            Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!("umount2({target}): {err}"),
-            )),
-        );
-        return;
-    }
-    let _ = std::fs::remove_dir(&target);
-    ack(state, client_fd, id, Ok(()));
-}
-
 /// Handle `Op::MountFuse`: spawn `tokimo-sandbox-fuse` as a child
-/// process. The child connects to the host's FUSE listener over vsock
-/// and mounts itself at `target`. We don't wait for the mount to be
-/// "ready" — the child runs as long as the FUSE filesystem is mounted.
+/// process. The child connects to the host's FUSE listener and mounts
+/// itself at `target`. We don't wait for the mount to be "ready" — the
+/// child runs as long as the FUSE filesystem is mounted.
+///
+/// If `attached_fd` is present (passed via SCM_RIGHTS from the host),
+/// uses `--transport unix-fd --fd <N>` (Linux bwrap path). Otherwise
+/// uses `--transport vsock --port <N>` (macOS/Windows VM path).
 ///
 /// The child inherits stderr to ours so its diagnostic output reaches
 /// the host console. PID is recorded in `state.fuse_mounts` so
@@ -1417,6 +1204,7 @@ fn handle_mount_fuse(
     vsock_port: u32,
     target: String,
     read_only: bool,
+    attached_fd: Option<OwnedFd>,
 ) {
     let res: Result<(), ErrorReply> = (|| {
         if state.fuse_mounts.contains_key(&name) {
@@ -1438,18 +1226,55 @@ fn handle_mount_fuse(
             "tokimo-sandbox-fuse".to_string()
         };
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--transport").arg("vsock");
-        cmd.arg("--port").arg(vsock_port.to_string());
+        if let Some(fd) = attached_fd {
+            // Linux bwrap path: fd received via SCM_RIGHTS from host.
+            let fuse_fd = fd.as_raw_fd();
+            // Clear CLOEXEC so the fd survives into the fuse child.
+            unsafe {
+                libc::fcntl(fuse_fd, libc::F_SETFD, 0);
+            }
+            cmd.arg("--transport").arg("unix-fd");
+            cmd.arg("--fd").arg(fuse_fd.to_string());
+            // Keep fd alive across spawn: the child inherits it, but we
+            // must not close it before the child starts. Forget the
+            // OwnedFd so it isn't closed on drop; the child owns it now.
+            std::mem::forget(fd);
+        } else {
+            // VM path (macOS/Windows): connect to host via vsock.
+            cmd.arg("--transport").arg("vsock");
+            cmd.arg("--port").arg(vsock_port.to_string());
+        }
         cmd.arg("--mount-name").arg(&name);
         cmd.arg("--target").arg(&target);
         if read_only {
             cmd.arg("--read-only");
         }
+
         let child = cmd
             .spawn()
             .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("spawn {exe}: {e}")))?;
         let pid = child.id() as i32;
         std::mem::forget(child);
+
+        // Wait for the FUSE mount to appear in /proc/mounts.
+        // fuser::mount2 calls mount(2) internally; once it returns, the
+        // mount is active and visible in /proc/mounts. Poll with a short
+        // timeout so we don't block init forever if something goes wrong.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut mounted = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+                // The mount entry contains the target path and "fuse" type.
+                if mounts.lines().any(|line| {
+                    line.contains(&target) && (line.contains(" fuse") || line.contains(" fuse."))
+                }) {
+                    mounted = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
         state.fuse_mounts.insert(
             name.clone(),
             FuseMount {
@@ -1457,7 +1282,13 @@ fn handle_mount_fuse(
                 child_pid: pid,
             },
         );
-        eprintln!("[tokimo-init] spawned fuse: name={name} pid={pid} target={target} port={vsock_port}");
+        if mounted {
+            eprintln!("[tokimo-init] mounted fuse: name={name} pid={pid} target={target}");
+        } else {
+            eprintln!(
+                "[tokimo-init] fuse mount pending: name={name} pid={pid} target={target} (proceeding)"
+            );
+        }
         Ok(())
     })();
     ack(state, client_fd, id, res);
@@ -1510,6 +1341,7 @@ fn handle_mount_fuse(
     _vsock_port: u32,
     _target: String,
     _read_only: bool,
+    _attached_fd: Option<OwnedFd>,
 ) {
     ack(
         state,
@@ -1526,34 +1358,6 @@ fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, _name: S
         client_fd,
         id,
         Err(ErrorReply::new(ErrorCode::Internal, "UnmountFuse is Linux-only")),
-    );
-}
-
-#[cfg(not(target_os = "linux"))]
-fn handle_add_mount_fd(
-    state: &mut State,
-    client_fd: RawFd,
-    id: String,
-    _name: String,
-    _host_path: String,
-    _target: String,
-    _read_only: bool,
-) {
-    ack(
-        state,
-        client_fd,
-        id,
-        Err(ErrorReply::new(ErrorCode::Internal, "AddMountFd is Linux-only")),
-    );
-}
-
-#[cfg(not(target_os = "linux"))]
-fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, _name: String) {
-    ack(
-        state,
-        client_fd,
-        id,
-        Err(ErrorReply::new(ErrorCode::Internal, "RemoveMountByName is Linux-only")),
     );
 }
 

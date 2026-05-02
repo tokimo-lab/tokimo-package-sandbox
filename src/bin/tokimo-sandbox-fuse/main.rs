@@ -80,7 +80,6 @@ mod linux {
         mount_name: String,
         target: PathBuf,
         read_only: bool,
-        allow_other: bool,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -91,7 +90,6 @@ mod linux {
         let mut mount_name: Option<String> = None;
         let mut target: Option<PathBuf> = None;
         let mut read_only = false;
-        let mut allow_other = false;
         while let Some(a) = argv.next() {
             match a.as_str() {
                 "--transport" => transport_kind = argv.next(),
@@ -100,7 +98,7 @@ mod linux {
                 "--mount-name" => mount_name = argv.next(),
                 "--target" => target = argv.next().map(PathBuf::from),
                 "--read-only" => read_only = true,
-                "--allow-other" => allow_other = true,
+                "--allow-other" => {} // accepted for backward compat, always enabled
                 "-h" | "--help" => {
                     eprintln!("{}", USAGE);
                     std::process::exit(0);
@@ -125,7 +123,6 @@ mod linux {
             mount_name: mount_name.ok_or("missing --mount-name")?,
             target: target.ok_or("missing --target")?,
             read_only,
-            allow_other,
         })
     }
 
@@ -178,15 +175,13 @@ mod linux {
         let mut opts = vec![
             MountOption::FSName(format!("tokimo-{}", args.mount_name)),
             MountOption::DefaultPermissions,
+            MountOption::AllowOther,
             MountOption::NoAtime,
         ];
         if args.read_only {
             opts.push(MountOption::RO);
         } else {
             opts.push(MountOption::RW);
-        }
-        if args.allow_other {
-            opts.push(MountOption::AllowOther);
         }
 
         // Make sure mountpoint exists.

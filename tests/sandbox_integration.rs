@@ -976,7 +976,7 @@ fn add_user_with_reverse_mount_writes_to_host() {
         format!("echo {SENTINEL} > $HOME/note.txt; echo DONE_REV_88\n").as_bytes(),
     )
     .unwrap();
-    let _ = drain_until(&rx, &bob, "DONE_REV_88", Duration::from_secs(30));
+    drain_until(&rx, &bob, "DONE_REV_88", Duration::from_secs(30));
 
     // Host-side readback: the bytes written from inside the guest must
     // be visible on the host without any explicit sync — virtio-fs /
