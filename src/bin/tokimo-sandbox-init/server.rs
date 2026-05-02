@@ -165,9 +165,7 @@ pub fn snapshot_base_env() -> Vec<(String, String)> {
     // child spawned inside the sandbox. Anything legitimate the user wants
     // visible inside the guest must come through `ConfigureParams::env`
     // and `ShellOpts::env`/`ExecOpts::env`, not the host process env.
-    env::vars()
-        .filter(|(k, _)| !k.starts_with("TOKIMO_SANDBOX_"))
-        .collect()
+    env::vars().filter(|(k, _)| !k.starts_with("TOKIMO_SANDBOX_")).collect()
 }
 
 pub fn run_loop(
@@ -183,11 +181,7 @@ pub fn run_loop(
 /// Linux bwrap entry point: the `client` fd is a pre-connected SEQPACKET
 /// socket (one half of a `socketpair(2)` whose other end the host kept).
 /// Skips listener `accept(2)` — there is no listener.
-pub fn run_loop_preconnected(
-    client: OwnedFd,
-    sigfd: OwnedFd,
-    base_env: Vec<(String, String)>,
-) -> Result<(), String> {
+pub fn run_loop_preconnected(client: OwnedFd, sigfd: OwnedFd, base_env: Vec<(String, String)>) -> Result<(), String> {
     run_loop_inner(client, None, sigfd, base_env, Transport::SeqPacket, true)
 }
 
@@ -222,9 +216,7 @@ fn run_loop_inner(
     #[cfg(target_os = "linux")]
     if preconnected_seqpacket {
         let cstr = std::ffi::CString::new("/.tps_host").unwrap();
-        let raw = unsafe {
-            libc::open(cstr.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        };
+        let raw = unsafe { libc::open(cstr.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         if raw < 0 {
             eprintln!(
                 "[init] open(/.tps_host) failed: {} (dynamic mounts will not work)",
@@ -949,7 +941,13 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::RemoveMount { id, name } => {
             handle_remove_mount(state, client_fd, id, name);
         }
-        Op::AddMountFd { id, name, host_path, target, read_only } => {
+        Op::AddMountFd {
+            id,
+            name,
+            host_path,
+            target,
+            read_only,
+        } => {
             handle_add_mount_fd(state, client_fd, id, name, host_path, target, read_only);
             let _ = attached_fd;
         }
@@ -1028,10 +1026,15 @@ fn handle_mount_manifest(state: &mut State, client_fd: RawFd, id: String, _entri
 #[cfg(target_os = "linux")]
 fn handle_add_mount(state: &mut State, client_fd: RawFd, id: String, entry: MountEntry) {
     if state.mount_fds.iter().any(|m| m.name == entry.aname) {
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::BadRequest,
-            format!("share {:?} already mounted", entry.aname),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("share {:?} already mounted", entry.aname),
+            )),
+        );
         return;
     }
     match mount_one(&entry) {
@@ -1054,10 +1057,15 @@ fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, name: St
     let idx = match state.mount_fds.iter().position(|m| m.name == name) {
         Some(i) => i,
         None => {
-            ack(state, client_fd, id, Err(ErrorReply::new(
-                ErrorCode::BadRequest,
-                format!("no such share: {name:?}"),
-            )));
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::BadRequest,
+                    format!("no such share: {name:?}"),
+                )),
+            );
             return;
         }
     };
@@ -1069,10 +1077,15 @@ fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, name: St
     drop(entry); // closes fd
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("umount2({target_str}): {err}"),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("umount2({target_str}): {err}"),
+            )),
+        );
         return;
     }
     // Best-effort: remove the now-empty mountpoint so a subsequent
@@ -1083,18 +1096,22 @@ fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, name: St
 
 #[cfg(not(target_os = "linux"))]
 fn handle_add_mount(state: &mut State, client_fd: RawFd, id: String, _entry: MountEntry) {
-    ack(state, client_fd, id, Err(ErrorReply::new(
-        ErrorCode::Internal,
-        "AddMount is Linux-only",
-    )));
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "AddMount is Linux-only")),
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
 fn handle_remove_mount(state: &mut State, client_fd: RawFd, id: String, _name: String) {
-    ack(state, client_fd, id, Err(ErrorReply::new(
-        ErrorCode::Internal,
-        "RemoveMount is Linux-only",
-    )));
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "RemoveMount is Linux-only")),
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1108,19 +1125,29 @@ fn handle_add_mount_fd(
     read_only: bool,
 ) {
     if state.dynamic_mounts.contains_key(&name) {
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::BadRequest,
-            format!("dynamic mount {name:?} already exists"),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("dynamic mount {name:?} already exists"),
+            )),
+        );
         return;
     }
     let host_root = match state.host_root_fd.as_ref() {
         Some(f) => f.as_raw_fd(),
         None => {
-            ack(state, client_fd, id, Err(ErrorReply::new(
-                ErrorCode::Internal,
-                "host_root_fd unavailable (init started without /.tps_host)",
-            )));
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::Internal,
+                    "host_root_fd unavailable (init started without /.tps_host)",
+                )),
+            );
             return;
         }
     };
@@ -1130,10 +1157,12 @@ fn handle_add_mount_fd(
     let rel_c = match std::ffi::CString::new(rel_for_open) {
         Ok(c) => c,
         Err(e) => {
-            ack(state, client_fd, id, Err(ErrorReply::new(
-                ErrorCode::BadRequest,
-                format!("host_path NUL: {e}"),
-            )));
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(ErrorCode::BadRequest, format!("host_path NUL: {e}"))),
+            );
             return;
         }
     };
@@ -1145,19 +1174,32 @@ fn handle_add_mount_fd(
         )
     };
     if src_fd < 0 {
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("openat(host_root, {rel_for_open:?}): {}", std::io::Error::last_os_error()),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!(
+                    "openat(host_root, {rel_for_open:?}): {}",
+                    std::io::Error::last_os_error()
+                ),
+            )),
+        );
         return;
     }
     let src_owned = unsafe { OwnedFd::from_raw_fd(src_fd) };
 
     if let Err(e) = std::fs::create_dir_all(&target) {
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("create_dir_all {target}: {e}"),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("create_dir_all {target}: {e}"),
+            )),
+        );
         return;
     }
     let src_proc = format!("/proc/self/fd/{}", src_owned.as_raw_fd());
@@ -1171,27 +1213,50 @@ fn handle_add_mount_fd(
     let base_flags = libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV;
     let flags = base_flags as libc::c_ulong;
     let rc = unsafe {
-        libc::mount(src_c.as_ptr(), tgt_c.as_ptr(), std::ptr::null(), flags, std::ptr::null())
+        libc::mount(
+            src_c.as_ptr(),
+            tgt_c.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
     };
     if rc != 0 {
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("mount(bind) {src_proc}->{target}: {}", std::io::Error::last_os_error()),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("mount(bind) {src_proc}->{target}: {}", std::io::Error::last_os_error()),
+            )),
+        );
         return;
     }
     drop(src_owned);
     if read_only {
-        let remount_flags = (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RDONLY) as libc::c_ulong;
+        let remount_flags =
+            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_RDONLY) as libc::c_ulong;
         let rc = unsafe {
-            libc::mount(none_c.as_ptr(), tgt_c.as_ptr(), std::ptr::null(), remount_flags, std::ptr::null())
+            libc::mount(
+                none_c.as_ptr(),
+                tgt_c.as_ptr(),
+                std::ptr::null(),
+                remount_flags,
+                std::ptr::null(),
+            )
         };
         if rc != 0 {
             let _ = unsafe { libc::umount2(tgt_c.as_ptr(), libc::MNT_DETACH) };
-            ack(state, client_fd, id, Err(ErrorReply::new(
-                ErrorCode::Internal,
-                format!("remount-ro {target}: {}", std::io::Error::last_os_error()),
-            )));
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::Internal,
+                    format!("remount-ro {target}: {}", std::io::Error::last_os_error()),
+                )),
+            );
             return;
         }
     }
@@ -1204,10 +1269,15 @@ fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, 
     let target = match state.dynamic_mounts.remove(&name) {
         Some(t) => t,
         None => {
-            ack(state, client_fd, id, Err(ErrorReply::new(
-                ErrorCode::BadRequest,
-                format!("no such dynamic mount: {name:?}"),
-            )));
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::BadRequest,
+                    format!("no such dynamic mount: {name:?}"),
+                )),
+            );
             return;
         }
     };
@@ -1215,10 +1285,15 @@ fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, 
     let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        ack(state, client_fd, id, Err(ErrorReply::new(
-            ErrorCode::Internal,
-            format!("umount2({target}): {err}"),
-        )));
+        ack(
+            state,
+            client_fd,
+            id,
+            Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("umount2({target}): {err}"),
+            )),
+        );
         return;
     }
     let _ = std::fs::remove_dir(&target);
@@ -1235,18 +1310,22 @@ fn handle_add_mount_fd(
     _target: String,
     _read_only: bool,
 ) {
-    ack(state, client_fd, id, Err(ErrorReply::new(
-        ErrorCode::Internal,
-        "AddMountFd is Linux-only",
-    )));
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "AddMountFd is Linux-only")),
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
 fn handle_remove_mount_by_name(state: &mut State, client_fd: RawFd, id: String, _name: String) {
-    ack(state, client_fd, id, Err(ErrorReply::new(
-        ErrorCode::Internal,
-        "RemoveMountByName is Linux-only",
-    )));
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "RemoveMountByName is Linux-only")),
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -457,11 +457,7 @@ impl SandboxBackend for LinuxBackend {
             let read_file = std::fs::File::from(read_fd);
             let write_file = std::fs::File::from(write_fd);
             let shutdown = Arc::new(AtomicBool::new(false));
-            let _ = crate::netstack::spawn(
-                Box::new(read_file),
-                Box::new(write_file),
-                Arc::clone(&shutdown),
-            );
+            let _ = crate::netstack::spawn(Box::new(read_file), Box::new(write_file), Arc::clone(&shutdown));
             Some(shutdown)
         } else {
             None
@@ -621,10 +617,7 @@ impl SandboxBackend for LinuxBackend {
         self.ensure_running()?;
         // Build argv (own the strings so we can release the state lock
         // before issuing the init RPC).
-        let argv: Vec<String> = opts
-            .argv
-            .clone()
-            .unwrap_or_else(|| vec!["/bin/bash".to_string()]);
+        let argv: Vec<String> = opts.argv.clone().unwrap_or_else(|| vec!["/bin/bash".to_string()]);
         let env = opts.env.clone();
         let cwd = opts.cwd.clone();
 

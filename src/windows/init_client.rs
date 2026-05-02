@@ -94,10 +94,7 @@ impl WinInitClient {
     /// the relevant byte-oriented trait. Used by the Windows service to drive
     /// the in-VM init protocol over an `HvSock` pair without going through a
     /// named-pipe tunnel.
-    pub fn with_transport(
-        write_half: Box<dyn Write + Send>,
-        read_half: Box<dyn Read + Send>,
-    ) -> Result<Self> {
+    pub fn with_transport(write_half: Box<dyn Write + Send>, read_half: Box<dyn Read + Send>) -> Result<Self> {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let reader_state = state.clone();
 
@@ -331,10 +328,7 @@ impl WinInitClient {
     /// `HcsModifyComputeSystem` so the guest's vsock dial succeeds.
     pub fn add_mount(&self, entry: MountEntry) -> Result<()> {
         let id = next_id(&self.inner.counter);
-        let op = Op::AddMount {
-            id: id.clone(),
-            entry,
-        };
+        let op = Op::AddMount { id: id.clone(), entry };
         // mount(2) inside the guest can take a moment for slow boots.
         let reply = self.send_op_sync(&id, op, Duration::from_secs(30))?;
         match reply {
@@ -342,10 +336,7 @@ impl WinInitClient {
                 if ok {
                     Ok(())
                 } else {
-                    Err(Error::exec(format!(
-                        "AddMount failed: {:?}",
-                        error.map(|e| e.message)
-                    )))
+                    Err(Error::exec(format!("AddMount failed: {:?}", error.map(|e| e.message))))
                 }
             }
             other => Err(Error::exec(format!("expected Ack reply, got {other:?}"))),

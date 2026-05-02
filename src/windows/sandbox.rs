@@ -16,8 +16,8 @@ use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, RemovePlan9ShareParams,
-    ResizeShellParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
+    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult,
+    RemovePlan9ShareParams, ResizeShellParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
