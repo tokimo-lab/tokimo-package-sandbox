@@ -4,10 +4,10 @@
 #
 # Run via: scripts/build-vm-local.ps1 (Windows orchestrator).
 #
-# Inputs (mounted at /work):
-#   /work/init.sh
-#   /work/vsock9p.c
-#   /work/tokimo-sandbox-init   (musl static, prebuilt)
+# Inputs:
+#   /vm-base/init.sh            (from packaging/vm-base/, mounted read-only)
+#   /vm-base/vsock9p.c          (from packaging/vm-base/, mounted read-only)
+#   /work/tokimo-sandbox-init   (musl static, prebuilt, in packaging/vm-local/)
 #
 # Outputs (placed in /out):
 #   /out/vmlinuz
@@ -36,7 +36,7 @@ apt-get install -y --no-install-recommends \
     >/dev/null
 
 echo "==> [2/6] compile vsock9p"
-gcc -static -O2 -o /tmp/vsock9p "$WORK/vsock9p.c"
+gcc -static -O2 -o /tmp/vsock9p /vm-base/vsock9p.c
 ls -lh /tmp/vsock9p
 
 echo "==> [3/6] extract kernel"
@@ -57,7 +57,7 @@ done
 ln -sf /bin/busybox "$INITRD/sbin/poweroff"
 ln -sf /bin/busybox "$INITRD/sbin/init"
 
-cp "$WORK/init.sh" "$INITRD/init"
+cp /vm-base/init.sh "$INITRD/init"
 chmod +x "$INITRD/init"
 
 cp /tmp/vsock9p "$INITRD/bin/vsock9p"

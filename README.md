@@ -205,17 +205,17 @@ sb.stop_vm().unwrap();
 Both platforms share the same Linux kernel + initrd + Debian 13 rootfs. Download via:
 
 ```powershell
-pwsh scripts/fetch-vm.ps1                 # latest release
-pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0  # specific tag
+pwsh scripts/windows/fetch-vm.ps1                 # latest release
+pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # specific tag
 ```
 
 Or symlink prebuilt arm64 artifacts for local macOS development:
 
 ```sh
 mkdir -p vm
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
 ### macOS code signing
@@ -224,7 +224,7 @@ Register the codesign cargo runner in your local `.cargo/config.toml`:
 
 ```toml
 [target.aarch64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 ```
 
 ### Windows service
@@ -237,7 +237,7 @@ cargo run --bin tokimo-sandbox-svc -- --console
 .\target\debug\tokimo-sandbox-svc.exe --install
 
 # Production — MSIX
-pwsh scripts/build-msix.ps1
+pwsh scripts/windows/build-msix.ps1
 ```
 
 ## What's inside the sandbox

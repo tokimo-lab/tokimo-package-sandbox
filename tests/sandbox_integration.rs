@@ -1,7 +1,7 @@
 //! Integration tests for the public `Sandbox` API.
 //!
 //! Requires the SYSTEM service to be running. See
-//! `scripts/test-integration.ps1` for the elevated runner.
+//! `scripts/windows/test-integration.ps1` for the elevated runner.
 //!
 //! Tests are serialized via `--test-threads=1` because Hyper-V is rate
 //! limited and tests share the host-side service.

@@ -111,9 +111,9 @@ Sandbox client (library, in-process)
 - Each `Sandbox` handle owns a unique `session_dir` under
   `~/.tokimo/sessions/<sanitized_name>-<session_id>-<pid>-<counter>` so
   concurrent sessions never collide.
-- The host binary must be code-signed with `vz.entitlements` (the
+- The host binary must be code-signed with `packaging/macos/vz.entitlements` (the
   `com.apple.security.virtualization` entitlement). `cargo test` does this
-  automatically via `scripts/codesign-and-run.sh` registered as a cargo
+  automatically via `scripts/macos/codesign-and-run.sh` registered as a cargo
   runner; see `docs/macos-testing.md`.
 - `tests/sandbox_integration.rs` (16/16 green) must run with
   `--test-threads=1` because the suite shares one host process and `BOOT_LOCK`
@@ -121,7 +121,7 @@ Sandbox client (library, in-process)
 
 ## Deployment modes (Windows)
 
-- **MSIX** (`packaging/windows/`, `scripts/build-msix.ps1`): recommended for production — registers service name `TokimoSandboxSvc` via `desktop6:Service`.
+- **MSIX** (`packaging/windows/`, `scripts/windows/build-msix.ps1`): recommended for production — registers service name `TokimoSandboxSvc` via `desktop6:Service`.
 - **CLI install** (`--install` / `--uninstall`): registers service name `tokimo-sandbox-svc` (lowercase-kebab) — for development. The two names are intentionally different so both can coexist on the same machine.
 - **Console mode** (`--console`): foreground dev mode, no SCM registration needed.
 
@@ -247,7 +247,7 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 | `src/bin/tokimo-sandbox-svc/imp/hvsock.rs` | AF_HYPERV listener with per-session ServiceId |
 | `src/bin/tokimo-sandbox-svc/imp/vhdx_pool.rs` | Per-target rootfs VHDX leasing (ephemeral clone vs persistent lock) |
 | `packaging/windows/AppxManifest.xml` | MSIX manifest declaring `desktop6:Service` |
-| `scripts/build-msix.ps1` | MSIX build script (optional Authenticode signing) |
+| `scripts/windows/build-msix.ps1` | MSIX build script (optional Authenticode signing) |
 
 ## Build & test
 
@@ -270,7 +270,7 @@ cargo test --lib
 cargo test --bin tokimo-sandbox-svc --lib
 
 # Package MSIX
-pwsh ./scripts/build-msix.ps1
+pwsh ./scripts/windows/build-msix.ps1
 ```
 
 ```bash
@@ -291,17 +291,17 @@ PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-t
 # --- macOS (Apple Silicon) ---
 
 # 1. Provide VM artifacts under <repo>/vm/ (symlinks are fine):
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 
 # 2. Register the codesign cargo runner once (in your gitignored
 #    .cargo/config.toml; the runner ad-hoc-signs each test binary with
-#    vz.entitlements before exec'ing):
+#    packaging/macos/vz.entitlements before exec'ing):
 #       [target.aarch64-apple-darwin]
-#       runner = "scripts/codesign-and-run.sh"
+#       runner = "scripts/macos/codesign-and-run.sh"
 #       [target.x86_64-apple-darwin]
-#       runner = "scripts/codesign-and-run.sh"
+#       runner = "scripts/macos/codesign-and-run.sh"
 
 # 3. Run. --test-threads=1 is required (the VZ dispatch queue cannot
 #    handle parallel vm.start() calls from one process; BOOT_LOCK
@@ -324,11 +324,11 @@ Linux/bwrap configuration is passed via argv (subcommand `tokimo-sandbox-init bw
 
 ## Windows VM artifacts
 
-Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm-image.yml` under tags with prefix `vm-v*` (see `packaging/vm-image/README.md` for the build pipeline). Download via:
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm-image.yml` under tags with prefix `vm-v*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
 
 ```powershell
-pwsh scripts/fetch-vm.ps1                 # latest
-pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0  # specific
+pwsh scripts/windows/fetch-vm.ps1                 # latest
+pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # specific
 ```
 
 `src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**

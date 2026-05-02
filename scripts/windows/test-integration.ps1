@@ -48,7 +48,7 @@ if (-not $isAdmin) {
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-$Root      = Split-Path $PSScriptRoot -Parent
+$Root      = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $Exe       = Join-Path $Root 'target\debug\tokimo-sandbox-svc.exe'
 $ArtDir    = Join-Path $Root 'target\integration'
 $SvcLog    = Join-Path $ArtDir 'svc.log'

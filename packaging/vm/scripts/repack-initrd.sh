@@ -7,10 +7,10 @@
 #
 # Output (paths assume a local dev checkout at /mnt/f/tokimo-package-sandbox):
 #   /mnt/f/tokimo-package-sandbox/initrd-new.img
-#   /mnt/f/tokimo-package-sandbox/packaging/vm-image/tokimo-os-amd64/initrd.img  (overwritten)
+#   /mnt/f/tokimo-package-sandbox/packaging/vm-base/tokimo-os-amd64/initrd.img  (overwritten)
 set -euo pipefail
 
-ROOTFS_PROJ=/mnt/f/tokimo-package-sandbox/packaging/vm-image
+ROOTFS_PROJ=/mnt/f/tokimo-package-sandbox/packaging/vm-base
 PREP="$ROOTFS_PROJ/initrd-prep"
 FINAL="$ROOTFS_PROJ/tokimo-os-amd64/initrd.img"
 OUT=/tmp/tokimo-initrd.img

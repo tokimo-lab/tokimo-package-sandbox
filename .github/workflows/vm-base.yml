@@ -48,13 +48,13 @@ jobs:
       - name: Build base VM image (no init binary baked)
         # TOKIMO_INIT_BIN is intentionally unset; build.sh emits a warning and
         # produces an initrd suitable for vm-image.yml to rebake.
-        working-directory: packaging/vm-image
+        working-directory: packaging/vm-base
         run: bash build.sh ${{ matrix.arch }}
 
       - name: Package rootfs tarball
         run: |
           SFX=${{ matrix.suffix }}
-          tar -cpf "tokimo-linux-rootfs-${SFX}.tar" -C "packaging/vm-image/tokimo-os-${{ matrix.arch }}/rootfs" .
+          tar -cpf "tokimo-linux-rootfs-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs" .
           zstd -10 -T0 "tokimo-linux-rootfs-${SFX}.tar" -o "tokimo-linux-rootfs-${SFX}.tar.zst"
           sha256sum "tokimo-linux-rootfs-${SFX}.tar.zst" > "tokimo-linux-rootfs-${SFX}.tar.zst.sha256"
           rm "tokimo-linux-rootfs-${SFX}.tar"
@@ -62,7 +62,7 @@ jobs:
       - name: Package kernel + base initrd bundle
         run: |
           SFX=${{ matrix.suffix }}
-          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C "packaging/vm-image/tokimo-os-${{ matrix.arch }}" vmlinuz initrd.img
+          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}" vmlinuz initrd.img
           zstd -10 -T0 "tokimo-linux-kernel-${SFX}.tar" -o "tokimo-linux-kernel-${SFX}.tar.zst"
           sha256sum "tokimo-linux-kernel-${SFX}.tar.zst" > "tokimo-linux-kernel-${SFX}.tar.zst.sha256"
           rm "tokimo-linux-kernel-${SFX}.tar"
@@ -71,7 +71,7 @@ jobs:
         if: matrix.arch == 'amd64'
         run: |
           SFX=${{ matrix.suffix }}
-          ROOTFS_DIR=packaging/vm-image/tokimo-os-${{ matrix.arch }}/rootfs
+          ROOTFS_DIR=packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs
           ROOTFS_SIZE=$(sudo du -sm "$ROOTFS_DIR" | cut -f1)
           IMG_SIZE=$((ROOTFS_SIZE + 512))
           sudo apt-get update -qq

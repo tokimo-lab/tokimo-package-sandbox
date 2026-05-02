@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run inside rust:1.95-slim-bookworm linux/arm64 — invoked by
-# scripts/rebake-arm64-initrd.sh. Builds aarch64-musl init + tun-pump,
+# scripts/linux/rebake-arm64-initrd.sh. Builds aarch64-musl init + tun-pump,
 # fetches tun.ko for the guest kernel, and rebakes the initrd in-place.
 #
 # Reads $KVER (e.g. "6.12.85+deb13-arm64") from environment.
@@ -57,14 +57,14 @@ cp "$TUN_PATH" "$EXTRAS/"
 
 # --- 4. Rebake initrd -------------------------------------------------
 echo "==> rebake initrd"
-bash /src/packaging/vm-image/scripts/rebake-initrd.sh \
-    --base       /src/packaging/vm-image/tokimo-os-arm64/initrd.img \
+bash /src/packaging/vm/scripts/rebake-initrd.sh \
+    --base       /src/packaging/vm-base/tokimo-os-arm64/initrd.img \
     --init-bin   "$INIT_BIN" \
-    --init-sh    /src/packaging/vm-image/init.sh \
+    --init-sh    /src/packaging/vm-base/init.sh \
     --tun-pump-bin "$PUMP_BIN" \
     --extras-dir "$EXTRAS" \
-    --out        /src/packaging/vm-image/tokimo-os-arm64/initrd.img.new
+    --out        /src/packaging/vm-base/tokimo-os-arm64/initrd.img.new
 
-mv /src/packaging/vm-image/tokimo-os-arm64/initrd.img.new \
-   /src/packaging/vm-image/tokimo-os-arm64/initrd.img
-echo "==> wrote $(stat -c%s /src/packaging/vm-image/tokimo-os-arm64/initrd.img) bytes"
+mv /src/packaging/vm-base/tokimo-os-arm64/initrd.img.new \
+   /src/packaging/vm-base/tokimo-os-arm64/initrd.img
+echo "==> wrote $(stat -c%s /src/packaging/vm-base/tokimo-os-arm64/initrd.img) bytes"

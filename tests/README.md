@@ -19,7 +19,7 @@ test runner script under `scripts/`.** Currently only Windows has one.
 | **Administrator** | HCS / HCN (Hyper-V Host Compute Service / Network) require SYSTEM-level access. The library connects to `\\.\pipe\tokimo-sandbox-svc` which is owned by the SYSTEM-level service. |
 | **Hyper-V feature enabled** | `Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All` must report `Enabled`. |
 | **PowerShell 7 (`pwsh.exe`)** | The wrapper script uses strict mode and fails on `cargo`'s stderr-on-success under Windows PowerShell 5.1 (`$ErrorActionPreference='Stop'` + `NativeCommandError`). PS 7 handles it correctly. Path: `C:\Program Files\PowerShell\7\pwsh.exe`. |
-| **VM artifacts in `vm/`** | `vm/vmlinuz`, `vm/initrd.img`, `vm/rootfs.vhdx` must exist. Pull via `pwsh scripts/fetch-vm.ps1`. |
+| **VM artifacts in `vm/`** | `vm/vmlinuz`, `vm/initrd.img`, `vm/rootfs.vhdx` must exist. Pull via `pwsh scripts/windows/fetch-vm.ps1`. |
 | **`tokimo-sandbox-svc` running** | Either as an installed service (`tokimo-sandbox-svc.exe --install`) or in console mode (`tokimo-sandbox-svc.exe --console`). The runner script auto-launches console mode when needed. |
 | **WAN NIC `Forwarding=Enabled`** | Required for `network_allow_all_has_nic`. HCN's NAT network only enables IP forwarding on its own `vEthernet (tokimo-sandbox-nat)` adapter; the host's WAN-facing physical NIC defaults to `Forwarding=Disabled`, which causes reverse-NAT'd return packets to be misrouted out the WAN instead of into the NAT vSwitch. The guest then never sees a SYN-ACK and `bash exec 3<>/dev/tcp/...` hangs past 5 s with probe text `NET_PROBE_DONE`. Fix (elevated, one-shot, no reboot): `Set-NetIPInterface -InterfaceAlias '<WAN-alias>' -Forwarding Enabled`. See [docs/network-allow-all-failure-investigation.md](../docs/network-allow-all-failure-investigation.md) for the full pktmon trace. |
 
@@ -180,9 +180,9 @@ knowing when porting tests or debugging:
 
 | Requirement | Why |
 |---|---|
-| **Apple Silicon (arm64) host** | The bundled prebuilt rootfs / kernel under `packaging/vm-image/tokimo-os-arm64/` is arm64-only. |
+| **Apple Silicon (arm64) host** | The bundled prebuilt rootfs / kernel under `packaging/vm-base/tokimo-os-arm64/` is arm64-only. |
 | **macOS 13+** | Apple Virtualization.framework's modern `VZVirtioFileSystemDevice` + virtio-vsock support. |
-| **Code-signed binary with `vz.entitlements`** | Without `com.apple.security.virtualization`, `start_vm()` fails with: *"The process doesn't have the com.apple.security.virtualization entitlement."* |
+| **Code-signed binary with `packaging/macos/vz.entitlements`** | Without `com.apple.security.virtualization`, `start_vm()` fails with: *"The process doesn't have the com.apple.security.virtualization entitlement."* |
 | **VM artifacts at `<repo>/vm/`** | The backend walks up from cwd looking for `vm/{vmlinuz,initrd.img,rootfs}` (override with `TOKIMO_VM_DIR`). |
 | **No service / no admin** | Like Linux, the macOS backend is library-only — `Sandbox::connect()` is a no-op. The host process directly drives `arcbox-vz` → Virtualization.framework. |
 
@@ -191,19 +191,19 @@ knowing when porting tests or debugging:
 ```sh
 # 1. Symlink prebuilt artifacts into vm/
 mkdir -p vm
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 
 # 2. Wire up the codesign cargo runner in your local .cargo/config.toml
 #    (gitignored). It ad-hoc-signs every test/example binary with
-#    vz.entitlements before exec.
+#    packaging/macos/vz.entitlements before exec.
 cat > .cargo/config.toml <<'EOF'
 [target.aarch64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 
 [target.x86_64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 EOF
 ```
 

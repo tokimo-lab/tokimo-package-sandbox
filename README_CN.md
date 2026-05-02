@@ -205,17 +205,17 @@ sb.stop_vm().unwrap();
 两个平台共享同一套 Linux 内核 + initrd + Debian 13 rootfs。下载：
 
 ```powershell
-pwsh scripts/fetch-vm.ps1                 # 最新发布
-pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0  # 指定标签
+pwsh scripts/windows/fetch-vm.ps1                 # 最新发布
+pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # 指定标签
 ```
 
 macOS 本地开发可直接符号链接预构建的 arm64 产物：
 
 ```sh
 mkdir -p vm
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
 ### macOS 代码签名
@@ -224,7 +224,7 @@ ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
 
 ```toml
 [target.aarch64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 ```
 
 ### Windows 服务
@@ -237,7 +237,7 @@ cargo run --bin tokimo-sandbox-svc -- --console
 .\target\debug\tokimo-sandbox-svc.exe --install
 
 # 生产 — MSIX
-pwsh scripts/build-msix.ps1
+pwsh scripts/windows/build-msix.ps1
 ```
 
 ## 沙箱内有什么

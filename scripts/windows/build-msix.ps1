@@ -19,8 +19,8 @@
     Password for the .pfx file. Only used when PfxPath is provided.
 
 .EXAMPLE
-    pwsh ./scripts/build-msix.ps1
-    pwsh ./scripts/build-msix.ps1 -PfxPath C:\certs\tokimo.pfx -PfxPassword $env:TOKIMO_PFX_PWD
+    pwsh ./scripts/windows/build-msix.ps1
+    pwsh ./scripts/windows/build-msix.ps1 -PfxPath C:\certs\tokimo.pfx -PfxPassword $env:TOKIMO_PFX_PWD
 #>
 param(
     [ValidateSet("release", "debug")]
@@ -30,7 +30,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $layout   = Join-Path $repoRoot "target\msix-layout"
 $outDir   = Join-Path $repoRoot "target\msix"
 $package  = Join-Path $outDir   "Tokimo.SandboxSvc.msix"

@@ -114,13 +114,13 @@
 
 ## 3. VM 启动用什么文件，从哪里来？
 
-三个文件都从本仓库 `vm-image.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `vm/` 目录。构建过程见 [`packaging/vm-image/README.md`](../packaging/vm-image/README.md)。
+三个文件都从本仓库 `vm-image.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `vm/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
 
 ```powershell
 # 下载最新 release 到 vm/
-pwsh scripts\fetch-vm.ps1
+pwsh scripts\windows\fetch-vm.ps1
 # 指定 tag
-pwsh scripts\fetch-vm.ps1 -Tag vm-v1.9.0
+pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 ```
 
 ### 3.1 内核（vmlinuz）
@@ -182,8 +182,8 @@ tokimo.session=1 tokimo.work_port=50002 tokimo.init_port=<per-session-port>
 
 | 路径 | 作用 |
 |---|---|
-| [scripts/fetch-vm.ps1](scripts/fetch-vm.ps1) | 从 sister project release 下载 VM 产物到 `vm/` |
-| [scripts/build-msix.ps1](scripts/build-msix.ps1) | 打包 MSIX |
+| [scripts/windows/fetch-vm.ps1](scripts/windows/fetch-vm.ps1) | 从 sister project release 下载 VM 产物到 `vm/` |
+| [scripts/windows/build-msix.ps1](scripts/windows/build-msix.ps1) | 打包 MSIX |
 | [scripts/check-env.ps1](scripts/check-env.ps1) | 接手者第一步：核实 Hyper-V / HCS / 文件齐不齐 |
 
 ---

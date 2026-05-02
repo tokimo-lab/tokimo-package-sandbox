@@ -3,9 +3,9 @@
 # tokimo-package-sandbox GitHub releases (tag prefix vm-v*) into <repo>/vm/.
 #
 # Usage:
-#   pwsh scripts/fetch-vm.ps1                       # latest vm-v* release, amd64
-#   pwsh scripts/fetch-vm.ps1 -Tag vm-v1.9.0        # specific tag
-#   pwsh scripts/fetch-vm.ps1 -Arch arm64           # arm64 (less tested)
+#   pwsh scripts/windows/fetch-vm.ps1                # latest vm-v* release, amd64
+#   pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0 # specific tag
+#   pwsh scripts/windows/fetch-vm.ps1 -Arch arm64    # arm64 (less tested)
 #
 # Layout produced (all read-only at runtime):
 #   vm/vmlinuz        — Linux kernel
@@ -20,7 +20,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vmDir = Join-Path $repoRoot "vm"
 $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 

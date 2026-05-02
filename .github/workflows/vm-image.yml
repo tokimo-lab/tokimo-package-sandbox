@@ -117,7 +117,7 @@ jobs:
 
       - name: Rebake initrd with tokimo-sandbox-init
         run: |
-          bash packaging/vm-image/scripts/rebake-initrd.sh \
+          bash packaging/vm/scripts/rebake-initrd.sh \
             --base     work/initrd.img \
             --init-bin target/${{ matrix.rust_target }}/release/tokimo-sandbox-init \
             --out      work/initrd.img.rebaked
@@ -191,5 +191,5 @@ jobs:
             | `tokimo-linux-kernel-x86_64.tar.zst` | Windows x86_64 (HCS) |
             | `tokimo-linux-kernel-arm64.tar.zst`  | macOS arm64 (VZ) |
 
-            Pull via `pwsh scripts/fetch-vm.ps1 -Tag ${{ steps.meta.outputs.tag }}`.
+            Pull via `pwsh scripts/windows/fetch-vm.ps1 -Tag ${{ steps.meta.outputs.tag }}`.
           files: dist/*

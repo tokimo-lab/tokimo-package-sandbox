@@ -12,7 +12,7 @@ Cargo.lock
 # IDE / agent config (per-developer)
 /.claude/
 /.ida-mcp/
-/packaging/vm-image/tokimo-os-arm64/
+/packaging/vm-base/tokimo-os-arm64/
 .github/copilot-instructions.md
 
 # Per-user IDE config

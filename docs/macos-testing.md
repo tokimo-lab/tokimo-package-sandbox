@@ -18,9 +18,9 @@ The backend auto-discovers `vmlinuz`, `initrd.img`, and `rootfs/` under
 prebuilt arm64 artifacts:
 
 ```sh
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-image/tokimo-os-arm64/rootfs"     vm/rootfs
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
+ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
 Override with `TOKIMO_VM_DIR=/path/to/dir` if needed.
@@ -28,22 +28,22 @@ Override with `TOKIMO_VM_DIR=/path/to/dir` if needed.
 ### 2. Register the codesign cargo runner
 
 `cargo test` on Apple Silicon needs every test/example binary ad-hoc-signed
-with `vz.entitlements` before exec. A helper is checked in at
-`scripts/codesign-and-run.sh`. Wire it up via your **local** (gitignored)
+with `packaging/macos/vz.entitlements` before exec. A helper is checked in at
+`scripts/macos/codesign-and-run.sh`. Wire it up via your **local** (gitignored)
 `.cargo/config.toml`:
 
 ```toml
 [target.aarch64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 
 [target.x86_64-apple-darwin]
-runner = "scripts/codesign-and-run.sh"
+runner = "scripts/macos/codesign-and-run.sh"
 ```
 
 Or invoke it manually:
 
 ```sh
-codesign --force --sign - --entitlements vz.entitlements \
+codesign --force --sign - --entitlements packaging/macos/vz.entitlements \
   target/debug/deps/sandbox_integration-*
 ```
 

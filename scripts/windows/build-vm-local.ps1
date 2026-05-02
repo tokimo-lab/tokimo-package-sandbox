@@ -15,9 +15,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vmDir = Join-Path $repoRoot "vm"
 $pkgDir = Join-Path $repoRoot "packaging/vm-local"
+$vmBaseDir = Join-Path $repoRoot "packaging/vm-base"
 
 # Detect docker (prefer docker.exe; fall back to docker on PATH).
 $docker = Get-Command docker -ErrorAction SilentlyContinue
@@ -50,10 +51,12 @@ if (-not $SkipInitBuild) {
 # ---------------------------------------------------------------------------
 Write-Host "==> [2/2] Building kernel + initrd + rootfs.vhdx (in debian:13)" -ForegroundColor Cyan
 $pkgMount = $pkgDir -replace '\\','/'
+$vmBaseMount = $vmBaseDir -replace '\\','/'
 $vmMount  = $vmDir  -replace '\\','/'
 
 docker run --rm --platform linux/amd64 `
     -v "${pkgMount}:/work:ro" `
+    -v "${vmBaseMount}:/vm-base:ro" `
     -v "${vmMount}:/out" `
     debian:13 bash /work/build-in-docker.sh
 if ($LASTEXITCODE -ne 0) { throw "VM build failed" }

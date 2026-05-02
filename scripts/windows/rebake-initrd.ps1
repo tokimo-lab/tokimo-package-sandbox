@@ -7,7 +7,7 @@
 #
 # Pipeline:
 #   1. cargo build --release --target x86_64-unknown-linux-musl --bin tokimo-sandbox-init
-#   2. WSL bash packaging/vm-image/scripts/rebake-initrd.sh \
+#   2. WSL bash packaging/vm/scripts/rebake-initrd.sh \
 #         --base   <BaseInitrd>      (default: vm/initrd.img — must already exist)
 #         --init-bin target/x86_64-unknown-linux-musl/release/tokimo-sandbox-init
 #         --out    target/vm-rebake/initrd.img
@@ -25,7 +25,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $rustTarget = if ($Arch -eq "amd64") { "x86_64-unknown-linux-musl" } else { "aarch64-unknown-linux-musl" }
 $initBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-sandbox-init"
 $tunPumpBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-tun-pump"
@@ -40,7 +40,7 @@ if (-not (Test-Path $BaseInitrd)) {
 # Sanity: WSL available?
 $wsl = Get-Command wsl -ErrorAction SilentlyContinue
 if (-not $wsl) {
-    throw "wsl.exe not found. Install WSL or run packaging/vm-image/scripts/rebake-initrd.sh from a Linux shell directly."
+    throw "wsl.exe not found. Install WSL or run packaging/vm/scripts/rebake-initrd.sh from a Linux shell directly."
 }
 
 if (-not $SkipBuild) {
@@ -73,9 +73,9 @@ $baseW = To-Wsl $BaseInitrd
 $initW = To-Wsl $initBinPath
 $tunW  = To-Wsl $tunPumpBinPath
 $outW  = To-Wsl $outImg
-$scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm-image\scripts\rebake-initrd.sh")
-$initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-image\init.sh")
-$extrasDir = Join-Path $repoRoot "packaging\vm-image\extras"
+$scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm\scripts\rebake-initrd.sh")
+$initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-base\init.sh")
+$extrasDir = Join-Path $repoRoot "packaging\vm\extras"
 $extrasArgs = @()
 if (Test-Path $extrasDir) {
     $extrasW = To-Wsl $extrasDir

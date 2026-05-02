@@ -63,7 +63,7 @@ tar -xpf tokimo-linux-rootfs-x86_64.tar -C /opt/tokimo/rootfs/
 
 ```bash
 # 仓库内置构建脚本
-cd packaging/vm-image
+cd packaging/vm-base
 bash build.sh amd64
 # 产出在 ./tokimo-os-amd64/rootfs/
 ```
@@ -163,4 +163,4 @@ sess.close()?;
 
 - [Windows 初始化](./windows.md)
 - [macOS 初始化](./macos.md)
-- [`packaging/vm-image/`](../../packaging/vm-image/) — rootfs / kernel / initrd 构建管线
+- [`packaging/vm-base/`](../../packaging/vm-base/) — rootfs / kernel / initrd 构建管线
