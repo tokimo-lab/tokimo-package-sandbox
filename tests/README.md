@@ -26,17 +26,23 @@ test runner script under `scripts/`.** Currently only Windows has one.
 ### Run
 
 ```powershell
-# From repo root, in any shell (the script self-elevates).
+# From repo root, in an elevated (Administrator) pwsh.
 pwsh scripts\test-integration.ps1
 ```
 
 The script:
 
-1. Builds `tokimo-sandbox-svc.exe` and the integration test binary.
-2. Self-elevates via `Start-Process -Verb RunAs` with `pwsh.exe`.
+1. Checks that the current shell is elevated (exits with code 87 if not).
+2. Builds `tokimo-sandbox-svc.exe` and the integration test binary.
 3. Launches `tokimo-sandbox-svc.exe --console` (logs → `target/integration/svc.log`).
 4. Runs `cargo test --test sandbox_integration` (logs → `target/integration/test.log`).
 5. Cleans up the service process.
+
+From a non-admin shell (Claude Code, CI, etc.):
+
+```powershell
+Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\test-integration.ps1' -Verb RunAs -Wait
+```
 
 Direct invocation (skip the wrapper, e.g. when you already have the service
 running and an elevated terminal):
