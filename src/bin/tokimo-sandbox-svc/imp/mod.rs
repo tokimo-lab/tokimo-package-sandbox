@@ -431,6 +431,7 @@ struct ActiveShare {
     boot_time: bool,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for SessionState {
     fn default() -> Self {
         Self {
@@ -534,10 +535,7 @@ impl InflightTracker {
 // ---------------------------------------------------------------------------
 
 /// Look up the [`SharedSession`] bound to this connection.
-fn get_session<'a>(
-    conn: &Connection,
-    sessions: &'a WindowsRegistry,
-) -> Result<Arc<SharedSession<SessionState>>, RpcError> {
+fn get_session(conn: &Connection, sessions: &WindowsRegistry) -> Result<Arc<SharedSession<SessionState>>, RpcError> {
     let key = conn.session_id.lock().unwrap();
     let key = key
         .as_ref()
@@ -1851,8 +1849,10 @@ mod tests {
 
     #[test]
     fn session_state_trait_impl() {
-        let mut st = SessionState::default();
-        st.running = true;
+        let mut st = SessionState {
+            running: true,
+            ..Default::default()
+        };
         assert!(SessionStateTrait::is_running(&st));
 
         SessionStateTrait::teardown(&mut st);
@@ -2103,6 +2103,7 @@ mod tests {
         .unwrap();
 
         let ids: Vec<String> = (0..10).map(|i| format!("req-{i}")).collect();
+        #[allow(clippy::type_complexity)]
         let results: Arc<Mutex<Vec<(String, Result<Value, RpcError>)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let mut handles = Vec::new();

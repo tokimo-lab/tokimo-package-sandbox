@@ -159,7 +159,10 @@ impl PipeClient {
         // first `ping` the handshake will have completed or the reader
         // will have marked the connection dead.
         let deadline = Instant::now() + timeout;
-        loop {
+        // Best-effort: don't busy-spin; the reader signals via Condvar
+        // through Pending. Since Hello has no oneshot, just sleep.
+        // We'll catch protocol errors on the first real request.
+        while Instant::now() < deadline {
             if self.inner.dead.load(Ordering::Relaxed) {
                 let g = self.inner.shared.lock().expect("shared lock");
                 return Err(Error::protocol(
@@ -168,17 +171,9 @@ impl PipeClient {
                         .unwrap_or_else(|| "service closed during handshake".into()),
                 ));
             }
-            // Best-effort: don't busy-spin; the reader signals via Condvar
-            // through Pending. Since Hello has no oneshot, just sleep.
             std::thread::sleep(Duration::from_millis(20));
-            if Instant::now() >= deadline {
-                return Ok(());
-            }
-            // Heuristic: as soon as the reader has had a chance to see
-            // *something*, return. We'll catch protocol errors on the
-            // first real request.
-            return Ok(());
         }
+        Ok(())
     }
 
     /// Issue a JSON-RPC request and block until response.

@@ -1,12 +1,12 @@
 //! HCS schema 2.x JSON config builder.
 //!
 //! Layout:
-//!   * Boot disk: SCSI controller 0 attachment 0 = `rootfs.vhdx` (ext4)
-//!   * Workspace: zero or more Plan9-over-vsock shares (one per
-//!                `Plan9Share` in `ConfigureParams`)
-//!   * Control:   AF_HYPERV/HvSocket, per-session vsock port allocated by
-//!                [`alloc_session_init_port`]
-//!   * Console:   COM2 named pipe (kernel kmsg dump)
+//! * Boot disk: SCSI controller 0 attachment 0 = `rootfs.vhdx` (ext4)
+//! * Workspace: zero or more Plan9-over-vsock shares (one per
+//!   `Plan9Share` in `ConfigureParams`)
+//! * Control: AF_HYPERV/HvSocket, per-session vsock port allocated by
+//!   [`alloc_session_init_port`]
+//! * Console: COM2 named pipe (kernel kmsg dump)
 //!
 //! The kernel cmdline tells initramfs-tools to mount `/dev/sda` as the
 //! ext4 rootfs. The custom `/sbin/init` shim (built into rootfs.vhdx)

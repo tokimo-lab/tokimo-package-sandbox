@@ -409,12 +409,7 @@ fn run(
         // 3b. Flush: poll again to transmit any frames queued above.
         {
             use smoltcp::iface::PollResult;
-            loop {
-                match iface.poll(smol_now(), &mut device, &mut sockets) {
-                    PollResult::SocketStateChanged => continue,
-                    PollResult::None => break,
-                }
-            }
+            while let PollResult::SocketStateChanged = iface.poll(smol_now(), &mut device, &mut sockets) {}
         }
 
         thread::sleep(Duration::from_millis(5));

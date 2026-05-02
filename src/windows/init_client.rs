@@ -683,69 +683,67 @@ impl Read for InitReader {
         }
 
         // Block on the client's Condvar until something is available.
+        let (lock, cv) = &*self.client.inner.state;
+        let mut g = lock
+            .lock()
+            .map_err(|_| std::io::Error::other("client state poisoned"))?;
         loop {
-            let (lock, cv) = &*self.client.inner.state;
-            let mut g = lock
-                .lock()
-                .map_err(|_| std::io::Error::other("client state poisoned"))?;
-            loop {
-                let entry_has_data = g
-                    .children
-                    .get(&self.child_id)
-                    .map(|c| match self.side {
-                        InitStream::Stdout => !c.stdout.is_empty(),
-                        InitStream::Stderr => !c.stderr.is_empty(),
-                    })
-                    .unwrap_or(false);
-                let exit_seen = g
-                    .children
-                    .get(&self.child_id)
-                    .map(|c| c.exit.is_some())
-                    .unwrap_or(false);
-                if entry_has_data {
-                    let entry = g.children.entry(self.child_id.clone()).or_default();
-                    let chunks = match self.side {
-                        InitStream::Stdout => std::mem::take(&mut entry.stdout),
-                        InitStream::Stderr => std::mem::take(&mut entry.stderr),
-                    };
-                    drop(g);
-                    let mut concat = Vec::new();
-                    for c in chunks {
-                        concat.extend_from_slice(&c);
-                    }
-                    let n = buf.len().min(concat.len());
-                    buf[..n].copy_from_slice(&concat[..n]);
-                    if n < concat.len() {
-                        self.leftover.extend_from_slice(&concat[n..]);
-                    }
-                    return Ok(n);
+            let entry_has_data = g
+                .children
+                .get(&self.child_id)
+                .map(|c| match self.side {
+                    InitStream::Stdout => !c.stdout.is_empty(),
+                    InitStream::Stderr => !c.stderr.is_empty(),
+                })
+                .unwrap_or(false);
+            let exit_seen = g
+                .children
+                .get(&self.child_id)
+                .map(|c| c.exit.is_some())
+                .unwrap_or(false);
+            if entry_has_data {
+                let entry = g.children.entry(self.child_id.clone()).or_default();
+                let chunks = match self.side {
+                    InitStream::Stdout => std::mem::take(&mut entry.stdout),
+                    InitStream::Stderr => std::mem::take(&mut entry.stderr),
+                };
+                drop(g);
+                let mut concat = Vec::new();
+                for c in chunks {
+                    concat.extend_from_slice(&c);
                 }
-                if g.eof || exit_seen {
-                    // Drain any leftover events one final time, then EOF.
-                    if let Some(c) = g.children.get_mut(&self.child_id) {
-                        let chunks = match self.side {
-                            InitStream::Stdout => std::mem::take(&mut c.stdout),
-                            InitStream::Stderr => std::mem::take(&mut c.stderr),
-                        };
-                        if !chunks.is_empty() {
-                            drop(g);
-                            let mut concat = Vec::new();
-                            for c in chunks {
-                                concat.extend_from_slice(&c);
-                            }
-                            let n = buf.len().min(concat.len());
-                            buf[..n].copy_from_slice(&concat[..n]);
-                            if n < concat.len() {
-                                self.leftover.extend_from_slice(&concat[n..]);
-                            }
-                            return Ok(n);
-                        }
-                    }
-                    return Ok(0); // EOF
+                let n = buf.len().min(concat.len());
+                buf[..n].copy_from_slice(&concat[..n]);
+                if n < concat.len() {
+                    self.leftover.extend_from_slice(&concat[n..]);
                 }
-                let g2 = cv.wait(g).map_err(|_| std::io::Error::other("client state poisoned"))?;
-                g = g2;
+                return Ok(n);
             }
+            if g.eof || exit_seen {
+                // Drain any leftover events one final time, then EOF.
+                if let Some(c) = g.children.get_mut(&self.child_id) {
+                    let chunks = match self.side {
+                        InitStream::Stdout => std::mem::take(&mut c.stdout),
+                        InitStream::Stderr => std::mem::take(&mut c.stderr),
+                    };
+                    if !chunks.is_empty() {
+                        drop(g);
+                        let mut concat = Vec::new();
+                        for c in chunks {
+                            concat.extend_from_slice(&c);
+                        }
+                        let n = buf.len().min(concat.len());
+                        buf[..n].copy_from_slice(&concat[..n]);
+                        if n < concat.len() {
+                            self.leftover.extend_from_slice(&concat[n..]);
+                        }
+                        return Ok(n);
+                    }
+                }
+                return Ok(0); // EOF
+            }
+            let g2 = cv.wait(g).map_err(|_| std::io::Error::other("client state poisoned"))?;
+            g = g2;
         }
     }
 }

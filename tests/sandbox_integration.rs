@@ -123,8 +123,7 @@ fn shell_env_does_not_leak_init_control_vars() {
     // `grep -c` prints "0" when nothing matches. Anything else means leakage.
     let count_line = captured
         .lines()
-        .filter(|l| l.trim().chars().all(|c| c.is_ascii_digit()))
-        .next_back()
+        .rfind(|l| l.trim().chars().all(|c| c.is_ascii_digit()))
         .unwrap_or("");
     assert_eq!(
         count_line.trim(),
@@ -803,6 +802,7 @@ fn multi_shell_independent_signals() {
     let mut b_exited = false;
     while Instant::now() < deadline && !a_exited {
         if let Ok(ev) = rx.recv_timeout(Duration::from_millis(500)) {
+            #[allow(clippy::collapsible_match)]
             if let Event::Exit { id, signal, .. } = &ev {
                 if id == &shell_a {
                     assert_eq!(*signal, Some(2), "A should die from SIGINT, got {signal:?}");

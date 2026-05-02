@@ -37,6 +37,7 @@ pub enum NetworkPolicy {
     Blocked,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for NetworkPolicy {
     fn default() -> Self {
         NetworkPolicy::AllowAll

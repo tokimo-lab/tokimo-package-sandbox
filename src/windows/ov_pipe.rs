@@ -73,8 +73,10 @@ fn run_overlapped<F>(pipe: HANDLE, event: HANDLE, op: F) -> io::Result<u32>
 where
     F: FnOnce(&mut OVERLAPPED) -> windows::core::Result<()>,
 {
-    let mut ov = OVERLAPPED::default();
-    ov.hEvent = event;
+    let mut ov = OVERLAPPED {
+        hEvent: event,
+        ..Default::default()
+    };
     let r = op(&mut ov);
     if r.is_err() {
         let last = unsafe { GetLastError() };
