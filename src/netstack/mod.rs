@@ -163,8 +163,11 @@ struct UdpFlow {
     upstream: UdpSocket,
     /// Last guest endpoint that sent to this port (for routing replies back).
     remote: smoltcp::wire::IpEndpoint,
-    /// Destination IP the guest was talking to (used as src IP in replies).
-    dst_ip: IpAddress,
+    /// IP family the guest is talking on; v4↔v6 are tracked separately so we
+    /// can discard cross-family replies. Reply src IP comes from the actual
+    /// upstream responder (`recv_from`), not from a stored value, so a guest
+    /// can talk to multiple upstream IPs on the same destination port.
+    family_v4: bool,
     last_activity: Instant,
 }
 
@@ -344,32 +347,36 @@ fn run(
             let mut buf = vec![0u8; 2048];
             loop {
                 match flow.upstream.recv_from(&mut buf) {
-                    Ok((n, _from)) => {
-                        // Reply: from upstream (dst_ip the guest spoke to) → guest (flow.remote).
-                        match (flow.dst_ip, flow.remote.addr) {
-                            (IpAddress::Ipv4(s), IpAddress::Ipv4(d)) => {
+                    Ok((n, from)) => {
+                        // Reply src IP = the actual upstream responder, not a
+                        // stored value. This is correct even when the guest
+                        // talks to several upstream IPs on the same dst port
+                        // (e.g. multiple DNS servers).
+                        match (from.ip(), flow.remote.addr, flow.family_v4) {
+                            (IpAddr::V4(s), IpAddress::Ipv4(d), true) => {
                                 let frame = build_udp_reply_ethernet_frame_v4(
                                     &s.octets(),
                                     &d.octets(),
-                                    port,
+                                    from.port(),
                                     flow.remote.port,
                                     &buf[..n],
                                 );
                                 let _ = tx_out_tx.send(frame);
                                 flow.last_activity = now;
                             }
-                            (IpAddress::Ipv6(s), IpAddress::Ipv6(d)) => {
+                            (IpAddr::V6(s), IpAddress::Ipv6(d), false) => {
                                 let frame = build_udp_reply_ethernet_frame_v6(
                                     &s.octets(),
                                     &d.octets(),
-                                    port,
+                                    from.port(),
                                     flow.remote.port,
                                     &buf[..n],
                                 );
                                 let _ = tx_out_tx.send(frame);
                                 flow.last_activity = now;
                             }
-                            _ => break,
+                            // Cross-family or mismatched flow record: drop.
+                            _ => continue,
                         }
                     }
                     Err(ref e)
@@ -449,19 +456,57 @@ fn inspect_and_register(
             };
             let src_ip = IpAddress::Ipv6(ipv6.src_addr());
             let dst_ip = IpAddress::Ipv6(ipv6.dst_addr());
+            // Walk past any IPv6 extension headers to reach the L4 protocol.
+            let (proto, l4_payload) = match skip_ipv6_ext_headers(ipv6.next_header(), ipv6.payload()) {
+                Some(v) => v,
+                None => return,
+            };
             dispatch_l4(
-                ipv6.next_header(),
-                ipv6.payload(),
-                src_ip,
-                dst_ip,
-                sockets,
-                tcp_flows,
-                udp_flows,
-                tx_out_tx,
+                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx,
             );
         }
         _ => {}
     }
+}
+
+/// Walk past IPv6 extension headers (RFC 8200 §4) to find the L4 protocol
+/// and its payload. Returns `None` on malformed/unknown headers or
+/// `Ipv6NoNxt`.
+fn skip_ipv6_ext_headers(mut next: IpProtocol, mut payload: &[u8]) -> Option<(IpProtocol, &[u8])> {
+    // Cap iterations: a well-formed packet has at most a handful of ext headers.
+    for _ in 0..8 {
+        match next {
+            IpProtocol::HopByHop | IpProtocol::Ipv6Route | IpProtocol::Ipv6Opts => {
+                if payload.len() < 8 {
+                    return None;
+                }
+                // hdr_ext_len is in 8-octet units, NOT counting the first 8 bytes.
+                let hdr_len = (payload[1] as usize + 1) * 8;
+                if payload.len() < hdr_len {
+                    return None;
+                }
+                next = IpProtocol::from(payload[0]);
+                payload = &payload[hdr_len..];
+            }
+            IpProtocol::Ipv6Frag => {
+                // Fragment header is fixed 8 bytes. We only forward the first
+                // fragment (offset == 0); subsequent fragments are dropped
+                // since reassembly is out of scope for this proxy.
+                if payload.len() < 8 {
+                    return None;
+                }
+                let frag_offset = u16::from_be_bytes([payload[2], payload[3]]) >> 3;
+                if frag_offset != 0 {
+                    return None;
+                }
+                next = IpProtocol::from(payload[0]);
+                payload = &payload[8..];
+            }
+            IpProtocol::Ipv6NoNxt => return None,
+            _ => return Some((next, payload)),
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -675,7 +720,7 @@ fn register_udp_flow(
                 addr: src_ip,
                 port: src_port,
             },
-            dst_ip,
+            family_v4: matches!(dst_ip, IpAddress::Ipv4(_)),
             last_activity: Instant::now(),
         },
     );
