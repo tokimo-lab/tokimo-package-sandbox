@@ -227,6 +227,30 @@ pub enum Op {
     /// `rmdir target` (best-effort). `name` is looked up against the
     /// init-side NFS registry.
     UnmountNfs { id: String, name: String },
+
+    /// Mount a FUSE-over-vsock filesystem inside the container. Replaces
+    /// `MountNfs` for backends that wire mounts through the cross-platform
+    /// `vfs_host::FuseHost`. Init spawns `tokimo-sandbox-fuse` as a child
+    /// process which connects to the host's FUSE listener at
+    /// `vsock://<host>:<vsock_port>` (host CID 2), performs the
+    /// VFS-protocol `Hello` handshake bound to `name`, then `mount(2)`s
+    /// FUSE at `target`.
+    ///
+    /// The init binary keeps a per-session registry keyed by `name` so
+    /// `UnmountFuse` can locate the child + target on teardown.
+    MountFuse {
+        id: String,
+        /// Logical share id (must match `FuseHost::register_mount`).
+        name: String,
+        /// Host-side vsock port the FUSE service listens on.
+        vsock_port: u32,
+        /// Guest-side mountpoint. Created if missing.
+        target: String,
+        read_only: bool,
+    },
+    /// Counterpart for `MountFuse`: `umount2(target, MNT_DETACH)` and
+    /// signal/reap the child fuse process. Looks up by `name`.
+    UnmountFuse { id: String, name: String },
 }
 
 /// One Plan9-over-vsock mount the guest must perform during `MountManifest`.

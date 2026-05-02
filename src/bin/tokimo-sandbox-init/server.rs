@@ -109,6 +109,12 @@ pub struct State {
     /// because the protocol enum is shared).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub nfs_mounts: HashMap<String, String>,
+    /// FUSE-over-vsock mounts (added via `Op::MountFuse`). Keyed by the
+    /// host-supplied logical name. Tracks the guest mountpoint **and**
+    /// the child `tokimo-sandbox-fuse` PID so `Op::UnmountFuse` can
+    /// `umount2(target, MNT_DETACH)` and signal+reap the child.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fuse_mounts: HashMap<String, FuseMount>,
     /// Long-lived O_PATH/O_DIRECTORY fd into the bwrap-staged
     /// `/.tps_host` (host root). Opened during init startup, before
     /// `/.tps_host` is umounted+rmdir'd. Used as the dirfd for
@@ -125,6 +131,14 @@ pub struct MountedShare {
     pub name: String,
     pub target: String,
     pub fd: OwnedFd,
+}
+
+/// Per-mount state for a `tokimo-sandbox-fuse` child process.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct FuseMount {
+    pub target: String,
+    pub child_pid: i32,
 }
 
 impl State {
@@ -214,6 +228,7 @@ fn run_loop_inner(
         mount_fds: Vec::new(),
         dynamic_mounts: HashMap::new(),
         nfs_mounts: HashMap::new(),
+        fuse_mounts: HashMap::new(),
         host_root_fd: None,
     };
 
@@ -1060,6 +1075,18 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::UnmountNfs { id, name } => {
             handle_unmount_nfs(state, client_fd, id, name);
         }
+        Op::MountFuse {
+            id,
+            name,
+            vsock_port,
+            target,
+            read_only,
+        } => {
+            handle_mount_fuse(state, client_fd, id, name, vsock_port, target, read_only);
+        }
+        Op::UnmountFuse { id, name } => {
+            handle_unmount_fuse(state, client_fd, id, name);
+        }
     }
 }
 
@@ -1534,9 +1561,139 @@ fn handle_unmount_nfs(state: &mut State, client_fd: RawFd, id: String, name: Str
     ack(state, client_fd, id, Ok(()));
 }
 
+/// Handle `Op::MountFuse`: spawn `tokimo-sandbox-fuse` as a child
+/// process. The child connects to the host's FUSE listener over vsock
+/// and mounts itself at `target`. We don't wait for the mount to be
+/// "ready" — the child runs as long as the FUSE filesystem is mounted.
+///
+/// The child inherits stderr to ours so its diagnostic output reaches
+/// the host console. PID is recorded in `state.fuse_mounts` so
+/// `Op::UnmountFuse` can SIGTERM + reap it.
+#[cfg(target_os = "linux")]
+fn handle_mount_fuse(
+    state: &mut State,
+    client_fd: RawFd,
+    id: String,
+    name: String,
+    vsock_port: u32,
+    target: String,
+    read_only: bool,
+) {
+    let res: Result<(), ErrorReply> = (|| {
+        if state.fuse_mounts.contains_key(&name) {
+            return Err(ErrorReply::new(
+                ErrorCode::BadRequest,
+                format!("fuse mount {name:?} already exists"),
+            ));
+        }
+        if let Err(e) = std::fs::create_dir_all(&target) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(ErrorReply::new(
+                    ErrorCode::Internal,
+                    format!("mkdir {target}: {e}"),
+                ));
+            }
+        }
+        let exe = if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
+            "/bin/tokimo-sandbox-fuse".to_string()
+        } else if std::path::Path::new("/usr/bin/tokimo-sandbox-fuse").exists() {
+            "/usr/bin/tokimo-sandbox-fuse".to_string()
+        } else {
+            "tokimo-sandbox-fuse".to_string()
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--transport").arg("vsock");
+        cmd.arg("--port").arg(vsock_port.to_string());
+        cmd.arg("--mount-name").arg(&name);
+        cmd.arg("--target").arg(&target);
+        if read_only {
+            cmd.arg("--read-only");
+        }
+        let child = cmd.spawn().map_err(|e| {
+            ErrorReply::new(ErrorCode::Internal, format!("spawn {exe}: {e}"))
+        })?;
+        let pid = child.id() as i32;
+        std::mem::forget(child);
+        state.fuse_mounts.insert(
+            name.clone(),
+            FuseMount {
+                target: target.clone(),
+                child_pid: pid,
+            },
+        );
+        eprintln!(
+            "[tokimo-init] spawned fuse: name={name} pid={pid} target={target} port={vsock_port}"
+        );
+        Ok(())
+    })();
+    ack(state, client_fd, id, res);
+}
+
+/// Handle `Op::UnmountFuse`: `umount2(target, MNT_DETACH)` first (the
+/// FUSE child will see EOF on its kernel channel and exit), then
+/// SIGTERM the child as a fallback. The init reaper takes care of the
+/// final wait.
+#[cfg(target_os = "linux")]
+fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, name: String) {
+    let entry = match state.fuse_mounts.remove(&name) {
+        Some(m) => m,
+        None => {
+            ack(
+                state,
+                client_fd,
+                id,
+                Err(ErrorReply::new(
+                    ErrorCode::BadRequest,
+                    format!("no such fuse mount: {name:?}"),
+                )),
+            );
+            return;
+        }
+    };
+    let target_c = std::ffi::CString::new(entry.target.as_str()).unwrap_or_default();
+    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!(
+            "[tokimo-init] umount2({}): {err} — sending SIGTERM to pid={}",
+            entry.target, entry.child_pid
+        );
+        unsafe {
+            libc::kill(entry.child_pid, libc::SIGTERM);
+        }
+    }
+    let _ = std::fs::remove_dir(&entry.target);
+    ack(state, client_fd, id, Ok(()));
+}
+
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
-fn handle_mount_nfs(
+fn handle_mount_fuse(
+    state: &mut State,
+    client_fd: RawFd,
+    id: String,
+    _name: String,
+    _vsock_port: u32,
+    _target: String,
+    _read_only: bool,
+) {
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "MountFuse is Linux-only")),
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, _name: String) {
+    ack(
+        state,
+        client_fd,
+        id,
+        Err(ErrorReply::new(ErrorCode::Internal, "UnmountFuse is Linux-only")),
+    );
+}
     state: &mut State,
     client_fd: RawFd,
     id: String,

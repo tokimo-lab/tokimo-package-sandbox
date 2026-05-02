@@ -48,10 +48,19 @@ pub enum Frame {
         proto_version: u32,
         max_inflight: u32,
         client_name: String,
+        /// If `Some`, the server binds this connection to the named
+        /// mount and returns its `mount_id` in `HelloAck.bound_mount_id`.
+        /// If `None`, the client must include `mount_id` in every
+        /// `Request` (multi-mount mode).
+        #[serde(default)]
+        mount_name: Option<String>,
     },
     HelloAck {
         proto_version: u32,
         max_inflight: u32,
+        /// Set when `Hello.mount_name` resolved successfully.
+        #[serde(default)]
+        bound_mount_id: Option<u32>,
     },
     Request {
         req_id: u64,
@@ -328,6 +337,7 @@ mod tests {
             proto_version: PROTOCOL_VERSION,
             max_inflight: 64,
             client_name: "tokimo-sandbox-fuse".into(),
+            mount_name: Some("work".into()),
         };
         let bytes = postcard::to_allocvec(&frame).unwrap();
         let back: Frame = postcard::from_bytes(&bytes).unwrap();
@@ -336,10 +346,12 @@ mod tests {
                 proto_version,
                 max_inflight,
                 client_name,
+                mount_name,
             } => {
                 assert_eq!(proto_version, PROTOCOL_VERSION);
                 assert_eq!(max_inflight, 64);
                 assert_eq!(client_name, "tokimo-sandbox-fuse");
+                assert_eq!(mount_name.as_deref(), Some("work"));
             }
             _ => panic!("expected Hello"),
         }

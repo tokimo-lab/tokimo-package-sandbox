@@ -155,6 +155,7 @@ impl FuseHost {
             Frame::Hello {
                 proto_version,
                 max_inflight,
+                mount_name,
                 ..
             } => {
                 if proto_version != PROTOCOL_VERSION {
@@ -164,6 +165,7 @@ impl FuseHost {
                         &Frame::HelloAck {
                             proto_version: PROTOCOL_VERSION,
                             max_inflight: 0,
+                            bound_mount_id: None,
                         },
                     )
                     .await;
@@ -175,6 +177,23 @@ impl FuseHost {
                         ),
                     ));
                 }
+                let bound_mount_id = mount_name.as_deref().and_then(|n| self.mount_id_by_name(n));
+                if mount_name.is_some() && bound_mount_id.is_none() {
+                    let mut tx_guard = tx.lock().await;
+                    let _ = write_frame(
+                        &mut *tx_guard,
+                        &Frame::HelloAck {
+                            proto_version: PROTOCOL_VERSION,
+                            max_inflight: 0,
+                            bound_mount_id: None,
+                        },
+                    )
+                    .await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("mount not registered: {:?}", mount_name),
+                    ));
+                }
                 {
                     let mut tx_guard = tx.lock().await;
                     write_frame(
@@ -182,6 +201,7 @@ impl FuseHost {
                         &Frame::HelloAck {
                             proto_version: PROTOCOL_VERSION,
                             max_inflight,
+                            bound_mount_id,
                         },
                     )
                     .await?;
@@ -1087,6 +1107,7 @@ mod tests {
                 proto_version: PROTOCOL_VERSION,
                 max_inflight: 16,
                 client_name: "test".into(),
+                mount_name: None,
             },
         )
         .await

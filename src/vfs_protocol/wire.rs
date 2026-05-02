@@ -115,6 +115,7 @@ mod tests {
                     proto_version: PROTOCOL_VERSION,
                     max_inflight: 32,
                     client_name: "test".into(),
+                    mount_name: None,
                 },
             )
             .await
@@ -130,6 +131,7 @@ mod tests {
                 &Frame::HelloAck {
                     proto_version: PROTOCOL_VERSION,
                     max_inflight: 32,
+                    bound_mount_id: None,
                 },
             )
             .await

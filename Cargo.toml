@@ -43,6 +43,10 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
 ] }
 crossbeam-channel = "0.5"
+# FUSE bridge (guest-side). Used only by the tokimo-sandbox-fuse binary
+# inside the VM/bwrap. abi-7-31 keeps the kernel ABI requirement
+# compatible with the Debian bookworm kernel shipped in the initrd.
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.29", features = ["process", "signal", "socket", "poll", "uio", "fs", "event", "ioctl", "term"] }
@@ -92,6 +96,10 @@ crossbeam-channel = "0.5"
 [[bin]]
 name = "tokimo-tun-pump"
 path = "src/bin/tokimo-tun-pump/main.rs"
+
+[[bin]]
+name = "tokimo-sandbox-fuse"
+path = "src/bin/tokimo-sandbox-fuse/main.rs"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
