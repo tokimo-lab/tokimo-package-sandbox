@@ -165,7 +165,7 @@ mod imp {
             return Err("ifname too long".into());
         }
         ifr[..nb.len()].copy_from_slice(nb);
-        let flags = (IFF_TAP | IFF_NO_PI) as i16;
+        let flags: i16 = IFF_TAP | IFF_NO_PI;
         ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
 
         let r = unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF as _, ifr.as_mut_ptr()) };

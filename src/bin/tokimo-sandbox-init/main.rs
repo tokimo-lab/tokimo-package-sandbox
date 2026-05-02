@@ -299,10 +299,10 @@ fn run() -> Result<(), String> {
         let client = unsafe { OwnedFd::from_raw_fd(raw) };
 
         // bwrap-side bringup: optional loopback up.
-        if cli.bringup_lo {
-            if let Err(e) = bringup_lo() {
-                eprintln!("[tokimo-sandbox-init] WARN bringup_lo: {e}");
-            }
+        if cli.bringup_lo
+            && let Err(e) = bringup_lo()
+        {
+            eprintln!("[tokimo-sandbox-init] WARN bringup_lo: {e}");
         }
 
         // Userspace-netstack pump: when host hands us a connected stream
