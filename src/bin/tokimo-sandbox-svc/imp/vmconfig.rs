@@ -195,11 +195,17 @@ pub fn build_session_v2_ex(
         ),
     };
 
+    // 0 = no limit: omit the field so HCS applies no constraint.
+    let mut topology = serde_json::Map::new();
+    if memory_mb > 0 {
+        topology.insert("Memory".into(), serde_json::json!({ "SizeInMB": memory_mb }));
+    }
+    if cpu_count > 0 {
+        topology.insert("Processor".into(), serde_json::json!({ "Count": cpu_count }));
+    }
+
     let vm = serde_json::json!({
-        "ComputeTopology": {
-            "Memory": { "SizeInMB": memory_mb },
-            "Processor": { "Count": cpu_count }
-        },
+        "ComputeTopology": topology,
         "Chipset": {
             "LinuxKernelDirect": {
                 "KernelFilePath": kernel_s,

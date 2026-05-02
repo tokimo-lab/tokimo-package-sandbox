@@ -155,8 +155,17 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     let rootfs_s = rootfs.to_string_lossy().into_owned();
     let dyn_root_s = config.dyn_root.to_string_lossy().into_owned();
 
-    let memory_mb = config.memory_mb.max(256);
-    let cpu_count = config.cpu_count.max(1) as usize;
+    // 0 = no limit: use large values so VZ clamps to host capacity.
+    let memory_mb = if config.memory_mb == 0 {
+        u64::MAX / (1024 * 1024)
+    } else {
+        config.memory_mb
+    };
+    let cpu_count = if config.cpu_count == 0 {
+        usize::MAX
+    } else {
+        config.cpu_count as usize
+    };
 
     let plan9 = config.mounts.clone();
     let network = config.network;

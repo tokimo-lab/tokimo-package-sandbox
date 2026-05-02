@@ -75,10 +75,14 @@ pub struct ConfigureParams {
     pub user_data_name: String,
 
     /// VM memory budget (mebibytes). Default 4096.
+    /// Pass 0 for no limit (backend-specific: HCS omits the constraint,
+    /// VZ requests maximum available).
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
 
     /// Virtual CPU count. Default 4.
+    /// Pass 0 for no limit (backend-specific: HCS omits the constraint,
+    /// VZ requests maximum available).
     #[serde(default = "default_cpu_count")]
     pub cpu_count: u32,
 
@@ -531,11 +535,11 @@ fn validate_configure(p: &ConfigureParams) -> Result<()> {
     if p.user_data_name.is_empty() {
         return Err(Error::validation("user_data_name must not be empty"));
     }
-    if p.memory_mb < 256 {
-        return Err(Error::validation("memory_mb must be >= 256"));
+    if p.memory_mb != 0 && p.memory_mb < 256 {
+        return Err(Error::validation("memory_mb must be 0 (no limit) or >= 256"));
     }
-    if p.cpu_count == 0 || p.cpu_count > 64 {
-        return Err(Error::validation("cpu_count must be in 1..=64"));
+    if p.cpu_count > 64 {
+        return Err(Error::validation("cpu_count must be 0 (no limit) or in 1..=64"));
     }
     let mut seen_names = std::collections::HashSet::new();
     let mut seen_guest = std::collections::HashSet::new();
