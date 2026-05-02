@@ -239,7 +239,7 @@ impl VsockInitClient {
     /// Mount an NFSv3 export inside the guest. The host runs the NFS
     /// server in-process (`src/macos/nfs.rs`) reachable via the smoltcp
     /// gateway as a `LocalService`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub fn mount_nfs(
         &self,
         name: &str,
@@ -263,9 +263,36 @@ impl VsockInitClient {
     }
 
     /// Counterpart for `mount_nfs`.
+    #[allow(dead_code)]
     pub fn unmount_nfs(&self, name: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::UnmountNfs {
+            id: id.clone(),
+            name: name.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Spawn `tokimo-sandbox-fuse` inside the guest. Init opens a vsock
+    /// connection from the child to the host's FUSE listener at
+    /// `vsock://2:vsock_port` (host CID), performs the VFS-protocol
+    /// handshake bound to `name`, then `mount(2)`s FUSE at `target`.
+    pub fn mount_fuse(&self, name: &str, vsock_port: u32, target: &str, read_only: bool) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::MountFuse {
+            id: id.clone(),
+            name: name.into(),
+            vsock_port,
+            target: target.into(),
+            read_only,
+        };
+        self.ack_op(&id, op)
+    }
+
+    /// Counterpart for `mount_fuse`.
+    pub fn unmount_fuse(&self, name: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::UnmountFuse {
             id: id.clone(),
             name: name.into(),
         };

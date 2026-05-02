@@ -1,6 +1,11 @@
 //! In-process NFSv3 server bridging guest `mount(2)` calls to the host
 //! filesystem.
 //!
+//! **DEPRECATED** as of the FUSE-over-vsock migration: superseded by
+//! `crate::vfs_host::FuseHost`. Kept in source (gated under
+//! `#![allow(dead_code)]`) for one release in case of emergency rollback.
+//! Will be deleted in the next major version.
+//!
 //! Architecture:
 //!
 //! ```text

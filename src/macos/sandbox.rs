@@ -29,15 +29,15 @@ use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
 use super::nfs::NfsServer;
-use super::vm::{BootedVm, VmConfig, boot_vm};
+use super::vm::{BootedVm, FUSE_VSOCK_PORT, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
 
-/// Guest-visible TCP port the in-process NFS server is dialed at via the
-/// smoltcp gateway IP (`HOST_IP = 192.168.127.1`). The host-side listener
-/// is on an ephemeral `127.0.0.1:N`; the gateway splices the two via a
-/// `LocalService`.
+use crate::vfs_host::FuseHost;
+use crate::vfs_impls::LocalDirVfs;
+
+#[allow(dead_code)] // retained for emergency rollback; no longer used
 const NFS_GUEST_PORT: u16 = 2049;
-/// Gateway IP (matches `crate::netstack::HOST_IP`).
+#[allow(dead_code)]
 const NFS_GUEST_IP: &str = "192.168.127.1";
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -61,9 +61,12 @@ enum State {
 struct RunningState {
     vm: VirtualMachine,
     init: Arc<VsockInitClient>,
-    /// In-process NFSv3 server backing all user mounts. Dropped before
-    /// `vm` so any in-flight client connections through the netstack
-    /// gateway tear down cleanly first.
+    /// FUSE-over-vsock host. One per session; serves all dynamic mounts.
+    /// Each `Mount` is registered as a [`LocalDirVfs`] backend.
+    fuse_host: Arc<FuseHost>,
+    /// Legacy NFS server slot. Always `None` for new sessions; kept in
+    /// the struct for one release to ease emergency rollback.
+    #[allow(dead_code)]
     nfs: Option<NfsServer>,
     /// Long-lived boot-time shell child id.
     shell_id: String,
@@ -77,8 +80,8 @@ struct RunningState {
     runtime: Arc<Runtime>,
     /// Names of shares declared at boot time (cannot be removed at runtime).
     boot_share_names: HashSet<String>,
-    /// All NFS-backed mounts currently registered (boot + runtime).
-    nfs_mount_names: HashSet<String>,
+    /// All FUSE-backed mounts currently registered (boot + runtime).
+    fuse_mount_names: HashSet<String>,
     /// Shutdown flag for the netstack thread. Setting true causes the
     /// reader/writer threads to exit at their next iteration.
     netstack_shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -142,6 +145,7 @@ impl SandboxBackend for MacosBackend {
             vm,
             vsock,
             netstack_listener: mut listener,
+            fuse_listener,
             runtime,
         } = boot_vm(&vm_config)?;
 
@@ -154,32 +158,23 @@ impl SandboxBackend for MacosBackend {
             return Err(e);
         }
 
-        // ---- NFS server ------------------------------------------------
-        // Spawn the per-session NFSv3 server BEFORE the netstack so we
-        // know the local port to register as a `LocalService`.
-        let nfs = match NfsServer::start(runtime.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = init.shutdown();
-                let _ = runtime.block_on(vm.stop());
-                return Err(e);
-            }
-        };
+        // ---- FUSE host -----------------------------------------------
+        // The FuseHost serves all dynamic mounts in this session over a
+        // single vsock listener. Each `tokimo-sandbox-fuse` child in the
+        // guest opens one connection per mount and binds to it via
+        // `Hello.mount_name`.
+        let fuse_host: Arc<FuseHost> = Arc::new(FuseHost::new());
+        spawn_fuse_accept_loop(fuse_listener, fuse_host.clone(), runtime.clone());
 
-        // ---- Network: always-on userspace netstack ---------------------
-        // The smoltcp gateway runs regardless of `NetworkPolicy`. The
-        // policy becomes an `EgressPolicy` filter inside the gateway:
-        // `Blocked` only routes registered `LocalService` flows (the NFS
-        // server). `AllowAll` additionally splices arbitrary upstream
-        // connect attempts.
+        // ---- Network: always-on userspace netstack -------------------
+        // FUSE no longer requires a `LocalService` (it talks vsock
+        // directly to host CID 2), so the gateway only carries upstream
+        // egress now: `AllowAll` splices anywhere, `Blocked` drops.
         let egress = match params.network {
             NetworkPolicy::AllowAll => crate::netstack::EgressPolicy::AllowAll,
             NetworkPolicy::Blocked => crate::netstack::EgressPolicy::Blocked,
         };
-        let local_services = vec![crate::netstack::LocalService {
-            host_port: NFS_GUEST_PORT,
-            local_addr: format!("127.0.0.1:{}", nfs.local_port).parse().unwrap(),
-        }];
+        let local_services: Vec<crate::netstack::LocalService> = Vec::new();
 
         let accept = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(30), listener.accept()).await });
         let netstack_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -207,13 +202,10 @@ impl SandboxBackend for MacosBackend {
             Err(_) => tracing::warn!("netstack accept timeout"),
         }
 
-        // ---- Mount each boot-time share via NFS ------------------------
+        // ---- Mount each boot-time share via FUSE ---------------------
         let mut boot_share_names = HashSet::new();
-        let mut nfs_mount_names = HashSet::new();
+        let mut fuse_mount_names = HashSet::new();
         for share in &params.mounts {
-            // `create_host_dir` is honoured here because virtio-fs used to
-            // require the host directory to exist; NFS doesn't strictly,
-            // but downstream code (and tests) rely on it.
             if share.create_host_dir
                 && !share.host_path.exists()
                 && let Err(e) = std::fs::create_dir_all(&share.host_path)
@@ -225,27 +217,16 @@ impl SandboxBackend for MacosBackend {
                     share.host_path.display()
                 )));
             }
-            if let Err(e) = nfs.add_mount(&share.name, share.host_path.clone(), share.read_only) {
-                let _ = init.shutdown();
-                let _ = runtime.block_on(vm.stop());
-                return Err(e);
-            }
+            let backend = LocalDirVfs::arc(share.host_path.clone());
+            fuse_host.register_mount(share.name.clone(), backend, share.read_only);
             let guest = share.guest_path.to_string_lossy().into_owned();
-            let export = format!("/{}", share.name);
-            if let Err(e) = init.mount_nfs(
-                &share.name,
-                NFS_GUEST_IP,
-                NFS_GUEST_PORT,
-                &export,
-                &guest,
-                share.read_only,
-            ) {
+            if let Err(e) = init.mount_fuse(&share.name, FUSE_VSOCK_PORT, &guest, share.read_only) {
                 let _ = init.shutdown();
                 let _ = runtime.block_on(vm.stop());
                 return Err(e);
             }
             boot_share_names.insert(share.name.clone());
-            nfs_mount_names.insert(share.name.clone());
+            fuse_mount_names.insert(share.name.clone());
         }
 
         // ---- Open long-lived shell --------------------------------------
@@ -276,12 +257,13 @@ impl SandboxBackend for MacosBackend {
         *state = State::Running(Box::new(RunningState {
             vm,
             init,
-            nfs: Some(nfs),
+            fuse_host,
+            nfs: None,
             shell_id,
             shells,
             runtime,
             boot_share_names,
-            nfs_mount_names,
+            fuse_mount_names,
             netstack_shutdown,
         }));
 
@@ -298,13 +280,15 @@ impl SandboxBackend for MacosBackend {
                     vm,
                     runtime,
                     nfs,
+                    fuse_host,
                     netstack_shutdown,
                     ..
                 } = *rs;
                 netstack_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = init.shutdown();
                 drop(init);
-                drop(nfs); // tear down NFS server task before dropping the runtime
+                drop(nfs); // tear down legacy NFS server slot (always None today)
+                drop(fuse_host); // tear down FuseHost; in-flight serve tasks see EOF
                 // Apple's VZVirtualMachine.stop() asserts when invoked off
                 // its dispatch queue. Use request_stop (fire-and-forget),
                 // wait briefly, then let Drop tear down the rest.
@@ -475,7 +459,7 @@ impl SandboxBackend for MacosBackend {
                 share.name
             )));
         }
-        if rs.nfs_mount_names.contains(&share.name) {
+        if rs.fuse_mount_names.contains(&share.name) {
             return Err(Error::validation(format!("share '{}' is already mounted", share.name)));
         }
         if share.name == "work" || share.name.is_empty() || share.name.contains('/') {
@@ -492,27 +476,23 @@ impl SandboxBackend for MacosBackend {
             )));
         }
 
-        // 1. Register with the in-process NFS server.
-        let nfs = rs.nfs.as_ref().ok_or_else(|| Error::other("nfs server not running"))?;
-        nfs.add_mount(&share.name, share.host_path.clone(), share.read_only)?;
+        // 1. Register the FUSE backend.
+        let backend = LocalDirVfs::arc(share.host_path.clone());
+        let mount_id = rs
+            .fuse_host
+            .register_mount(share.name.clone(), backend, share.read_only);
 
-        // 2. Ask the guest to `mount(2) -t nfs` it through the gateway.
+        // 2. Ask the guest to spawn a tokimo-sandbox-fuse child for it.
         let guest = share.guest_path.to_string_lossy().into_owned();
-        let export = format!("/{}", share.name);
-        if let Err(e) = rs.init.mount_nfs(
-            &share.name,
-            NFS_GUEST_IP,
-            NFS_GUEST_PORT,
-            &export,
-            &guest,
-            share.read_only,
-        ) {
-            // Roll back the host-side registration so a retry can succeed.
-            let _ = nfs.remove_mount(&share.name);
+        if let Err(e) = rs
+            .init
+            .mount_fuse(&share.name, FUSE_VSOCK_PORT, &guest, share.read_only)
+        {
+            let _ = rs.fuse_host.remove_mount(mount_id);
             return Err(e);
         }
 
-        rs.nfs_mount_names.insert(share.name.clone());
+        rs.fuse_mount_names.insert(share.name.clone());
         Ok(())
     }
 
@@ -528,15 +508,13 @@ impl SandboxBackend for MacosBackend {
                 "share '{name}' was declared at boot time and cannot be removed at runtime"
             )));
         }
-        if !rs.nfs_mount_names.remove(name) {
+        if !rs.fuse_mount_names.remove(name) {
             return Err(Error::validation(format!("no such share '{name}'")));
         }
 
-        // Unmount in the guest first; if that fails we still tombstone
-        // the host registration so a re-add of the same name succeeds.
-        let unmount_err = rs.init.unmount_nfs(name).err();
-        if let Some(nfs) = rs.nfs.as_ref() {
-            let _ = nfs.remove_mount(name);
+        let unmount_err = rs.init.unmount_fuse(name).err();
+        if let Some(mount_id) = rs.fuse_host.mount_id_by_name(name) {
+            let _ = rs.fuse_host.remove_mount(mount_id);
         }
         if let Some(e) = unmount_err {
             return Err(e);
@@ -639,4 +617,55 @@ fn event_pump_loop(init: Arc<VsockInitClient>, event_senders: Arc<Mutex<Vec<Send
     let event = Event::GuestConnected { connected: false };
     let mut senders = event_senders.lock().unwrap();
     senders.retain(|tx| tx.send(event.clone()).is_ok());
+}
+
+/// Spawn the FUSE accept loop on the runtime: each accepted connection
+/// from a `tokimo-sandbox-fuse` child goes to `FuseHost::serve`. Runs
+/// until the listener returns an error (typically VM shutdown).
+fn spawn_fuse_accept_loop(
+    mut listener: arcbox_vz::VirtioSocketListener,
+    fuse_host: Arc<crate::vfs_host::FuseHost>,
+    runtime: Arc<Runtime>,
+) {
+    runtime.spawn(async move {
+        use std::os::fd::IntoRawFd;
+        loop {
+            match listener.accept().await {
+                Ok(conn) => {
+                    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                    let raw = conn.into_raw_fd();
+                    // Wrap in OwnedFd; tokio AsyncFd over a unix stream
+                    // requires a non-blocking fd. Use tokio's UnixStream
+                    // adapter from the std fd.
+                    let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+                    let fd = owned.as_raw_fd();
+                    // Set non-blocking.
+                    unsafe {
+                        let flags = libc::fcntl(fd, libc::F_GETFL);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
+                    }
+                    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(owned.into_raw_fd()) };
+                    match tokio::net::UnixStream::from_std(std_stream) {
+                        Ok(stream) => {
+                            let host = fuse_host.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = host.serve(stream).await {
+                                    tracing::warn!("fuse_host serve: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("fuse listener: from_std: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("fuse listener accept failed: {e}");
+                    break;
+                }
+            }
+        }
+    });
 }

@@ -3,6 +3,7 @@
 //! Boots a Linux micro-VM running `tokimo-sandbox-init`, communicates over
 //! virtio-vsock with the guest's init binary.
 
+#[allow(dead_code)]
 pub(crate) mod nfs;
 pub(crate) mod sandbox;
 pub(crate) mod vm;
