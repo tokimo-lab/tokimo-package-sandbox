@@ -60,8 +60,7 @@ Sandbox::start_vm()
   └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
                  --unshare-net                ← 始终：全新网络命名空间
                  --ro-bind /usr /bin /sbin /lib /lib64
-                 --bind <workspace> /workspace
-                 --cap-add CAP_SYS_ADMIN
+                 --cap-add CAP_SYS_ADMIN      ← fusermount3 需要
                  --cap-add CAP_NET_ADMIN      ← 用于 TAP 和 lo 启动
                  --cap-add CAP_NET_RAW        ← 客机 ping 需要
                  --cap-add CAP_MKNOD          ← 回退 TUN 节点创建
@@ -73,12 +72,13 @@ Sandbox::start_vm()
                               │
                               └─ bwrap 内 PID 2（bwrap 是 PID 1）
                                  ├─ 控制：SEQPACKET，PTY 通过 SCM_RIGHTS 传递
-                                 └─ 网络：STREAM，TAP tk0 ↔ 宿主 smoltcp
+                                 ├─ 网络：STREAM，TAP tk0 ↔ 宿主 smoltcp
+                                 └─ FUSE：每个挂载一个 socketpair，宿主 FuseHost 服务
 ```
 
 - **无守护进程、无服务、不需要 root。** 每个 `Sandbox` 拥有独立的 bwrap+init 组合。
 - **网络：** `AllowAll` 和 `Blocked` 都使用 `--unshare-net` 创建全新网络命名空间。`AllowAll` 通过 TAP 设备（`tk0`）叠加 smoltcp 用户态网络栈，经 STREAM socketpair 桥接到宿主——与 macOS 和 Windows 架构完全一致。`Blocked` 只有 `lo`。
-- **动态挂载：** 宿主 fd 通过 `SCM_RIGHTS` 发送 → init 通过 `openat` 在 `/.tps_host` 暂存区打开 → bind-mount 到客机路径。
+- **文件共享：** 所有挂载使用 **FUSE-over-socketpair** —— 与 macOS 和 Windows 共同一套 `FuseHost` + `tokimo-sandbox-fuse` 基础设施。每个挂载获得一个 `AF_UNIX SOCK_STREAM` socketpair；宿主端由 `FuseHost` 服务，客机端通过 `--transport unix-fd` 传递给 `tokimo-sandbox-fuse`。启动时和运行时挂载使用相同机制。
 - **PTY：** 主 fd 通过 `SCM_RIGHTS` 传递到宿主，直接 I/O。
 
 ### macOS — Virtualization.framework
@@ -88,10 +88,10 @@ Sandbox::start_vm()
   │
   └─ arcbox-vz → VZVirtualMachine
        ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
-       ├─ VZVirtioFileSystemDevice  tag="work"        ← rootfs（只读）
-       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn"   ← 动态共享池
+       ├─ VZVirtioFileSystemDevice  tag="rootfs"       ← rootfs（只读）
        ├─ VZVirtioSocketDevice      port=2222          ← init 控制通道
        ├─ VZVirtioSocketDevice      port=4444          ← 用户态网络栈
+       ├─ VZVirtioSocketDevice      port=5555          ← FUSE-over-vsock 宿主
        └─ VZNetworkDeviceConfiguration::nat()          ← 仅 AllowAll
             │
             └─ Linux 微型虚拟机（arm64）
@@ -99,7 +99,7 @@ Sandbox::start_vm()
 ```
 
 - **无服务、不需要 root。** 纯库调用；每个 `Sandbox` 启动自己的虚拟机。
-- **共享文件系统：** virtio-fs（非 Plan9）。静态共享通过 `work` 标签，动态共享通过 `tokimo_dyn` 池（APFS 克隆）。
+- **共享文件系统：** 所有挂载使用 **FUSE-over-vsock** —— 宿主在 vsock 端口 5555 上运行进程内 `FuseHost`，每个挂载在客机中启动一个 `tokimo-sandbox-fuse` 子进程通过 vsock 连回。与 Linux 和 Windows 共同一套基础设施。
 - **网络：** `AllowAll` 使用宿主侧 **smoltcp 用户态网络栈**（vsock 传输）。`Blocked` 从虚拟机配置中省略网络设备。
 - **PTY：** 主 fd 留在客机中；init 通过协议 `Stdout`/`Write` 事件桥接 I/O。
 
@@ -111,7 +111,7 @@ Sandbox（库） ──命名管道──▶ tokimo-sandbox-svc.exe（SYSTEM）
                                 ├─ HCS 计算系统（Schema 2.5）
                                 │    ├─ LinuxKernelDirect(vmlinuz, initrd)
                                 │    ├─ SCSI：每会话 rootfs.vhdx
-                                │    ├─ Plan9 共享（通过 vsock 9p）
+                                │    ├─ FUSE-over-vsock（用户挂载）
                                 │    └─ HvSocket ServiceTable
                                 │
                                 ├─ AF_HYPERV 监听器（每会话 GUID）
@@ -161,7 +161,7 @@ StreamDevice（smoltcp，宿主侧）
 | VSOCK 流（客机监听） | macOS VZ | 协议桥接（Stdout/Write 事件） |
 | VSOCK 流（客机连接） | Windows HCS | 协议桥接（Stdout/Write 事件） |
 
-能力：`Pipes` 和 `Pty` stdio 模式、`Resize`、`Signal`、`Killpg`、`OpenShell`、`AddUser`/`RemoveUser`、`BindMount`/`Unmount`、动态 `AddMountFd`/`RemoveMountByName`、`MountManifest`（9p-over-vsock）。
+能力：`Pipes` 和 `Pty` stdio 模式、`Resize`、`Signal`、`Killpg`、`OpenShell`、`AddUser`/`RemoveUser`、`MountFuse`/`UnmountFuse`（FUSE-over-vsock/socketpair）。
 
 ## 快速开始
 
@@ -309,7 +309,7 @@ sb.remove_mount("workspace")?;
 
 ## 测试
 
-24 个集成测试，通过公共 `Sandbox` API 测试真实客机。平台无关的源码；同一套测试在三个平台上运行。
+34 个集成测试，通过公共 `Sandbox` API 测试真实客机。平台无关的源码；同一套测试在三个平台上运行。
 
 ```bash
 # Linux
@@ -326,7 +326,7 @@ cargo test --test sandbox_integration -- --nocapture
 
 Linux（bwrap 速率限制）和 macOS（VZ 调度队列串行化虚拟机启动）必须使用 `--test-threads=1`。Windows 支持并发。
 
-覆盖范围：生命周期、Shell I/O、多 Shell 流 + 信号 + 枚举、PTY 大小/调整/ctrl-c/转义序列、Plan9 共享添加/移除、网络 blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP、多会话并发。
+覆盖范围：生命周期、Shell I/O、多 Shell 流 + 信号 + 枚举、PTY 大小/调整/ctrl-c/转义序列、FUSE 挂载添加/移除、网络 blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP、多会话并发。
 
 单元测试：`cargo test --lib`（会话注册表、协议、服务内部）。
 
@@ -356,6 +356,16 @@ src/
 │   ├── types.rs              Frame、Op、Reply、Event、StdioMode
 │   └── wire.rs               长度前缀 JSON + SCM_RIGHTS 帧
 │
+├── vfs_host/                 FUSE-over-vsock/socketpair 宿主端（三平台统一）
+│   ├── mod.rs                FuseHost：accept 循环、每挂载分发
+│   └── id_table.rs           Nodeid + fh 分配器
+│
+├── vfs_protocol/             客机 ↔ 宿主 VFS 线路协议
+│   ├── mod.rs                Frame、Req、Res、AttrOut、EntryOut
+│   └── wire.rs               长度前缀 postcard 帧
+│
+├── vfs_impls.rs              LocalDirVfs：宿主目录 VfsBackend 实现
+│
 ├── netstack/                 用户态 smoltcp L3/L4 代理（三平台统一）
 │   ├── mod.rs                StreamDevice、TCP/UDP/ICMP 流代理
 │   └── icmp/                 平台特定 ICMP echo 后端
@@ -382,6 +392,9 @@ src/
     │   ├── server.rs         事件循环（mio::Poll）
     │   ├── child.rs          fork/exec 辅助函数
     │   └── pty.rs            PTY 分配
+    │
+    ├── tokimo-sandbox-fuse/   客机侧 FUSE 桥接二进制
+    │   └── main.rs           将内核 FUSE 操作翻译为 VfsProtocol 线路请求
     │
     ├── tokimo-sandbox-svc/   Windows SYSTEM 服务
     │   └── imp/

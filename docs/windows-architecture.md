@@ -59,7 +59,7 @@
 │         │                                                          │
 │         └─ /bin/bash + 用户命令 (支持多个并发 job)                 │
 │                                                                    │
-│   /mnt/work  = Plan9-over-vsock share "work"  (port 50002)         │
+│   /mnt/work  = FUSE-over-vsock share "work"  (port 5555)           │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -86,7 +86,7 @@
 |---|---|
 | [mod.rs](src/bin/tokimo-sandbox-svc/imp/mod.rs) | SCM 生命周期 + 命名管道服务器 + 客户端 Authenticode 校验 + `handle_open_session` 主流程 |
 | [hcs.rs](src/bin/tokimo-sandbox-svc/imp/hcs.rs) | 动态加载 ComputeCore.dll，封装 create/start/terminate/close/poll |
-| [vmconfig.rs](src/bin/tokimo-sandbox-svc/imp/vmconfig.rs) | HCS Schema 2.x JSON 生成（SCSI VHDX + Plan9 + HvSocketConfig + ComPorts）；`alloc_session_init_port()` |
+| [vmconfig.rs](src/bin/tokimo-sandbox-svc/imp/vmconfig.rs) | HCS Schema 2.x JSON 生成（SCSI VHDX + FUSE-over-vsock + HvSocketConfig + ComPorts）；`alloc_fuse_port()` |
 | [hvsock.rs](src/bin/tokimo-sandbox-svc/imp/hvsock.rs) | AF_HYPERV listener：`HV_GUID_WILDCARD` VmId + per-session ServiceId，等待 guest 拨入 |
 
 `handle_open_session` 关键步骤（每个 Session 独立）：
@@ -105,7 +105,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| [main.rs](src/bin/tokimo-sandbox-init/main.rs) | 解析 `tokimo.*` cmdline 参数；`AF_VSOCK connect(CID=2, port=<tokimo.init_port>)`；mount /mnt/work via 9p `trans=fd` |
+| [main.rs](src/bin/tokimo-sandbox-init/main.rs) | 解析 `tokimo.*` cmdline 参数；`AF_VSOCK connect(CID=2, port=<tokimo.init_port>)`；FUSE-over-vsock 挂载用户目录 |
 | [server.rs](src/bin/tokimo-sandbox-init/server.rs) | length-prefixed JSON 解码；分发 Op；通过 vsock 把 Reply/Event 推回 host |
 | [child.rs](src/bin/tokimo-sandbox-init/child.rs) | 拉起子进程，stdout/stderr → Event::Stdout/Stderr，退出 → Event::Exit |
 | [pty.rs](src/bin/tokimo-sandbox-init/pty.rs) | shell 模式 PTY 处理 |
@@ -131,7 +131,7 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 ### 3.2 Initrd（initrd.img）
 
-- **来源**：`vm-base.yml` 现场打包基础 initrd（busybox + Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, 9p 等共 ~19 个 .ko，外加 `init.sh` 挂载/chroot 流程）；`vm-image.yml` 在此之上调用 `rebake-initrd.sh`，把当次构建的 `tokimo-sandbox-init` 注入 `/bin/`
+- **来源**：`vm-base.yml` 现场打包基础 initrd（busybox + Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse 等共 ~19 个 .ko，外加 `init.sh` 挂载/chroot 流程）；`vm-image.yml` 在此之上调用 `rebake-initrd.sh`，把当次构建的 `tokimo-sandbox-init` 和 `tokimo-sandbox-fuse` 注入 `/bin/`
 - **session 模式流程**：init.sh 加载模块 → mount `/dev/sda` → chroot → exec `tokimo-sandbox-init`
 - **位置**：`vm/initrd.img`
 

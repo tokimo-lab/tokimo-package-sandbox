@@ -182,12 +182,12 @@ will fail with `Access is denied`. Kill the service first, or use
 
 The file uses only public API types. Caveats per backend:
 
-- **`Mount`**: on Windows this maps to FUSE-over-vsock (real shared
-  filesystem). Linux (bwrap) uses `--bind host_path guest_path` (or a
-  runtime `AddMountFd` for dynamic shares). macOS uses FUSE-over-vsock
-  (same mechanism as Windows). All three backends honor the same
-  `Mount { name, host_path, guest_path }` contract — tests 6 and
-  9 are written against observable behavior, not a specific transport.
+- **`Mount`**: all three backends use FUSE — Linux via
+  FUSE-over-socketpair, macOS and Windows via FUSE-over-vsock. The
+  same `FuseHost` + `tokimo-sandbox-fuse` infrastructure is shared
+  across platforms. All three backends honor the same
+  `Mount { name, host_path, guest_path }` contract — tests are
+  written against observable behavior, not a specific transport.
 - **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
   path (Windows HCN NAT, Linux shared host netns, macOS bridged NAT
   via vmnet). Test 12 only asserts capability — link enumeration plus
@@ -229,13 +229,12 @@ self-throttling under heavy parallelism).
 The Linux backend lives in `src/linux/`. Cross-cutting decisions worth
 knowing when porting tests or debugging:
 
-- **Mount story.** FUSE / virtio-fs are unavailable outside a VM, so
-  `Mount { host_path, guest_path }` is implemented as a `bwrap`
-  bind mount (`--bind host_path guest_path`). Capabilities and tests
-  6 / 9 (host file visible in guest, dynamic add/remove) work because
-  init holds `CAP_SYS_ADMIN` over the user-namespace and can issue
-  runtime `mount(2)` calls via the `AddMountFd` op. Same observable
-  semantics as Windows FUSE-over-vsock, different mechanism.
+- **Mount story.** All three backends use FUSE for mounts. Linux uses
+  FUSE-over-socketpair (`AF_UNIX SOCK_STREAM` socketpair per mount;
+  host end served by `FuseHost`, guest end passed to
+  `tokimo-sandbox-fuse` via `--transport unix-fd`). macOS and Windows
+  use FUSE-over-vsock. Init holds `CAP_SYS_ADMIN` in the
+  user-namespace so `fusermount3` can call `mount(2)`.
 - **`/sys` is policy-aware.**
   * `AllowAll` → host `/sys` is bind-mounted read-only (the netns is
     shared, so the host NIC list is the correct view).
@@ -245,8 +244,9 @@ knowing when porting tests or debugging:
     not per-task. Init keys off `TOKIMO_SANDBOX_MOUNT_SYSFS=1` set
     by the host.
 - **Network policy.**
-  * `AllowAll` → no `--unshare-net`; full host network access. Egress
-    test 12 hits `1.1.1.1:53` directly.
+  * `AllowAll` → `--unshare-net` + smoltcp userspace netstack via TAP
+    + socketpair. Full network access through the netstack proxy.
+    Egress test hits `1.1.1.1:53` via the smoltcp TCP proxy.
   * `Blocked`  → `--unshare-net`; init brings up `lo` (the
     `SIOCSIFFLAGS Operation not permitted` warning is benign, `lo`
     exists in a fresh netns regardless of explicit ifup).

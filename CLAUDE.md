@@ -56,8 +56,7 @@ Sandbox client (library, in-process)
         │
         └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
                        [--unshare-net for Blocked]
-                       --bind / staging
-                       --cap-add CAP_SYS_ADMIN
+                       --cap-add CAP_SYS_ADMIN    ← fusermount3
                        -- /path/to/tokimo-sandbox-init bwrap
                               --control-fd=<n>
                               [--bringup-lo --mount-sysfs for Blocked]
@@ -68,11 +67,12 @@ Sandbox client (library, in-process)
 ```
 
 No service, no daemon, no admin: the Linux backend is library-only and
-each `Sandbox` owns its own bwrap+init pair. FUSE / virtio-fs are not
-available outside a VM, so `Mount` is implemented via `--bind`
-(static) and runtime `AddMountFd` ops (dynamic add/remove). API and
-observable behavior match the Windows backend; the mount mechanism
-differs.
+each `Sandbox` owns its own bwrap+init pair. Mounts use
+**FUSE-over-socketpair** — the same `FuseHost` + `tokimo-sandbox-fuse`
+infrastructure as macOS (vsock) and Windows (vsock). Each mount gets an
+`AF_UNIX SOCK_STREAM` socketpair; the host end is served by `FuseHost`,
+the guest end is passed to `tokimo-sandbox-fuse` via `--transport
+unix-fd`. API and observable behavior match the other backends.
 
 `/sys` handling is policy-aware:
 - **AllowAll** → bind-mount host `/sys` (shared netns, host NIC view).
@@ -122,7 +122,7 @@ Sandbox client (library, in-process)
   `com.apple.security.virtualization` entitlement). `cargo test` does this
   automatically via `scripts/macos/codesign-and-run.sh` registered as a cargo
   runner; see `docs/macos-testing.md`.
-- `tests/sandbox_integration.rs` (16/16 green) must run with
+- `tests/sandbox_integration.rs` (34 tests) must run with
   `--test-threads=1` because the suite shares one host process and `BOOT_LOCK`
   enforces serial VM start anyway.
 
@@ -229,6 +229,13 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 | `src/protocol/` | Host ↔ init wire protocol (shared across all backends) |
 | `src/protocol/types.rs` | `Frame` envelope, `StdioMode`, op/event enums, version constants |
 | `src/protocol/wire.rs` | Frame encode/decode, SEQPACKET + stream transport helpers |
+| `src/vfs_host/` | FUSE-over-vsock/socketpair host (all platforms) |
+| `src/vfs_host/mod.rs` | `FuseHost`: accept loop, per-mount dispatch to `VfsBackend` |
+| `src/vfs_host/id_table.rs` | Nodeid + fh allocator |
+| `src/vfs_protocol/` | Guest ↔ host VFS wire protocol |
+| `src/vfs_protocol/mod.rs` | `Frame`, `Req`, `Res`, `AttrOut`, `EntryOut` |
+| `src/vfs_protocol/wire.rs` | Length-prefixed postcard framing |
+| `src/vfs_impls.rs` | `LocalDirVfs`: host-directory `VfsBackend` impl |
 | `src/svc_protocol.rs` | Host ↔ Windows service JSON-RPC: `Frame`, method names, typed param/result structs, `RootfsSpec` |
 | `src/windows/mod.rs` | Windows backend module declarations |
 | `src/windows/sandbox.rs` | `WindowsBackend: SandboxBackend` — forwards API calls as JSON-RPC over named pipe |
@@ -247,6 +254,7 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 | `src/bin/tokimo-sandbox-init/server.rs` | Init's main request loop |
 | `src/bin/tokimo-sandbox-init/child.rs` | Child process management (fork/exec, pipes, PTY) |
 | `src/bin/tokimo-sandbox-init/pty.rs` | PTY allocation inside the guest |
+| `src/bin/tokimo-sandbox-fuse/main.rs` | Guest-side FUSE bridge: kernel FUSE ops → VfsProtocol wire reqs |
 | `src/bin/tokimo-sandbox-svc/main.rs` | Service entry point |
 | `src/bin/tokimo-sandbox-svc/imp/mod.rs` | Service main: SCM lifecycle, pipe server loop, caller verification, per-session handler |
 | `src/bin/tokimo-sandbox-svc/imp/hcs.rs` | HCS API wrapper: loads `ComputeCore.dll`, exposes create/start/terminate/close/poll |
@@ -289,7 +297,7 @@ sudo apt install bubblewrap
 # Build init binary so bwrap can exec it
 cargo build --bin tokimo-sandbox-init
 
-# Full integration suite (16 tests, ~8 s). --test-threads=1 keeps bwrap
+# Full integration suite (34 tests). --test-threads=1 keeps bwrap
 # user-namespace creation rate sane and avoids cross-test PATH races.
 PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
 ```

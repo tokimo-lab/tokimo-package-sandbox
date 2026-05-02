@@ -60,8 +60,7 @@ Sandbox::start_vm()
   └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
                  --unshare-net                ← always: fresh netns
                  --ro-bind /usr /bin /sbin /lib /lib64
-                 --bind <workspace> /workspace
-                 --cap-add CAP_SYS_ADMIN
+                 --cap-add CAP_SYS_ADMIN      ← for fusermount3
                  --cap-add CAP_NET_ADMIN      ← for TAP + lo bringup
                  --cap-add CAP_NET_RAW        ← for guest ping
                  --cap-add CAP_MKNOD          ← fallback TUN node creation
@@ -73,12 +72,13 @@ Sandbox::start_vm()
                               │
                               └─ PID 2 inside bwrap (bwrap is PID 1)
                                  ├─ control: SEQPACKET, SCM_RIGHTS for PTY
-                                 └─ net: STREAM, TAP tk0 ↔ smoltcp on host
+                                 ├─ net: STREAM, TAP tk0 ↔ smoltcp on host
+                                 └─ FUSE: socketpair per mount, FuseHost on host
 ```
 
 - **No daemon, no service, no root.** Each `Sandbox` owns its own bwrap+init pair.
 - **Networking:** Both `AllowAll` and `Blocked` use `--unshare-net` with a fresh netns. `AllowAll` layers a userspace smoltcp netstack on top via a TAP device (`tk0`) inside the sandbox, bridged to the host through a STREAM socketpair — the same architecture as macOS and Windows. `Blocked` gets only `lo`.
-- **Dynamic mounts:** Host fd sent via `SCM_RIGHTS` → init opens via `openat` into `/.tps_host` staging → bind-mount to guest path.
+- **File sharing:** All mounts use **FUSE-over-socketpair** — the same `FuseHost` + `tokimo-sandbox-fuse` infrastructure as macOS and Windows. Each mount gets a `AF_UNIX SOCK_STREAM` socketpair; the host end is served by `FuseHost`, the guest end is passed to `tokimo-sandbox-fuse` via `--transport unix-fd`. Boot-time and runtime mounts use the same mechanism.
 - **PTY:** Master fd transferred to host via `SCM_RIGHTS` for direct I/O.
 
 ### macOS — Virtualization.framework
@@ -88,10 +88,10 @@ Sandbox::start_vm()
   │
   └─ arcbox-vz → VZVirtualMachine
        ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
-       ├─ VZVirtioFileSystemDevice  tag="work"        ← rootfs (read-only)
-       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn"   ← dynamic share pool
+       ├─ VZVirtioFileSystemDevice  tag="rootfs"       ← rootfs (read-only)
        ├─ VZVirtioSocketDevice      port=2222          ← init control plane
        ├─ VZVirtioSocketDevice      port=4444          ← userspace netstack
+       ├─ VZVirtioSocketDevice      port=5555          ← FUSE-over-vsock host
        └─ VZNetworkDeviceConfiguration::nat()          ← AllowAll only
             │
             └─ Linux micro-VM (arm64)
@@ -99,7 +99,7 @@ Sandbox::start_vm()
 ```
 
 - **No service, no root.** Library-only; each `Sandbox` boots its own VM.
-- **Shared filesystem:** virtio-fs (not Plan9). Static shares via `work` tag, dynamic shares via `tokimo_dyn` pool with APFS clone-on-copy.
+- **Shared filesystem:** All mounts use **FUSE-over-vsock** — the host runs an in-process `FuseHost` listening on vsock port 5555, each mount spawns a `tokimo-sandbox-fuse` child in the guest that connects back via vsock. Same infrastructure as Linux and Windows.
 - **Networking:** `AllowAll` uses a **userspace smoltcp netstack** on the host (see below). `Blocked` omits the network device entirely.
 - **PTY:** Master fd stays in guest; init bridges I/O through protocol `Stdout`/`Write` events over vsock.
 
@@ -111,7 +111,7 @@ Sandbox (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (SYSTEM)
                                          ├─ HCS compute system (Schema 2.5)
                                          │    ├─ LinuxKernelDirect(vmlinuz, initrd)
                                          │    ├─ SCSI: per-session rootfs.vhdx
-                                         │    ├─ Plan9 shares via vsock 9p
+                                         │    ├─ FUSE-over-vsock (user mounts)
                                          │    └─ HvSocket ServiceTable
                                          │
                                          ├─ AF_HYPERV listener (per-session GUID)
@@ -161,7 +161,7 @@ StreamDevice (smoltcp) on host
 | VSOCK stream (guest listens) | macOS VZ | Protocol bridge (Stdout/Write events) |
 | VSOCK stream (guest connects) | Windows HCS | Protocol bridge (Stdout/Write events) |
 
-Capabilities: `Pipes` and `Pty` stdio modes, `Resize`, `Signal`, `Killpg`, `OpenShell`, `AddUser`/`RemoveUser`, `BindMount`/`Unmount`, dynamic `AddMountFd`/`RemoveMountByName`, `MountManifest` (9p-over-vsock).
+Capabilities: `Pipes` and `Pty` stdio modes, `Resize`, `Signal`, `Killpg`, `OpenShell`, `AddUser`/`RemoveUser`, `MountFuse`/`UnmountFuse` (FUSE-over-vsock/socketpair).
 
 ## Quick start
 
@@ -309,7 +309,7 @@ sb.remove_mount("workspace")?;
 
 ## Tests
 
-24 integration tests exercising the real guest through the public `Sandbox` API. Platform-agnostic source; same suite runs on all three platforms.
+34 integration tests exercising the real guest through the public `Sandbox` API. Platform-agnostic source; same suite runs on all three platforms.
 
 ```bash
 # Linux
@@ -326,7 +326,7 @@ cargo test --test sandbox_integration -- --nocapture
 
 `--test-threads=1` is required on Linux (bwrap rate limits) and macOS (VZ dispatch queue serializes VM starts). Windows runs with concurrency.
 
-Coverage: lifecycle, shell I/O, multi-shell streams + signals + enumeration, PTY size/resize/ctrl-c/escape codes, Plan9 share add/remove, network blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP, multi-session concurrency.
+Coverage: lifecycle, shell I/O, multi-shell streams + signals + enumeration, PTY size/resize/ctrl-c/escape codes, FUSE mount add/remove, network blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP, multi-session concurrency.
 
 Unit tests: `cargo test --lib` (session registry, protocol, svc internals).
 
@@ -356,7 +356,17 @@ src/
 │   ├── types.rs              Frame, Op, Reply, Event, StdioMode
 │   └── wire.rs               Length-prefixed JSON + SCM_RIGHTS framing
 │
-├── netstack/                 Userspace smoltcp L3/L4 proxy (macOS + Windows)
+├── vfs_host/                 FUSE-over-vsock/socketpair host (all platforms)
+│   ├── mod.rs                FuseHost: accept loop, per-mount dispatch
+│   └── id_table.rs           Nodeid + fh allocator
+│
+├── vfs_protocol/             Guest ↔ host VFS wire protocol
+│   ├── mod.rs                Frame, Req, Res, AttrOut, EntryOut
+│   └── wire.rs               Length-prefixed postcard framing
+│
+├── vfs_impls.rs              LocalDirVfs: host-directory VfsBackend impl
+│
+├── netstack/                 Userspace smoltcp L3/L4 proxy (all platforms)
 │   ├── mod.rs                StreamDevice, TCP/UDP/ICMP flow proxy
 │   └── icmp/                 OS-specific ICMP echo backends
 │
@@ -382,6 +392,9 @@ src/
     │   ├── server.rs         Event loop (mio::Poll)
     │   ├── child.rs          fork/exec helpers
     │   └── pty.rs            PTY allocation
+    │
+    ├── tokimo-sandbox-fuse/   Guest-side FUSE bridge binary
+    │   └── main.rs           Translates kernel FUSE ops → VfsProtocol wire reqs
     │
     ├── tokimo-sandbox-svc/   Windows SYSTEM service
     │   └── imp/
