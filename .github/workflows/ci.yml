@@ -83,7 +83,7 @@ jobs:
           # which test (if any) hangs on the hosted runner. Wrap in
           # `timeout` to bound total wall time at 10 min — anything over
           # that is almost certainly a deadlock, not slow CI.
-        run: timeout --signal=ABRT 600 cargo test --tests -- --test-threads=1 --nocapture
+        run: PATH="$PWD/target/debug:$PATH" timeout --signal=ABRT 600 cargo test --tests -- --test-threads=1 --nocapture
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)
