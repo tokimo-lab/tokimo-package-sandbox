@@ -550,9 +550,7 @@ fn reader_loop(mut sock: OwnedFd, state: Arc<(Mutex<Shared>, Condvar)>) {
 
 fn reply_id(r: &Reply) -> String {
     match r {
-        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } | Reply::MountManifest { id, .. } => {
-            id.clone()
-        }
+        Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
     }
 }
 

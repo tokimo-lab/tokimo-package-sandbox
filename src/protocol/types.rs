@@ -165,23 +165,6 @@ pub enum Op {
     },
     /// Unmount a previously bind-mounted path.
     Unmount { id: String, target: String },
-    /// Sent once per session, immediately after `Hello` and before any
-    /// `OpenShell` / `Spawn`. Tells the guest to dial each `vsock_port`
-    /// and 9p-mount the resulting fd at `guest_path`. Required on
-    /// platforms that pre-allocate one Plan9 share per host directory
-    /// (currently Windows only). On platforms whose backend mounts the
-    /// workspace itself (Linux bwrap, macOS VZ) hosts simply omit this op.
-    MountManifest { id: String, entries: Vec<MountEntry> },
-    /// Add a single Plan9-over-vsock share at runtime (after `MountManifest`).
-    /// The host has already attached the share to the live VM via
-    /// `HcsModifyComputeSystem`; init dials the new vsock port, performs
-    /// `mount(2)` and stashes the fd in `state.mount_fds`. Init replies
-    /// with a generic `Reply::Ack`.
-    AddMount { id: String, entry: MountEntry },
-    /// Remove a previously-added Plan9 share by 9p tag (`aname`). Init
-    /// `umount2(target, MNT_DETACH)`s the share and drops the held fd.
-    /// Replies with `Reply::Ack`.
-    RemoveMount { id: String, name: String },
     /// Bwrap-backend dynamic mount: init opens `host_path` relative to
     /// its long-lived `/.tps_host` fd (no SCM_RIGHTS required), then
     /// bind-mounts the result at `target`. If `read_only`, init follows
@@ -222,15 +205,6 @@ pub enum Op {
     UnmountFuse { id: String, name: String },
 }
 
-/// One Plan9-over-vsock mount the guest must perform during `MountManifest`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MountEntry {
-    pub vsock_port: u32,
-    pub guest_path: String,
-    pub aname: String,
-    pub read_only: bool,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -266,16 +240,6 @@ pub enum Reply {
     Ack {
         id: String,
         ok: bool,
-        #[serde(default)]
-        error: Option<ErrorReply>,
-    },
-    /// Reply to `Op::MountManifest`. On failure `failing_index` points at
-    /// the first entry that could not be mounted.
-    MountManifest {
-        id: String,
-        ok: bool,
-        #[serde(default)]
-        failing_index: Option<u32>,
         #[serde(default)]
         error: Option<ErrorReply>,
     },
@@ -357,7 +321,6 @@ pub fn default_features() -> Vec<String> {
         "removeuser".into(),
         "bindmount".into(),
         "unmount".into(),
-        "mount_manifest".into(),
         "dynamic_mount".into(),
         "fuse_mount".into(),
     ]
