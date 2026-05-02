@@ -5,11 +5,11 @@
 //!  * `configure` stores params (allowed Empty → Configured, Configured →
 //!     Configured, Stopped → Configured).
 //!  * `start_vm` boots the VM (one virtiofs share per pre-declared
-//!     Plan9Share, plus a per-session "dynamic share" pool used for runtime
-//!     `add_plan9_share`), runs the init Hello handshake, asks the guest to
+//!     Mount, plus a per-session "dynamic share" pool used for runtime
+//!     `add_mount`), runs the init Hello handshake, asks the guest to
 //!     mount each share, and opens the long-lived shell.
 //!  * `stop_vm` shuts down the VM and tears down the per-session host dir.
-//!  * `add_plan9_share` / `remove_plan9_share` materialise dynamic shares
+//!  * `add_mount` / `remove_mount` materialise dynamic shares
 //!     by APFS-cloning into the dynamic-share pool and bind-mounting on the
 //!     guest (Apple's VZ does not support virtio-fs hot-plug).
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -66,7 +66,7 @@ struct RunningState {
     /// Names of shares declared at boot time (cannot be removed at runtime).
     boot_share_names: HashSet<String>,
     /// Currently active runtime-added Plan9 shares (name → share).
-    dyn_shares: HashMap<String, Plan9Share>,
+    dyn_shares: HashMap<String, Mount>,
 }
 
 impl MacosBackend {
@@ -196,7 +196,7 @@ impl SandboxBackend for MacosBackend {
         let vm_config = VmConfig {
             memory_mb: params.memory_mb,
             cpu_count: params.cpu_count,
-            plan9_shares: params.plan9_shares.clone(),
+            mounts: params.mounts.clone(),
             network: params.network,
             dyn_root: dyn_root.clone(),
         };
@@ -278,7 +278,7 @@ impl SandboxBackend for MacosBackend {
 
         // ---- Mount each boot-time Plan9 share ---------------------------
         let mut boot_share_names = HashSet::new();
-        for share in &params.plan9_shares {
+        for share in &params.mounts {
             let guest = share.guest_path.to_string_lossy().into_owned();
             if let Err(e) = guest_mount_virtiofs(&init, &share.name, &guest, share.read_only) {
                 let _ = init.shutdown();
@@ -503,7 +503,7 @@ impl SandboxBackend for MacosBackend {
         Err(Error::not_implemented("passthrough on macOS"))
     }
 
-    fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
+    fn add_mount(&self, share: Mount) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let rs = match &mut *state {
             State::Running(rs) => rs,
@@ -560,7 +560,7 @@ impl SandboxBackend for MacosBackend {
         Ok(())
     }
 
-    fn remove_plan9_share(&self, name: &str) -> Result<()> {
+    fn remove_mount(&self, name: &str) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let rs = match &mut *state {
             State::Running(rs) => rs,

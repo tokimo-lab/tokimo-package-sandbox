@@ -10,7 +10,7 @@
 use std::io::{self, Read, Write};
 use std::thread;
 
-use tokimo_package_sandbox::{ConfigureParams, Plan9Share, Sandbox, ShellOpts};
+use tokimo_package_sandbox::{ConfigureParams, Mount, Sandbox, ShellOpts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sb = Sandbox::connect()?;
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_data_name: "pty-shell".into(),
         memory_mb: 4096,
         cpu_count: 4,
-        plan9_shares: vec![Plan9Share {
+        mounts: vec![Mount {
             name: "work".into(),
             host_path: cwd,
             guest_path: "/work".into(),

@@ -41,7 +41,7 @@ pub(crate) mod macos;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
-pub use api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, Sandbox, ShellOpts};
+pub use api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, ShellOpts};
 pub use backend::SandboxBackend;
 pub use error::{Error, Result};
 

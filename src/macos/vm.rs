@@ -19,7 +19,7 @@ use arcbox_vz::{
 };
 use tokio::runtime::Runtime;
 
-use crate::api::{NetworkPolicy, Plan9Share};
+use crate::api::{Mount, NetworkPolicy};
 use crate::error::{Error, Result};
 
 /// Vsock port the guest's `tokimo-sandbox-init` listens on.
@@ -57,7 +57,7 @@ pub struct BootedVm {
 pub struct VmConfig {
     pub memory_mb: u64,
     pub cpu_count: u32,
-    pub plan9_shares: Vec<Plan9Share>,
+    pub mounts: Vec<Mount>,
     pub network: NetworkPolicy,
     /// Host-side directory mounted as the dynamic-share pool.
     pub dyn_root: PathBuf,
@@ -158,7 +158,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     let memory_mb = config.memory_mb.max(256);
     let cpu_count = config.cpu_count.max(1) as usize;
 
-    let plan9 = config.plan9_shares.clone();
+    let plan9 = config.mounts.clone();
     let network = config.network;
 
     // Cmdline picks netstack mode for AllowAll, no kernel NIC otherwise.

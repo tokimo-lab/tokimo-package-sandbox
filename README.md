@@ -297,14 +297,14 @@ for event in rx {
 ### Dynamic file sharing
 
 ```rust
-sb.add_plan9_share(Plan9Share {
+sb.add_mount(Mount {
     name: "workspace".into(),
     host_path: "/tmp/my-project".into(),
     guest_path: "/workspace".into(),
     read_only: false,
 })?;
 // ... guest can access /workspace ...
-sb.remove_plan9_share("workspace")?;
+sb.remove_mount("workspace")?;
 ```
 
 ## Tests
@@ -345,7 +345,7 @@ cargo run --example smoltcp_netstack
 ```
 src/
 ├── lib.rs                    Public surface, re-exports
-├── api.rs                    Sandbox handle, ConfigureParams, Event, Plan9Share
+├── api.rs                    Sandbox handle, ConfigureParams, Event, Mount
 ├── backend.rs                SandboxBackend trait (22 methods)
 ├── error.rs                  Error enum + Result alias
 ├── platform.rs               default_backend() per OS

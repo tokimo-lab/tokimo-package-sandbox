@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use tokimo_package_sandbox::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, Sandbox, ShellOpts};
+use tokimo_package_sandbox::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, ShellOpts};
 
 // Counter to make per-test session_id unique within a single test process.
 static N: AtomicU32 = AtomicU32::new(0);
@@ -26,7 +26,7 @@ fn config(label: &str) -> ConfigureParams {
         user_data_name: "test".into(),
         memory_mb: 1024,
         cpu_count: 2,
-        plan9_shares: vec![Plan9Share {
+        mounts: vec![Mount {
             name: "ws".into(),
             host_path: workspace_dir(label),
             guest_path: "/work".into(),
@@ -304,13 +304,13 @@ fn plan9_dynamic_add_remove() {
     );
 
     // 2. Add share, then read sentinel from inside the guest.
-    sb.add_plan9_share(Plan9Share {
+    sb.add_mount(Mount {
         name: "extra".into(),
         host_path: extra.clone(),
         guest_path: "/extra".into(),
         read_only: false,
     })
-    .expect("add_plan9_share");
+    .expect("add_mount");
     sb.write_stdin(&shell, format!("cat /extra/{FNAME}; echo POST_ADD_2CD\n").as_bytes())
         .unwrap();
     let post = drain_until(&rx, &shell, "POST_ADD_2CD", Duration::from_secs(30));
@@ -320,7 +320,7 @@ fn plan9_dynamic_add_remove() {
     );
 
     // 3. Remove share. After this, /extra may be empty or fail to read.
-    sb.remove_plan9_share("extra").expect("remove_plan9_share");
+    sb.remove_mount("extra").expect("remove_mount");
     sb.write_stdin(
         &shell,
         format!("cat /extra/{FNAME} 2>&1; echo POST_REM_3EF\n").as_bytes(),

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -50,7 +50,7 @@ pub trait SandboxBackend: Send + Sync + 'static {
     fn send_guest_response(&self, raw: serde_json::Value) -> Result<()>;
     fn passthrough(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value>;
 
-    // -- Dynamic Plan9 share management ------------------------------
-    fn add_plan9_share(&self, share: Plan9Share) -> Result<()>;
-    fn remove_plan9_share(&self, name: &str) -> Result<()>;
+    // -- Dynamic mount management -------------------------------------
+    fn add_mount(&self, mount: Mount) -> Result<()>;
+    fn remove_mount(&self, name: &str) -> Result<()>;
 }

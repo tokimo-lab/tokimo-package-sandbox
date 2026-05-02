@@ -27,7 +27,7 @@ println!("{}", r.stdout_str());
 sb.stop_vm().unwrap();
 ```
 
-Key types exported from `src/lib.rs`: `Sandbox`, `SandboxBackend`, `ConfigureParams`, `ExecOpts`, `ExecResult`, `JobId`, `Event`, `NetworkPolicy`, `Plan9Share`, `Error`, `Result`.
+Key types exported from `src/lib.rs`: `Sandbox`, `SandboxBackend`, `ConfigureParams`, `ExecOpts`, `ExecResult`, `JobId`, `Event`, `NetworkPolicy`, `Mount`, `Error`, `Result`.
 
 ## Architecture (Windows)
 
@@ -69,7 +69,7 @@ Sandbox client (library, in-process)
 
 No service, no daemon, no admin: the Linux backend is library-only and
 each `Sandbox` owns its own bwrap+init pair. Plan9 / virtio-fs are not
-available outside a VM, so `Plan9Share` is implemented via `--bind`
+available outside a VM, so `Mount` is implemented via `--bind`
 (static) and runtime `AddMountFd` ops (dynamic add/remove). API and
 observable behavior match the Windows backend; the mount mechanism
 differs.
@@ -89,7 +89,7 @@ Sandbox client (library, in-process)
         │       │
         │       ├─ VZLinuxBootLoader(vmlinuz, initrd.img)
         │       ├─ VZVirtioFileSystemDevice  tag="work"      ← rootfs (read-only host-shared)
-        │       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn" ← dynamic Plan9Share pool
+        │       ├─ VZVirtioFileSystemDevice  tag="tokimo_dyn" ← dynamic mount pool
         │       ├─ VZVirtioSocketDevice (vsock CID/port 2222) ← init control plane
         │       ├─ VZNetworkDeviceConfiguration::nat()        ← AllowAll: vmnet NAT
         │       └─ VZSerialPortConfiguration                  ← guest console (debug)
@@ -102,7 +102,7 @@ Sandbox client (library, in-process)
                 │   the actual VZ NAT lease (vmnet picks ~192.168.64.x at
                 │   runtime, NOT the Hyper-V 192.168.127.x baked into init.sh)
                 ├─ OpenShell / Spawn / Exec
-                └─ Plan9Share add/remove → bind dyn-pool subdirs at runtime
+                └─ add_mount / remove_mount → bind dyn-pool subdirs at runtime
 ```
 
 **Process-wide invariants:**
@@ -215,7 +215,7 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 | Path | Purpose |
 |---|---|
 | `src/lib.rs` | Crate root: re-exports public API types, declares platform modules |
-| `src/api.rs` | Public `Sandbox` handle (17 commands), `ConfigureParams`, `ExecOpts`, `ExecResult`, `Event`, `JobId`, `Plan9Share`, `NetworkPolicy` |
+| `src/api.rs` | Public `Sandbox` handle (17 commands), `ConfigureParams`, `ExecOpts`, `ExecResult`, `Event`, `JobId`, `Mount`, `NetworkPolicy` |
 | `src/backend.rs` | `SandboxBackend` trait — per-platform implementation contract |
 | `src/platform.rs` | `default_backend()` — dispatches to the OS-specific backend |
 | `src/error.rs` | `Error` enum + `Result<T>` alias |

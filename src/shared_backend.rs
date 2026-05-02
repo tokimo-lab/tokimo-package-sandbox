@@ -48,7 +48,7 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -242,12 +242,12 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
         self.get()?.passthrough(method, params)
     }
 
-    fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
-        self.get()?.add_plan9_share(share)
+    fn add_mount(&self, share: Mount) -> Result<()> {
+        self.get()?.add_mount(share)
     }
 
-    fn remove_plan9_share(&self, name: &str) -> Result<()> {
-        self.get()?.remove_plan9_share(name)
+    fn remove_mount(&self, name: &str) -> Result<()> {
+        self.get()?.remove_mount(name)
     }
 }
 
@@ -345,10 +345,10 @@ mod tests {
         fn passthrough(&self, _m: &str, _p: serde_json::Value) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
-        fn add_plan9_share(&self, _s: Plan9Share) -> Result<()> {
+        fn add_mount(&self, _s: Mount) -> Result<()> {
             Ok(())
         }
-        fn remove_plan9_share(&self, _n: &str) -> Result<()> {
+        fn remove_mount(&self, _n: &str) -> Result<()> {
             Ok(())
         }
     }

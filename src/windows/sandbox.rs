@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{ConfigureParams, Event, JobId, Plan9Share, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult,
-    RemovePlan9ShareParams, ResizeShellParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, RemoveMountParams,
+    ResizeShellParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -196,15 +196,15 @@ impl SandboxBackend for WindowsBackend {
         self.call(method, params, LONG_CALL_TIMEOUT)
     }
 
-    fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
-        let p = AddPlan9ShareParams { share };
-        self.call(method::ADD_PLAN9_SHARE, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
+    fn add_mount(&self, share: Mount) -> Result<()> {
+        let p = AddMountParams { share };
+        self.call(method::ADD_MOUNT, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 
-    fn remove_plan9_share(&self, name: &str) -> Result<()> {
-        let p = RemovePlan9ShareParams { name: name.to_string() };
-        self.call(method::REMOVE_PLAN9_SHARE, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
+    fn remove_mount(&self, name: &str) -> Result<()> {
+        let p = RemoveMountParams { name: name.to_string() };
+        self.call(method::REMOVE_MOUNT, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 }

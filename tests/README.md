@@ -80,7 +80,7 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 | 6 | `plan9_host_file_visible_in_guest` | Host writes sentinel file → guest `cat` returns same bytes (real I/O) |
 | 7 | `status_rpcs_during_blocking_shell` | `status()` returns under load (5 calls in <2 s while shell is busy) |
 | 8 | `multi_session_concurrent` | Two parallel sessions each run a marker — no cross-talk |
-| 9 | `plan9_dynamic_add_remove` | `add_plan9_share` after start exposes content; `remove_plan9_share` retracts it |
+| 9 | `plan9_dynamic_add_remove` | `add_mount` after start exposes content; `remove_mount` retracts it |
 | 10 | `signal_shell_delivers_sigint` | `signal_shell(boot, 2)` produces `Event::Exit { signal: Some(2) }` for the boot shell |
 | 11 | `network_blocked_only_loopback` | `NetworkPolicy::Blocked` → `/sys/class/net/` only `lo`; bash `/dev/tcp/1.1.1.1/53` times out |
 | 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC enumerated **and** `bash exec 3<>/dev/tcp/1.1.1.1/53` succeeds (cross-platform egress capability check; the previous Windows-only HCN 192.168.127.0/24 subnet assertion was dropped so Linux bwrap + macOS VZ pass without backend-specific carve-outs) |
@@ -93,12 +93,12 @@ cargo test --test sandbox_integration <test_name> -- --nocapture
 
 The file uses only public API types. Caveats per backend:
 
-- **`Plan9Share`**: on Windows this maps to plan9-over-vsock (real shared
+- **`Mount`**: on Windows this maps to plan9-over-vsock (real shared
   filesystem). Linux (bwrap) uses `--bind host_path guest_path` (or a
   runtime `AddMountFd` for dynamic shares). macOS uses two virtio-fs
   share devices (a static `work` tag and a dynamic `tokimo_dyn` pool
   bind-mounted inside the guest). All three backends honor the same
-  `Plan9Share { name, host_path, guest_path }` contract — tests 6 and
+  `Mount { name, host_path, guest_path }` contract — tests 6 and
   9 are written against observable behavior, not a specific transport.
 - **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
   path (Windows HCN NAT, Linux shared host netns, macOS bridged NAT
@@ -142,7 +142,7 @@ The Linux backend lives in `src/linux/`. Cross-cutting decisions worth
 knowing when porting tests or debugging:
 
 - **Mount story.** Plan9 / virtio-fs are unavailable outside a VM, so
-  `Plan9Share { host_path, guest_path }` is implemented as a `bwrap`
+  `Mount { host_path, guest_path }` is implemented as a `bwrap`
   bind mount (`--bind host_path guest_path`). Capabilities and tests
   6 / 9 (host file visible in guest, dynamic add/remove) work because
   init holds `CAP_SYS_ADMIN` over the user-namespace and can issue
@@ -232,13 +232,13 @@ cargo test --test sandbox_integration <test_name> -- --test-threads=1 --nocaptur
 The macOS backend lives in `src/macos/`. Cross-cutting decisions worth
 knowing when porting tests or debugging:
 
-- **Mount story.** `Plan9Share { host_path, guest_path }` is **not**
+- **Mount story.** `Mount { host_path, guest_path }` is **not**
   implemented over Plan9. macOS uses two virtio-fs share devices:
   - `tag="work"` — read-only host workspace tree (the per-Sandbox
     `session_dir` lives under `~/.tokimo/sessions/...`).
   - `tag="tokimo_dyn"` — a per-session dynamic pool mounted at
-    `/__tokimo_dyn` inside the guest. `add_plan9_share` /
-    `remove_plan9_share` create/destroy bind mounts inside this pool
+    `/__tokimo_dyn` inside the guest. `add_mount` /
+    `remove_mount` create/destroy bind mounts inside this pool
     via init RPCs, exposing the same `host_path → guest_path` contract
     as the Windows Plan9-over-vsock backend. The transport differs
     (virtio-fs vs Plan9), but tests 6 and 9 pass because they target

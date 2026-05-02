@@ -51,11 +51,11 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::protocol::types::MountEntry;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddPlan9ShareParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, RemovePlan9ShareParams, ResizeShellParams, RootfsSpec, RpcError,
-    SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, RemoveMountParams, ResizeShellParams, RootfsSpec, RpcError, SignalShellParams, SpawnShellParams,
+    WriteStdinParams, encode_frame, method,
 };
-use tokimo_package_sandbox::{ConfigureParams, NetworkPolicy, Plan9Share};
+use tokimo_package_sandbox::{ConfigureParams, Mount, NetworkPolicy};
 
 mod hcs;
 mod hvsock;
@@ -426,7 +426,7 @@ struct SessionState {
 struct ActiveShare {
     port: u32,
     /// True for shares attached at boot-time via `build_session_v2`; the
-    /// dispatcher refuses `removePlan9Share` for these because the HCS
+    /// dispatcher refuses `removeMount` for these because the HCS
     /// schema rejects `Remove` on shares declared in the original config.
     boot_time: bool,
 }
@@ -759,15 +759,15 @@ fn dispatch(
             "send_guest_response not yet implemented",
         )),
 
-        method::ADD_PLAN9_SHARE => {
-            let p: AddPlan9ShareParams =
+        method::ADD_MOUNT => {
+            let p: AddMountParams =
                 serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_add_plan9_share(conn, p, sessions)
+            handle_add_mount(conn, p, sessions)
         }
-        method::REMOVE_PLAN9_SHARE => {
-            let p: RemovePlan9ShareParams =
+        method::REMOVE_MOUNT => {
+            let p: RemoveMountParams =
                 serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_remove_plan9_share(conn, p, sessions)
+            handle_remove_mount(conn, p, sessions)
         }
 
         other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
@@ -848,26 +848,23 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
 
     let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg).map_err(|e| RpcError::new("bad_path", e))?;
 
-    if cfg.plan9_shares.is_empty() {
-        return Err(RpcError::new(
-            "validation",
-            "at least one plan9_share is required on Windows",
-        ));
+    if cfg.mounts.is_empty() {
+        return Err(RpcError::new("validation", "at least one mount is required on Windows"));
     }
-    if cfg.plan9_shares.len() > 64 {
+    if cfg.mounts.len() > 64 {
         return Err(RpcError::new(
             "validation",
-            format!("too many plan9_shares: {} (max 64)", cfg.plan9_shares.len()),
+            format!("too many mounts: {} (max 64)", cfg.mounts.len()),
         ));
     }
 
     // Canonicalise share host paths (TOCTOU-safe).
-    let mut canon_shares: Vec<(PathBuf, &tokimo_package_sandbox::Plan9Share)> = Vec::new();
-    for (i, s) in cfg.plan9_shares.iter().enumerate() {
+    let mut canon_shares: Vec<(PathBuf, &tokimo_package_sandbox::Mount)> = Vec::new();
+    for (i, s) in cfg.mounts.iter().enumerate() {
         let canon = canonicalize_safe(&s.host_path).map_err(|e| {
             RpcError::new(
                 "bad_path",
-                format!("plan9_shares[{i}].host_path ({}): {e}", s.host_path.display()),
+                format!("mounts[{i}].host_path ({}): {e}", s.host_path.display()),
             )
         })?;
         canon_shares.push((canon, s));
@@ -1277,12 +1274,8 @@ fn child_poller(
     }
 }
 
-fn handle_add_plan9_share(
-    conn: &Arc<Connection>,
-    p: AddPlan9ShareParams,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let share: Plan9Share = p.share;
+fn handle_add_mount(conn: &Arc<Connection>, p: AddMountParams, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let share: Mount = p.share;
     if share.name.is_empty() {
         return Err(RpcError::new("validation", "share name must not be empty"));
     }
@@ -1348,9 +1341,9 @@ fn handle_add_plan9_share(
     Ok(json!({}))
 }
 
-fn handle_remove_plan9_share(
+fn handle_remove_mount(
     conn: &Arc<Connection>,
-    p: RemovePlan9ShareParams,
+    p: RemoveMountParams,
     sessions: &WindowsRegistry,
 ) -> Result<Value, RpcError> {
     let name = p.name;

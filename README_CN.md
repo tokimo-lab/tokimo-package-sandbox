@@ -297,14 +297,14 @@ for event in rx {
 ### 动态文件共享
 
 ```rust
-sb.add_plan9_share(Plan9Share {
+sb.add_mount(Mount {
     name: "workspace".into(),
     host_path: "/tmp/my-project".into(),
     guest_path: "/workspace".into(),
     read_only: false,
 })?;
 // ... 客机可以访问 /workspace ...
-sb.remove_plan9_share("workspace")?;
+sb.remove_mount("workspace")?;
 ```
 
 ## 测试
@@ -345,7 +345,7 @@ cargo run --example smoltcp_netstack
 ```
 src/
 ├── lib.rs                    公共接口，re-exports
-├── api.rs                    Sandbox 句柄、ConfigureParams、Event、Plan9Share
+├── api.rs                    Sandbox 句柄、ConfigureParams、Event、Mount
 ├── backend.rs                SandboxBackend trait（22 个方法）
 ├── error.rs                  Error 枚举 + Result 别名
 ├── platform.rs               每平台 default_backend()

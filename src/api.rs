@@ -44,16 +44,17 @@ impl Default for NetworkPolicy {
     }
 }
 
-/// Plan9 / virtiofs share — a host directory exposed to the guest.
+/// A host directory exposed to the guest (Plan9 on Windows, virtiofs on
+/// macOS, bind mount on Linux).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Plan9Share {
-    /// Logical share name. Used as the 9p tag and the guest mount tag.
+pub struct Mount {
+    /// Logical mount name (used as the 9p tag / virtiofs tag).
     pub name: String,
     /// Host-side directory.
     pub host_path: PathBuf,
     /// Guest mount point (absolute path inside the VM).
     pub guest_path: PathBuf,
-    /// Mount the share read-only.
+    /// Mount read-only.
     #[serde(default)]
     pub read_only: bool,
 }
@@ -75,9 +76,9 @@ pub struct ConfigureParams {
     #[serde(default = "default_cpu_count")]
     pub cpu_count: u32,
 
-    /// Plan9 / virtiofs shares (host ↔ guest path bindings).
+    /// Host directories to mount into the guest.
     #[serde(default)]
-    pub plan9_shares: Vec<Plan9Share>,
+    pub mounts: Vec<Mount>,
 
     /// Network policy. Currently TODO, defaults to AllowAll.
     #[serde(default)]
@@ -378,27 +379,23 @@ impl Sandbox {
 
     // ---- Dynamic Plan9 share management --------------------------------
 
-    /// Mount a new Plan9 share into the running guest. Equivalent to a
-    /// runtime version of [`ConfigureParams::plan9_shares`] — must be
-    /// called only after [`Sandbox::start_vm`]. Returns an error if the
-    /// VM is not running, the share name collides with an existing share,
-    /// or the host path cannot be canonicalised.
-    pub fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
-        if share.name.is_empty() {
-            return Err(Error::validation("plan9 share name must not be empty"));
+    /// Mount a host directory into the running guest at runtime. Must be
+    /// called after [`Sandbox::start_vm`]. The mount name must not collide
+    /// with boot-time mounts listed in [`ConfigureParams::mounts`].
+    pub fn add_mount(&self, mount: Mount) -> Result<()> {
+        if mount.name.is_empty() {
+            return Err(Error::validation("mount name must not be empty"));
         }
-        self.inner.add_plan9_share(share)
+        self.inner.add_mount(mount)
     }
 
-    /// Unmount a previously added Plan9 share by `name`. The matching
-    /// share must have been added via [`Sandbox::add_plan9_share`] (the
-    /// boot-time shares listed in [`ConfigureParams::plan9_shares`]
-    /// cannot be removed at runtime).
-    pub fn remove_plan9_share(&self, name: &str) -> Result<()> {
+    /// Unmount a previously added runtime mount by `name`. Boot-time
+    /// mounts (listed in [`ConfigureParams::mounts`]) cannot be removed.
+    pub fn remove_mount(&self, name: &str) -> Result<()> {
         if name.is_empty() {
-            return Err(Error::validation("plan9 share name must not be empty"));
+            return Err(Error::validation("mount name must not be empty"));
         }
-        self.inner.remove_plan9_share(name)
+        self.inner.remove_mount(name)
     }
 }
 
@@ -418,17 +415,17 @@ fn validate_configure(p: &ConfigureParams) -> Result<()> {
     }
     let mut seen_names = std::collections::HashSet::new();
     let mut seen_guest = std::collections::HashSet::new();
-    for s in &p.plan9_shares {
-        if s.name.is_empty() {
-            return Err(Error::validation("plan9 share name must not be empty"));
+    for m in &p.mounts {
+        if m.name.is_empty() {
+            return Err(Error::validation("mount name must not be empty"));
         }
-        if !seen_names.insert(s.name.clone()) {
-            return Err(Error::validation(format!("duplicate plan9 share name: {}", s.name)));
+        if !seen_names.insert(m.name.clone()) {
+            return Err(Error::validation(format!("duplicate mount name: {}", m.name)));
         }
-        if !seen_guest.insert(s.guest_path.clone()) {
+        if !seen_guest.insert(m.guest_path.clone()) {
             return Err(Error::validation(format!(
-                "duplicate plan9 share guest_path: {}",
-                s.guest_path.display()
+                "duplicate mount guest_path: {}",
+                m.guest_path.display()
             )));
         }
     }

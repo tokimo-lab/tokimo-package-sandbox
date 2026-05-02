@@ -4,7 +4,7 @@
 //!  1. `new()` — construct empty backend state.
 //!  2. `configure(params)` — store ConfigureParams.
 //!  3. `create_vm()` — no-op (Linux has no VM).
-//!  4. `start_vm()` — spawn `bwrap` + init, mount workspace + Plan9Shares,
+//!  4. `start_vm()` — spawn `bwrap` + init, mount workspace + Mounts,
 //!     connect InitClient, send Hello + OpenShell.
 //!  5. `exec/spawn/write_stdin/kill` — forward to InitClient.
 //!  6. `stop_vm()` — InitClient::shutdown, kill bwrap process.
@@ -25,7 +25,7 @@ use std::{env, thread};
 
 use nix::sys::socket::{SockFlag, socketpair};
 
-use crate::api::{ConfigureParams, Event, JobId, NetworkPolicy, Plan9Share, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::linux::init_client::{DrainedEvent, InitClient};
@@ -44,9 +44,9 @@ struct BackendState {
     jobs: HashMap<String, JobSpawnInfo>,
     /// Reverse map: init child_id → JobId, for the event pump.
     child_to_job: HashMap<String, JobId>,
-    /// Names of dynamically added shares (via `add_plan9_share` after
+    /// Names of dynamically added shares (via `add_mount` after
     /// start_vm). Boot-time shares are NOT in this set so they cannot be
-    /// removed via `remove_plan9_share`.
+    /// removed via `remove_mount`.
     dynamic_shares: HashSet<String>,
     /// Event subscribers (each gets a clone of incoming events).
     subscribers: Vec<std::sync::mpsc::Sender<Event>>,
@@ -322,7 +322,7 @@ impl SandboxBackend for LinuxBackend {
         );
 
         // Boot-time Plan9-style binds.
-        for share in &config.plan9_shares {
+        for share in &config.mounts {
             let flag = if share.read_only { "--ro-bind" } else { "--bind" };
             args.push(flag.into());
             args.push(share.host_path.display().to_string());
@@ -816,7 +816,7 @@ impl SandboxBackend for LinuxBackend {
         Err(Error::not_implemented(format!("passthrough: {}", method)))
     }
 
-    fn add_plan9_share(&self, share: Plan9Share) -> Result<()> {
+    fn add_mount(&self, share: Mount) -> Result<()> {
         self.ensure_running()?;
         let host_path = share
             .host_path
@@ -847,7 +847,7 @@ impl SandboxBackend for LinuxBackend {
         Ok(())
     }
 
-    fn remove_plan9_share(&self, name: &str) -> Result<()> {
+    fn remove_mount(&self, name: &str) -> Result<()> {
         self.ensure_running()?;
         let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         if !g.dynamic_shares.contains(name) {

@@ -104,8 +104,8 @@ pub mod method {
     pub const SET_DEBUG_LOGGING: &str = "setDebugLogging";
     pub const IS_DEBUG_LOGGING_ENABLED: &str = "isDebugLoggingEnabled";
     pub const SEND_GUEST_RESPONSE: &str = "sendGuestResponse";
-    pub const ADD_PLAN9_SHARE: &str = "addPlan9Share";
-    pub const REMOVE_PLAN9_SHARE: &str = "removePlan9Share";
+    pub const ADD_MOUNT: &str = "addMount";
+    pub const REMOVE_MOUNT: &str = "removeMount";
 
     // Event names (service → client)
     pub const EV_STDOUT: &str = "stdout";
@@ -221,12 +221,12 @@ pub struct CreateDiskImageParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddPlan9ShareParams {
-    pub share: crate::Plan9Share,
+pub struct AddMountParams {
+    pub share: crate::Mount,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemovePlan9ShareParams {
+pub struct RemoveMountParams {
     pub name: String,
 }
 
