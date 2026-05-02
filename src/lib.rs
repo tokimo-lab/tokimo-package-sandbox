@@ -34,6 +34,7 @@ pub mod svc_protocol;
 // FUSE-over-vsock VFS bridge (cross-platform). See
 // plan/cross-platform-fuse-vfs.md.
 pub mod vfs_backend;
+pub mod vfs_host;
 pub mod vfs_impls;
 pub mod vfs_protocol;
 
