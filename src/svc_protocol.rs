@@ -110,6 +110,12 @@ pub mod method {
     pub const REMOVE_USER: &str = "removeUser";
     pub const RENAME_USER: &str = "renameUser";
 
+    // Management / introspection ops (additive, do not require a
+    // PROTOCOL_VERSION bump — old clients simply don't call them).
+    pub const LIST_SESSIONS: &str = "listSessions";
+    pub const SESSION_INFO: &str = "sessionInfo";
+    pub const STOP_SESSION: &str = "stopSession";
+
     // Event names (service → client)
     pub const EV_STDOUT: &str = "stdout";
     pub const EV_STDERR: &str = "stderr";
@@ -253,6 +259,26 @@ pub struct RenameUserParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddUserResult {
     pub job_id: String,
+}
+
+/// Wire result for `listSessions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListSessionsResult {
+    pub sessions: Vec<crate::SessionSummary>,
+}
+
+/// Parameters for `sessionInfo` / `stopSession`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionNameParams {
+    pub name: String,
+}
+
+/// Wire result for `sessionInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfoResult {
+    /// `None` when the named session does not exist.
+    #[serde(default)]
+    pub details: Option<crate::SessionDetails>,
 }
 
 // ---------------------------------------------------------------------------

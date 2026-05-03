@@ -223,6 +223,49 @@ fn default_true() -> bool {
     true
 }
 
+/// One-line summary of a session known to a [`Sandbox`] instance,
+/// returned by [`Sandbox::list_sessions`].
+///
+/// On Windows this is enumerated from the `tokimo-sandbox-svc` global
+/// session registry across all clients. On Linux/macOS each `Sandbox`
+/// owns at most one session (its own VM/sandbox), so the returned vec
+/// is either empty or has a single entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// Stable identifier (Windows: session UUID supplied at configure
+    /// time; Linux/macOS: same as `user_data_name`).
+    pub name: String,
+    /// Human-friendly name from [`ConfigureParams::user_data_name`].
+    pub user_data_name: String,
+    /// Whether the underlying VM/sandbox is currently up.
+    pub running: bool,
+    /// Whether the in-guest init client has connected.
+    pub guest_connected: bool,
+    /// Configured memory budget (mebibytes); `0` = no limit.
+    pub memory_mb: u64,
+    /// Unix-millisecond timestamp captured when the VM transitioned to
+    /// `running`. `None` if the VM has not been started yet.
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
+}
+
+/// Detailed view of a single session, returned by
+/// [`Sandbox::session_info`]. Fields beyond [`SessionSummary`] are
+/// best-effort and may be `None` on backends that don't track them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDetails {
+    pub summary: SessionSummary,
+    /// Owner process ID for the connection that originally configured /
+    /// started this session. Windows-only — `None` on Linux/macOS where
+    /// the sandbox is in-process and there is no remote owner concept.
+    #[serde(default)]
+    pub owner_pid: Option<u32>,
+    /// Number of currently-active shells (boot shell + any spawn_shell).
+    pub shell_count: usize,
+    /// Number of currently-registered mounts (boot + runtime).
+    pub mount_count: usize,
+}
+
 /// Asynchronous events delivered via [`Sandbox::subscribe`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -538,6 +581,39 @@ impl Sandbox {
         validate_user_id(old)?;
         validate_user_id(new)?;
         self.inner.rename_user(old, new)
+    }
+
+    // ---- Management / introspection ------------------------------------
+
+    /// Enumerate all sessions known to this `Sandbox`'s backend.
+    ///
+    /// * Windows — returns every session tracked by `tokimo-sandbox-svc`
+    ///   across **all** clients of the named pipe (admin view).
+    /// * Linux / macOS — returns 0 or 1 entries (the in-process backend
+    ///   only owns a single sandbox).
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        self.inner.list_sessions()
+    }
+
+    /// Look up detailed info for a specific session by `name`. Returns
+    /// `None` if no session with that name is known.
+    pub fn session_info(&self, name: &str) -> Result<Option<SessionDetails>> {
+        if name.is_empty() {
+            return Err(Error::validation("session name must not be empty"));
+        }
+        self.inner.session_info(name)
+    }
+
+    /// Force-stop a session by name regardless of its owner. Used by
+    /// management UIs to reclaim leaked VMs. The Windows service logs a
+    /// warning when stopping a session whose owner process is still
+    /// alive. Returns `Ok(())` even when the named session does not
+    /// exist (idempotent).
+    pub fn stop_session(&self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::validation("session name must not be empty"));
+        }
+        self.inner.stop_session(name)
     }
 }
 

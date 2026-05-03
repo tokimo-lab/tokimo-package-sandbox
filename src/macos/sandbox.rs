@@ -75,6 +75,14 @@ struct RunningState {
     /// Shutdown flag for the netstack thread. Setting true causes the
     /// reader/writer threads to exit at their next iteration.
     netstack_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Snapshot of [`ConfigureParams`] that drove this boot — preserved
+    /// here so management RPCs (`list_sessions` / `session_info`) can
+    /// report the original `user_data_name`, `memory_mb`, etc., without
+    /// reaching back into the (now-consumed) `Configured` state.
+    params: ConfigureParams,
+    /// Unix-millisecond timestamp captured when transitioning into
+    /// `State::Running`.
+    started_at_unix_ms: u64,
 }
 
 impl MacosBackend {
@@ -254,6 +262,8 @@ impl SandboxBackend for MacosBackend {
             boot_share_names,
             fuse_mount_names,
             netstack_shutdown,
+            params: params.clone(),
+            started_at_unix_ms: macos_now_unix_ms(),
         }));
 
         Ok(())
@@ -564,6 +574,91 @@ impl SandboxBackend for MacosBackend {
         init.rename_user(old, new)
             .map_err(|e| Error::other(format!("rename_user: {e}")))
     }
+
+    fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
+        let state = self.state.lock().unwrap();
+        Ok(match &*state {
+            State::Empty | State::Stopped => Vec::new(),
+            State::Configured { params } => vec![crate::SessionSummary {
+                name: macos_session_name(params),
+                user_data_name: params.user_data_name.clone(),
+                running: false,
+                guest_connected: false,
+                memory_mb: params.memory_mb,
+                started_at_unix_ms: None,
+            }],
+            State::Running(rs) => vec![crate::SessionSummary {
+                name: macos_session_name(&rs.params),
+                user_data_name: rs.params.user_data_name.clone(),
+                running: true,
+                guest_connected: !rs.init.is_dead(),
+                memory_mb: rs.params.memory_mb,
+                started_at_unix_ms: Some(rs.started_at_unix_ms),
+            }],
+        })
+    }
+
+    fn session_info(&self, name: &str) -> Result<Option<crate::SessionDetails>> {
+        let state = self.state.lock().unwrap();
+        Ok(match &*state {
+            State::Empty | State::Stopped => None,
+            State::Configured { params } if macos_session_name(params) == name => Some(crate::SessionDetails {
+                summary: crate::SessionSummary {
+                    name: macos_session_name(params),
+                    user_data_name: params.user_data_name.clone(),
+                    running: false,
+                    guest_connected: false,
+                    memory_mb: params.memory_mb,
+                    started_at_unix_ms: None,
+                },
+                owner_pid: None,
+                shell_count: 0,
+                mount_count: 0,
+            }),
+            State::Configured { .. } => None,
+            State::Running(rs) if macos_session_name(&rs.params) == name => Some(crate::SessionDetails {
+                summary: crate::SessionSummary {
+                    name: macos_session_name(&rs.params),
+                    user_data_name: rs.params.user_data_name.clone(),
+                    running: true,
+                    guest_connected: !rs.init.is_dead(),
+                    memory_mb: rs.params.memory_mb,
+                    started_at_unix_ms: Some(rs.started_at_unix_ms),
+                },
+                owner_pid: None,
+                shell_count: rs.shells.len(),
+                mount_count: rs.fuse_mount_names.len(),
+            }),
+            State::Running(_) => None,
+        })
+    }
+
+    fn stop_session(&self, name: &str) -> Result<()> {
+        let matches = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => macos_session_name(&rs.params) == name,
+                _ => false,
+            }
+        };
+        if matches { self.stop_vm() } else { Ok(()) }
+    }
+}
+
+fn macos_session_name(params: &ConfigureParams) -> String {
+    if !params.session_id.is_empty() {
+        params.session_id.clone()
+    } else {
+        params.user_data_name.clone()
+    }
+}
+
+fn macos_now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Event pump: drains stdout/stderr and exit notifications for **every**

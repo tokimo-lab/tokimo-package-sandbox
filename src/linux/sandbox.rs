@@ -68,6 +68,9 @@ struct BackendState {
     /// no smoltcp thread is spawned). Setting to true makes the netstack
     /// reader/writer threads exit on their next loop iteration.
     netstack_shutdown: Option<Arc<AtomicBool>>,
+    /// Unix-millisecond timestamp captured when `start_vm` flips
+    /// `running` to `true`. `None` until first successful start.
+    started_at_unix_ms: Option<u64>,
 }
 
 struct JobSpawnInfo {
@@ -95,6 +98,7 @@ impl Default for BackendState {
             next_job_id: 0,
             debug_logging: false,
             netstack_shutdown: None,
+            started_at_unix_ms: None,
         }
     }
 }
@@ -662,6 +666,7 @@ impl SandboxBackend for LinuxBackend {
 
         // Emit Ready + GuestConnected events to subscribers.
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.started_at_unix_ms = Some(now_unix_ms());
         Self::broadcast_event(&mut g, Event::Ready);
         Self::broadcast_event(&mut g, Event::GuestConnected { connected: true });
 
@@ -1145,6 +1150,80 @@ impl SandboxBackend for LinuxBackend {
             .rename_user(old, new)
             .map_err(|e| Error::other(format!("init rename_user failed: {e}")))
     }
+
+    fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let Some(cfg) = g.config.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![crate::SessionSummary {
+            name: session_name_from_config(cfg),
+            user_data_name: cfg.user_data_name.clone(),
+            running: self.running.load(Ordering::Relaxed),
+            guest_connected: g.init_client.is_some(),
+            memory_mb: cfg.memory_mb,
+            started_at_unix_ms: g.started_at_unix_ms,
+        }])
+    }
+
+    fn session_info(&self, name: &str) -> Result<Option<crate::SessionDetails>> {
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let Some(cfg) = g.config.as_ref() else {
+            return Ok(None);
+        };
+        if session_name_from_config(cfg) != name {
+            return Ok(None);
+        }
+        Ok(Some(crate::SessionDetails {
+            summary: crate::SessionSummary {
+                name: session_name_from_config(cfg),
+                user_data_name: cfg.user_data_name.clone(),
+                running: self.running.load(Ordering::Relaxed),
+                guest_connected: g.init_client.is_some(),
+                memory_mb: cfg.memory_mb,
+                started_at_unix_ms: g.started_at_unix_ms,
+            },
+            owner_pid: None,
+            shell_count: g.jobs.len(),
+            mount_count: g.fuse_mount_names.len(),
+        }))
+    }
+
+    fn stop_session(&self, name: &str) -> Result<()> {
+        let matches = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            g.config
+                .as_ref()
+                .map(|cfg| session_name_from_config(cfg) == name)
+                .unwrap_or(false)
+        };
+        if !matches {
+            return Ok(());
+        }
+        if !self.running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.stop_vm()
+    }
+}
+
+/// Linux/macOS sandboxes are in-process and have no remote owner; we
+/// derive a stable session name from the configured `user_data_name`,
+/// falling back to the caller-supplied `session_id` if non-empty.
+fn session_name_from_config(cfg: &ConfigureParams) -> String {
+    if !cfg.session_id.is_empty() {
+        cfg.session_id.clone()
+    } else {
+        cfg.user_data_name.clone()
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // Note: Event pump architecture is simplified for this port.

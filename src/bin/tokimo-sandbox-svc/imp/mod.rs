@@ -53,9 +53,9 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
     AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult,
-    JobIdResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams, RenameUserParams,
-    ResizeShellParams, RootfsSpec, RpcError, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame,
-    method,
+    JobIdResult, ListSessionsResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams,
+    RenameUserParams, ResizeShellParams, RootfsSpec, RpcError, SessionInfoResult, SessionNameParams, SignalShellParams,
+    SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::vfs_host::FuseHost;
 use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
@@ -463,6 +463,12 @@ struct SessionState {
     netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     running: bool,
     guest_connected: bool,
+    /// Unix-millisecond timestamp captured when `running` flips to true.
+    started_at_unix_ms: Option<u64>,
+    /// Owner process ID for the connection that originally configured /
+    /// started this session (best-effort; updated on each `configure`).
+    /// Used by management RPCs and the owner-PID waiter.
+    owner_pid: Option<u32>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -483,6 +489,8 @@ impl Default for SessionState {
             netstack_shutdown: None,
             running: false,
             guest_connected: false,
+            started_at_unix_ms: None,
+            owner_pid: None,
         }
     }
 }
@@ -513,6 +521,10 @@ struct Connection {
     write_lock: Mutex<()>,
     /// Key into the global [`WindowsRegistry`]. Set by `handle_configure`.
     session_id: Mutex<Option<String>>,
+    /// PID of the named-pipe peer (best-effort, captured at connect time
+    /// via `GetNamedPipeClientProcessId`). Used by management RPCs and
+    /// the owner-PID waiter to associate a session with a live caller.
+    owner_pid: Option<u32>,
 }
 
 // HANDLE is `*mut c_void` (not Send); we manually attest single-thread-of-write
@@ -611,6 +623,7 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         pipe,
         write_lock: Mutex::new(()),
         session_id: Mutex::new(None),
+        owner_pid: caller_pid(pipe),
     });
 
     // Hello handshake.
@@ -823,6 +836,18 @@ fn dispatch(
             handle_rename_user(conn, p, sessions)
         }
 
+        method::LIST_SESSIONS => handle_list_sessions(sessions),
+        method::SESSION_INFO => {
+            let p: SessionNameParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_session_info(sessions, p)
+        }
+        method::STOP_SESSION => {
+            let p: SessionNameParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_stop_session(conn, sessions, p)
+        }
+
         other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
     }
 }
@@ -846,9 +871,15 @@ fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsReg
 
     // If the VM is already running for this session, just bind and return.
     {
-        let st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
         if st.running {
             eprintln!("[svc] reusing existing session {key}");
+            // Refresh owner_pid for the rebind so management RPCs and
+            // the owner-PID waiter associate the live caller with the
+            // session.
+            if conn.owner_pid.is_some() {
+                st.owner_pid = conn.owner_pid;
+            }
             *conn.session_id.lock().unwrap() = Some(key);
             return Ok(json!({}));
         }
@@ -858,11 +889,82 @@ fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsReg
     {
         let mut st = shared.state.lock().unwrap();
         st.config = Some(cfg);
+        st.owner_pid = conn.owner_pid;
     }
 
     // Bind this connection to the session.
     *conn.session_id.lock().unwrap() = Some(key);
     Ok(json!({}))
+}
+
+fn handle_list_sessions(sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let mut out = Vec::new();
+    for (name, shared) in sessions.entries() {
+        let st = shared.state.lock().unwrap();
+        out.push(summarize_session(&name, &st));
+    }
+    serde_json::to_value(ListSessionsResult { sessions: out }).map_err(|e| RpcError::new("encode", e.to_string()))
+}
+
+fn handle_session_info(sessions: &WindowsRegistry, p: SessionNameParams) -> Result<Value, RpcError> {
+    let details = match sessions.get(&p.name) {
+        None => None,
+        Some(shared) => {
+            let st = shared.state.lock().unwrap();
+            Some(tokimo_package_sandbox::SessionDetails {
+                summary: summarize_session(&p.name, &st),
+                owner_pid: st.owner_pid,
+                shell_count: st.children.len(),
+                mount_count: st.fuse_mount_names.len(),
+            })
+        }
+    };
+    serde_json::to_value(SessionInfoResult { details }).map_err(|e| RpcError::new("encode", e.to_string()))
+}
+
+fn handle_stop_session(
+    _conn: &Arc<Connection>,
+    sessions: &WindowsRegistry,
+    p: SessionNameParams,
+) -> Result<Value, RpcError> {
+    let Some(shared) = sessions.get(&p.name) else {
+        // Idempotent — unknown session is a no-op.
+        return Ok(json!({}));
+    };
+    // Owner-still-alive warning: the owner process for this session is
+    // tracked in `SessionState.owner_pid`. We log when we're killing a
+    // session whose owner is still running so this admin override is
+    // visible in svc logs.
+    let owner_alive = {
+        let st = shared.state.lock().unwrap();
+        st.owner_pid.map(is_pid_alive).unwrap_or(false)
+    };
+    if owner_alive {
+        eprintln!(
+            "[svc] stop_session: forcibly stopping session {} whose owner pid is still alive",
+            p.name
+        );
+    }
+    {
+        let mut st = shared.state.lock().unwrap();
+        teardown_session(&mut st);
+    }
+    sessions.remove(&p.name);
+    Ok(json!({}))
+}
+
+/// Best-effort check whether `pid` still refers to a running process on
+/// this host. Used by `stop_session` to log an admin-override warning.
+fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+    let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    // OpenProcess succeeds for both running and recently-exited processes
+    // (until the handle table is reaped), but for our log-only purpose
+    // this is good enough.
+    let _ = unsafe { CloseHandle(h) };
+    true
 }
 
 fn handle_create_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
@@ -1162,6 +1264,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         st.netstack_shutdown = netstack_shutdown;
         st.running = true;
         st.guest_connected = true;
+        st.started_at_unix_ms = Some(svc_now_unix_ms());
         st.fuse_host = Some(fuse_host);
         st.fuse_port = fuse_port;
         st.fuse_mount_names = fuse_mount_names;
@@ -1209,6 +1312,26 @@ fn teardown_session(st: &mut SessionState) {
     }
     st.running = false;
     st.guest_connected = false;
+    st.started_at_unix_ms = None;
+}
+
+fn svc_now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn summarize_session(name: &str, st: &SessionState) -> tokimo_package_sandbox::SessionSummary {
+    tokimo_package_sandbox::SessionSummary {
+        name: name.to_string(),
+        user_data_name: st.config.as_ref().map(|c| c.user_data_name.clone()).unwrap_or_default(),
+        running: st.running,
+        guest_connected: st.guest_connected,
+        memory_mb: st.config.as_ref().map(|c| c.memory_mb).unwrap_or(0),
+        started_at_unix_ms: st.started_at_unix_ms,
+    }
 }
 
 fn handle_write_stdin(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
@@ -1809,8 +1932,7 @@ fn verify_caller_required() -> bool {
 }
 
 fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
-    let mut pid: u32 = 0;
-    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid).ok()? };
+    let pid = caller_pid(pipe)?;
     let proc_h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut buf = [0u16; 32 * 1024];
     let mut sz: u32 = buf.len() as u32;
@@ -1828,6 +1950,13 @@ fn caller_image_path(pipe: HANDLE) -> Option<PathBuf> {
     }
     let s = String::from_utf16_lossy(&buf[..sz as usize]);
     Some(PathBuf::from(s))
+}
+
+/// Returns the named-pipe peer PID, or `None` if unavailable.
+fn caller_pid(pipe: HANDLE) -> Option<u32> {
+    let mut pid: u32 = 0;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid).ok()? };
+    Some(pid)
 }
 
 fn verify_authenticode(path: &Path) -> Result<(), String> {
@@ -1923,6 +2052,7 @@ mod tests {
             pipe: HANDLE(std::ptr::null_mut()),
             write_lock: Mutex::new(()),
             session_id: Mutex::new(None),
+            owner_pid: None,
         })
     }
 

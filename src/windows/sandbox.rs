@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
     AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult,
-    JobIdResult, RemoveMountParams, RemoveUserParams, RenameUserParams, ResizeShellParams, SignalShellParams,
-    SpawnShellParams, WriteStdinParams, method,
+    JobIdResult, ListSessionsResult, RemoveMountParams, RemoveUserParams, RenameUserParams, ResizeShellParams,
+    SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -233,6 +233,25 @@ impl SandboxBackend for WindowsBackend {
             new: new.to_string(),
         };
         self.call(method::RENAME_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let v = self.call(method::LIST_SESSIONS, json!({}), SHORT_CALL_TIMEOUT)?;
+        let r: ListSessionsResult = serde_json::from_value(v)?;
+        Ok(r.sessions)
+    }
+
+    fn session_info(&self, name: &str) -> Result<Option<SessionDetails>> {
+        let p = SessionNameParams { name: name.to_string() };
+        let v = self.call(method::SESSION_INFO, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+        let r: SessionInfoResult = serde_json::from_value(v)?;
+        Ok(r.details)
+    }
+
+    fn stop_session(&self, name: &str) -> Result<()> {
+        let p = SessionNameParams { name: name.to_string() };
+        self.call(method::STOP_SESSION, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 }

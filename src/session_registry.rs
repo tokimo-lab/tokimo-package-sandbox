@@ -95,6 +95,17 @@ impl<S: SessionState> SessionRegistry<S> {
     pub fn is_empty(&self) -> bool {
         self.sessions.lock().unwrap().is_empty()
     }
+
+    /// Snapshot of all `(session_id, SharedSession)` pairs currently
+    /// tracked. Cheap because each `SharedSession` is `Arc`-wrapped.
+    pub fn entries(&self) -> Vec<(String, Arc<SharedSession<S>>)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
+    }
 }
 
 impl<S: SessionState> Default for SessionRegistry<S> {

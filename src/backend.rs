@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -62,4 +62,13 @@ pub trait SandboxBackend: Send + Sync + 'static {
     /// pass `validate_user_id`. Existing shells are NOT migrated;
     /// callers should close & reopen any per-user shells after rename.
     fn rename_user(&self, old: &str, new: &str) -> Result<()>;
+
+    // -- Management / introspection -----------------------------------
+    /// Enumerate sessions tracked by the backend. See
+    /// [`crate::Sandbox::list_sessions`] for semantics.
+    fn list_sessions(&self) -> Result<Vec<SessionSummary>>;
+    /// Look up detail for one session by name; `Ok(None)` if unknown.
+    fn session_info(&self, name: &str) -> Result<Option<SessionDetails>>;
+    /// Force-stop a session by name, idempotent.
+    fn stop_session(&self, name: &str) -> Result<()>;
 }
