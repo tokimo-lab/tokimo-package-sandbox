@@ -33,8 +33,6 @@ use crate::pty as ptymod;
 /// them away defeats audit.
 const PROTECTED_ENV: &[&str] = &[
     "PATH",
-    "LANG",
-    "LC_ALL",
     "SAFEBOX",
     "HTTP_PROXY",
     "HTTPS_PROXY",
