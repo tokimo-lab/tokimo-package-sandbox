@@ -261,6 +261,45 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
     fn rename_user(&self, old: &str, new: &str) -> Result<()> {
         self.get()?.rename_user(old, new)
     }
+
+    fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
+        let snap: Vec<Arc<B>> = self.registry.lock().unwrap().values().cloned().collect();
+        let mut out = Vec::new();
+        for b in snap {
+            if let Ok(mut v) = b.list_sessions() {
+                out.append(&mut v);
+            }
+        }
+        Ok(out)
+    }
+
+    fn session_info(&self, name: &str) -> Result<Option<crate::SessionDetails>> {
+        let snap: Vec<Arc<B>> = self.registry.lock().unwrap().values().cloned().collect();
+        for b in snap {
+            if let Some(d) = b.session_info(name)? {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
+    }
+
+    fn stop_session(&self, name: &str) -> Result<()> {
+        let snap: Vec<(String, Arc<B>)> = self
+            .registry
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for (sid, b) in snap {
+            if b.session_info(name)?.is_some() {
+                let _ = b.stop_session(name);
+                self.registry.lock().unwrap().remove(&sid);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +409,15 @@ mod tests {
             Ok(())
         }
         fn rename_user(&self, _o: &str, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
+            Ok(vec![])
+        }
+        fn session_info(&self, _n: &str) -> Result<Option<crate::SessionDetails>> {
+            Ok(None)
+        }
+        fn stop_session(&self, _n: &str) -> Result<()> {
             Ok(())
         }
     }
