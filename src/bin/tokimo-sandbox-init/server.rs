@@ -847,24 +847,24 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 let cwd_q = shell_quote(&effective_cwd);
                 let inner = format!("{exports}cd {cwd_q} 2>/dev/null || true; exec bash");
                 let inner_q = shell_quote(&inner);
-                // user_id is validated [A-Za-z0-9_-]+ so direct splice is safe.
+                // user_id was relaxed to allow Unicode (CJK etc.), so we
+                // *must* quote it before splicing into the sh -c script.
+                // `--badname` makes useradd skip its kernel NAME_REGEX so
+                // non-ASCII usernames are accepted.
+                let uid_q = shell_quote(&user_id);
                 let script = format!(
-                    "if ! getent passwd {uid} >/dev/null 2>&1; then \
-                         useradd -M -d {home_q} -s /bin/bash -g 1000 -N {uid} 2>/dev/null \
-                         || adduser -D -H -h {home_q} -s /bin/bash -G users {uid} 2>/dev/null \
+                    "if ! getent passwd {uid_q} >/dev/null 2>&1; then \
+                         useradd -M -d {home_q} -s /bin/bash -g 1000 -N --badname {uid_q} 2>/dev/null \
+                         || adduser -D -H -h {home_q} -s /bin/bash -G users {uid_q} 2>/dev/null \
                          || true; \
                      fi; \
-                     if getent passwd {uid} >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then \
-                         exec runuser -l {uid} -c {inner_q}; \
+                     if getent passwd {uid_q} >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then \
+                         exec runuser -l {uid_q} -c {inner_q}; \
                      fi; \
-                     export USER={uid} LOGNAME={uid} HOME={home_q} \
-                            PS1='\\u@tokimo:\\w\\$ ' MAIL=/var/mail/{uid}; \
+                     export USER={uid_q} LOGNAME={uid_q} HOME={home_q} \
+                            PS1='\\u@tokimo:\\w\\$ ' MAIL=/var/mail/{uid_q}; \
                      cd {cwd_q} 2>/dev/null || true; \
                      exec /bin/bash --noprofile --norc",
-                    uid = user_id,
-                    home_q = home_q,
-                    cwd_q = cwd_q,
-                    inner_q = inner_q,
                 );
                 vec!["/bin/sh".into(), "-c".into(), script]
             } else {
@@ -1341,11 +1341,24 @@ fn spawn_child_inner(
     }
 }
 
-/// Validate `user_id`: only ASCII letters, digits, underscore, and dash;
-/// length 1..=32. Used by `Op::AddUser`/`Op::RemoveUser` because the id
-/// is interpolated into a `sh -c` script.
+/// Validate `user_id`: non-empty, byte length 1..=32, no path separators
+/// (`/`, `\`), no `:` (used by `/etc/passwd`), no ASCII space / NUL /
+/// other ASCII control char, and no leading `-` or `.`. All other
+/// Unicode is allowed (CJK etc.) — `useradd --badname` is used inside
+/// the guest so the kernel's NAME_REGEX doesn't reject e.g. `测试`.
+/// Mirrors `crate::api::validate_user_id`.
 fn is_valid_user_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    if s.starts_with('-') || s.starts_with('.') {
+        return false;
+    }
+    s.chars().all(|c| match c {
+        '/' | '\\' | ':' | ' ' | '\0' => false,
+        c if (c as u32) < 0x20 || c == '\u{7f}' => false,
+        _ => true,
+    })
 }
 
 /// POSIX single-quote escape, used for splicing untrusted paths into a
