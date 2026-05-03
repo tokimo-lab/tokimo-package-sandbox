@@ -828,6 +828,15 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             let env = merge_env(&state.base_env, &env_overlay);
             let effective_cwd = cwd.unwrap_or_else(|| home.clone());
 
+            // Ensure cwd exists. Caller may pass a sub-path of `home` (e.g.
+            // `/home/<user>/workspace`) that lives inside a FUSE-over-vsock
+            // mount; if the mount is already up, this materialises the dir
+            // on the host side. If the mount isn't ready yet, the mkdir
+            // falls back to the bare guest fs — better than failing chdir.
+            if effective_cwd != home {
+                let _ = std::fs::create_dir_all(&effective_cwd);
+            }
+
             // real_user=true: hybrid script. Try real account creation
             // + `runuser -l` (works on macOS VZ / Windows HCS where the
             // VM has a real root). If that fails (Linux bwrap: user ns
