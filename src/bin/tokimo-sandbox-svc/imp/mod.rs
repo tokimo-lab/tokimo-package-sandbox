@@ -626,6 +626,20 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         owner_pid: caller_pid(pipe),
     });
 
+    // Owner-PID waiter — auto-tear-down on caller exit.
+    //
+    // Why: the named-pipe transport doesn't surface "client process
+    // crashed". If rust-server panics (or is killed mid-rebuild during
+    // dev) while a Hyper-V VM is running, the svc has no way to know
+    // the owner is gone — the VM keeps holding ~8 GiB of RAM until the
+    // service is restarted. We block that leak by parking a thread on
+    // `WaitForSingleObject(owner_proc, INFINITE)`; when it returns we
+    // tear down the bound session if any.
+    if let Some(pid) = conn.owner_pid {
+        let sessions_w = sessions.clone();
+        let conn_w = Arc::clone(&conn);
+        std::thread::spawn(move || owner_pid_waiter(pid, conn_w, sessions_w));
+    }
     // Hello handshake.
     match read_frame(pipe) {
         Ok(Frame::Hello { version, peer, .. }) => {
@@ -1957,6 +1971,51 @@ fn caller_pid(pipe: HANDLE) -> Option<u32> {
     let mut pid: u32 = 0;
     unsafe { GetNamedPipeClientProcessId(pipe, &mut pid).ok()? };
     Some(pid)
+}
+
+/// Block on the owner process handle; on its exit, tear down whichever
+/// session this connection happens to be bound to at that moment.
+///
+/// Notes:
+/// * `OpenProcess(SYNCHRONIZE)` requires the same SID or admin
+///   privileges. The svc always runs as LocalSystem, so this never
+///   fails for production callers.
+/// * The connection's `session_id` may legitimately be `None` (caller
+///   died before configuring) or point to a session that has already
+///   been torn down (caller died after `stop_vm`). Both are no-ops.
+/// * Re-entrancy: if the same caller crashes twice in quick succession
+///   it'll spawn two waiters; that's fine, the second one finds no
+///   session and does nothing.
+fn owner_pid_waiter(pid: u32, conn: Arc<Connection>, sessions: WindowsRegistry) {
+    // SYNCHRONIZE = 0x00100000 (standard right). Not exposed by name
+    // on `PROCESS_ACCESS_RIGHTS` in windows-rs but is a valid value.
+    let access = windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(0x0010_0000);
+    let proc_h = match unsafe { OpenProcess(access, false, pid) } {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[svc] owner-waiter: OpenProcess({pid}) failed: {e}");
+            return;
+        }
+    };
+
+    unsafe { WaitForSingleObject(proc_h, u32::MAX) };
+    let _ = unsafe { CloseHandle(proc_h) };
+
+    let bound = conn.session_id.lock().unwrap().clone();
+    let Some(key) = bound else {
+        eprintln!("[svc] owner-waiter: pid {pid} exited; no session bound — nothing to do");
+        return;
+    };
+    let Some(shared) = sessions.get(&key) else {
+        eprintln!("[svc] owner-waiter: pid {pid} exited; session {key} already gone");
+        return;
+    };
+    eprintln!("[svc] owner-waiter: pid {pid} exited; tearing down session {key}");
+    {
+        let mut st = shared.state.lock().unwrap();
+        teardown_session(&mut st);
+    }
+    sessions.remove(&key);
 }
 
 fn verify_authenticode(path: &Path) -> Result<(), String> {
