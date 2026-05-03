@@ -11,8 +11,10 @@
 //! * **macOS**   — boots a Linux VM via Apple Virtualization framework
 //!   (arcbox-vz), guest-side init binary same as Linux.
 //!
-//! Network policies, hooks, and CA installation are TODO and currently
-//! behave as `AllowAll`.
+//! Egress filtering for [`NetworkPolicy::Blocked`] is enforced today on all
+//! three backends (smoltcp gateway / userspace netstack drop the upstream
+//! traffic; the guest-side `tokimo.netdns=off` cmdline disables the DNS
+//! resolver). Pre-/post-spawn hooks and CA installation are still TODO.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,14 +28,21 @@ use crate::error::{Error, Result};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Network policy. Currently both variants behave identically (allow-all)
-/// because the network-hook layer is a TODO across all backends.
+/// Network policy.
+///
+/// Egress filtering is enforced at the host-side network gateway:
+/// * **macOS VZ** / **Linux** — smoltcp gateway drops upstream packets.
+/// * **Windows HCS** — the userspace netstack (svc) drops them.
+///
+/// On `Blocked` the guest also receives `tokimo.netdns=off` on the kernel
+/// cmdline, which makes the in-guest DNS responder NXDOMAIN every query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkPolicy {
     /// Forward all traffic; no host-side filtering.
     AllowAll,
-    /// Block all egress. Currently behaves as AllowAll (TODO).
+    /// Block all egress at the host network gateway and disable in-guest
+    /// DNS resolution.
     Blocked,
 }
 
@@ -90,7 +99,8 @@ pub struct ConfigureParams {
     #[serde(default)]
     pub mounts: Vec<Mount>,
 
-    /// Network policy. Currently TODO, defaults to AllowAll.
+    /// Network policy. Defaults to [`NetworkPolicy::AllowAll`]; setting
+    /// `Blocked` engages the host-side gateway egress filter.
     #[serde(default)]
     pub network: NetworkPolicy,
 
@@ -290,7 +300,8 @@ pub enum Event {
     Ready,
     /// Guest connection state changed.
     GuestConnected { connected: bool },
-    /// Network status. Currently informational only — see TODOs.
+    /// Network status. Informational reachability ping reported by the
+    /// backend (independent of [`NetworkPolicy`]).
     NetworkStatus { up: bool, message: String },
     /// API reachability probe result (controlled by `api_probe_url`).
     ApiReachability { reachable: bool, latency_ms: Option<u64> },
