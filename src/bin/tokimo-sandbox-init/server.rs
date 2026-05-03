@@ -890,13 +890,15 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                 ChildKind::Shell,
             );
         }
-        Op::RemoveUser { id, user_id } => {
+        Op::RemoveUser { id, user_id: _ } => {
             // Best-effort: SIGKILL every shell whose argv mentions this
             // user_id (we don't track per-user ownership in init state),
             // plus userdel if the account exists. The host already knows
             // which child_ids belong to which user via add_user replies,
             // so the canonical cleanup path is host-driven Op::Signal +
             // RemoveUser; this op is the safety net.
+            // TODO: actually invoke `userdel` here using the field — the
+            // comment promises it but the body only SIGKILLs by owner_fd.
             let child_ids: Vec<String> = state
                 .children
                 .iter()
