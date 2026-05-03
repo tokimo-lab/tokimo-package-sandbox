@@ -226,4 +226,12 @@ impl SandboxBackend for WindowsBackend {
         self.call(method::REMOVE_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
+
+    fn rename_user(&self, _old: &str, _new: &str) -> Result<()> {
+        // Wired up in A3c via method::RENAME_USER — placeholder so the
+        // trait is satisfied while A3b lands the API + linux/macos paths.
+        Err(Error::not_implemented(
+            "rename_user not yet wired through the Windows sandbox-svc",
+        ))
+    }
 }

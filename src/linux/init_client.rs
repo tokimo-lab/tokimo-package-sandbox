@@ -257,6 +257,18 @@ impl InitClient {
         self.ack_op(&id, op)
     }
 
+    /// RenameUser — `userdel <old>` + `useradd --badname <new>` inside
+    /// the guest. Best-effort.
+    pub fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RenameUser {
+            id: id.clone(),
+            old: old.into(),
+            new: new.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
     fn spawn_ack(&self, id: &str, op: Op) -> Result<SpawnInfo> {
         let reply = self.send_op_sync(id, op, Duration::from_secs(10))?;
         match reply {

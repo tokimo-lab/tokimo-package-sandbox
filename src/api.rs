@@ -525,6 +525,20 @@ impl Sandbox {
         validate_user_id(user_id)?;
         self.inner.remove_user(user_id)
     }
+
+    /// Rename a user inside the running guest. Runs `userdel <old>` +
+    /// `useradd -M -d /home/<new> --badname <new>` in one shot. Existing
+    /// shells keep their old uid (kernel uid is fixed at exec) — the
+    /// caller should close & reopen any shells started under `old` to
+    /// pick up the new identity.
+    ///
+    /// Both `old` and `new` are validated with the same rules as
+    /// [`Sandbox::add_user`].
+    pub fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        validate_user_id(old)?;
+        validate_user_id(new)?;
+        self.inner.rename_user(old, new)
+    }
 }
 
 // ---------------------------------------------------------------------------

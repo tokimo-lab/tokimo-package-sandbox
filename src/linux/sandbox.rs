@@ -1134,6 +1134,17 @@ impl SandboxBackend for LinuxBackend {
             .remove_user(user_id)
             .map_err(|e| Error::other(format!("init remove_user failed: {e}")))
     }
+
+    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        self.ensure_running()?;
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            Arc::clone(g.init_client.as_ref().ok_or(Error::VmNotRunning)?)
+        };
+        client
+            .rename_user(old, new)
+            .map_err(|e| Error::other(format!("init rename_user failed: {e}")))
+    }
 }
 
 // Note: Event pump architecture is simplified for this port.

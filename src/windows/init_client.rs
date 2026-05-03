@@ -298,6 +298,18 @@ impl WinInitClient {
         self.ack_op(&id, op)
     }
 
+    /// RenameUser — `userdel <old>` + `useradd --badname <new>` inside
+    /// the guest. Best-effort.
+    pub fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RenameUser {
+            id: id.clone(),
+            old: old.into(),
+            new: new.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
     pub fn close_child(&self, child_id: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::Close {

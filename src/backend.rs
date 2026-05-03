@@ -57,4 +57,9 @@ pub trait SandboxBackend: Send + Sync + 'static {
     // -- User management ----------------------------------------------
     fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId>;
     fn remove_user(&self, user_id: &str) -> Result<()>;
+    /// Rename a previously-added user. Best-effort: returns Ok even
+    /// if the old account didn't exist on the guest. The new id must
+    /// pass `validate_user_id`. Existing shells are NOT migrated;
+    /// callers should close & reopen any per-user shells after rename.
+    fn rename_user(&self, old: &str, new: &str) -> Result<()>;
 }

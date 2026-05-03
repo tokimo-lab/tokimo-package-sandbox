@@ -257,6 +257,10 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
     fn remove_user(&self, user_id: &str) -> Result<()> {
         self.get()?.remove_user(user_id)
     }
+
+    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        self.get()?.rename_user(old, new)
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +367,9 @@ mod tests {
             Err(Error::not_implemented("fake"))
         }
         fn remove_user(&self, _u: &str) -> Result<()> {
+            Ok(())
+        }
+        fn rename_user(&self, _o: &str, _n: &str) -> Result<()> {
             Ok(())
         }
     }

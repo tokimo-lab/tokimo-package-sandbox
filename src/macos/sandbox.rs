@@ -552,6 +552,18 @@ impl SandboxBackend for MacosBackend {
         init.remove_user(user_id)
             .map_err(|e| Error::other(format!("remove_user: {e}")))
     }
+
+    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        let init = {
+            let state = self.state.lock().unwrap();
+            match &*state {
+                State::Running(rs) => rs.init.clone(),
+                _ => return Err(Error::VmNotRunning),
+            }
+        };
+        init.rename_user(old, new)
+            .map_err(|e| Error::other(format!("rename_user: {e}")))
+    }
 }
 
 /// Event pump: drains stdout/stderr and exit notifications for **every**
