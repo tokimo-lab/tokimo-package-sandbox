@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::stat::Mode;
-use nix::unistd::{ForkResult, Pid, chdir, dup2, fork, pipe2, setpgid, setsid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, dup2, fork, initgroups, pipe2, setgid, setpgid, setsid, setuid};
 
 use tokimo_package_sandbox::protocol::types::{ErrorCode, ErrorReply};
 
@@ -236,6 +236,13 @@ fn child_setup_pipes(
     }
     // Unblock signals we blocked in init main (so child sees default SIGINT etc).
     unblock_signals();
+    // Drop to the unprivileged `tokimo` user (uid=1000, gid=1000) so all
+    // agent-facing commands run with the same low-privilege identity.
+    // Order matters: setgid → initgroups → setuid, because once setuid(1000)
+    // succeeds we lose root and can no longer call initgroups.
+    if let Err(e) = drop_to_tokimo_user() {
+        report_errno_and_exit(err_w, e);
+    }
     let argv_p: Vec<*const libc::c_char> = argv
         .iter()
         .map(|s| s.as_ptr())
@@ -299,6 +306,10 @@ fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CStr
         let _ = fcntl(f, FcntlArg::F_SETFD(FdFlag::empty()));
     }
     unblock_signals();
+    // Drop to the unprivileged `tokimo` user (see child_setup_pipes).
+    if let Err(e) = drop_to_tokimo_user() {
+        report_errno_and_exit(err_w, e);
+    }
     let argv_p: Vec<*const libc::c_char> = argv
         .iter()
         .map(|s| s.as_ptr())
@@ -311,6 +322,24 @@ fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CStr
         .collect();
     let _ = unsafe { libc::execvpe(argv_p[0], argv_p.as_ptr(), env_p.as_ptr()) };
     report_errno_and_exit(err_w, Errno::last_raw());
+}
+
+/// Drop privileges from root to the `tokimo` user (uid=1000, gid=1000).
+///
+/// Called in the child after fork+dup2 but before execvpe. Returns the raw
+/// errno on failure so the caller can forward it through the pre-exec error
+/// pipe. The username `"tokimo"` matches the entry baked into the rootfs's
+/// `/etc/passwd` and `/etc/group` (see `packaging/vm-local/build-in-docker.sh`
+/// and `packaging/vm-base/build.sh`).
+fn drop_to_tokimo_user() -> Result<(), i32> {
+    let gid = Gid::from_raw(1000);
+    let uid = Uid::from_raw(1000);
+    setgid(gid).map_err(|e| e as i32)?;
+    // initgroups requires root; must run before setuid drops privileges.
+    let user = CString::new("tokimo").map_err(|_| Errno::EINVAL as i32)?;
+    initgroups(&user, gid).map_err(|e| e as i32)?;
+    setuid(uid).map_err(|e| e as i32)?;
+    Ok(())
 }
 
 fn report_errno_and_exit(err_w: i32, errno: i32) -> ! {
