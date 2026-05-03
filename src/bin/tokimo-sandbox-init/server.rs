@@ -905,15 +905,65 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
             }
             // Best-effort userdel — ignore errors (account may not have
             // been created in env-only mode).
-            if is_valid_user_id(&user_id) {
-                let _ = std::process::Command::new("/usr/sbin/userdel")
-                    .arg("-f")
-                    .arg(&user_id)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
             ack(state, client_fd, id, Ok(()));
+        }
+        Op::RenameUser { id, old, new } => {
+            // Validate both old and new — they're spliced into a sh -c
+            // script (after shell_quote) and passed to useradd/userdel.
+            if !is_valid_user_id(&old) {
+                ack(
+                    state,
+                    client_fd,
+                    id,
+                    Err(ErrorReply::new(
+                        ErrorCode::BadRequest,
+                        format!("invalid old user_id {old:?}"),
+                    )),
+                );
+                return;
+            }
+            if !is_valid_user_id(&new) {
+                ack(
+                    state,
+                    client_fd,
+                    id,
+                    Err(ErrorReply::new(
+                        ErrorCode::BadRequest,
+                        format!("invalid new user_id {new:?}"),
+                    )),
+                );
+                return;
+            }
+            // userdel old (best-effort, account may not exist if it was
+            // ever only tracked in env-only fallback mode), then useradd
+            // the new name. Existing shells keep their old uid.
+            let old_q = shell_quote(&old);
+            let new_q = shell_quote(&new);
+            let new_home_q = shell_quote(&format!("/home/{new}"));
+            let script = format!(
+                "/usr/sbin/userdel -f {old_q} >/dev/null 2>&1 || true; \
+                 useradd -M -d {new_home_q} -s /bin/bash -g 1000 -N --badname {new_q} >/dev/null 2>&1 \
+                 || adduser -D -H -h {new_home_q} -s /bin/bash -G users {new_q} >/dev/null 2>&1 \
+                 || true",
+            );
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            match status {
+                Ok(_) => ack(state, client_fd, id, Ok(())),
+                Err(e) => ack(
+                    state,
+                    client_fd,
+                    id,
+                    Err(ErrorReply::new(
+                        ErrorCode::Internal,
+                        format!("rename_user spawn failed: {e}"),
+                    )),
+                ),
+            }
         }
         Op::BindMount {
             id,
@@ -1494,6 +1544,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Shutdown { .. } => "Shutdown",
         Op::AddUser { .. } => "AddUser",
         Op::RemoveUser { .. } => "RemoveUser",
+        Op::RenameUser { .. } => "RenameUser",
         Op::BindMount { .. } => "BindMount",
         Op::Unmount { .. } => "Unmount",
         Op::AddMountFd { .. } => "AddMountFd",

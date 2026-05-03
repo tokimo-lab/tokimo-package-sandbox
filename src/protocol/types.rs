@@ -154,6 +154,12 @@ pub enum Op {
     /// Remove a previously-added user: SIGKILL all shells owned by
     /// `user_id` and (if `real_user` was used) `userdel` the account.
     RemoveUser { id: String, user_id: String },
+    /// Rename a previously-added user inside the guest. Init runs
+    /// `userdel <old>` and then `useradd -M -d /home/<new> --badname <new>`.
+    /// Existing shells are left running with the *old* uid (kernel-level
+    /// uid is fixed at exec); the host should close & reopen any shells
+    /// after a successful rename.
+    RenameUser { id: String, old: String, new: String },
     /// Dynamic bind mount inside the container. `source` must be a path
     /// already visible inside the container (e.g., pre-mounted host dir).
     /// `target` is the mount point created by init.
@@ -319,6 +325,7 @@ pub fn default_features() -> Vec<String> {
         "openshell".into(),
         "adduser".into(),
         "removeuser".into(),
+        "renameuser".into(),
         "bindmount".into(),
         "unmount".into(),
         "dynamic_mount".into(),
