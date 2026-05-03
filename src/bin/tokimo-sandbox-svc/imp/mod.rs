@@ -53,8 +53,9 @@ use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
     AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult,
-    JobIdResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams, ResizeShellParams, RootfsSpec,
-    RpcError, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
+    JobIdResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams, RenameUserParams,
+    ResizeShellParams, RootfsSpec, RpcError, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame,
+    method,
 };
 use tokimo_package_sandbox::vfs_host::FuseHost;
 use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
@@ -816,6 +817,11 @@ fn dispatch(
                 serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             handle_remove_user(conn, p, sessions)
         }
+        method::RENAME_USER => {
+            let p: RenameUserParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_rename_user(conn, p, sessions)
+        }
 
         other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
     }
@@ -1551,6 +1557,17 @@ fn handle_remove_user(
     let init = require_init(conn, sessions)?;
     init.remove_user(&p.user_id)
         .map_err(|e| RpcError::new("remove_user", e.to_string()))?;
+    Ok(json!({}))
+}
+
+fn handle_rename_user(
+    conn: &Arc<Connection>,
+    p: RenameUserParams,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    init.rename_user(&p.old, &p.new)
+        .map_err(|e| RpcError::new("rename_user", e.to_string()))?;
     Ok(json!({}))
 }
 

@@ -108,6 +108,7 @@ pub mod method {
     pub const REMOVE_MOUNT: &str = "removeMount";
     pub const ADD_USER: &str = "addUser";
     pub const REMOVE_USER: &str = "removeUser";
+    pub const RENAME_USER: &str = "renameUser";
 
     // Event names (service → client)
     pub const EV_STDOUT: &str = "stdout";
@@ -241,6 +242,12 @@ pub struct AddUserParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveUserParams {
     pub user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameUserParams {
+    pub old: String,
+    pub new: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

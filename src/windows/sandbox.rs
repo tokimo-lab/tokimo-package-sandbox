@@ -17,8 +17,8 @@ use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
     AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult,
-    JobIdResult, RemoveMountParams, RemoveUserParams, ResizeShellParams, SignalShellParams, SpawnShellParams,
-    WriteStdinParams, method,
+    JobIdResult, RemoveMountParams, RemoveUserParams, RenameUserParams, ResizeShellParams, SignalShellParams,
+    SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -227,11 +227,12 @@ impl SandboxBackend for WindowsBackend {
         Ok(())
     }
 
-    fn rename_user(&self, _old: &str, _new: &str) -> Result<()> {
-        // Wired up in A3c via method::RENAME_USER — placeholder so the
-        // trait is satisfied while A3b lands the API + linux/macos paths.
-        Err(Error::not_implemented(
-            "rename_user not yet wired through the Windows sandbox-svc",
-        ))
+    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
+        let p = RenameUserParams {
+            old: old.to_string(),
+            new: new.to_string(),
+        };
+        self.call(method::RENAME_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
+        Ok(())
     }
 }
