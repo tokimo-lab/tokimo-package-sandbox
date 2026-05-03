@@ -562,15 +562,89 @@ fn validate_configure(p: &ConfigureParams) -> Result<()> {
 
 /// Validate a `user_id` for [`Sandbox::add_user`] / [`Sandbox::remove_user`].
 /// Mirrors the init-side check (`is_valid_user_id`).
+///
+/// Accepts any UTF-8 string (including CJK / other Unicode) up to 32 bytes
+/// long, with these guard-rails to keep the id usable as a filesystem name,
+/// shell argument, and `useradd` username (with `--badname`):
+///
+/// * non-empty
+/// * byte length ≤ 32 (matches `useradd` UT_NAMESIZE-ish limit)
+/// * no `/`, `\`, `:`, ASCII space, NUL byte, or any other ASCII control
+///   char (`< 0x20` or `0x7F`)
+/// * does not start with `-` (would be parsed as a CLI flag) or `.`
+///   (hidden / dot-file convention)
 fn validate_user_id(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::validation("user_id must not be empty"));
     }
     if s.len() > 32 {
-        return Err(Error::validation("user_id must be <= 32 chars"));
+        return Err(Error::validation("user_id must be <= 32 bytes"));
     }
-    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(Error::validation("user_id must match [A-Za-z0-9_-]+"));
+    if s.starts_with('-') {
+        return Err(Error::validation("user_id must not start with '-'"));
+    }
+    if s.starts_with('.') {
+        return Err(Error::validation("user_id must not start with '.'"));
+    }
+    for c in s.chars() {
+        match c {
+            '/' | '\\' | ':' | ' ' | '\0' => {
+                return Err(Error::validation(format!("user_id must not contain {c:?}")));
+            }
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                return Err(Error::validation("user_id must not contain ASCII control characters"));
+            }
+            _ => {}
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_user_id;
+
+    #[test]
+    fn validate_user_id_accepts_ascii_and_unicode() {
+        // ASCII
+        assert!(validate_user_id("bob").is_ok());
+        assert!(validate_user_id("alice_42").is_ok());
+        assert!(validate_user_id("user-name").is_ok());
+        // CJK / Greek / mixed Unicode
+        assert!(validate_user_id("测试agent").is_ok());
+        assert!(validate_user_id("测试").is_ok());
+        assert!(validate_user_id("αβγ").is_ok());
+        assert!(validate_user_id("ユーザー").is_ok());
+        // Boundary: leading non-`-`/`.` punctuation is allowed.
+        assert!(validate_user_id("_internal").is_ok());
+    }
+
+    #[test]
+    fn validate_user_id_rejects_bad_inputs() {
+        // Empty.
+        assert!(validate_user_id("").is_err());
+        // Forbidden characters.
+        assert!(validate_user_id("bad/name").is_err());
+        assert!(validate_user_id("bad\\name").is_err());
+        assert!(validate_user_id("bad:name").is_err());
+        assert!(validate_user_id(" ").is_err());
+        assert!(validate_user_id("has space").is_err());
+        assert!(validate_user_id("nul\0byte").is_err());
+        assert!(validate_user_id("ctrl\x01char").is_err());
+        assert!(validate_user_id("del\x7fchar").is_err());
+        // Forbidden leading characters.
+        assert!(validate_user_id("-leading").is_err());
+        assert!(validate_user_id(".dot").is_err());
+        // Length limit (33 ASCII bytes).
+        let long_ascii: String = "a".repeat(33);
+        assert!(validate_user_id(&long_ascii).is_err());
+        // Length limit (33 bytes via UTF-8: 11 × "测" = 33 bytes).
+        let long_cjk: String = "测".repeat(11);
+        assert_eq!(long_cjk.len(), 33);
+        assert!(validate_user_id(&long_cjk).is_err());
+        // 32 bytes is OK (10 × "测" = 30 bytes + 2 ASCII).
+        let ok_cjk = format!("{}xx", "测".repeat(10));
+        assert_eq!(ok_cjk.len(), 32);
+        assert!(validate_user_id(&ok_cjk).is_ok());
+    }
 }
