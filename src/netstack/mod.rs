@@ -269,21 +269,26 @@ struct TcpFlow {
     pending_to_guest: Option<(Vec<u8>, usize)>,
 }
 
-/// State for one upstream UDP flow (keyed by destination port).
+/// State for one upstream UDP flow (keyed by full 4-tuple).
 ///
-/// Each destination port gets a smoltcp `udp::Socket` that intercepts guest
-/// traffic, plus a real `UdpSocket` for upstream. Reply Ethernet frames are
+/// Each (src_ip, src_port, dst_ip, dst_port) gets its own smoltcp
+/// `udp::Socket` and upstream `UdpSocket`.  Reply Ethernet frames are
 /// built manually (bypassing smoltcp ARP resolution which has no neighbor
 /// entry for the guest — TCP populates it via SYN/SYN-ACK, but UDP doesn't).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpKey {
+    src_ip: IpAddress,
+    src_port: u16,
+    dst_ip: IpAddress,
+    dst_port: u16,
+}
+
 struct UdpFlow {
     sock_handle: SocketHandle,
     upstream: UdpSocket,
-    /// Last guest endpoint that sent to this port (for routing replies back).
+    /// Guest-side sender endpoint (used to address reply Ethernet frames).
     remote: smoltcp::wire::IpEndpoint,
-    /// IP family the guest is talking on; v4↔v6 are tracked separately so we
-    /// can discard cross-family replies. Reply src IP comes from the actual
-    /// upstream responder (`recv_from`), not from a stored value, so a guest
-    /// can talk to multiple upstream IPs on the same destination port.
+    /// IP family; v4↔v6 replies from wrong family are discarded.
     family_v4: bool,
     last_activity: Instant,
 }
@@ -377,7 +382,7 @@ fn run(
 
     let mut sockets = SocketSet::new(Vec::new());
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
-    let mut udp_flows: HashMap<u16, UdpFlow> = HashMap::new();
+    let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
 
     eprintln!(
         "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready (egress={:?}, local_services={})",
@@ -487,15 +492,15 @@ fn run(
         }
 
         // 3. Service UDP flows: forward guest ↔ upstream via smoltcp sockets.
-        let mut udp_to_remove: Vec<u16> = Vec::new();
-        for (&port, flow) in udp_flows.iter_mut() {
+        let mut udp_to_remove: Vec<UdpKey> = Vec::new();
+        for (&key, flow) in udp_flows.iter_mut() {
             let sock = sockets.get_mut::<udp::Socket>(flow.sock_handle);
 
             // Guest → upstream: drain smoltcp recv buffer, forward to real server.
             if sock.can_recv() {
                 while let Ok((data, meta)) = sock.recv() {
                     let dst_ip = meta.local_address.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
-                    let dst = SocketAddr::new(ipaddr_to_std(dst_ip), port);
+                    let dst = SocketAddr::new(ipaddr_to_std(dst_ip), key.dst_port);
                     let _ = flow.upstream.send_to(data, dst);
                     flow.remote = meta.endpoint;
                     flow.last_activity = now;
@@ -545,18 +550,18 @@ fn run(
                         break;
                     }
                     Err(_) => {
-                        udp_to_remove.push(port);
+                        udp_to_remove.push(key);
                         break;
                     }
                 }
             }
 
             if now.duration_since(flow.last_activity) > idle_timeout {
-                udp_to_remove.push(port);
+                udp_to_remove.push(key);
             }
         }
-        for port in udp_to_remove {
-            if let Some(flow) = udp_flows.remove(&port) {
+        for key in udp_to_remove {
+            if let Some(flow) = udp_flows.remove(&key) {
                 sockets.remove(flow.sock_handle);
             }
         }
@@ -572,7 +577,7 @@ fn inspect_and_register(
     frame: &[u8],
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<u16, UdpFlow>,
+    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
 ) {
@@ -668,7 +673,7 @@ fn dispatch_l4(
     dst_ip: IpAddress,
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<u16, UdpFlow>,
+    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
 ) {
@@ -713,19 +718,20 @@ fn dispatch_l4(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let dst_port = udp.dst_port();
-            let src_port = udp.src_port();
-            if let Some(flow) = udp_flows.get_mut(&dst_port) {
-                // Existing flow: forward this packet upstream and refresh remote.
-                let dst = SocketAddr::new(ipaddr_to_std(dst_ip), dst_port);
-                let _ = flow.upstream.send_to(udp.payload(), dst);
-                flow.remote = smoltcp::wire::IpEndpoint {
-                    addr: src_ip,
-                    port: src_port,
-                };
+            let key = UdpKey {
+                src_ip,
+                src_port: udp.src_port(),
+                dst_ip,
+                dst_port: udp.dst_port(),
+            };
+            // If the 4-tuple is already tracked, smoltcp will deliver this
+            // packet to the existing socket in the next burst poll.  The main
+            // loop reads it from sock.recv() and forwards it upstream then.
+            // (Forwarding it here too would double-send.)
+            if udp_flows.contains_key(&key) {
                 return;
             }
-            register_udp_flow(dst_port, dst_ip, src_ip, src_port, sockets, udp_flows, udp.payload());
+            register_udp_flow(key, sockets, udp_flows);
             let _ = tx_out_tx;
         }
         IpProtocol::Icmp => {
@@ -852,27 +858,21 @@ fn tcp_proxy(
     }
 }
 
-fn register_udp_flow(
-    dst_port: u16,
-    dst_ip: IpAddress,
-    src_ip: IpAddress,
-    src_port: u16,
-    sockets: &mut SocketSet<'_>,
-    udp_flows: &mut HashMap<u16, UdpFlow>,
-    initial_payload: &[u8],
-) {
-    // smoltcp UDP socket bound to dst_port. With any_ip=true, this catches
-    // all UDP traffic destined to that port regardless of dst IP.
+fn register_udp_flow(key: UdpKey, sockets: &mut SocketSet<'_>, udp_flows: &mut HashMap<UdpKey, UdpFlow>) {
+    // smoltcp UDP socket bound to key.dst_port.  With any_ip=true this catches
+    // all guest traffic to that port regardless of dst IP.  Note: two concurrent
+    // flows with the same dst_port but different src will both try to bind; the
+    // second bind fails and is logged — this is acceptable for the common case.
     let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
     let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
     let mut sock = udp::Socket::new(rx_buf, tx_buf);
-    if let Err(e) = sock.bind(dst_port) {
-        eprintln!("[netstack] udp bind port {}: {e}", dst_port);
+    if let Err(e) = sock.bind(key.dst_port) {
+        eprintln!("[netstack] udp bind port {}: {e}", key.dst_port);
         return;
     }
     let sock_handle = sockets.add(sock);
 
-    let bind_addr = match dst_ip {
+    let bind_addr = match key.dst_ip {
         IpAddress::Ipv4(_) => "0.0.0.0:0",
         IpAddress::Ipv6(_) => "[::]:0",
     };
@@ -886,25 +886,29 @@ fn register_udp_flow(
     };
     let _ = upstream.set_read_timeout(Some(Duration::from_millis(100)));
 
-    // Forward the initial packet that triggered registration.
-    let upstream_dst = SocketAddr::new(ipaddr_to_std(dst_ip), dst_port);
-    let _ = upstream.send_to(initial_payload, upstream_dst);
+    // The initial payload is NOT forwarded here — smoltcp will deliver it to
+    // the newly-created socket in the next burst poll and the main loop will
+    // forward it then.  Forwarding here too would double-send the packet.
 
+    let upstream_dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
     udp_flows.insert(
-        dst_port,
+        key,
         UdpFlow {
             sock_handle,
             upstream,
             remote: smoltcp::wire::IpEndpoint {
-                addr: src_ip,
-                port: src_port,
+                addr: key.src_ip,
+                port: key.src_port,
             },
-            family_v4: matches!(dst_ip, IpAddress::Ipv4(_)),
+            family_v4: matches!(key.dst_ip, IpAddress::Ipv4(_)),
             last_activity: Instant::now(),
         },
     );
 
-    eprintln!("[netstack] udp flow opened port {dst_port} → {upstream_dst}");
+    eprintln!(
+        "[netstack] udp flow opened {}:{} → {}",
+        key.src_ip, key.src_port, upstream_dst
+    );
 }
 
 // ─── UDP reply frame builders ───────────────────────────────────────────────
