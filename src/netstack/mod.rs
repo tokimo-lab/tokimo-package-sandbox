@@ -263,6 +263,10 @@ struct TcpFlow {
     upstream_closed: Arc<AtomicBool>,
     last_activity: Instant,
     closed: bool,
+    /// Bytes received from upstream that could not be fully written into the
+    /// smoltcp TX buffer in one shot.  The usize is the already-written
+    /// offset.  Must be flushed before accepting new upstream buffers.
+    pending_to_guest: Option<(Vec<u8>, usize)>,
 }
 
 /// State for one upstream UDP flow (keyed by destination port).
@@ -430,16 +434,38 @@ fn run(
                     (buf.len(), ())
                 });
             }
-            while let Ok(buf) = flow.upstream_to_guest_rx.try_recv() {
-                let mut off = 0;
-                while off < buf.len() {
-                    match socket.send_slice(&buf[off..]) {
-                        Ok(0) => break,
-                        Ok(n) => off += n,
-                        Err(_) => break,
+            // Flush any bytes that didn't fit in the smoltcp TX buffer last round.
+            let still_pending = if let Some((buf, off)) = &mut flow.pending_to_guest {
+                match socket.send_slice(&buf[*off..]) {
+                    Ok(0) | Err(_) => true, // TX buffer still full — try again next round
+                    Ok(n) => {
+                        *off += n;
+                        flow.last_activity = now;
+                        *off < buf.len()
                     }
                 }
-                flow.last_activity = now;
+            } else {
+                false
+            };
+            if !still_pending {
+                flow.pending_to_guest = None;
+                // Only accept new upstream data once the pending buffer is clear.
+                while let Ok(buf) = flow.upstream_to_guest_rx.try_recv() {
+                    let mut off = 0;
+                    while off < buf.len() {
+                        match socket.send_slice(&buf[off..]) {
+                            Ok(0) | Err(_) => {
+                                flow.pending_to_guest = Some((buf, off));
+                                break;
+                            }
+                            Ok(n) => off += n,
+                        }
+                    }
+                    if flow.pending_to_guest.is_some() {
+                        break; // TX buffer full — stop draining, preserve order
+                    }
+                    flow.last_activity = now;
+                }
             }
             if flow.upstream_closed.load(Ordering::Relaxed) && !flow.closed {
                 socket.close();
@@ -758,6 +784,7 @@ fn register_tcp_flow(
             upstream_closed,
             last_activity: Instant::now(),
             closed: false,
+            pending_to_guest: None,
         },
     );
     eprintln!("[netstack] tcp flow opened {} → {}", key.src_port, upstream);
