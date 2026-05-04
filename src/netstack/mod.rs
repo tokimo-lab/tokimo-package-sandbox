@@ -1061,9 +1061,26 @@ fn register_udp_flow(
     }
     let sock_handle = sockets.add(sock);
 
-    let bind_addr: SocketAddr = match key.dst_ip {
-        IpAddress::Ipv4(_) => "0.0.0.0:0".parse().unwrap(),
-        IpAddress::Ipv6(_) => "[::]:0".parse().unwrap(),
+    // DNS proxy: guest queries to (gateway, 53) get redirected to the host's
+    // real resolver so the guest's /etc/resolv.conf can safely point at the
+    // gateway IP without leaking host DNS topology.
+    let is_gateway = matches!(key.dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
+        || matches!(key.dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
+    let dns_rewrite = if is_gateway && key.dst_port == 53 {
+        ctx.host_dns
+    } else {
+        None
+    };
+
+    // Determine the actual upstream target address and bind the socket to the
+    // matching family. When DNS proxy rewrites to a different family (e.g.
+    // guest→v4 gateway but host DNS is v6), the socket must be bound to the
+    // target family.
+    let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port));
+    let bind_addr: SocketAddr = if upstream_dst.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
     };
     let mut upstream = match MioUdpSocket::bind(bind_addr) {
         Ok(s) => s,
@@ -1084,18 +1101,6 @@ fn register_udp_flow(
     // the newly-created socket in the next burst poll and the main loop will
     // forward it then.  Forwarding here too would double-send the packet.
 
-    // DNS proxy: guest queries to (gateway, 53) get redirected to the host's
-    // real resolver so the guest's /etc/resolv.conf can safely point at the
-    // gateway IP without leaking host DNS topology.
-    let is_gateway = matches!(key.dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
-        || matches!(key.dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
-    let dns_rewrite = if is_gateway && key.dst_port == 53 {
-        ctx.host_dns
-    } else {
-        None
-    };
-
-    let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port));
     udp_flows.insert(
         key,
         UdpFlow {
@@ -1105,6 +1110,8 @@ fn register_udp_flow(
                 addr: key.src_ip,
                 port: key.src_port,
             },
+            // family_v4 tracks the guest's original request family so reply
+            // frames are built in the correct format.
             family_v4: matches!(key.dst_ip, IpAddress::Ipv4(_)),
             last_activity: Instant::now(),
             dns_rewrite,
