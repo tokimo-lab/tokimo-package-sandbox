@@ -168,7 +168,21 @@ pub fn build_session_v2_ex(
     // 0 = no limit: omit the field so HCS applies no constraint.
     let mut topology = serde_json::Map::new();
     if memory_mb > 0 {
-        topology.insert("Memory".into(), serde_json::json!({ "SizeInMB": memory_mb }));
+        // Dynamic backing: VM only consumes physical RAM as the guest actually
+        // touches pages. Mirrors WSL2 / hcsshim defaults. AllowOvercommit must
+        // be true for EnableDeferredCommit (HCS rejects otherwise).
+        // Field reference: microsoft/hcsshim internal/hcs/schema2/virtual_machine_memory.go
+        topology.insert(
+            "Memory".into(),
+            serde_json::json!({
+                "SizeInMB": memory_mb,
+                "AllowOvercommit": true,
+                "EnableDeferredCommit": true,
+                "EnableHotHint": true,
+                "EnableColdHint": true,
+                "EnableColdDiscardHint": true,
+            }),
+        );
     }
     if cpu_count > 0 {
         topology.insert("Processor".into(), serde_json::json!({ "Count": cpu_count }));
