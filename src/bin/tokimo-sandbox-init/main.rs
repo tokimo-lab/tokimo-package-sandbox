@@ -162,6 +162,10 @@ fn run() -> Result<(), String> {
     let pid = getpid();
     let bwrap_cli = parse_bwrap_cli();
     let bwrap_mode = bwrap_cli.is_some();
+    if bwrap_mode {
+        crate::child::SKIP_DROP_TO_TOKIMO.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[tokimo-sandbox-init] bwrap mode: skipping drop_to_tokimo_user (host user_ns owns isolation)");
+    }
     if pid.as_raw() != 1 && !bwrap_mode {
         return Err(format!("init must be PID 1 (got {}); host forgot --as-pid-1", pid));
     }

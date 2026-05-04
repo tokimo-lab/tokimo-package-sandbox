@@ -7,6 +7,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
@@ -16,6 +17,14 @@ use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, dup2, fork, initgroups, pipe
 use tokimo_package_sandbox::protocol::types::{ErrorCode, ErrorReply};
 
 use crate::pty as ptymod;
+
+/// When true (set by main on bwrap mode start-up), child setup skips the
+/// uid/gid drop to tokimo. bwrap already established user-namespace
+/// isolation on the host side and the user_ns GID map typically does not
+/// include 1000 — calling setgid(1000) would EINVAL. VM mode (macOS VZ /
+/// Windows HCS) keeps the drop because init runs as PID-1 root inside the
+/// guest and the rootfs has the tokimo user (uid=1000) baked in.
+pub static SKIP_DROP_TO_TOKIMO: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy)]
 pub enum ChildKind {
@@ -240,7 +249,9 @@ fn child_setup_pipes(
     // agent-facing commands run with the same low-privilege identity.
     // Order matters: setgid → initgroups → setuid, because once setuid(1000)
     // succeeds we lose root and can no longer call initgroups.
-    if let Err(e) = drop_to_tokimo_user() {
+    if !SKIP_DROP_TO_TOKIMO.load(Ordering::Relaxed)
+        && let Err(e) = drop_to_tokimo_user()
+    {
         report_errno_and_exit(err_w, e);
     }
     let argv_p: Vec<*const libc::c_char> = argv
@@ -307,7 +318,9 @@ fn child_setup_pty(slave_path: &str, err_w: i32, cwd: Option<&str>, argv: &[CStr
     }
     unblock_signals();
     // Drop to the unprivileged `tokimo` user (see child_setup_pipes).
-    if let Err(e) = drop_to_tokimo_user() {
+    if !SKIP_DROP_TO_TOKIMO.load(Ordering::Relaxed)
+        && let Err(e) = drop_to_tokimo_user()
+    {
         report_errno_and_exit(err_w, e);
     }
     let argv_p: Vec<*const libc::c_char> = argv
