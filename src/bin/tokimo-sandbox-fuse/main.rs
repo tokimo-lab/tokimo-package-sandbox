@@ -49,8 +49,9 @@ fn main() -> std::process::ExitCode {
 mod linux {
     use std::collections::HashMap;
     use std::ffi::OsStr;
+    use std::fs::File;
     use std::io;
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +65,7 @@ mod linux {
     };
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
 
+    use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
     use tokimo_package_sandbox::vfs_protocol::{
         AttrOut, EntryOut, Frame, NodeKind, PROTOCOL_VERSION, Req, Res, StatfsOut, WireError,
     };
@@ -150,9 +152,15 @@ mod linux {
             }
         };
 
-        // Handshake.
-        let mut conn = WireConn::new(stream);
-        let bound_id = match conn.handshake(&args.mount_name) {
+        // Handshake: bind connection to mount_name.
+        let stream_for_handshake = match dup_fd(&stream) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[tokimo-fuse] dup transport: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        let bound_id = match handshake(stream, &args.mount_name) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("[tokimo-fuse] handshake: {e}");
@@ -165,7 +173,13 @@ mod linux {
         );
 
         // Spawn dispatcher thread that owns the wire connection.
-        let dispatcher = Arc::new(Dispatcher::new(conn, bound_id));
+        let dispatcher = match Dispatcher::new(stream_for_handshake, bound_id) {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                eprintln!("[tokimo-fuse] dispatcher init: {e}");
+                return ExitCode::from(4);
+            }
+        };
         let dispatch_handle = dispatcher.clone().spawn_reader();
 
         // Build FUSE filesystem and mount.
@@ -208,11 +222,14 @@ mod linux {
     fn open_transport(t: &Transport) -> io::Result<OwnedFd> {
         match *t {
             Transport::Vsock { port } => {
-                // Connect to host CID 2 (VMADDR_CID_HOST).
-                const VMADDR_CID_HOST: u32 = 2;
+                // Connect to host CID 2 (VMADDR_CID_HOST). One-shot — the
+                // host listener is up by the time fuse is spawned by init.
                 let sock =
                     socket(AddressFamily::Vsock, SockType::Stream, SockFlag::empty(), None).map_err(io::Error::from)?;
-                let addr = VsockAddr::new(VMADDR_CID_HOST, port);
+                let addr = VsockAddr::new(
+                    tokimo_package_sandbox::net_constants::VMADDR_CID_HOST,
+                    port,
+                );
                 connect(std::os::fd::AsRawFd::as_raw_fd(&sock), &addr).map_err(io::Error::from)?;
                 Ok(sock)
             }
@@ -226,196 +243,98 @@ mod linux {
 
     // ---------- Wire codec (blocking, std::io) ----------
 
-    struct WireConn {
-        // Use std::fs::File for raw fd compat with both vsock + unix.
-        // We split read/write halves logically via dup() so the
-        // dispatcher can own a pair of file descriptors.
-        fd: OwnedFd,
+    fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+        let raw = fd.as_raw_fd();
+        let new = unsafe { libc::dup(raw) };
+        if new < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(new) })
     }
 
-    impl WireConn {
-        fn new(fd: OwnedFd) -> Self {
-            Self { fd }
-        }
-
-        fn handshake(&mut self, mount_name: &str) -> io::Result<u32> {
-            let hello = Frame::Hello {
-                proto_version: PROTOCOL_VERSION,
-                max_inflight: 64,
-                client_name: format!("tokimo-sandbox-fuse pid={}", std::process::id()),
-                mount_name: Some(mount_name.to_string()),
-            };
-            self.send(&hello)?;
-            let ack = self
-                .recv()?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no HelloAck"))?;
-            match ack {
-                Frame::HelloAck {
-                    proto_version,
-                    bound_mount_id,
-                    ..
-                } => {
-                    if proto_version != PROTOCOL_VERSION {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("proto mismatch: server={} client={}", proto_version, PROTOCOL_VERSION),
-                        ));
-                    }
-                    bound_mount_id
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "server did not bind mount_name"))
+    /// One-shot Hello/HelloAck handshake on the freshly-opened transport.
+    /// Consumes its half of the connection — the caller passes in a
+    /// `dup`'d fd for use by the dispatcher.
+    fn handshake(fd: OwnedFd, mount_name: &str) -> io::Result<u32> {
+        let mut file = File::from(fd);
+        let hello = Frame::Hello {
+            proto_version: PROTOCOL_VERSION,
+            max_inflight: 64,
+            client_name: format!("tokimo-sandbox-fuse pid={}", std::process::id()),
+            mount_name: Some(mount_name.to_string()),
+        };
+        wire::write_frame(&mut file, &hello)?;
+        let ack = wire::read_frame(&mut file)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no HelloAck"))?;
+        match ack {
+            Frame::HelloAck {
+                proto_version,
+                bound_mount_id,
+                ..
+            } => {
+                if proto_version != PROTOCOL_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("proto mismatch: server={} client={}", proto_version, PROTOCOL_VERSION),
+                    ));
                 }
-                other => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expected HelloAck, got {other:?}"),
-                )),
+                bound_mount_id
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "server did not bind mount_name"))
             }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected HelloAck, got {other:?}"),
+            )),
         }
-
-        fn send(&mut self, f: &Frame) -> io::Result<()> {
-            let payload =
-                postcard::to_allocvec(f).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let len = payload.len() as u32;
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&self.fd);
-            let mut header = len.to_le_bytes().to_vec();
-            header.extend_from_slice(&payload);
-            write_all_fd(raw, &header)
-        }
-
-        fn recv(&mut self) -> io::Result<Option<Frame>> {
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&self.fd);
-            let mut len_buf = [0u8; 4];
-            match read_exact_fd(raw, &mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e),
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            if len == 0 || len > 8 * 1024 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad frame length {len}"),
-                ));
-            }
-            let mut buf = vec![0u8; len];
-            read_exact_fd(raw, &mut buf)?;
-            let frame: Frame =
-                postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(Some(frame))
-        }
-    }
-
-    fn write_all_fd(fd: i32, buf: &[u8]) -> io::Result<()> {
-        let mut off = 0usize;
-        while off < buf.len() {
-            let n = unsafe { libc::write(fd, buf[off..].as_ptr() as *const _, buf.len() - off) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
-            }
-            off += n as usize;
-        }
-        Ok(())
-    }
-
-    fn read_exact_fd(fd: i32, buf: &mut [u8]) -> io::Result<()> {
-        let mut off = 0usize;
-        while off < buf.len() {
-            let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            if n == 0 {
-                if off == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
-                }
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
-            }
-            off += n as usize;
-        }
-        Ok(())
     }
 
     // ---------- Dispatcher: serialise wire writes, route responses by req_id ----------
 
     struct Dispatcher {
-        write_fd: Mutex<OwnedFd>,
-        read_fd: Mutex<Option<OwnedFd>>,
+        // Two `File`s wrapping `dup`'d fds of the same underlying socket.
+        // vsock + unix-stream both support concurrent r/w on the same fd,
+        // but separate fds keep the locking rules trivial: writer holds
+        // `write_file` lock, reader thread parks in `read(2)` on
+        // `read_file` without contention.
+        write_file: Mutex<File>,
+        read_file: Mutex<Option<File>>,
         next_req_id: AtomicU64,
         pending: Mutex<HashMap<u64, mpsc::Sender<Res>>>,
         bound_mount_id: u32,
     }
 
     impl Dispatcher {
-        fn new(conn: WireConn, bound_mount_id: u32) -> Self {
-            // Dup the fd so the reader thread can park in `read(2)`
-            // without holding the writer's lock. vsock + unix-stream
-            // both support concurrent r/w on the same fd, but using
-            // separate fds keeps the locking rules trivial.
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&conn.fd);
-            let dup_fd = unsafe { libc::dup(raw) };
-            let read_owned = if dup_fd >= 0 {
-                Some(unsafe { OwnedFd::from_raw_fd(dup_fd) })
-            } else {
-                None
-            };
-            Self {
-                write_fd: Mutex::new(conn.fd),
-                read_fd: Mutex::new(read_owned),
+        fn new(fd: OwnedFd, bound_mount_id: u32) -> io::Result<Self> {
+            let read_dup = dup_fd(&fd)?;
+            Ok(Self {
+                write_file: Mutex::new(File::from(fd)),
+                read_file: Mutex::new(Some(File::from(read_dup))),
                 next_req_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 bound_mount_id,
-            }
+            })
         }
 
         /// Spawn the reader thread that demuxes frames from the host.
         fn spawn_reader(self: Arc<Self>) -> thread::JoinHandle<()> {
             let me = self;
             thread::spawn(move || {
-                let read_fd = match me.read_fd.lock().unwrap().take() {
-                    Some(fd) => fd,
+                let mut read_file = match me.read_file.lock().unwrap().take() {
+                    Some(f) => f,
                     None => {
-                        eprintln!("[tokimo-fuse] reader: dup failed, no read fd");
+                        eprintln!("[tokimo-fuse] reader: no read fd");
                         return;
                     }
                 };
-                let raw = std::os::fd::AsRawFd::as_raw_fd(&read_fd);
                 loop {
-                    let mut len_buf = [0u8; 4];
-                    match read_exact_fd(raw, &mut len_buf) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    let frame = match wire::read_frame(&mut read_file) {
+                        Ok(Some(f)) => f,
+                        Ok(None) => {
                             eprintln!("[tokimo-fuse] host closed connection");
                             break;
                         }
                         Err(e) => {
                             eprintln!("[tokimo-fuse] reader error: {e}");
-                            break;
-                        }
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    if len == 0 || len > 8 * 1024 * 1024 {
-                        eprintln!("[tokimo-fuse] bad frame length {len}");
-                        break;
-                    }
-                    let mut buf = vec![0u8; len];
-                    if let Err(e) = read_exact_fd(raw, &mut buf) {
-                        eprintln!("[tokimo-fuse] reader body: {e}");
-                        break;
-                    }
-                    let frame: Frame = match postcard::from_bytes(&buf) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            eprintln!("[tokimo-fuse] decode: {e}");
                             break;
                         }
                     };
@@ -455,23 +374,9 @@ mod linux {
                 mount_id: self.bound_mount_id,
                 op,
             };
-            // Encode + send under writer lock only.
-            let payload = match postcard::to_allocvec(&frame) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.pending.lock().unwrap().remove(&req_id);
-                    return Res::Error(WireError {
-                        errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
-                        message: format!("encode: {e}"),
-                    });
-                }
-            };
-            let mut hdr = (payload.len() as u32).to_le_bytes().to_vec();
-            hdr.extend_from_slice(&payload);
             {
-                let guard = self.write_fd.lock().unwrap();
-                let raw = std::os::fd::AsRawFd::as_raw_fd(&*guard);
-                if let Err(e) = write_all_fd(raw, &hdr) {
+                let mut guard = self.write_file.lock().unwrap();
+                if let Err(e) = wire::write_frame(&mut *guard, &frame) {
                     self.pending.lock().unwrap().remove(&req_id);
                     return Res::Error(WireError {
                         errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,

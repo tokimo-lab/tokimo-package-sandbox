@@ -9,6 +9,14 @@
 //! ```
 //!
 //! `length` does not include the 4 bytes of the prefix itself.
+//!
+//! Two flavours are provided:
+//!
+//! - top-level [`read_frame`] / [`write_frame`] — async, used by `vfs_host`
+//!   and any tokio-based consumer.
+//! - [`blocking`] submodule — same wire format, sync `Read`/`Write`
+//!   trait-based, used by `tokimo-sandbox-fuse` (a single-process FUSE
+//!   bridge that runs blocking inside the guest).
 
 use std::io;
 
@@ -62,6 +70,61 @@ where
     writer.write_all(&payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Blocking variant — same wire format, sync Read/Write
+// ---------------------------------------------------------------------------
+
+/// Sync (blocking) flavour of the same length-prefix + postcard codec.
+/// Used by `tokimo-sandbox-fuse` which runs blocking inside the guest.
+pub mod blocking {
+    use std::io::{self, Read, Write};
+
+    use super::{Frame, MAX_FRAME_BYTES};
+
+    /// Read one frame. Returns `Ok(None)` on clean EOF before any bytes
+    /// are read for the length prefix; this is how the peer signals
+    /// graceful close.
+    pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Option<Frame>> {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let len = u32::from_le_bytes(len_buf);
+        if len == 0 || len > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large or empty: {len} (max {MAX_FRAME_BYTES})"),
+            ));
+        }
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf)?;
+        let frame: Frame = postcard::from_bytes(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard decode: {e}")))?;
+        Ok(Some(frame))
+    }
+
+    /// Write one frame. Caller is responsible for serialising concurrent
+    /// writers (e.g. behind a `Mutex<W>`) — frames must be atomic on the
+    /// wire.
+    pub fn write_frame<W: Write>(writer: &mut W, frame: &Frame) -> io::Result<()> {
+        let payload = postcard::to_allocvec(frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("postcard encode: {e}")))?;
+        if payload.len() > MAX_FRAME_BYTES as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large: {} > {}", payload.len(), MAX_FRAME_BYTES),
+            ));
+        }
+        let len = (payload.len() as u32).to_le_bytes();
+        writer.write_all(&len)?;
+        writer.write_all(&payload)?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
