@@ -402,6 +402,9 @@ fn run(
     );
 
     let idle_timeout = Duration::from_secs(120);
+    // UDP flows are typically short-lived (DNS, NTP); reap them aggressively
+    // so accumulated idle sockets don't slow down the main poll loop.
+    let udp_idle_timeout = Duration::from_secs(15);
 
     // Holds a frame received during the poll_delay sleep so it isn't lost.
     let mut lookahead: Option<Vec<u8>> = None;
@@ -592,7 +595,7 @@ fn run(
                 }
             }
 
-            if now.duration_since(flow.last_activity) > idle_timeout {
+            if now.duration_since(flow.last_activity) > udp_idle_timeout {
                 udp_to_remove.push(key);
             }
         }
@@ -943,7 +946,7 @@ fn register_udp_flow(key: UdpKey, sockets: &mut SocketSet<'_>, udp_flows: &mut H
             return;
         }
     };
-    let _ = upstream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = upstream.set_nonblocking(true);
 
     // The initial payload is NOT forwarded here — smoltcp will deliver it to
     // the newly-created socket in the next burst poll and the main loop will
