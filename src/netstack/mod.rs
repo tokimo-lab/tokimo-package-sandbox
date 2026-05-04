@@ -457,10 +457,17 @@ fn run(
                 }
             }
 
-            if socket.can_recv() {
+            // Only consume from the smoltcp RX buffer when the channel to the
+            // upstream-writer thread has room.  If we drain bytes from the
+            // socket unconditionally, smoltcp opens its receive window wide
+            // and the guest can flood us; the bytes then pile up in an
+            // unbounded Vec<u8> queue.  By leaving them in the smoltcp RX
+            // buffer instead, smoltcp shrinks the advertised window → natural
+            // TCP backpressure all the way to the guest NIC.
+            if socket.can_recv() && !flow.guest_to_upstream_tx.is_full() {
                 let _ = socket.recv(|buf| {
                     if !buf.is_empty() {
-                        let _ = flow.guest_to_upstream_tx.send(buf.to_vec());
+                        let _ = flow.guest_to_upstream_tx.try_send(buf.to_vec());
                         flow.last_activity = now;
                     }
                     (buf.len(), ())
