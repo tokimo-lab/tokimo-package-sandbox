@@ -29,6 +29,7 @@ use tokio::runtime::Runtime;
 
 use crate::api::NetworkPolicy;
 use crate::error::{Error, Result};
+use crate::raw_io;
 
 /// Vsock port the guest's `tokimo-sandbox-init` listens on.
 pub(crate) const INIT_VSOCK_PORT: u32 = 2222;
@@ -285,13 +286,12 @@ fn drain_serial_into(fd: std::os::fd::RawFd, out: &mut String) {
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
-            if n <= 0 {
-                break;
-            }
-            out.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        match raw_io::read_once_nb(fd, &mut buf) {
+            Ok(Some(n)) if n > 0 => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+            _ => break,
         }
     }
 }
@@ -320,23 +320,23 @@ fn drain_serial_forever(fd: std::os::fd::RawFd, dst: Option<String>) {
     }
     let mut buf = [0u8; 4096];
     loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            // EAGAIN on a blocking read shouldn't happen, but if it does,
-            // back off briefly so we don't busy-loop.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            continue;
-        }
-        if n == 0 {
-            break;
-        }
-        let chunk = &buf[..n as usize];
-        if let Some(f) = file.as_mut() {
-            let _ = f.write_all(chunk);
-            let _ = f.flush();
-        }
-        if want_stderr {
-            let _ = std::io::stderr().write_all(chunk);
+        match raw_io::read_once_nb(fd, &mut buf) {
+            Ok(None) => {
+                // EAGAIN on a blocking read shouldn't happen, but if it does,
+                // back off briefly so we don't busy-loop.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(Some(0)) | Err(_) => break,
+            Ok(Some(n)) => {
+                let chunk = &buf[..n];
+                if let Some(f) = file.as_mut() {
+                    let _ = f.write_all(chunk);
+                    let _ = f.flush();
+                }
+                if want_stderr {
+                    let _ = std::io::stderr().write_all(chunk);
+                }
+            }
         }
     }
 }

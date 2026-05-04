@@ -23,6 +23,7 @@ use tokimo_package_sandbox::protocol::types::{
 };
 use tokimo_package_sandbox::protocol::wire::encode_frame;
 use tokimo_package_sandbox::protocol::wire::{recv_frame_seqpacket, send_frame_seqpacket};
+use tokimo_package_sandbox::raw_io;
 
 use crate::child::{ChildKind, ChildRecord};
 use crate::pty as ptymod;
@@ -130,9 +131,7 @@ impl State {
                 }
             };
             let write_fd = client.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(client_fd);
-            unsafe {
-                let _ = libc::write(write_fd, data.as_ptr().cast(), data.len());
-            }
+            let _ = raw_io::write_once(write_fd, &data);
         } else {
             let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
             let _ = send_frame_seqpacket(bf, frame, fd);
@@ -246,8 +245,7 @@ fn run_loop_inner(
             {
                 let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
                 let marker = b"HBHBHBHBHB";
-                let n = unsafe { libc::write(wfd, marker.as_ptr().cast(), marker.len()) };
-                let _ = n;
+                let _ = raw_io::write_once(wfd, marker);
             }
         }
 
@@ -381,9 +379,9 @@ fn drain_sigfd(sigfd: &OwnedFd) {
     // Just drain — content not used; we always waitpid(-1, WNOHANG).
     let mut buf = [0u8; 1024];
     loop {
-        let n = unsafe { libc::read(sigfd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            break;
+        match raw_io::read_once_nb(sigfd.as_raw_fd(), &mut buf) {
+            Ok(Some(n)) if n > 0 => {}
+            _ => break,
         }
     }
 }
@@ -455,11 +453,11 @@ fn emit_exit(state: &mut State, registry: &mio::Registry, pid: Pid, code: i32, s
 fn drain_pipe(fd: &OwnedFd, child_id: &str, owner_fd: RawFd, is_stderr: bool, state: &State) {
     let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
     loop {
-        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            break;
-        }
-        let chunk = &buf[..n as usize];
+        let n = match raw_io::read_once_nb(fd.as_raw_fd(), &mut buf) {
+            Ok(Some(n)) if n > 0 => n,
+            _ => break,
+        };
+        let chunk = &buf[..n];
         let frame = Frame::Event(if is_stderr {
             Event::Stderr {
                 child_id: child_id.to_string(),
@@ -539,21 +537,17 @@ fn handle_client_readable(client_fd: RawFd, state: &mut State, registry: &mio::R
 fn handle_client_readable_vsock(client_fd: RawFd, state: &mut State, registry: &mio::Registry) -> Result<bool, String> {
     let mut tmp = [0u8; 8192];
     loop {
-        let n = unsafe { libc::read(client_fd, tmp.as_mut_ptr().cast(), tmp.len()) };
-        if n == 0 {
-            return Ok(false);
-        }
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                break;
+        match raw_io::read_once_nb(client_fd, &mut tmp) {
+            Ok(Some(0)) => return Ok(false),
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+            Ok(Some(n)) => {
+                if let Some(c) = state.clients.get_mut(&client_fd) {
+                    c.read_buf.extend_from_slice(&tmp[..n]);
+                } else {
+                    return Ok(false);
+                }
             }
-            return Err(err.to_string());
-        }
-        if let Some(c) = state.clients.get_mut(&client_fd) {
-            c.read_buf.extend_from_slice(&tmp[..n as usize]);
-        } else {
-            return Ok(false);
         }
     }
 
@@ -679,21 +673,8 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
                     .stdin_fd
                     .as_ref()
                     .ok_or_else(|| ErrorReply::new(ErrorCode::BadRequest, "child has no stdin (PTY?)"))?;
-                let mut off = 0;
-                while off < bytes.len() {
-                    let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().add(off).cast(), bytes.len() - off) };
-                    if n < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(ErrorReply::new(
-                            ErrorCode::Internal,
-                            format!("write child stdin: {err}"),
-                        ));
-                    }
-                    off += n as usize;
-                }
+                raw_io::write_all(fd.as_raw_fd(), &bytes)
+                    .map_err(|e| ErrorReply::new(ErrorCode::Internal, format!("write child stdin: {e}")))?;
                 Ok(())
             })();
             ack(state, client_fd, id, res);

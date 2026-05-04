@@ -376,7 +376,7 @@ fn klog(s: &str) {
     unsafe {
         let fd = libc::open(c"/dev/kmsg".as_ptr(), libc::O_WRONLY);
         if fd >= 0 {
-            libc::write(fd, line.as_ptr().cast(), line.len());
+            let _ = tokimo_package_sandbox::raw_io::write_once(fd, line.as_bytes());
             libc::close(fd);
         }
     }

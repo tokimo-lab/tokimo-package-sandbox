@@ -39,6 +39,9 @@ pub mod ifreq;
 #[cfg(target_os = "linux")]
 pub mod vsock_util;
 
+#[cfg(unix)]
+pub mod raw_io;
+
 // FUSE-over-vsock VFS bridge (cross-platform). See
 // plan/cross-platform-fuse-vfs.md.
 pub mod vfs_backend;

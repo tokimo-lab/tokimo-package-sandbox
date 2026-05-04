@@ -15,6 +15,7 @@ use nix::sys::stat::Mode;
 use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, dup2, fork, initgroups, pipe2, setgid, setpgid, setsid, setuid};
 
 use tokimo_package_sandbox::protocol::types::{ErrorCode, ErrorReply};
+use tokimo_package_sandbox::raw_io;
 
 use crate::pty as ptymod;
 
@@ -119,7 +120,7 @@ pub fn spawn_pipes(argv: &[String], env: &[(String, String)], cwd: Option<&str>)
             // races the child's write and lets exec failures slip through as
             // "successful spawn" with a child that immediately exits 127.
             let mut buf = [0u8; 4];
-            let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let n = raw_io::read_once(err_r.as_raw_fd(), &mut buf).unwrap_or(0);
             if n == 4 {
                 let errno = i32::from_ne_bytes(buf);
                 let code = match errno {
@@ -183,7 +184,7 @@ pub fn spawn_pty(
             // when CLOEXEC closes err_w on successful execve) means success;
             // 4 bytes means execve reported errno before _exit(127).
             let mut buf = [0u8; 4];
-            let n = unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let n = raw_io::read_once(err_r.as_raw_fd(), &mut buf).unwrap_or(0);
             if n == 4 {
                 let errno = i32::from_ne_bytes(buf);
                 let code = match errno {
@@ -357,10 +358,8 @@ fn drop_to_tokimo_user() -> Result<(), i32> {
 
 fn report_errno_and_exit(err_w: i32, errno: i32) -> ! {
     let bytes = errno.to_ne_bytes();
-    unsafe {
-        let _ = libc::write(err_w, bytes.as_ptr().cast(), bytes.len());
-        libc::_exit(127);
-    }
+    let _ = raw_io::write_once(err_w, &bytes);
+    unsafe { libc::_exit(127) }
 }
 
 fn unblock_signals() {
