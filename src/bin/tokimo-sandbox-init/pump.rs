@@ -217,12 +217,7 @@ fn scopeguard_close(fd: RawFd) -> CloseOnDrop {
 }
 
 fn ifr_with_name(name: &str) -> libc::ifreq {
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let nb = name.as_bytes();
-    for (i, &b) in nb.iter().enumerate() {
-        ifr.ifr_name[i] = b as libc::c_char;
-    }
-    ifr
+    tokimo_package_sandbox::ifreq::ifr_with_name(name).expect("interface name fits in IFNAMSIZ")
 }
 
 fn set_mac(sock: RawFd, name: &str, mac: [u8; 6]) -> Result<(), String> {
@@ -281,13 +276,7 @@ fn set_ipv4(sock: RawFd, name: &str, addr: [u8; 4], prefix: u8) -> Result<(), St
 }
 
 fn set_iff_up(sock: RawFd, name: &str) -> Result<(), String> {
-    let mut ifr = ifr_with_name(name);
-    ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-    let r = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
-    if r != 0 {
-        return Err(format!("SIOCSIFFLAGS: {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
+    tokimo_package_sandbox::ifreq::set_iff_up(sock, name).map_err(|e| format!("SIOCSIFFLAGS: {e}"))
 }
 
 fn add_ipv4_default_route(sock: RawFd, gw: [u8; 4]) -> Result<(), String> {

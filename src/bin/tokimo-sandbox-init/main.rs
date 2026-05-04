@@ -663,8 +663,7 @@ fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
 /// the per-VM hvsock plumbing after VM start.
 #[cfg(target_os = "linux")]
 fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
-    let fd = tokimo_package_sandbox::vsock_util::connect_host(port)
-        .map_err(|e| format!("connect VSOCK port {port}: {e}"))?;
+    let fd = tokimo_package_sandbox::vsock_util::connect_host(port).map_err(|e| format!("connect VSOCK port {port}: {e}"))?;
     eprintln!("[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}");
     // Set non-blocking AFTER connect succeeds so the mio event loop can
     // poll the socket the same way as the listener path used to.
@@ -680,25 +679,5 @@ fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
 
 #[cfg(target_os = "linux")]
 fn bringup_lo() -> Result<(), String> {
-    // Open a generic AF_INET DGRAM socket — used solely as the ioctl
-    // delivery vehicle for SIOCSIFFLAGS.
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(format!("socket(AF_INET, DGRAM): {}", std::io::Error::last_os_error()));
-    }
-    // libc::ifreq layout: char ifr_name[IFNAMSIZ]; union { short ifru_flags; ... }
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name = b"lo\0";
-    for (i, &b) in name.iter().enumerate() {
-        ifr.ifr_name[i] = b as libc::c_char;
-    }
-    ifr.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-    let rc = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
-    let res = if rc != 0 {
-        Err(format!("ioctl(SIOCSIFFLAGS, lo): {}", std::io::Error::last_os_error()))
-    } else {
-        Ok(())
-    };
-    unsafe { libc::close(sock) };
-    res
+    tokimo_package_sandbox::ifreq::bringup_lo().map_err(|e| format!("bringup_lo: {e}"))
 }

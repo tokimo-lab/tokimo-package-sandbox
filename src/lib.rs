@@ -28,10 +28,12 @@ pub mod session_registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod shared_backend;
 
+pub mod net_constants;
 pub mod protocol;
 pub mod svc_protocol;
-pub mod net_constants;
 
+#[cfg(target_os = "linux")]
+pub mod ifreq;
 #[cfg(target_os = "linux")]
 pub mod vsock_util;
 
