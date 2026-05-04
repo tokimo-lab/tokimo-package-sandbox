@@ -63,8 +63,6 @@ mod linux {
         FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
         ReplyOpen, ReplyStatfs, ReplyWrite, Request,
     };
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
-
     use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
     use tokimo_package_sandbox::vfs_protocol::{
         AttrOut, EntryOut, Frame, NodeKind, PROTOCOL_VERSION, Req, Res, StatfsOut, WireError,
@@ -221,15 +219,7 @@ mod linux {
 
     fn open_transport(t: &Transport) -> io::Result<OwnedFd> {
         match *t {
-            Transport::Vsock { port } => {
-                // Connect to host CID 2 (VMADDR_CID_HOST). One-shot — the
-                // host listener is up by the time fuse is spawned by init.
-                let sock =
-                    socket(AddressFamily::Vsock, SockType::Stream, SockFlag::empty(), None).map_err(io::Error::from)?;
-                let addr = VsockAddr::new(tokimo_package_sandbox::net_constants::VMADDR_CID_HOST, port);
-                connect(std::os::fd::AsRawFd::as_raw_fd(&sock), &addr).map_err(io::Error::from)?;
-                Ok(sock)
-            }
+            Transport::Vsock { port } => tokimo_package_sandbox::vsock_util::connect_host(port),
             Transport::UnixFd { fd } => {
                 // The fd was passed via fork+inherit; assume it's a SOCK_STREAM unix socket.
                 // Take ownership.
