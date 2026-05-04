@@ -261,8 +261,13 @@ struct TcpFlow {
     upstream_to_guest_rx: chan::Receiver<Vec<u8>>,
     guest_to_upstream_tx: chan::Sender<Vec<u8>>,
     upstream_closed: Arc<AtomicBool>,
+    /// Set to true by tcp_proxy once the upstream TCP connection succeeds.
+    /// The main loop watches this to unpause the SYN-ACK.
+    upstream_ready: Arc<AtomicBool>,
     last_activity: Instant,
     closed: bool,
+    /// True once we have called sock.pause_synack(false).
+    synack_unpaused: bool,
     /// Bytes received from upstream that could not be fully written into the
     /// smoltcp TX buffer in one shot.  The usize is the already-written
     /// offset.  Must be flushed before accepting new upstream buffers.
@@ -438,6 +443,20 @@ fn run(
         let mut tcp_to_remove: Vec<TcpKey> = Vec::new();
         for (key, flow) in tcp_flows.iter_mut() {
             let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
+
+            // Unpause SYN-ACK once upstream connect succeeds; RST if it failed.
+            if !flow.synack_unpaused {
+                if flow.upstream_ready.load(Ordering::Relaxed) {
+                    socket.pause_synack(false);
+                    flow.synack_unpaused = true;
+                } else if flow.upstream_closed.load(Ordering::Relaxed) {
+                    // Connect failed — abort the TCP handshake.
+                    socket.abort();
+                    tcp_to_remove.push(*key);
+                    continue;
+                }
+            }
+
             if socket.can_recv() {
                 let _ = socket.recv(|buf| {
                     if !buf.is_empty() {
@@ -790,16 +809,22 @@ fn register_tcp_flow(
     }
     sock.set_nagle_enabled(false);
     sock.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+    // Hold the SYN-ACK until tcp_proxy confirms the upstream connection is up.
+    // This prevents the guest from starting to send data before we know
+    // whether the upstream is reachable.
+    sock.pause_synack(true);
     let handle = sockets.add(sock);
 
     let (u2g_tx, u2g_rx) = chan::bounded::<Vec<u8>>(64);
     let (g2u_tx, g2u_rx) = chan::bounded::<Vec<u8>>(64);
     let upstream_closed = Arc::new(AtomicBool::new(false));
     let upstream_closed2 = Arc::clone(&upstream_closed);
+    let upstream_ready = Arc::new(AtomicBool::new(false));
+    let upstream_ready2 = Arc::clone(&upstream_ready);
 
     thread::Builder::new()
         .name(format!("net-tcp-{}-{}", key.dst_ip, key.dst_port))
-        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2))
+        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2, upstream_ready2))
         .ok();
 
     tcp_flows.insert(
@@ -809,8 +834,10 @@ fn register_tcp_flow(
             upstream_to_guest_rx: u2g_rx,
             guest_to_upstream_tx: g2u_tx,
             upstream_closed,
+            upstream_ready,
             last_activity: Instant::now(),
             closed: false,
+            synack_unpaused: false,
             pending_to_guest: None,
         },
     );
@@ -822,6 +849,7 @@ fn tcp_proxy(
     u2g_tx: chan::Sender<Vec<u8>>,
     g2u_rx: chan::Receiver<Vec<u8>>,
     upstream_closed: Arc<AtomicBool>,
+    upstream_ready: Arc<AtomicBool>,
 ) {
     let mut up = match TcpStream::connect_timeout(&dst, Duration::from_secs(8)) {
         Ok(s) => s,
@@ -831,6 +859,9 @@ fn tcp_proxy(
             return;
         }
     };
+    // Signal success *before* starting data transfer so the main loop
+    // can unpause the SYN-ACK as soon as possible.
+    upstream_ready.store(true, Ordering::Relaxed);
     let _ = up.set_nodelay(true);
     let _ = up.set_read_timeout(Some(Duration::from_millis(200)));
 

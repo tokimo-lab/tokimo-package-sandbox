@@ -41,6 +41,7 @@ mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 # Userspace network stack — same as Windows/macOS. See src/netstack/.
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+    "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
 # FUSE bridge (guest-side). Used only by the tokimo-sandbox-fuse binary
@@ -58,6 +59,7 @@ mio = { version = "1", features = ["os-poll", "os-ext"] }
 # Userspace network stack — same as Windows. See src/netstack/.
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+    "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
 
@@ -86,6 +88,7 @@ windows-service = "0.8"
 # docs/network-allow-all-failure-investigation.md for the rationale.
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+    "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
 
@@ -101,5 +104,6 @@ path = "src/bin/tokimo-sandbox-fuse/main.rs"
 tracing-subscriber = "0.3"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+    "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
