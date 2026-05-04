@@ -1332,3 +1332,91 @@ fn rootfs_python_version() {
         "expected Python 3.x from packaged rootfs, got: {captured:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9.x HTTPS throughput — verify the smoltcp netstack can carry a real HTTPS
+// download end-to-end, 5 times in series.
+//
+// Uses `curl` inside the sandbox to download a small, stable HTTPS resource
+// and checks:
+//   - HTTP status 200
+//   - total time < 5 seconds per run
+//   - at least 1 KiB transferred (body is not empty)
+//
+// Marked #[ignore] because it requires outbound internet access from the CI
+// runner. Run manually:
+//   PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration \
+//     netstack_https_throughput -- --ignored --test-threads=1 --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn netstack_https_throughput() {
+    const RUNS: usize = 5;
+    const END: &str = "HTTPS_THRU_DONE_7E3C";
+    // Use example.com (IANA-maintained, ~1.2 KiB, stable, no CDN surprises).
+    const URL: &str = "https://example.com/";
+
+    let mut cfg = config("net-https-thru");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    for run in 1..=RUNS {
+        let sentinel = format!("{END}_{run}");
+        // curl -s: silent, -L: follow redirects, -w: write status + time + size
+        // to stdout after the body, -o /dev/null: discard body.
+        let cmd = format!(
+            "curl -s -L -w '\\nHTTPS_STAT=%{{http_code}} T=%{{time_total}} SZ=%{{size_download}}\\n' \
+             -o /dev/null '{URL}'; echo {sentinel}\n"
+        );
+        sb.write_stdin(&shell, cmd.as_bytes()).expect("write_stdin");
+        let out = drain_until(&rx, &shell, &sentinel, Duration::from_secs(30));
+
+        // Parse the curl write-out line.
+        let stat_line = out
+            .lines()
+            .find(|l| l.contains("HTTPS_STAT="))
+            .unwrap_or_else(|| panic!("run {run}: no HTTPS_STAT line in output:\n{out}"));
+
+        let http_code: u32 = stat_line
+            .split("HTTPS_STAT=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let time_secs: f64 = stat_line
+            .split("T=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(f64::MAX);
+
+        let size_bytes: u64 = stat_line
+            .split("SZ=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        assert_eq!(
+            http_code, 200,
+            "run {run}: expected HTTP 200, got {http_code}. curl output:\n{out}"
+        );
+        assert!(
+            time_secs < 5.0,
+            "run {run}: request took {time_secs:.3}s, expected < 5s. curl output:\n{out}"
+        );
+        assert!(
+            size_bytes >= 1024,
+            "run {run}: only {size_bytes} bytes received, expected ≥ 1024. curl output:\n{out}"
+        );
+    }
+
+    sb.stop_vm().ok();
+}
