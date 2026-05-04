@@ -208,26 +208,40 @@ impl SandboxBackend for LinuxBackend {
         let bwrap_path = find_bwrap()?;
 
         // 3. Build bwrap args.
-        let mut args: Vec<String> = vec![
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind",
-            "/bin",
-            "/bin",
-            "--ro-bind",
-            "/sbin",
-            "/sbin",
-            "--ro-bind",
-            "/lib",
-            "/lib",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        if Path::new("/lib64").is_dir() {
-            args.extend(["--ro-bind", "/lib64", "/lib64"].iter().map(|s| s.to_string()));
+        //
+        // Binaries + libraries + user table come from the packaged rootfs
+        // (vm/rootfs/) so all three platforms (Linux/macOS/Windows) see the
+        // same tool versions inside the sandbox. Network/DNS/CA/runtime
+        // config still come from the host: those are environmental, not
+        // packaged content.
+        let vm_dir = crate::vm_dir::find_vm_dir()?;
+        let rootfs = vm_dir.join("rootfs");
+        let rootfs_str = |sub: &str| -> String { rootfs.join(sub).to_string_lossy().into_owned() };
+        for sub in ["usr", "bin", "sbin", "lib", "lib64"] {
+            if !rootfs.join(sub).is_dir() {
+                return Err(Error::other(format!(
+                    "packaged rootfs is missing /{sub}: {}",
+                    rootfs.join(sub).display()
+                )));
+            }
         }
+        let mut args: Vec<String> = vec![
+            "--ro-bind".to_string(),
+            rootfs_str("usr"),
+            "/usr".to_string(),
+            "--ro-bind".to_string(),
+            rootfs_str("bin"),
+            "/bin".to_string(),
+            "--ro-bind".to_string(),
+            rootfs_str("sbin"),
+            "/sbin".to_string(),
+            "--ro-bind".to_string(),
+            rootfs_str("lib"),
+            "/lib".to_string(),
+            "--ro-bind".to_string(),
+            rootfs_str("lib64"),
+            "/lib64".to_string(),
+        ];
         // /sys handling depends on network policy:
         //   - AllowAll: bind-mount host's /sys so the guest sees the same
         //     NIC list as the host (the netns is shared).
@@ -238,14 +252,33 @@ impl SandboxBackend for LinuxBackend {
         //     view, so we cannot use it here.
         // The actual mount is appended below inside the network-policy
         // match block so the two modes stay symmetric.
-        if Path::new("/etc/alternatives").is_dir() {
-            args.extend(
-                ["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
-                    .iter()
-                    .map(|s| s.to_string()),
-            );
+
+        // /etc/alternatives — use rootfs version when present so symlinks
+        // resolve against the packaged binary set. Falls back gracefully.
+        if rootfs.join("etc/alternatives").is_dir() {
+            args.extend([
+                "--ro-bind".to_string(),
+                rootfs_str("etc/alternatives"),
+                "/etc/alternatives".to_string(),
+            ]);
         }
-        // Network/DNS files (only if present on host).
+        // /etc/passwd + /etc/group — always from rootfs so the sandbox
+        // user table is independent of the host.
+        for f in ["etc/passwd", "etc/group"] {
+            if rootfs.join(f).is_file() {
+                args.extend([
+                    "--ro-bind".to_string(),
+                    rootfs_str(f),
+                    format!("/{f}"),
+                ]);
+            } else {
+                return Err(Error::other(format!(
+                    "packaged rootfs is missing /{f}: {}",
+                    rootfs.join(f).display()
+                )));
+            }
+        }
+        // Network/DNS/CA/runtime config — still from the host (only if present).
         for p in [
             "/etc/resolv.conf",
             "/etc/hosts",
@@ -253,9 +286,6 @@ impl SandboxBackend for LinuxBackend {
             "/etc/ssl",
             "/etc/ca-certificates",
             "/etc/pki",
-            // fusermount3 needs /etc/passwd for username lookup.
-            "/etc/passwd",
-            "/etc/group",
         ] {
             if Path::new(p).exists() {
                 args.extend(["--ro-bind".to_string(), p.into(), p.into()]);
