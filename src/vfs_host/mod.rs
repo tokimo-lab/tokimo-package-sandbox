@@ -38,7 +38,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::vfs_backend::{SharedVfsBackend, VfsError, VfsFileInfo, VfsResult};
 use crate::vfs_protocol::wire::{read_frame, write_frame};
 use crate::vfs_protocol::{
-    AttrOut, DirEntry as WireDirEntry, EntryOut, Frame, NodeKind, PROTOCOL_VERSION, Req, Res, StatfsOut, errno_for,
+    AttrOut, DirEntry as WireDirEntry, EntryOut, Frame, NodeKind, Req, Res, StatfsOut, errno_for,
 };
 use id_table::{FhEntry, IdTable, StagingFile};
 
@@ -148,69 +148,13 @@ impl FuseHost {
         let tx = Arc::new(AsyncMutex::new(tx));
 
         // 1. Hello handshake.
-        let Some(first) = read_frame(&mut rx).await? else {
-            return Ok(());
-        };
-        let max_inflight = match first {
-            Frame::Hello {
-                proto_version,
-                max_inflight,
-                mount_name,
-                ..
-            } => {
-                if proto_version != PROTOCOL_VERSION {
-                    let mut tx_guard = tx.lock().await;
-                    let _ = write_frame(
-                        &mut *tx_guard,
-                        &Frame::HelloAck {
-                            proto_version: PROTOCOL_VERSION,
-                            max_inflight: 0,
-                            bound_mount_id: None,
-                        },
-                    )
-                    .await;
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "protocol mismatch: client={} server={}",
-                            proto_version, PROTOCOL_VERSION
-                        ),
-                    ));
-                }
-                let bound_mount_id = mount_name.as_deref().and_then(|n| self.mount_id_by_name(n));
-                if mount_name.is_some() && bound_mount_id.is_none() {
-                    let mut tx_guard = tx.lock().await;
-                    let _ = write_frame(
-                        &mut *tx_guard,
-                        &Frame::HelloAck {
-                            proto_version: PROTOCOL_VERSION,
-                            max_inflight: 0,
-                            bound_mount_id: None,
-                        },
-                    )
-                    .await;
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("mount not registered: {:?}", mount_name),
-                    ));
-                }
-                {
-                    let mut tx_guard = tx.lock().await;
-                    write_frame(
-                        &mut *tx_guard,
-                        &Frame::HelloAck {
-                            proto_version: PROTOCOL_VERSION,
-                            max_inflight,
-                            bound_mount_id,
-                        },
-                    )
-                    .await?;
-                }
-                max_inflight
-            }
-            other => {
-                tracing::warn!("vfs_host: first frame not Hello: {:?}", other);
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "first frame not Hello"));
+        let max_inflight = {
+            let mut guard = tx.lock().await;
+            match crate::vfs_protocol::handshake::server_handshake(&mut rx, &mut *guard, |n| self.mount_id_by_name(n))
+                .await?
+            {
+                Some(mi) => mi,
+                None => return Ok(()),
             }
         };
 

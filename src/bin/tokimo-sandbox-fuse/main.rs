@@ -64,9 +64,7 @@ mod linux {
         ReplyOpen, ReplyStatfs, ReplyWrite, Request,
     };
     use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
-    use tokimo_package_sandbox::vfs_protocol::{
-        AttrOut, EntryOut, Frame, NodeKind, PROTOCOL_VERSION, Req, Res, StatfsOut, WireError,
-    };
+    use tokimo_package_sandbox::vfs_protocol::{AttrOut, EntryOut, Frame, NodeKind, Req, Res, StatfsOut, WireError};
 
     // ---------- CLI ----------
 
@@ -244,35 +242,8 @@ mod linux {
     /// `dup`'d fd for use by the dispatcher.
     fn handshake(fd: OwnedFd, mount_name: &str) -> io::Result<u32> {
         let mut file = File::from(fd);
-        let hello = Frame::Hello {
-            proto_version: PROTOCOL_VERSION,
-            max_inflight: 64,
-            client_name: format!("tokimo-sandbox-fuse pid={}", std::process::id()),
-            mount_name: Some(mount_name.to_string()),
-        };
-        wire::write_frame(&mut file, &hello)?;
-        let ack =
-            wire::read_frame(&mut file)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no HelloAck"))?;
-        match ack {
-            Frame::HelloAck {
-                proto_version,
-                bound_mount_id,
-                ..
-            } => {
-                if proto_version != PROTOCOL_VERSION {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("proto mismatch: server={} client={}", proto_version, PROTOCOL_VERSION),
-                    ));
-                }
-                bound_mount_id
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "server did not bind mount_name"))
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected HelloAck, got {other:?}"),
-            )),
-        }
+        let client_name = format!("tokimo-sandbox-fuse pid={}", std::process::id());
+        tokimo_package_sandbox::vfs_protocol::handshake::client_handshake(&mut file, mount_name, &client_name)
     }
 
     // ---------- Dispatcher: serialise wire writes, route responses by req_id ----------

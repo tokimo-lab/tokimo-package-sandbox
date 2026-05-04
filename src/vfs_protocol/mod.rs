@@ -12,6 +12,7 @@
 //! See [`plan/cross-platform-fuse-vfs.md`](../../plan/cross-platform-fuse-vfs.md)
 //! for the design rationale and op table.
 
+pub mod handshake;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
