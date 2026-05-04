@@ -398,8 +398,16 @@ fn run(
 
     let idle_timeout = Duration::from_secs(120);
 
+    // Holds a frame received during the poll_delay sleep so it isn't lost.
+    let mut lookahead: Option<Vec<u8>> = None;
+
     while !shutdown.load(Ordering::Relaxed) {
         let mut staged: Vec<Vec<u8>> = Vec::new();
+        // Process any frame buffered during last iteration's sleep first.
+        if let Some(frame) = lookahead.take() {
+            inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
+            staged.push(frame);
+        }
         while let Ok(frame) = rx_in_rx.try_recv() {
             inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
             staged.push(frame);
@@ -568,7 +576,18 @@ fn run(
             }
         }
 
-        thread::sleep(Duration::from_millis(5));
+        // Sleep until smoltcp needs to run again or a new frame arrives.
+        // poll_delay() returns None when no timers are pending (wait forever
+        // on input); Some(d) means we must wake within d to service retransmits
+        // / keepalives.  Cap at 50ms so flow-idle checks run reasonably often.
+        let poll_delay = iface
+            .poll_delay(smol_now(), &sockets)
+            .map(|d| Duration::from_micros(d.total_micros()))
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
+        if let Ok(frame) = rx_in_rx.recv_timeout(poll_delay) {
+            lookahead = Some(frame);
+        }
     }
 
     drop(writer);
