@@ -611,6 +611,50 @@ fn get_session(conn: &Connection, sessions: &WindowsRegistry) -> Result<Arc<Shar
         .ok_or_else(|| RpcError::new("session_lost", "session no longer exists"))
 }
 
+/// Perform the server-side `Hello` / `Hello` (reply) handshake.
+///
+/// Both sides send `Frame::Hello` (not a separate `HelloAck`). The client
+/// sends first; the server reads, validates the version, and replies with its
+/// own `Hello`. Returns `Ok(peer)` on success, `Err(())` if the connection
+/// should be torn down (version mismatch, unexpected frame, or I/O error).
+/// The caller is responsible for calling `disconnect(pipe)` on `Err`.
+fn server_hello_handshake(pipe: HANDLE, conn: &Arc<Connection>) -> Result<String, ()> {
+    match read_frame(pipe) {
+        Ok(Frame::Hello { version, peer, .. }) => {
+            slog!("[svc] hello from {peer} (proto v{version})");
+            if version != PROTOCOL_VERSION {
+                slog!("[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}");
+                let _ = send_frame(
+                    conn,
+                    &Frame::Hello {
+                        version: PROTOCOL_VERSION,
+                        peer: format!("tokimo-sandbox-svc/{VERSION}"),
+                        info: json!({ "error": "protocol_version_mismatch" }),
+                    },
+                );
+                return Err(());
+            }
+            let _ = send_frame(
+                conn,
+                &Frame::Hello {
+                    version: PROTOCOL_VERSION,
+                    peer: format!("tokimo-sandbox-svc/{VERSION}"),
+                    info: json!({}),
+                },
+            );
+            Ok(peer)
+        }
+        Ok(other) => {
+            slog!("[svc] expected Hello, got {other:?}");
+            Err(())
+        }
+        Err(e) => {
+            slog!("[svc] failed to read Hello: {e}");
+            Err(())
+        }
+    }
+}
+
 fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
     let caller = caller_image_path(pipe);
     match &caller {
@@ -657,42 +701,9 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
         std::thread::spawn(move || owner_pid_waiter(pid, conn_w, sessions_w));
     }
     // Hello handshake.
-    match read_frame(pipe) {
-        Ok(Frame::Hello { version, peer, .. }) => {
-            slog!("[svc] hello from {peer} (proto v{version})");
-            if version != PROTOCOL_VERSION {
-                slog!("[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}");
-                let _ = send_frame(
-                    &conn,
-                    &Frame::Hello {
-                        version: PROTOCOL_VERSION,
-                        peer: format!("tokimo-sandbox-svc/{VERSION}"),
-                        info: json!({ "error": "protocol_version_mismatch" }),
-                    },
-                );
-                disconnect(pipe);
-                return;
-            }
-            // Reply with our Hello.
-            let _ = send_frame(
-                &conn,
-                &Frame::Hello {
-                    version: PROTOCOL_VERSION,
-                    peer: format!("tokimo-sandbox-svc/{VERSION}"),
-                    info: json!({}),
-                },
-            );
-        }
-        Ok(other) => {
-            slog!("[svc] expected Hello, got {other:?}");
-            disconnect(pipe);
-            return;
-        }
-        Err(e) => {
-            slog!("[svc] failed to read Hello: {e}");
-            disconnect(pipe);
-            return;
-        }
+    if server_hello_handshake(pipe, &conn).is_err() {
+        disconnect(pipe);
+        return;
     }
 
     // Persistent RPC dispatch loop — concurrent, not serial.
