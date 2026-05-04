@@ -239,6 +239,10 @@ fn run() -> Result<(), String> {
         Ok(()) => eprintln!("[tokimo-sandbox-init] ensured /home/tokimo (uid=1000:gid=1000)"),
         Err(e) => eprintln!("[tokimo-sandbox-init] WARN: ensure_tokimo_home: {e}"),
     }
+    match ensure_workspaces_root() {
+        Ok(()) => eprintln!("[tokimo-sandbox-init] ensured /work (uid=1000:gid=1000)"),
+        Err(e) => eprintln!("[tokimo-sandbox-init] WARN: ensure_workspaces_root: {e}"),
+    }
 
     // bwrap mode: the host stages /dev as tmpfs + bind-mounts a small set of
     // device nodes (null/zero/full/random/urandom/tty), but devpts and ptmx
@@ -577,6 +581,19 @@ fn ensure_tokimo_home() -> std::io::Result<()> {
     std::fs::set_permissions("/home/tokimo/agents", perms)?;
     chown("/home/tokimo", Some(1000), Some(1000))?;
     chown("/home/tokimo/agents", Some(1000), Some(1000))?;
+    Ok(())
+}
+
+/// Ensures `/work` exists with tokimo ownership; per-agent fuse mount points
+/// are created as `/work/<sanitized>` subdirectories at agent build time.
+#[cfg(target_os = "linux")]
+fn ensure_workspaces_root() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::chown;
+    std::fs::create_dir_all("/work")?;
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions("/work", perms)?;
+    chown("/work", Some(1000), Some(1000))?;
     Ok(())
 }
 
