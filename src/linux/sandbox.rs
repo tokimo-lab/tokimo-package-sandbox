@@ -274,9 +274,25 @@ impl SandboxBackend for LinuxBackend {
                 )));
             }
         }
-        // Network/DNS/CA/runtime config — still from the host (only if present).
+        // /etc/resolv.conf: write a fresh one pointing at the gateway so the
+        // userspace netstack handles DNS (matches VM-mode init.sh behavior).
+        // Host's resolv.conf is intentionally NOT bind-mounted — that would
+        // leak host DNS topology into the sandbox.
+        let _resolv_conf_file = {
+            let mut tmp =
+                tempfile::NamedTempFile::new().map_err(|e| Error::other(format!("create resolv.conf tmpfile: {e}")))?;
+            use std::io::Write;
+            tmp.write_all(b"nameserver 192.168.127.1\n")
+                .map_err(|e| Error::other(format!("write resolv.conf: {e}")))?;
+            args.extend([
+                "--ro-bind".to_string(),
+                tmp.path().to_string_lossy().into_owned(),
+                "/etc/resolv.conf".to_string(),
+            ]);
+            tmp
+        };
+        // Other network/DNS/CA/runtime config — still from the host (only if present).
         for p in [
-            "/etc/resolv.conf",
             "/etc/hosts",
             "/etc/nsswitch.conf",
             "/etc/ssl",

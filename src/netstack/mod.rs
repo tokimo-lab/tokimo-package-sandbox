@@ -59,6 +59,7 @@ use smoltcp::wire::{
     TcpPacket, UdpPacket,
 };
 
+mod host_dns;
 mod icmp;
 
 // ─── Topology constants ──────────────────────────────────────────────────────
@@ -150,6 +151,10 @@ pub struct LocalService {
 struct RouteCtx {
     egress: EgressPolicy,
     local_services: Vec<LocalService>,
+    /// Upstream DNS resolver used to proxy guest queries sent to the
+    /// gateway IP on port 53. Discovered at netstack start. `None`
+    /// disables DNS proxying (queries to the gateway will time out).
+    host_dns: Option<SocketAddr>,
 }
 
 impl RouteCtx {
@@ -296,6 +301,11 @@ struct UdpFlow {
     /// IP family; v4↔v6 replies from wrong family are discarded.
     family_v4: bool,
     last_activity: Instant,
+    /// If `Some`, this flow is a guest→gateway:53 DNS proxy: outbound
+    /// packets are sent to this resolver instead of the literal gateway IP,
+    /// and reply frames spoof their source as the gateway:53 so the guest
+    /// resolver accepts them.
+    dns_rewrite: Option<SocketAddr>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -312,7 +322,17 @@ pub fn spawn(
     egress: EgressPolicy,
     local_services: Vec<LocalService>,
 ) -> thread::JoinHandle<()> {
-    let ctx = RouteCtx { egress, local_services };
+    let host_dns = host_dns::detect();
+    if let Some(d) = host_dns {
+        eprintln!("[netstack] host DNS resolver: {d}");
+    } else {
+        eprintln!("[netstack] no host DNS resolver detected; gateway:53 proxy disabled");
+    }
+    let ctx = RouteCtx {
+        egress,
+        local_services,
+        host_dns,
+    };
     thread::Builder::new()
         .name("tokimo-netstack".into())
         .spawn(move || {
@@ -538,8 +558,12 @@ fn run(
             // Guest → upstream: drain smoltcp recv buffer, forward to real server.
             if sock.can_recv() {
                 while let Ok((data, meta)) = sock.recv() {
-                    let dst_ip = meta.local_address.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
-                    let dst = SocketAddr::new(ipaddr_to_std(dst_ip), key.dst_port);
+                    let dst = if let Some(rewrite) = flow.dns_rewrite {
+                        rewrite
+                    } else {
+                        let dst_ip = meta.local_address.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
+                        SocketAddr::new(ipaddr_to_std(dst_ip), key.dst_port)
+                    };
                     let _ = flow.upstream.send_to(data, dst);
                     flow.remote = meta.endpoint;
                     flow.last_activity = now;
@@ -552,16 +576,28 @@ fn run(
             loop {
                 match flow.upstream.recv_from(&mut buf) {
                     Ok((n, from)) => {
-                        // Reply src IP = the actual upstream responder, not a
-                        // stored value. This is correct even when the guest
-                        // talks to several upstream IPs on the same dst port
-                        // (e.g. multiple DNS servers).
-                        match (from.ip(), flow.remote.addr, flow.family_v4) {
+                        // For DNS-proxied flows the guest sent to the gateway,
+                        // so the reply must appear to come from the gateway —
+                        // not from the real upstream resolver. Otherwise the
+                        // guest resolver discards it as a martian response.
+                        let (src_ip_addr, src_port) = if flow.dns_rewrite.is_some() {
+                            (
+                                if flow.family_v4 {
+                                    IpAddr::V4(std::net::Ipv4Addr::from(HOST_IP.octets()))
+                                } else {
+                                    IpAddr::V6(std::net::Ipv6Addr::from(HOST_IP6.octets()))
+                                },
+                                key.dst_port,
+                            )
+                        } else {
+                            (from.ip(), from.port())
+                        };
+                        match (src_ip_addr, flow.remote.addr, flow.family_v4) {
                             (IpAddr::V4(s), IpAddress::Ipv4(d), true) => {
                                 let frame = build_udp_reply_ethernet_frame_v4(
                                     &s.octets(),
                                     &d.octets(),
-                                    from.port(),
+                                    src_port,
                                     flow.remote.port,
                                     &buf[..n],
                                 );
@@ -572,7 +608,7 @@ fn run(
                                 let frame = build_udp_reply_ethernet_frame_v6(
                                     &s.octets(),
                                     &d.octets(),
-                                    from.port(),
+                                    src_port,
                                     flow.remote.port,
                                     &buf[..n],
                                 );
@@ -781,7 +817,7 @@ fn dispatch_l4(
             if udp_flows.contains_key(&key) {
                 return;
             }
-            register_udp_flow(key, sockets, udp_flows);
+            register_udp_flow(key, sockets, udp_flows, ctx);
             let _ = tx_out_tx;
         }
         IpProtocol::Icmp => {
@@ -920,7 +956,12 @@ fn tcp_proxy(
     }
 }
 
-fn register_udp_flow(key: UdpKey, sockets: &mut SocketSet<'_>, udp_flows: &mut HashMap<UdpKey, UdpFlow>) {
+fn register_udp_flow(
+    key: UdpKey,
+    sockets: &mut SocketSet<'_>,
+    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    ctx: &RouteCtx,
+) {
     // smoltcp UDP socket bound to key.dst_port.  With any_ip=true this catches
     // all guest traffic to that port regardless of dst IP.  Note: two concurrent
     // flows with the same dst_port but different src will both try to bind; the
@@ -952,7 +993,18 @@ fn register_udp_flow(key: UdpKey, sockets: &mut SocketSet<'_>, udp_flows: &mut H
     // the newly-created socket in the next burst poll and the main loop will
     // forward it then.  Forwarding here too would double-send the packet.
 
-    let upstream_dst = SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port);
+    // DNS proxy: guest queries to (gateway, 53) get redirected to the host's
+    // real resolver so the guest's /etc/resolv.conf can safely point at the
+    // gateway IP without leaking host DNS topology.
+    let is_gateway = matches!(key.dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
+        || matches!(key.dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
+    let dns_rewrite = if is_gateway && key.dst_port == 53 {
+        ctx.host_dns
+    } else {
+        None
+    };
+
+    let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port));
     udp_flows.insert(
         key,
         UdpFlow {
@@ -964,12 +1016,16 @@ fn register_udp_flow(key: UdpKey, sockets: &mut SocketSet<'_>, udp_flows: &mut H
             },
             family_v4: matches!(key.dst_ip, IpAddress::Ipv4(_)),
             last_activity: Instant::now(),
+            dns_rewrite,
         },
     );
 
     eprintln!(
-        "[netstack] udp flow opened {}:{} → {}",
-        key.src_ip, key.src_port, upstream_dst
+        "[netstack] udp flow opened {}:{} → {}{}",
+        key.src_ip,
+        key.src_port,
+        upstream_dst,
+        if dns_rewrite.is_some() { " (dns proxy)" } else { "" }
     );
 }
 
