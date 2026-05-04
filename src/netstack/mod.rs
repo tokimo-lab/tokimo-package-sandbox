@@ -354,8 +354,12 @@ fn run(
         }
     })?;
 
+    // TX-only device after initialisation: the rx side is permanently closed so
+    // smoltcp never reads frames directly from the main channel.  All guest RX
+    // frames are routed through inspect_and_register → burst_dev instead.
+    let (_, dead_rx) = chan::bounded::<Vec<u8>>(0); // sender dropped → always Err
     let mut device = StreamDevice {
-        rx: rx_in_rx.clone(),
+        rx: dead_rx,
         tx: tx_out_tx.clone(),
     };
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(HOST_MAC)));
@@ -391,11 +395,15 @@ fn run(
             inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
             staged.push(frame);
         }
-        if !staged.is_empty() {
+        // Feed staged frames (possibly empty) to smoltcp via a one-shot
+        // device.  When staged is empty the channel drains immediately and
+        // smoltcp still runs to emit ACKs / retransmits / keepalives.
+        {
             let (re_tx, re_rx) = chan::unbounded::<Vec<u8>>();
             for f in staged.drain(..) {
                 let _ = re_tx.send(f);
             }
+            drop(re_tx); // disconnect → receive() → None once drained
             let mut burst_dev = StreamDevice {
                 rx: re_rx,
                 tx: tx_out_tx.clone(),
@@ -407,8 +415,6 @@ fn run(
                     PollResult::None => break,
                 }
             }
-        } else {
-            iface.poll(smol_now(), &mut device, &mut sockets);
         }
 
         let now = Instant::now();
@@ -527,12 +533,6 @@ fn run(
             if let Some(flow) = udp_flows.remove(&port) {
                 sockets.remove(flow.sock_handle);
             }
-        }
-
-        // 3b. Flush: poll again to transmit any frames queued above.
-        {
-            use smoltcp::iface::PollResult;
-            while let PollResult::SocketStateChanged = iface.poll(smol_now(), &mut device, &mut sockets) {}
         }
 
         thread::sleep(Duration::from_millis(5));
