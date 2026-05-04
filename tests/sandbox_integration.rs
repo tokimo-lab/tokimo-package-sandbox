@@ -1351,10 +1351,10 @@ fn rootfs_python_version() {
 #[test]
 #[ignore]
 fn netstack_https_throughput() {
-    const RUNS: usize = 5;
+    const RUNS: usize = 10;
     const END: &str = "HTTPS_THRU_DONE_7E3C";
-    // Use example.com (IANA-maintained, ~1.2 KiB, stable, no CDN surprises).
-    const URL: &str = "https://example.com/";
+    // Google: stable, large response, exercises real-world throughput.
+    const URL: &str = "https://www.google.com/";
 
     let mut cfg = config("net-https-thru");
     cfg.network = NetworkPolicy::AllowAll;
@@ -1409,8 +1409,8 @@ fn netstack_https_throughput() {
             "run {run}: expected HTTP 200, got {http_code}. curl output:\n{out}"
         );
         assert!(
-            time_secs < 10.0,
-            "run {run}: request took {time_secs:.3}s, expected < 10s. curl output:\n{out}"
+            time_secs < 20.0,
+            "run {run}: request took {time_secs:.3}s, expected < 20s. curl output:\n{out}"
         );
         assert!(
             size_bytes >= 256,
