@@ -15,9 +15,7 @@
 //! (see `src/vfs_host/`). The only directory share that remains as
 //! virtio-fs is `work` (the rootfs / chroot base).
 
-use std::env;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,69 +71,7 @@ pub struct VmConfig {
     pub network: NetworkPolicy,
 }
 
-/// Locate the VM artifacts: vmlinuz (file), initrd.img (file), rootfs/ (dir).
-///
-/// Priority:
-/// 1. `TOKIMO_VM_DIR` env var.
-/// 2. `<repo>/vm/` walking up from `current_exe()` and `current_dir()`.
-/// 3. `~/.tokimo/`.
-pub fn find_vm_dir() -> Result<PathBuf> {
-    if let Ok(dir) = env::var("TOKIMO_VM_DIR") {
-        let p = PathBuf::from(dir);
-        if validate_vm_dir(&p) {
-            return Ok(p);
-        }
-        return Err(Error::other(format!(
-            "TOKIMO_VM_DIR={} does not contain vmlinuz, initrd.img and a rootfs/ directory",
-            p.display()
-        )));
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        let mut cur: &Path = exe.as_path();
-        for _ in 0..8 {
-            if let Some(parent) = cur.parent() {
-                let vm_dir = parent.join("vm");
-                if validate_vm_dir(&vm_dir) {
-                    return Ok(vm_dir);
-                }
-                cur = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    if let Ok(cwd) = env::current_dir() {
-        let mut cur: &Path = cwd.as_path();
-        for _ in 0..8 {
-            let vm_dir = cur.join("vm");
-            if validate_vm_dir(&vm_dir) {
-                return Ok(vm_dir);
-            }
-            if let Some(parent) = cur.parent() {
-                cur = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".tokimo");
-        if validate_vm_dir(&p) {
-            return Ok(p);
-        }
-    }
-
-    Err(Error::other(
-        "VM artifacts not found. Set TOKIMO_VM_DIR, or place vmlinuz + initrd.img + rootfs/ in <repo>/vm/ or ~/.tokimo/.",
-    ))
-}
-
-fn validate_vm_dir(dir: &Path) -> bool {
-    dir.join("vmlinuz").is_file() && dir.join("initrd.img").is_file() && dir.join("rootfs").is_dir()
-}
+pub use crate::vm_dir::find_vm_dir;
 
 /// Boot the VM and connect to the guest's vsock listener.
 pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {

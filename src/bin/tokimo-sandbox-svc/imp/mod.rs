@@ -1681,7 +1681,9 @@ fn find_artifact(name: &str) -> Result<PathBuf, String> {
             d = p.parent().map(Path::to_path_buf);
         }
     }
-    Err(format!("could not locate vm/{name} (no env vars consulted)"))
+    Err(format!(
+        "could not locate vm/{name}. Place vmlinuz + initrd.img + rootfs.vhdx in <repo>/vm/. Run scripts/windows/fetch-vm.ps1 to download."
+    ))
 }
 
 // ---------------------------------------------------------------------------

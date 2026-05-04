@@ -31,6 +31,7 @@ pub(crate) mod shared_backend;
 pub mod net_constants;
 pub mod protocol;
 pub mod svc_protocol;
+pub mod vm_dir;
 
 #[cfg(target_os = "linux")]
 pub mod ifreq;
