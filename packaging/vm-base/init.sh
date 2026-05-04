@@ -235,8 +235,8 @@ if [ "$SESSION_MODE" = 1 ]; then
             if [ "$NETDNS" = "on" ]; then
                 /bin/busybox ip route add default via 192.168.127.1 dev tk0 2>/dev/null || true
                 /bin/busybox ip -6 route add default via fd00:7f::1 dev tk0 2>/dev/null || true
-                echo "nameserver 1.1.1.1" > /newroot/etc/resolv.conf 2>/dev/null || true
-                echo "nameserver 8.8.8.8" >> /newroot/etc/resolv.conf 2>/dev/null || true
+                # Point at the gateway; netstack proxies :53 to host's resolver.
+                echo "nameserver 192.168.127.1" > /newroot/etc/resolv.conf 2>/dev/null || true
             fi
             # Even with NETDNS=off, the /24 directly-attached route from
             # `ip addr add` covers traffic to the gateway IP itself.
