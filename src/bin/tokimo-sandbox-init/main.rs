@@ -221,17 +221,6 @@ fn run() -> Result<(), String> {
         if let Err(e) = chroot("/mnt/work") {
             return Err(format!("chroot /mnt/work: {e}"));
         }
-
-        // Ensure /home/tokimo and /home/tokimo/agents exist and are owned by
-        // uid=1000:gid=1000 so subsequent unprivileged spawn_shell calls
-        // (which drop to uid=1000) can create per-agent workspace
-        // directories under /home/tokimo/agents/<sanitized>.
-        match ensure_tokimo_home() {
-            Ok(()) => {
-                eprintln!("[tokimo-sandbox-init] ensured /home/tokimo (uid=1000:gid=1000)");
-            }
-            Err(e) => eprintln!("[tokimo-sandbox-init] WARN: ensure_tokimo_home: {e}"),
-        }
     } else if !pre_chrooted && bwrap_cli.as_ref().map(|c| c.mount_sysfs).unwrap_or(false) {
         // bwrap + Blocked mode: host provides an empty /sys; mount fresh
         // sysfs here so `/sys/class/net` is filtered by our new netns.
@@ -240,6 +229,15 @@ fn run() -> Result<(), String> {
             Err(e) if e.contains("Resource busy") || e.contains("16") => {}
             Err(e) => eprintln!("[tokimo-sandbox-init] WARN: mount /sys: {e}"),
         }
+    }
+
+    // Ensure /home/tokimo and /home/tokimo/agents exist and are owned by
+    // uid=1000:gid=1000 BEFORE any unprivileged spawn_shell drops privileges.
+    // Applies to all modes: VM (post-chroot above), pre_chrooted (init.sh
+    // chrooted before exec), bwrap (host set up the user_ns).
+    match ensure_tokimo_home() {
+        Ok(()) => eprintln!("[tokimo-sandbox-init] ensured /home/tokimo (uid=1000:gid=1000)"),
+        Err(e) => eprintln!("[tokimo-sandbox-init] WARN: ensure_tokimo_home: {e}"),
     }
 
     // bwrap mode: the host stages /dev as tmpfs + bind-mounts a small set of
