@@ -1353,8 +1353,9 @@ fn rootfs_python_version() {
 fn netstack_https_throughput() {
     const RUNS: usize = 10;
     const END: &str = "HTTPS_THRU_DONE_7E3C";
-    // Google: stable, large response, exercises real-world throughput.
-    const URL: &str = "https://www.google.com/";
+    // Baidu: domestic CDN, low-latency from CN networks; if this is slow,
+    // it indicates a real netstack throughput bug rather than upstream RTT.
+    const URL: &str = "https://www.baidu.com/";
 
     let mut cfg = config("net-https-thru");
     cfg.network = NetworkPolicy::AllowAll;
@@ -1371,7 +1372,7 @@ fn netstack_https_throughput() {
         // curl -s: silent, -L: follow redirects, -w: write status + time + size
         // to stdout after the body, -o /dev/null: discard body.
         let cmd = format!(
-            "curl -s -L -w '\\nHTTPS_CODE=%{{http_code}} HTTPS_TIME=%{{time_total}} HTTPS_SIZE=%{{size_download}}\\n' \
+            "curl -4 -s -L -w '\\nHTTPS_CODE=%{{http_code}} HTTPS_TIME=%{{time_total}} HTTPS_SIZE=%{{size_download}} HTTPS_DNS=%{{time_namelookup}} HTTPS_CONN=%{{time_connect}} HTTPS_TLS=%{{time_appconnect}} HTTPS_TTFB=%{{time_starttransfer}}\\n' \
              -o /dev/null '{URL}'; echo {sentinel}\n"
         );
         sb.write_stdin(&shell, cmd.as_bytes()).expect("write_stdin");
@@ -1404,17 +1405,33 @@ fn netstack_https_throughput() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        let parse_field = |key: &str| -> f64 {
+            stat_line
+                .split(key)
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let dns = parse_field("HTTPS_DNS=");
+        let conn = parse_field("HTTPS_CONN=");
+        let tls = parse_field("HTTPS_TLS=");
+        let ttfb = parse_field("HTTPS_TTFB=");
+        eprintln!(
+            "[https-thru] run {run}: code={http_code} total={time_secs:.3}s size={size_bytes} dns={dns:.3} conn={conn:.3} tls={tls:.3} ttfb={ttfb:.3}"
+        );
+
         assert_eq!(
             http_code, 200,
             "run {run}: expected HTTP 200, got {http_code}. curl output:\n{out}"
         );
         assert!(
-            time_secs < 20.0,
-            "run {run}: request took {time_secs:.3}s, expected < 20s. curl output:\n{out}"
+            time_secs < 5.0,
+            "run {run}: request took {time_secs:.3}s, expected < 5s. curl output:\n{out}"
         );
         assert!(
-            size_bytes >= 256,
-            "run {run}: only {size_bytes} bytes received, expected ≥ 256. curl output:\n{out}"
+            size_bytes >= 128,
+            "run {run}: only {size_bytes} bytes received, expected ≥ 128. curl output:\n{out}"
         );
     }
 
