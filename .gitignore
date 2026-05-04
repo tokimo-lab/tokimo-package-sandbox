@@ -1,4 +1,5 @@
 /target
+/target-staging
 Cargo.lock
 *.swp
 .DS_Store

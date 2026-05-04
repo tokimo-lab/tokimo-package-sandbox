@@ -64,8 +64,11 @@ use tokimo_package_sandbox::{ConfigureParams, Mount, NetworkPolicy};
 mod hcs;
 mod hvsock;
 mod netstack;
+mod svclog;
 mod vhdx_pool;
 mod vmconfig;
+
+use svclog::slog;
 
 /// Convert an [`hvsock::HvSock`] to a [`tokio::net::TcpStream`].
 ///
@@ -122,6 +125,7 @@ static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 // ---------------------------------------------------------------------------
 
 pub fn run() {
+    svclog::init_log();
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
@@ -366,11 +370,11 @@ fn pipe_server_loop(console_mode: bool) {
         }
     };
     let pipe_name = HSTRING::from(PIPE_NAME);
-    eprintln!("[svc] listening on {PIPE_NAME} (v{VERSION})");
+    slog!("[svc] listening on {PIPE_NAME} (v{VERSION})");
     if verify_caller_required() {
-        eprintln!("[svc] caller signature verification: ENFORCED");
+        slog!("[svc] caller signature verification: ENFORCED");
     } else {
-        eprintln!("[svc] caller signature verification: log-only");
+        slog!("[svc] caller signature verification: log-only");
     }
 
     while !SHUTDOWN.load(Ordering::Relaxed) {
@@ -388,7 +392,7 @@ fn pipe_server_loop(console_mode: bool) {
             )
         };
         if pipe == INVALID_HANDLE_VALUE {
-            eprintln!("[svc] CreateNamedPipeW failed: {:?}", unsafe { GetLastError() });
+            slog!("[svc] CreateNamedPipeW failed: {:?}", unsafe { GetLastError() });
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
@@ -396,7 +400,7 @@ fn pipe_server_loop(console_mode: bool) {
         let connect_evt = match create_event() {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("[svc] CreateEventW failed: {e}");
+                slog!("[svc] CreateEventW failed: {e}");
                 let _ = unsafe { CloseHandle(pipe) };
                 continue;
             }
@@ -598,21 +602,21 @@ fn get_session(conn: &Connection, sessions: &WindowsRegistry) -> Result<Arc<Shar
 fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
     let caller = caller_image_path(pipe);
     match &caller {
-        Some(p) => eprintln!("[svc] client connected: {}", p.display()),
-        None => eprintln!("[svc] client connected: <unknown caller>"),
+        Some(p) => slog!("[svc] client connected: {}", p.display()),
+        None => slog!("[svc] client connected: <unknown caller>"),
     }
 
     if verify_caller_required() {
         match caller.as_deref().and_then(safe_canon_or_log) {
             Some(canon) => {
                 if let Err(why) = verify_authenticode(&canon) {
-                    eprintln!("[svc] REJECT unsigned/untrusted caller {}: {why}", canon.display());
+                    slog!("[svc] REJECT unsigned/untrusted caller {}: {why}", canon.display());
                     disconnect(pipe);
                     return;
                 }
             }
             None => {
-                eprintln!("[svc] REJECT caller: could not resolve image path");
+                slog!("[svc] REJECT caller: could not resolve image path");
                 disconnect(pipe);
                 return;
             }
@@ -643,9 +647,9 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
     // Hello handshake.
     match read_frame(pipe) {
         Ok(Frame::Hello { version, peer, .. }) => {
-            eprintln!("[svc] hello from {peer} (proto v{version})");
+            slog!("[svc] hello from {peer} (proto v{version})");
             if version != PROTOCOL_VERSION {
-                eprintln!("[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}");
+                slog!("[svc] protocol version mismatch: client={version}, svc={PROTOCOL_VERSION}");
                 let _ = send_frame(
                     &conn,
                     &Frame::Hello {
@@ -668,12 +672,12 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
             );
         }
         Ok(other) => {
-            eprintln!("[svc] expected Hello, got {other:?}");
+            slog!("[svc] expected Hello, got {other:?}");
             disconnect(pipe);
             return;
         }
         Err(e) => {
-            eprintln!("[svc] failed to read Hello: {e}");
+            slog!("[svc] failed to read Hello: {e}");
             disconnect(pipe);
             return;
         }
@@ -698,7 +702,7 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
             Ok(f) => f,
             Err(e) => {
                 if DEBUG_LOGGING.load(Ordering::Relaxed) {
-                    eprintln!("[svc] connection closed: {e}");
+                    slog!("[svc] connection closed: {e}");
                 }
                 break;
             }
@@ -724,7 +728,7 @@ fn handle_client(pipe: HANDLE, sessions: WindowsRegistry) {
                         },
                     };
                     if let Err(e) = send_frame(&conn_t, &resp) {
-                        eprintln!("[svc] write response failed: {e}");
+                        slog!("[svc] write response failed: {e}");
                     }
                     tracker_t.end();
                 });
@@ -887,7 +891,7 @@ fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsReg
     {
         let mut st = shared.state.lock().unwrap();
         if st.running {
-            eprintln!("[svc] reusing existing session {key}");
+            slog!("[svc] reusing existing session {key}");
             // Refresh owner_pid for the rebind so management RPCs and
             // the owner-PID waiter associate the live caller with the
             // session.
@@ -954,7 +958,7 @@ fn handle_stop_session(
         st.owner_pid.map(is_pid_alive).unwrap_or(false)
     };
     if owner_alive {
-        eprintln!(
+        slog!(
             "[svc] stop_session: forcibly stopping session {} whose owner pid is still alive",
             p.name
         );
@@ -1904,7 +1908,7 @@ fn safe_canon_or_log(p: &Path) -> Option<PathBuf> {
     match canonicalize_safe(p) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("[svc] path rejected ({}): {e}", p.display());
+            slog!("[svc] path rejected ({}): {e}", p.display());
             None
         }
     }
@@ -1993,7 +1997,7 @@ fn owner_pid_waiter(pid: u32, conn: Arc<Connection>, sessions: WindowsRegistry) 
     let proc_h = match unsafe { OpenProcess(access, false, pid) } {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("[svc] owner-waiter: OpenProcess({pid}) failed: {e}");
+            slog!("[svc] owner-waiter: OpenProcess({pid}) failed: {e}");
             return;
         }
     };
@@ -2003,14 +2007,14 @@ fn owner_pid_waiter(pid: u32, conn: Arc<Connection>, sessions: WindowsRegistry) 
 
     let bound = conn.session_id.lock().unwrap().clone();
     let Some(key) = bound else {
-        eprintln!("[svc] owner-waiter: pid {pid} exited; no session bound — nothing to do");
+        slog!("[svc] owner-waiter: pid {pid} exited; no session bound — nothing to do");
         return;
     };
     let Some(shared) = sessions.get(&key) else {
-        eprintln!("[svc] owner-waiter: pid {pid} exited; session {key} already gone");
+        slog!("[svc] owner-waiter: pid {pid} exited; session {key} already gone");
         return;
     };
-    eprintln!("[svc] owner-waiter: pid {pid} exited; tearing down session {key}");
+    slog!("[svc] owner-waiter: pid {pid} exited; tearing down session {key}");
     {
         let mut st = shared.state.lock().unwrap();
         teardown_session(&mut st);
