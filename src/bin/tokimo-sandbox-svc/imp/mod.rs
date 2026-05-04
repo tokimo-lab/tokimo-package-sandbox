@@ -432,12 +432,21 @@ fn pipe_server_loop(console_mode: bool) {
 
 /// Per-spawned-child handle held by the service.
 struct ChildEntry {
-    /// Joiner for the per-child poller thread; dropped on `kill` so the
-    /// thread can exit cleanly.
-    _joiner: thread::JoinHandle<()>,
     /// Set to `true` once the child's exit has been observed and the
-    /// `EV_EXIT` event sent.
+    /// `EV_EXIT` event sent by the session dispatcher thread.
     finished: Arc<AtomicBool>,
+}
+
+/// Handle for the single per-session event-dispatch thread that drains
+/// stdout / stderr / exit events for all children in the session.
+struct DispatcherHandle {
+    stop: Arc<AtomicBool>,
+    /// Kept so the thread is detached (and its resources freed) when the
+    /// session is torn down.  We never join inside `teardown_session`
+    /// because the caller holds the session mutex and the dispatcher also
+    /// acquires it; instead we rely on `stop` + a dead init to make the
+    /// thread exit promptly on its own.
+    _join: thread::JoinHandle<()>,
 }
 
 struct SessionState {
@@ -450,6 +459,9 @@ struct SessionState {
     /// Child ID of the auto-started shell (set by startVm).
     shell_child_id: Option<String>,
     children: HashMap<String, ChildEntry>,
+    /// Single dispatch thread consuming events for all children in this
+    /// session (stdout / stderr / exit → `EV_*` frames on the pipe).
+    dispatcher: Option<DispatcherHandle>,
     /// FUSE-over-vsock host serving all user mounts.
     fuse_host: Option<Arc<FuseHost>>,
     /// Vsock port the FUSE listener accepts connections on.
@@ -484,6 +496,7 @@ impl Default for SessionState {
             vhdx: None,
             shell_child_id: None,
             children: HashMap::new(),
+            dispatcher: None,
             fuse_host: None,
             fuse_port: 0,
             fuse_mount_names: HashMap::new(),
@@ -1239,28 +1252,16 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // Install state.
     let init_arc = Arc::new(init);
 
-    // Spawn the per-child poller for the shell so its stdout/stderr/exit
-    // flow back to subscribers as Frame::Event.
-    let shell_finished = Arc::new(AtomicBool::new(false));
-    let shell_joiner = {
-        let conn_w = Arc::clone(conn);
-        let init_w = Arc::clone(&init_arc);
-        let id_w = shell_child_id.clone();
-        let fin_w = Arc::clone(&shell_finished);
-        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
-    };
-
     {
         let mut st = shared.state.lock().unwrap();
         st.hcs = Some((api.clone(), cs, vm_id.clone()));
-        st.init = Some(init_arc);
+        st.init = Some(Arc::clone(&init_arc));
         st.vhdx = Some(lease);
         st.shell_child_id = Some(shell_child_id.clone());
         st.children.insert(
             shell_child_id,
             ChildEntry {
-                _joiner: shell_joiner,
-                finished: shell_finished,
+                finished: Arc::new(AtomicBool::new(false)),
             },
         );
         st.netstack_shutdown = netstack_shutdown;
@@ -1272,6 +1273,25 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         st.fuse_mount_names = fuse_mount_names;
         st.boot_mount_names = boot_mount_names;
         st.fuse_rt = Some(fuse_rt);
+    }
+
+    // Spawn the single per-session dispatcher thread AFTER releasing the
+    // session lock so the thread can acquire it on its first iteration
+    // without risk of deadlock.
+    {
+        let disp_stop = Arc::new(AtomicBool::new(false));
+        let disp_join = {
+            let conn_w = Arc::clone(conn);
+            let init_w = Arc::clone(&init_arc);
+            let shared_w = Arc::clone(&shared);
+            let stop_w = Arc::clone(&disp_stop);
+            thread::spawn(move || dispatcher_loop(conn_w, init_w, shared_w, stop_w))
+        };
+        let mut st = shared.state.lock().unwrap();
+        st.dispatcher = Some(DispatcherHandle {
+            stop: disp_stop,
+            _join: disp_join,
+        });
     }
 
     // Emit Ready + GuestConnected events.
@@ -1289,6 +1309,13 @@ fn handle_stop_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<
 }
 
 fn teardown_session(st: &mut SessionState) {
+    // Signal the dispatcher to stop.  We do not join here because the
+    // caller holds the session mutex and the dispatcher also acquires it;
+    // setting `stop` (plus the init EOF below) makes the thread exit
+    // within one loop iteration without needing a join.
+    if let Some(ref d) = st.dispatcher {
+        d.stop.store(true, Ordering::Relaxed);
+    }
     if let Some(init) = st.init.take() {
         let _ = init.shutdown();
     }
@@ -1298,6 +1325,9 @@ fn teardown_session(st: &mut SessionState) {
     }
     st.shell_child_id = None;
     st.children.clear();
+    // Detach the dispatcher JoinHandle; the thread exits promptly because
+    // we set `stop` above and the init is now dead.
+    st.dispatcher = None;
     // Drop FuseHost first (causes in-flight serve tasks to see EOF),
     // then shut down the tokio runtime.
     st.fuse_host = None;
@@ -1400,24 +1430,13 @@ fn handle_spawn_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
     };
     let child_id = shell_info.child_id;
 
-    // Spawn the per-child poller so stdout/stderr/exit flow back to subscribers.
-    let finished = Arc::new(AtomicBool::new(false));
-    let joiner = {
-        let conn_w = Arc::clone(conn);
-        let init_w = Arc::clone(&init);
-        let id_w = child_id.clone();
-        let fin_w = Arc::clone(&finished);
-        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
-    };
-
     {
         let shared = get_session(conn, sessions)?;
         let mut st = shared.state.lock().unwrap();
         st.children.insert(
             child_id.clone(),
             ChildEntry {
-                _joiner: joiner,
-                finished,
+                finished: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -1474,46 +1493,74 @@ fn handle_list_shells(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Res
     Ok(serde_json::to_value(JobIdListResult { ids }).unwrap())
 }
 
-fn child_poller(
+/// Single per-session dispatch thread: waits for any child event, drains all
+/// pending stdout / stderr / exit events, and forwards them as `EV_*` frames
+/// on the pipe.  Replaces the previous N-thread model (one per child).
+fn dispatcher_loop(
     conn: Arc<Connection>,
     init: Arc<tokimo_package_sandbox::init_client::WinInitClient>,
-    child_id: String,
-    finished: Arc<AtomicBool>,
+    shared: Arc<tokimo_package_sandbox::session_registry::SharedSession<SessionState>>,
+    stop: Arc<AtomicBool>,
 ) {
+    use tokimo_package_sandbox::init_client::DrainedEvent;
     loop {
-        for chunk in init.drain_stdout(&child_id) {
-            let _ = send_event(&conn, method::EV_STDOUT, json!({ "id": child_id, "data": chunk }));
-        }
-        for chunk in init.drain_stderr(&child_id) {
-            let _ = send_event(&conn, method::EV_STDERR, json!({ "id": child_id, "data": chunk }));
-        }
-        if let Some((exit_code, signal)) = init.take_exit(&child_id) {
-            // Final drain.
-            for chunk in init.drain_stdout(&child_id) {
-                let _ = send_event(&conn, method::EV_STDOUT, json!({ "id": child_id, "data": chunk }));
-            }
-            for chunk in init.drain_stderr(&child_id) {
-                let _ = send_event(&conn, method::EV_STDERR, json!({ "id": child_id, "data": chunk }));
-            }
-            let _ = send_event(
-                &conn,
-                method::EV_EXIT,
-                json!({
-                    "id": child_id,
-                    "exit_code": exit_code,
-                    "signal": signal,
-                }),
-            );
-            let _ = init.close_child(&child_id);
-            finished.store(true, Ordering::Relaxed);
+        if stop.load(Ordering::Relaxed) || init.is_dead() {
             return;
         }
-        if init.is_dead() {
-            finished.store(true, Ordering::Relaxed);
+
+        // Snapshot child IDs; release lock before blocking.
+        let ids: HashSet<String> = {
+            let st = shared.state.lock().unwrap();
+            st.children.keys().cloned().collect()
+        };
+
+        if ids.is_empty() {
+            // No children yet; yield and try again shortly.
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        // Block until any child has data, the init died, or timeout.
+        let _ = init.wait_any_event_or_eof(Instant::now() + Duration::from_millis(250));
+
+        if stop.load(Ordering::Relaxed) || init.is_dead() {
             return;
         }
-        // Cap polling frequency.
-        let _ = init.wait_for_event(&child_id, Instant::now() + Duration::from_millis(250));
+
+        let drained = init.drain_pending_events_for(&ids);
+        if drained.is_empty() {
+            continue;
+        }
+
+        let mut to_close: Vec<String> = Vec::new();
+        for ev in drained {
+            match ev {
+                DrainedEvent::Stdout { child_id, data } => {
+                    let _ = send_event(&conn, method::EV_STDOUT, json!({ "id": child_id, "data": data }));
+                }
+                DrainedEvent::Stderr { child_id, data } => {
+                    let _ = send_event(&conn, method::EV_STDERR, json!({ "id": child_id, "data": data }));
+                }
+                DrainedEvent::Exit { child_id, code, signal } => {
+                    let _ = send_event(
+                        &conn,
+                        method::EV_EXIT,
+                        json!({ "id": child_id, "exit_code": code, "signal": signal }),
+                    );
+                    to_close.push(child_id);
+                }
+            }
+        }
+
+        for cid in to_close {
+            let _ = init.close_child(&cid);
+            // Use try_lock so we never block the dispatcher on teardown.
+            if let Ok(mut st) = shared.state.try_lock() {
+                if let Some(entry) = st.children.get(&cid) {
+                    entry.finished.store(true, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
