@@ -23,17 +23,12 @@ use crate::net_constants::VMADDR_CID_HOST;
 ///
 /// The socket is created with `SOCK_CLOEXEC`. The caller is responsible
 /// for any post-connect mode flips (e.g. `O_NONBLOCK`).
-pub fn connect_with_retry(
-    cid: u32,
-    port: u32,
-    timeout: Duration,
-    retry_interval: Duration,
-) -> io::Result<OwnedFd> {
+pub fn connect_with_retry(cid: u32, port: u32, timeout: Duration, retry_interval: Duration) -> io::Result<OwnedFd> {
     let deadline = Instant::now() + timeout;
     let addr = VsockAddr::new(cid, port);
     loop {
-        let fd = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(io::Error::from)?;
+        let fd =
+            socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None).map_err(io::Error::from)?;
         match connect(fd.as_raw_fd(), &addr) {
             Ok(()) => return Ok(fd),
             Err(e) => {
@@ -50,5 +45,10 @@ pub fn connect_with_retry(
 /// Connect to the well-known host CID with library-default retry timing
 /// (30 s deadline, 200 ms retry interval). Convenience wrapper.
 pub fn connect_host(port: u32) -> io::Result<OwnedFd> {
-    connect_with_retry(VMADDR_CID_HOST, port, Duration::from_secs(30), Duration::from_millis(200))
+    connect_with_retry(
+        VMADDR_CID_HOST,
+        port,
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+    )
 }

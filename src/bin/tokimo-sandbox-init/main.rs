@@ -34,9 +34,7 @@ use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, listen, socket,
-};
+use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, listen, socket};
 #[cfg(target_os = "linux")]
 use nix::unistd::getpid;
 
@@ -663,7 +661,8 @@ fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
 /// the per-VM hvsock plumbing after VM start.
 #[cfg(target_os = "linux")]
 fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
-    let fd = tokimo_package_sandbox::vsock_util::connect_host(port).map_err(|e| format!("connect VSOCK port {port}: {e}"))?;
+    let fd = tokimo_package_sandbox::vsock_util::connect_host(port)
+        .map_err(|e| format!("connect VSOCK port {port}: {e}"))?;
     eprintln!("[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}");
     // Set non-blocking AFTER connect succeeds so the mio event loop can
     // poll the socket the same way as the listener path used to.

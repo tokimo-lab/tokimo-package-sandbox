@@ -226,10 +226,7 @@ mod linux {
                 // host listener is up by the time fuse is spawned by init.
                 let sock =
                     socket(AddressFamily::Vsock, SockType::Stream, SockFlag::empty(), None).map_err(io::Error::from)?;
-                let addr = VsockAddr::new(
-                    tokimo_package_sandbox::net_constants::VMADDR_CID_HOST,
-                    port,
-                );
+                let addr = VsockAddr::new(tokimo_package_sandbox::net_constants::VMADDR_CID_HOST, port);
                 connect(std::os::fd::AsRawFd::as_raw_fd(&sock), &addr).map_err(io::Error::from)?;
                 Ok(sock)
             }
@@ -264,8 +261,8 @@ mod linux {
             mount_name: Some(mount_name.to_string()),
         };
         wire::write_frame(&mut file, &hello)?;
-        let ack = wire::read_frame(&mut file)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no HelloAck"))?;
+        let ack =
+            wire::read_frame(&mut file)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no HelloAck"))?;
         match ack {
             Frame::HelloAck {
                 proto_version,

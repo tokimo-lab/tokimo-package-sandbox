@@ -266,11 +266,7 @@ impl SandboxBackend for LinuxBackend {
         // user table is independent of the host.
         for f in ["etc/passwd", "etc/group"] {
             if rootfs.join(f).is_file() {
-                args.extend([
-                    "--ro-bind".to_string(),
-                    rootfs_str(f),
-                    format!("/{f}"),
-                ]);
+                args.extend(["--ro-bind".to_string(), rootfs_str(f), format!("/{f}")]);
             } else {
                 return Err(Error::other(format!(
                     "packaged rootfs is missing /{f}: {}",

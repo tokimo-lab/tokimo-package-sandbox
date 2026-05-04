@@ -1303,10 +1303,7 @@ fn rootfs_node_version() {
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
 
-    let line = captured
-        .lines()
-        .find(|l| l.trim_start().starts_with('v'))
-        .unwrap_or("");
+    let line = captured.lines().find(|l| l.trim_start().starts_with('v')).unwrap_or("");
     assert!(
         line.trim().starts_with("v24."),
         "expected Node 24.x from packaged rootfs, got: {captured:?}"
