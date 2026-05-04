@@ -12,14 +12,14 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # Linux: full build + test (requires bubblewrap + Debian rootfs)
+  # Linux: build + lib/bins tests. Integration tests are skipped in CI;
+  # they require the packaged vm/rootfs (Node 24, Python 3, …) which is
+  # produced by .github/workflows/vm.yml under tag prefix vm-v* and is
+  # not bundled in the repo. Run them locally after fetch-vm.sh.
   # ------------------------------------------------------------------
   linux:
     name: linux (build + test)
     runs-on: ubuntu-latest
-    env:
-      ROOTFS_VERSION: v1.3.1
-      ROOTFS_ASSET: rootfs-amd64.tar.zst
     steps:
       - uses: actions/checkout@v4
 
@@ -29,61 +29,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install bubblewrap + zstd
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap zstd
-
-      - name: Allow unprivileged user namespaces
-        # Ubuntu 24.04 (ubuntu-latest) restricts unprivileged userns by
-        # default via AppArmor, which blocks bwrap from creating the
-        # loopback interface inside an unshared network namespace
-        # (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
-        # Disable that restriction so integration tests can use
-        # `NetworkPolicy::Blocked` (`bwrap --unshare-net`).
-        run: |
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
-          fi
-
-      - name: Cache test rootfs
-        id: rootfs-cache
-        uses: actions/cache@v4
-        with:
-          path: .test-rootfs
-          key: tokimo-test-rootfs-${{ env.ROOTFS_VERSION }}-${{ env.ROOTFS_ASSET }}
-
-      - name: Download + extract rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          mkdir -p .test-rootfs
-          curl -sSL -o rootfs.tar.zst \
-            "https://github.com/tokimo-lab/tokimo-package-rootfs/releases/download/${ROOTFS_VERSION}/${ROOTFS_ASSET}"
-          # Sanity peek at archive layout — must extract to top-level dirs
-          # like ./bin, ./usr, etc.
-          zstd -d -c rootfs.tar.zst | tar -tf - 2>/dev/null | head -3 || true
-          zstd -d -c rootfs.tar.zst | tar -xf - -C .test-rootfs
-          rm -f rootfs.tar.zst
-          test -x .test-rootfs/usr/bin/bash || test -x .test-rootfs/bin/bash
+      - name: Install bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
 
       - name: Build
         run: cargo build --lib --bins --tests --examples
 
       - name: Test (lib + bins)
         run: cargo test --lib --bins
-
-      - name: Test (integration tests with rootfs)
-        env:
-          TOKIMO_TEST_ROOTFS: ${{ github.workspace }}/.test-rootfs
-          # network_observed_sink_records_events deadlocks on hosted
-          # ubuntu-latest runners (seccomp_notify + host proxy loopback
-          # interaction). Reproduces locally as a fast pass. Tracked at:
-          # https://github.com/tokimo-lab/tokimo-package-sandbox/issues/1
-          TOKIMO_SKIP_NETWORK_OBSERVED: "1"
-          # Force serial test execution with live output so we can see
-          # which test (if any) hangs on the hosted runner. Wrap in
-          # `timeout` to bound total wall time at 10 min — anything over
-          # that is almost certainly a deadlock, not slow CI.
-        run: PATH="$PWD/target/debug:$PATH" timeout --signal=ABRT 600 cargo test --tests -- --test-threads=1 --nocapture
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)
