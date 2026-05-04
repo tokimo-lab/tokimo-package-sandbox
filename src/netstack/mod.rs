@@ -644,12 +644,19 @@ fn run(
         // Sleep until smoltcp needs to run again or a new frame arrives.
         // poll_delay() returns None when no timers are pending (wait forever
         // on input); Some(d) means we must wake within d to service retransmits
-        // / keepalives.  Cap at 50ms so flow-idle checks run reasonably often.
+        // / keepalives.  Cap at 1ms when any upstream flow is active so DNS/TCP
+        // upstream replies (only polled inside this loop) don't sit idle.
+        let active = !tcp_flows.is_empty() || !udp_flows.is_empty();
+        let cap = if active {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(50)
+        };
         let poll_delay = iface
             .poll_delay(smol_now(), &sockets)
             .map(|d| Duration::from_micros(d.total_micros()))
-            .unwrap_or(Duration::from_millis(50))
-            .min(Duration::from_millis(50));
+            .unwrap_or(cap)
+            .min(cap);
         if let Ok(frame) = rx_in_rx.recv_timeout(poll_delay) {
             lookahead = Some(frame);
         }
