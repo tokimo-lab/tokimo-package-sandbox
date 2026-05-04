@@ -42,13 +42,15 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as chan;
+use mio::net::UdpSocket as MioUdpSocket;
+use mio::{Events, Interest, Poll, Token, Waker};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
@@ -143,6 +145,23 @@ pub struct LocalService {
     /// Where to splice incoming flows on the host side. Typically
     /// `127.0.0.1:<ephemeral>`.
     pub local_addr: SocketAddr,
+}
+
+/// I/O context: mio Registry + Waker + per-flow token allocator. Threaded
+/// through the dispatch chain so new flows can register their upstream
+/// sockets / wake signals with the main loop's `Poll`.
+struct IoCtx<'a> {
+    registry: &'a mio::Registry,
+    next_token: &'a mut usize,
+    waker: &'a Arc<Waker>,
+}
+
+impl IoCtx<'_> {
+    fn alloc_token(&mut self) -> Token {
+        // Token(0) is reserved for the Waker.
+        *self.next_token = self.next_token.wrapping_add(1).max(1);
+        Token(*self.next_token)
+    }
 }
 
 /// Routing context plumbed through the dispatch chain. Cheap to clone
@@ -295,7 +314,7 @@ struct UdpKey {
 
 struct UdpFlow {
     sock_handle: SocketHandle,
-    upstream: UdpSocket,
+    upstream: MioUdpSocket,
     /// Guest-side sender endpoint (used to address reply Ethernet frames).
     remote: smoltcp::wire::IpEndpoint,
     /// IP family; v4↔v6 replies from wrong family are discarded.
@@ -352,7 +371,16 @@ fn run(
     let (rx_in_tx, rx_in_rx) = chan::bounded::<Vec<u8>>(256);
     let (tx_out_tx, tx_out_rx) = chan::bounded::<Vec<u8>>(256);
 
+    // mio Poll multiplexes upstream UDP sockets + a Waker for "channel got
+    // pushed" events (rx_in_rx, tcp upstream→guest channels, tcp ready
+    // signals).  This replaces the prior fixed-cap sleep-on-recv_timeout
+    // scheme so any upstream readiness wakes the main loop immediately.
+    const TOKEN_WAKER: Token = Token(0);
+    let mut poll = Poll::new()?;
+    let waker = Arc::new(Waker::new(poll.registry(), TOKEN_WAKER)?);
+
     let shutdown_r = Arc::clone(&shutdown);
+    let waker_r = Arc::clone(&waker);
     thread::Builder::new().name("netstack-rx".into()).spawn(move || {
         while !shutdown_r.load(Ordering::Relaxed) {
             match read_frame(&mut read_half) {
@@ -360,6 +388,7 @@ fn run(
                     if rx_in_tx.send(f).is_err() {
                         break;
                     }
+                    let _ = waker_r.wake();
                 }
                 Err(e) => {
                     eprintln!("[netstack-rx] read end: {e}");
@@ -426,18 +455,26 @@ fn run(
     // so accumulated idle sockets don't slow down the main poll loop.
     let udp_idle_timeout = Duration::from_secs(15);
 
-    // Holds a frame received during the poll_delay sleep so it isn't lost.
-    let mut lookahead: Option<Vec<u8>> = None;
+    let mut events = Events::with_capacity(64);
+    let mut next_token: usize = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
+        let mut io = IoCtx {
+            registry: poll.registry(),
+            next_token: &mut next_token,
+            waker: &waker,
+        };
         let mut staged: Vec<Vec<u8>> = Vec::new();
-        // Process any frame buffered during last iteration's sleep first.
-        if let Some(frame) = lookahead.take() {
-            inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
-            staged.push(frame);
-        }
         while let Ok(frame) = rx_in_rx.try_recv() {
-            inspect_and_register(&frame, &mut sockets, &mut tcp_flows, &mut udp_flows, &tx_out_tx, &ctx);
+            inspect_and_register(
+                &frame,
+                &mut sockets,
+                &mut tcp_flows,
+                &mut udp_flows,
+                &tx_out_tx,
+                &ctx,
+                &mut io,
+            );
             staged.push(frame);
         }
         // Feed staged frames (possibly empty) to smoltcp via a one-shot
@@ -636,30 +673,22 @@ fn run(
             }
         }
         for key in udp_to_remove {
-            if let Some(flow) = udp_flows.remove(&key) {
+            if let Some(mut flow) = udp_flows.remove(&key) {
+                let _ = poll.registry().deregister(&mut flow.upstream);
                 sockets.remove(flow.sock_handle);
             }
         }
 
-        // Sleep until smoltcp needs to run again or a new frame arrives.
-        // poll_delay() returns None when no timers are pending (wait forever
-        // on input); Some(d) means we must wake within d to service retransmits
-        // / keepalives.  Cap at 1ms when any upstream flow is active so DNS/TCP
-        // upstream replies (only polled inside this loop) don't sit idle.
-        let active = !tcp_flows.is_empty() || !udp_flows.is_empty();
-        let cap = if active {
-            Duration::from_millis(1)
-        } else {
-            Duration::from_millis(50)
-        };
+        // Wake on any of: a guest frame arrives (rx_in waker), an upstream
+        // UDP socket becomes readable (registered tokens), a TCP proxy
+        // pushes data or a state change (tcp_proxy waker), or smoltcp's
+        // own retransmit/keepalive timer expires.
         let poll_delay = iface
             .poll_delay(smol_now(), &sockets)
             .map(|d| Duration::from_micros(d.total_micros()))
-            .unwrap_or(cap)
-            .min(cap);
-        if let Ok(frame) = rx_in_rx.recv_timeout(poll_delay) {
-            lookahead = Some(frame);
-        }
+            .unwrap_or(Duration::from_secs(1));
+        events.clear();
+        let _ = poll.poll(&mut events, Some(poll_delay));
     }
 
     drop(writer);
@@ -673,6 +702,7 @@ fn inspect_and_register(
     udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
+    io: &mut IoCtx<'_>,
 ) {
     let eth = match EthernetFrame::new_checked(frame) {
         Ok(e) => e,
@@ -696,6 +726,7 @@ fn inspect_and_register(
                 udp_flows,
                 tx_out_tx,
                 ctx,
+                io,
             );
         }
         EthernetProtocol::Ipv6 => {
@@ -711,7 +742,7 @@ fn inspect_and_register(
                 None => return,
             };
             dispatch_l4(
-                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx, ctx,
+                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx, ctx, io,
             );
         }
         _ => {}
@@ -769,6 +800,7 @@ fn dispatch_l4(
     udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
+    io: &mut IoCtx<'_>,
 ) {
     match proto {
         IpProtocol::Tcp => {
@@ -801,7 +833,7 @@ fn dispatch_l4(
                     return;
                 }
             };
-            register_tcp_flow(key, upstream, sockets, tcp_flows);
+            register_tcp_flow(key, upstream, sockets, tcp_flows, io);
         }
         IpProtocol::Udp => {
             if !ctx.allows_upstream() {
@@ -824,7 +856,7 @@ fn dispatch_l4(
             if udp_flows.contains_key(&key) {
                 return;
             }
-            register_udp_flow(key, sockets, udp_flows, ctx);
+            register_udp_flow(key, sockets, udp_flows, ctx, io);
             let _ = tx_out_tx;
         }
         IpProtocol::Icmp => {
@@ -848,6 +880,7 @@ fn register_tcp_flow(
     upstream: SocketAddr,
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
+    io: &mut IoCtx<'_>,
 ) {
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
@@ -874,10 +907,11 @@ fn register_tcp_flow(
     let upstream_closed2 = Arc::clone(&upstream_closed);
     let upstream_ready = Arc::new(AtomicBool::new(false));
     let upstream_ready2 = Arc::clone(&upstream_ready);
+    let waker = Arc::clone(io.waker);
 
     thread::Builder::new()
         .name(format!("net-tcp-{}-{}", key.dst_ip, key.dst_port))
-        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2, upstream_ready2))
+        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2, upstream_ready2, waker))
         .ok();
 
     tcp_flows.insert(
@@ -903,18 +937,21 @@ fn tcp_proxy(
     g2u_rx: chan::Receiver<Vec<u8>>,
     upstream_closed: Arc<AtomicBool>,
     upstream_ready: Arc<AtomicBool>,
+    waker: Arc<Waker>,
 ) {
     let mut up = match TcpStream::connect_timeout(&dst, Duration::from_secs(8)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[netstack] connect {} fail: {}", dst, e);
             upstream_closed.store(true, Ordering::Relaxed);
+            let _ = waker.wake();
             return;
         }
     };
     // Signal success *before* starting data transfer so the main loop
     // can unpause the SYN-ACK as soon as possible.
     upstream_ready.store(true, Ordering::Relaxed);
+    let _ = waker.wake();
     let _ = up.set_nodelay(true);
     let _ = up.set_read_timeout(Some(Duration::from_millis(200)));
 
@@ -922,10 +959,12 @@ fn tcp_proxy(
         Ok(w) => w,
         Err(_) => {
             upstream_closed.store(true, Ordering::Relaxed);
+            let _ = waker.wake();
             return;
         }
     };
     let upstream_closed_w = Arc::clone(&upstream_closed);
+    let waker_w = Arc::clone(&waker);
     let writer = thread::Builder::new()
         .name(format!("net-tcp-w-{}", dst))
         .spawn(move || {
@@ -936,6 +975,7 @@ fn tcp_proxy(
             }
             let _ = up_w.shutdown(std::net::Shutdown::Write);
             upstream_closed_w.store(true, Ordering::Relaxed);
+            let _ = waker_w.wake();
         })
         .ok();
 
@@ -947,6 +987,7 @@ fn tcp_proxy(
                 if u2g_tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
+                let _ = waker.wake();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                 if upstream_closed.load(Ordering::Relaxed) {
@@ -958,6 +999,7 @@ fn tcp_proxy(
         }
     }
     upstream_closed.store(true, Ordering::Relaxed);
+    let _ = waker.wake();
     if let Some(j) = writer {
         let _ = j.join();
     }
@@ -968,6 +1010,7 @@ fn register_udp_flow(
     sockets: &mut SocketSet<'_>,
     udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     ctx: &RouteCtx,
+    io: &mut IoCtx<'_>,
 ) {
     // smoltcp UDP socket bound to key.dst_port.  With any_ip=true this catches
     // all guest traffic to that port regardless of dst IP.  Note: two concurrent
@@ -982,11 +1025,11 @@ fn register_udp_flow(
     }
     let sock_handle = sockets.add(sock);
 
-    let bind_addr = match key.dst_ip {
-        IpAddress::Ipv4(_) => "0.0.0.0:0",
-        IpAddress::Ipv6(_) => "[::]:0",
+    let bind_addr: SocketAddr = match key.dst_ip {
+        IpAddress::Ipv4(_) => "0.0.0.0:0".parse().unwrap(),
+        IpAddress::Ipv6(_) => "[::]:0".parse().unwrap(),
     };
-    let upstream = match UdpSocket::bind(bind_addr) {
+    let mut upstream = match MioUdpSocket::bind(bind_addr) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[netstack] upstream udp bind: {e}");
@@ -994,7 +1037,12 @@ fn register_udp_flow(
             return;
         }
     };
-    let _ = upstream.set_nonblocking(true);
+    let token = io.alloc_token();
+    if let Err(e) = io.registry.register(&mut upstream, token, Interest::READABLE) {
+        eprintln!("[netstack] mio register udp: {e}");
+        sockets.remove(sock_handle);
+        return;
+    }
 
     // The initial payload is NOT forwarded here — smoltcp will deliver it to
     // the newly-created socket in the next burst poll and the main loop will
