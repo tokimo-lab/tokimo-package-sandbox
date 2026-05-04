@@ -59,7 +59,9 @@ Sandbox::start_vm()
   │
   └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
                  --unshare-net                ← 始终：全新网络命名空间
-                 --ro-bind /usr /bin /sbin /lib /lib64
+                 --ro-bind <vm/rootfs>/{usr,bin,sbin,lib,lib64}
+                 --ro-bind <vm/rootfs>/etc/{passwd,group}     ← 打包的用户表
+                 --ro-bind /etc/{resolv.conf,hosts,ssl,...}   ← 仅宿主网络/CA
                  --cap-add CAP_SYS_ADMIN      ← fusermount3 需要
                  --cap-add CAP_NET_ADMIN      ← 用于 TAP 和 lo 启动
                  --cap-add CAP_NET_RAW        ← 客机 ping 需要
@@ -77,6 +79,7 @@ Sandbox::start_vm()
 ```
 
 - **无守护进程、无服务、不需要 root。** 每个 `Sandbox` 拥有独立的 bwrap+init 组合。
+- **打包 rootfs。** `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` 都来自 `vm/rootfs/`（与 macOS、Windows 启动用的同一份 artifact），保证三平台 sandbox 内看到同一套工具版本。仅网络/DNS/CA 配置仍从宿主机绑定。
 - **网络：** `AllowAll` 和 `Blocked` 都使用 `--unshare-net` 创建全新网络命名空间。`AllowAll` 通过 TAP 设备（`tk0`）叠加 smoltcp 用户态网络栈，经 STREAM socketpair 桥接到宿主——与 macOS 和 Windows 架构完全一致。`Blocked` 只有 `lo`。
 - **文件共享：** 所有挂载使用 **FUSE-over-socketpair** —— 与 macOS 和 Windows 共同一套 `FuseHost` + `tokimo-sandbox-fuse` 基础设施。每个挂载获得一个 `AF_UNIX SOCK_STREAM` socketpair；宿主端由 `FuseHost` 服务，客机端通过 `--transport unix-fd` 传递给 `tokimo-sandbox-fuse`。启动时和运行时挂载使用相同机制。
 - **PTY：** 主 fd 通过 `SCM_RIGHTS` 传递到宿主，直接 I/O。
@@ -196,15 +199,22 @@ sb.stop_vm().unwrap();
 
 | 平台 | 要求 |
 |---|---|
-| **Linux** | `sudo apt install bubblewrap` — 运行时不需要 root |
+| **Linux** | `sudo apt install bubblewrap` — 运行时不需要 root。需要 `<repo>/vm/` 下的虚拟机产物（rootfs 会被绑定进 bwrap）。 |
 | **macOS** | macOS 13+，Apple Silicon。需要 `<repo>/vm/` 下的虚拟机产物（见下方）。代码签名需要 `com.apple.security.virtualization` 权限。 |
 | **Windows** | 启用"虚拟机平台"（Win 10 1903+）。一次性管理员权限安装服务。需要 `<repo>/vm/下的虚拟机产物。 |
 
-### 虚拟机产物（macOS 和 Windows）
+### 虚拟机产物（所有平台）
 
-两个平台共享同一套 Linux 内核 + initrd + Debian 13 rootfs。下载：
+三个后端共享同一套 Linux 内核 + initrd + Debian 13 rootfs。下载：
+
+```sh
+# Linux / WSL
+scripts/linux/fetch-vm.sh                  # 最新发布
+scripts/linux/fetch-vm.sh -t vm-v1.9.0     # 指定标签
+```
 
 ```powershell
+# Windows
 pwsh scripts/windows/fetch-vm.ps1                 # 最新发布
 pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # 指定标签
 ```

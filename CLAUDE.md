@@ -2,7 +2,7 @@
 
 Cross-platform native sandbox for running arbitrary commands in isolated environments.
 
-- **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer
+- **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer; uses the packaged `vm/rootfs/` for `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` (same artifact as macOS/Windows)
 - **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, in-process FUSE-over-vsock host (`vfs_host::FuseHost`) for boot/runtime mounts, virtio-vsock control plane
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 

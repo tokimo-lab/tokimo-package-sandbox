@@ -30,53 +30,45 @@ sudo pacman -S bubblewrap
 bwrap --version
 ```
 
-## Step 2：准备 rootfs（可选）
+## Step 2：准备 rootfs（必需）
 
-Linux 上 bwrap 可以直接 mount 宿主机文件系统（`--ro-bind /usr /usr`），**不需要完整的 rootfs**。沙箱复用宿主机的 `/usr`、`/bin`、`/lib` 等系统目录。
+> ⚠️ **从 v0.1.x 起，Linux 后端不再绑定宿主机 `/usr` `/bin` `/lib`。** bwrap 现在挂载 `vm/rootfs/` 作为打包根文件系统，与 macOS / Windows 共享同一份 artifact——这样三个平台 sandbox 内见到的工具版本完全一致（Node 24、Python 3、ffmpeg、libreoffice、tesseract、…）。
 
-如果你需要隔离的工具（如特定版本的 Node.js、Python 包），有以下选项：
-
-### 选项 A：直接用宿主机系统
-
-零配置，bwrap 自动 bind-mount 必要目录：
+### 推荐：通过脚本下载预构建 rootfs
 
 ```bash
-# 不需要额外准备，直接可用
+# 仓库 vm.yml 发布，tag 前缀 vm-v*。脚本依赖 curl/jq/tar/zstd。
+scripts/linux/fetch-vm.sh
+# 产出：vm/vmlinuz, vm/initrd.img, vm/rootfs/
 ```
 
-### 选项 B：使用 TokimoOS rootfs
+`vm/` 目录的查找顺序（与 macOS 一致）：
+1. `TOKIMO_VM_DIR` 环境变量
+2. 从 `current_exe()` / `current_dir()` 向上找 `vm/`
+3. `~/.tokimo/`
 
-如果你想用预装了完整工具链的 Debian rootfs（含 Node.js、Python、pandoc、ffmpeg 等）：
-
-```bash
-# 下载预构建 rootfs（本仓库 vm.yml 发布，tag 前缀 vm-v*）
-BASE=https://github.com/tokimo-lab/tokimo-package-sandbox/releases/latest/download
-curl -LO $BASE/tokimo-linux-rootfs-x86_64.tar.zst
-zstd -d tokimo-linux-rootfs-x86_64.tar.zst
-
-# 解压到任意目录
-mkdir -p /opt/tokimo/rootfs
-tar -xpf tokimo-linux-rootfs-x86_64.tar -C /opt/tokimo/rootfs/
-```
-
-### 选项 C：用 Docker 构建自己的 rootfs
+### 备选：本地构建
 
 ```bash
-# 仓库内置构建脚本
 cd packaging/vm-base
-bash build.sh amd64
-# 产出在 ./tokimo-os-amd64/rootfs/
+bash build.sh amd64        # 需要 Docker
+ln -sfn $PWD/tokimo-os-amd64/rootfs    ../../vm/rootfs
+ln -sf  $PWD/tokimo-os-amd64/vmlinuz   ../../vm/vmlinuz
+ln -sf  $PWD/tokimo-os-amd64/initrd.img ../../vm/initrd.img
 ```
 
-## Step 3：设置环境变量（可选）
+如果 `vm/rootfs/` 缺失，`start_vm()` 会立即返回统一报错：
 
-如果使用了外部 rootfs，通过环境变量或代码指定路径：
+```
+rootfs not found. Place vmlinuz + initrd.img + rootfs/ in <repo>/vm/
+or set TOKIMO_VM_DIR. Run scripts/<platform>/fetch-vm.* to download.
+```
+
+## Step 3：环境变量（可选）
 
 | 变量 | 说明 |
 |---|---|
-| `TOKIMO_SANDBOX_ROOTFS` | rootfs 路径（可选，仅当使用外部 rootfs） |
-
-Linux 上通常不需要设置任何环境变量，bwrap 直接复用宿主机文件系统。
+| `TOKIMO_VM_DIR` | 覆盖 `vm/` 目录查找路径（绝对路径，必须包含 `vmlinuz` / `initrd.img` / `rootfs/`）|
 
 ## Step 4：代码集成
 
@@ -110,7 +102,10 @@ your-app
   └─ Sandbox::connect() → configure() → start_vm()
        │
        ├─ bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
-       │         --unshare-net --ro-bind /usr /bin /sbin /lib /lib64
+       │         --unshare-net
+       │         --ro-bind <vm/rootfs>/{usr,bin,sbin,lib,lib64}
+       │         --ro-bind <vm/rootfs>/etc/{passwd,group}      ← 打包用户表
+       │         --ro-bind /etc/{resolv.conf,hosts,ssl,ca-certificates,...}  ← 仅宿主网络/CA
        │         --cap-add CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_MKNOD
        │
        ├─ tokimo-sandbox-init (PID 2 inside bwrap)
@@ -152,7 +147,8 @@ sb.stop_vm().unwrap();
 | `bwrap: No such file or directory` | `sudo apt install bubblewrap` |
 | `unshare failed: Operation not permitted` | 内核未开启 user namespaces 或受 seccomp 限制 |
 | `seccomp BPF failed` | 某些精简内核/容器环境不支持 seccomp，使用 `firejail` fallback |
-| rootfs 工具找不到 | bwrap 模式下复用宿主机 `/usr`，确认宿主机已安装对应工具 |
+| rootfs 工具找不到 | 检查 `vm/rootfs/` 是否完整，运行 `scripts/linux/fetch-vm.sh` 重新拉取 |
+| `rootfs not found. Place vmlinuz + initrd.img + rootfs/...` | `vm/` 目录缺失，运行 `scripts/linux/fetch-vm.sh` |
 
 ## 相关文档
 
