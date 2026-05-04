@@ -477,7 +477,9 @@ fn run(
                 flow.closed = true;
             }
             let st = socket.state();
-            let dead = matches!(st, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing);
+            let upstream_done = flow.upstream_closed.load(Ordering::Relaxed);
+            let dead = matches!(st, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing)
+                || (upstream_done && matches!(st, tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::LastAck));
             let idle = now.duration_since(flow.last_activity) > idle_timeout;
             if dead || idle {
                 tcp_to_remove.push(*key);
