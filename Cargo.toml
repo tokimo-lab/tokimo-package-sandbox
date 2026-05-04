@@ -91,6 +91,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
+mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 
 [[bin]]
 name = "tokimo-tun-pump"

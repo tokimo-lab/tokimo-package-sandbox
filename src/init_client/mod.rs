@@ -792,3 +792,13 @@ fn reply_id(r: &Reply) -> String {
         Reply::Hello { id, .. } | Reply::Spawn { id, .. } | Reply::Ack { id, .. } => id.clone(),
     }
 }
+
+// Platform type-alias re-exports for stable public paths
+// `tokimo_package_sandbox::init_client::{WinInitClient,VsockInitClient,LinuxInitClient}`.
+
+#[cfg(target_os = "linux")]
+pub use crate::linux::init_client::InitClient as LinuxInitClient;
+#[cfg(target_os = "macos")]
+pub use crate::macos::vsock_init_client::VsockInitClient;
+#[cfg(target_os = "windows")]
+pub use crate::windows::init_client::{InitReader, InitStdin, InitStream, WinInitClient};

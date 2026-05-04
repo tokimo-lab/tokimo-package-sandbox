@@ -58,7 +58,7 @@ fn split(fd: OwnedFd) -> Result<(VsockSend, VsockRecv)> {
 
 impl crate::init_client::InitClient<VsockSend> {
     /// Wrap an already-connected VSOCK stream socket and spawn the reader.
-    pub fn new(sock: OwnedFd) -> Result<Self> {
+    pub fn connect(sock: OwnedFd) -> Result<Self> {
         let (send, recv) = split(sock)?;
         // macOS VM mode: init is always PID 1.
         crate::init_client::InitClient::new(send, recv, true)

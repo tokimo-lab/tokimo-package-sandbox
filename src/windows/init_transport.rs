@@ -25,13 +25,13 @@ pub struct PipeRecv(pub(crate) Box<dyn Read + Send>);
 
 impl TransportSend for PipeSend {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        send_frame_stream(&mut *self.0, frame)
+        send_frame_stream(&mut self.0, frame)
     }
 }
 
 impl TransportRecv for PipeRecv {
     fn recv_frame(&mut self) -> Result<Option<ReceivedFrame>> {
-        match recv_frame_stream(&mut *self.0) {
+        match recv_frame_stream(&mut self.0) {
             Ok(None) => Ok(None),
             Ok(Some(frame)) => Ok(Some(ReceivedFrame { frame })),
             Err(e) => Err(e),
@@ -50,7 +50,7 @@ impl crate::init_client::InitClient<PipeSend> {
     /// Build a client from the bidirectional `OvPipe`. The pipe is split via
     /// `try_clone()` (`DuplicateHandle` internally) so reader and writer share
     /// no I/O state.
-    pub fn new(pipe: OvPipe) -> crate::Result<Self> {
+    pub fn connect(pipe: OvPipe) -> crate::Result<Self> {
         let read = pipe
             .try_clone()
             .map_err(|e| crate::Error::exec(format!("try_clone session pipe: {e}")))?;

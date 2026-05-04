@@ -64,5 +64,3 @@ pub use error::{Error, Result};
 
 #[cfg(target_os = "windows")]
 pub use windows::canonicalize_safe;
-#[cfg(target_os = "windows")]
-pub use windows::init_client;

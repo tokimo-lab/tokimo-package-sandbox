@@ -147,7 +147,7 @@ impl SandboxBackend for MacosBackend {
             runtime,
         } = boot_vm(&vm_config)?;
 
-        let init = Arc::new(VsockInitClient::new(vsock)?);
+        let init = Arc::new(VsockInitClient::connect(vsock)?);
 
         // Hello handshake.
         if let Err(e) = init.hello() {

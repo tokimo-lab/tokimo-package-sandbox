@@ -62,21 +62,21 @@ fn is_sandbox_gateway(ip: IpAddr) -> bool {
 fn windows_get_network_params() -> Option<SocketAddr> {
     use std::ffi::CStr;
     use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
-    use windows::Win32::NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams};
+    use windows::Win32::NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams, IP_ADDR_STRING};
 
     unsafe {
         let mut size: u32 = 0;
         let rc = GetNetworkParams(None, &mut size);
-        if rc != ERROR_BUFFER_OVERFLOW.0 && size == 0 {
+        if rc.0 != ERROR_BUFFER_OVERFLOW.0 && size == 0 {
             return None;
         }
         let mut buf = vec![0u8; size as usize];
         let info = buf.as_mut_ptr() as *mut FIXED_INFO_W2KSP1;
         let rc = GetNetworkParams(Some(info), &mut size);
-        if rc != 0 {
+        if rc.0 != 0 {
             return None;
         }
-        let mut node = &(*info).DnsServerList as *const _;
+        let mut node: *const IP_ADDR_STRING = &(*info).DnsServerList;
         while !node.is_null() {
             let s = (*node).IpAddress.String.as_ptr() as *const i8;
             let cstr = CStr::from_ptr(s);
