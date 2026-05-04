@@ -35,7 +35,7 @@ use nix::sys::signal::{SigSet, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, connect, listen, socket,
+    AddressFamily, Backlog, SockFlag, SockType, UnixAddr, VsockAddr, bind, listen, socket,
 };
 #[cfg(target_os = "linux")]
 use nix::unistd::getpid;
@@ -663,35 +663,19 @@ fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
 /// the per-VM hvsock plumbing after VM start.
 #[cfg(target_os = "linux")]
 fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, port);
-    loop {
-        let fd = socket(AddressFamily::Vsock, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(|e| format!("socket(AF_VSOCK): {e}"))?;
-        match connect(fd.as_raw_fd(), &addr) {
-            Ok(()) => {
-                eprintln!("[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}");
-                // Set non-blocking AFTER connect succeeds so the mio event
-                // loop can poll the socket the same way as the listener
-                // path used to.
-                unsafe {
-                    let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0);
-                    if flags >= 0 {
-                        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-                    }
-                }
-                return Ok(fd);
-            }
-            Err(e) => {
-                drop(fd);
-                if Instant::now() >= deadline {
-                    return Err(format!("connect VSOCK CID=HOST port {port}: {e}"));
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+    let fd = tokimo_package_sandbox::vsock_util::connect_host(port)
+        .map_err(|e| format!("connect VSOCK port {port}: {e}"))?;
+    eprintln!("[tokimo-sandbox-init] connected VSOCK CID=HOST port={port}");
+    // Set non-blocking AFTER connect succeeds so the mio event loop can
+    // poll the socket the same way as the listener path used to.
+    unsafe {
+        let raw = fd.as_raw_fd();
+        let flags = libc::fcntl(raw, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
     }
+    Ok(fd)
 }
 
 #[cfg(target_os = "linux")]

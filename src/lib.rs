@@ -32,6 +32,9 @@ pub mod protocol;
 pub mod svc_protocol;
 pub mod net_constants;
 
+#[cfg(target_os = "linux")]
+pub mod vsock_util;
+
 // FUSE-over-vsock VFS bridge (cross-platform). See
 // plan/cross-platform-fuse-vfs.md.
 pub mod vfs_backend;
