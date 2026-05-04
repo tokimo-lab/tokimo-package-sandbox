@@ -6,7 +6,7 @@
 # the init binary baked in at /bin/tokimo-sandbox-init.
 #
 # Used by:
-#   * .github/workflows/vm-image.yml — assembles vm-v* release from vm-base-v*
+#   * .github/workflows/vm.yml — appends fuse binary onto build.sh's initrd
 #   * scripts/rebake-initrd.{sh,ps1} — local dev iteration after editing init/
 #
 # Usage:

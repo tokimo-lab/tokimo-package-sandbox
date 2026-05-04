@@ -1,0 +1,176 @@
+name: vm
+
+# Single workflow that builds the user-facing VM image (kernel + initrd
+# + rootfs) end-to-end.
+#
+# This collapses the previous two-stage `vm-base.yml` + `vm-image.yml`
+# split. The split existed to make rebuilding the init binary cheap by
+# reusing a cached debootstrap, but in practice debootstrap takes only
+# ~5 min per arch and the cross-workflow tag namespace
+# (`vm-base-v*` ↔ `vm-v*`) was a constant source of confusion. Build it
+# all in one pipeline and pay the few extra minutes.
+#
+# Trigger:
+#   * push tag vm-v*               → publish GitHub Release at that tag
+#   * workflow_dispatch            → optional release_tag for manual cuts
+#
+# Output (per arch):
+#   tokimo-linux-kernel-{x86_64,arm64}.tar.zst   (vmlinuz + initrd with init/fuse/tun-pump baked in)
+#   tokimo-linux-rootfs-{x86_64,arm64}.tar.zst   (Debian rootfs tarball)
+#   tokimo-linux-rootfs-x86_64.vhdx.zip          (Windows HCS, amd64 only)
+
+on:
+  push:
+    tags: ['vm-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to publish (e.g. vm-v1.9.0). Leave empty for dry run."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            suffix: x86_64
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            rust_target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: vm-${{ github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools zstd cpio gzip qemu-utils zip
+
+      - name: Build guest binaries (init + tun-pump + fuse) musl static
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} \
+            --bin tokimo-sandbox-init \
+            --bin tokimo-tun-pump \
+            --bin tokimo-sandbox-fuse
+
+      - name: Build base VM image (debootstrap + kernel + initrd) with init/tun-pump baked in
+        working-directory: packaging/vm-base
+        env:
+          TOKIMO_INIT_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-sandbox-init
+          TOKIMO_TUN_PUMP_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-tun-pump
+        run: bash build.sh ${{ matrix.arch }}
+
+      - name: Rebake initrd to also include tokimo-sandbox-fuse
+        # build.sh doesn't (yet) accept a FUSE binary; run the rebake
+        # script for that single addition. init.sh + already-baked init
+        # are preserved.
+        run: |
+          bash packaging/vm/scripts/rebake-initrd.sh \
+            --base         packaging/vm-base/tokimo-os-${{ matrix.arch }}/initrd.img \
+            --init-bin     target/${{ matrix.rust_target }}/release/tokimo-sandbox-init \
+            --tun-pump-bin target/${{ matrix.rust_target }}/release/tokimo-tun-pump \
+            --fuse-bin     target/${{ matrix.rust_target }}/release/tokimo-sandbox-fuse \
+            --init-sh      packaging/vm-base/init.sh \
+            --out          packaging/vm-base/tokimo-os-${{ matrix.arch }}/initrd.img.rebaked
+          mv packaging/vm-base/tokimo-os-${{ matrix.arch }}/initrd.img.rebaked \
+             packaging/vm-base/tokimo-os-${{ matrix.arch }}/initrd.img
+
+      - name: Package rootfs tarball
+        run: |
+          SFX=${{ matrix.suffix }}
+          tar -cpf "tokimo-linux-rootfs-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs" .
+          zstd -10 -T0 "tokimo-linux-rootfs-${SFX}.tar" -o "tokimo-linux-rootfs-${SFX}.tar.zst"
+          sha256sum "tokimo-linux-rootfs-${SFX}.tar.zst" > "tokimo-linux-rootfs-${SFX}.tar.zst.sha256"
+          rm "tokimo-linux-rootfs-${SFX}.tar"
+
+      - name: Package kernel + initrd bundle
+        run: |
+          SFX=${{ matrix.suffix }}
+          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}" vmlinuz initrd.img
+          zstd -10 -T0 "tokimo-linux-kernel-${SFX}.tar" -o "tokimo-linux-kernel-${SFX}.tar.zst"
+          sha256sum "tokimo-linux-kernel-${SFX}.tar.zst" > "tokimo-linux-kernel-${SFX}.tar.zst.sha256"
+          rm "tokimo-linux-kernel-${SFX}.tar"
+
+      - name: Package rootfs as VHDX (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: |
+          SFX=${{ matrix.suffix }}
+          ROOTFS_DIR=packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs
+          ROOTFS_SIZE=$(sudo du -sm "$ROOTFS_DIR" | cut -f1)
+          IMG_SIZE=$((ROOTFS_SIZE + 512))
+          qemu-img create -f raw rootfs.img ${IMG_SIZE}M
+          mkfs.ext4 -F rootfs.img
+          mkdir -p /tmp/rootfs-mnt
+          sudo mount -o loop rootfs.img /tmp/rootfs-mnt
+          sudo cp -a "$ROOTFS_DIR"/. /tmp/rootfs-mnt/
+          sudo umount /tmp/rootfs-mnt
+          qemu-img convert -f raw -O vhdx -o subformat=dynamic rootfs.img rootfs.vhdx
+          zip -9 "tokimo-linux-rootfs-${SFX}.vhdx.zip" rootfs.vhdx
+          sha256sum "tokimo-linux-rootfs-${SFX}.vhdx.zip" > "tokimo-linux-rootfs-${SFX}.vhdx.zip.sha256"
+          rm rootfs.img rootfs.vhdx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vm-${{ matrix.suffix }}
+          path: |
+            tokimo-linux-rootfs-${{ matrix.suffix }}.tar.zst*
+            tokimo-linux-kernel-${{ matrix.suffix }}.tar.zst*
+            tokimo-linux-rootfs-${{ matrix.suffix }}.vhdx.zip*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: vm-x86_64, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: vm-arm64,  path: dist }
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          make_latest: true
+          body: |
+            VM image (kernel + initrd + rootfs) for tokimo-package-sandbox.
+
+            ## Artifacts
+
+            | File | Consumed by |
+            |------|-------------|
+            | `tokimo-linux-rootfs-x86_64.tar.zst`  | Linux x86_64 (bwrap) |
+            | `tokimo-linux-rootfs-arm64.tar.zst`   | macOS arm64 (VZ virtiofs) |
+            | `tokimo-linux-rootfs-x86_64.vhdx.zip` | Windows x86_64 (HCS) |
+            | `tokimo-linux-kernel-x86_64.tar.zst`  | Windows x86_64 (HCS) |
+            | `tokimo-linux-kernel-arm64.tar.zst`   | macOS arm64 (VZ) |
+
+            Pull via `pwsh scripts/windows/fetch-vm.ps1 -Tag ${{ steps.meta.outputs.tag }}`.
+          files: dist/*

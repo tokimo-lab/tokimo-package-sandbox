@@ -2,7 +2,7 @@
 
 > Audience: 接手 Windows 后端开发的工程师
 > Last verified: 2026-04-30 — 14/14 `tests/session.rs` 用例通过（4 线程并发，16s）
-> Artifacts: in-repo `vm-image.yml`, tag prefix `vm-v*` (e.g. `vm-v1.9.0`)
+> Artifacts: in-repo `vm.yml`, tag prefix `vm-v*` (e.g. `vm-v1.9.0`)
 
 ---
 
@@ -114,7 +114,7 @@
 
 ## 3. VM 启动用什么文件，从哪里来？
 
-三个文件都从本仓库 `vm-image.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `vm/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
+三个文件都从本仓库 `vm.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `vm/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
 
 ```powershell
 # 下载最新 release 到 vm/
@@ -125,13 +125,13 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 ### 3.1 内核（vmlinuz）
 
-- **来源**：`vm-base.yml` 在 `debian:13` 容器中复制 `linux-image-{amd64,arm64}`（含 hv_vmbus / hv_sock 等可加载模块）
+- **来源**：`vm.yml` 在 `debian:13` 容器中复制 `linux-image-{amd64,arm64}`（含 hv_vmbus / hv_sock 等可加载模块）
 - **大小**：约 15 MB（含模块）
 - **位置**：`vm/vmlinuz`
 
 ### 3.2 Initrd（initrd.img）
 
-- **来源**：`vm-base.yml` 现场打包基础 initrd（busybox + Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse 等共 ~19 个 .ko，外加 `init.sh` 挂载/chroot 流程）；`vm-image.yml` 在此之上调用 `rebake-initrd.sh`，把当次构建的 `tokimo-sandbox-init` 和 `tokimo-sandbox-fuse` 注入 `/bin/`
+- **来源**：`vm.yml` 单一工作流：`build.sh` 用 debootstrap 打基础 rootfs + busybox initrd（含 Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse 等共 ~19 个 .ko，外加 `init.sh` 挂载/chroot 流程），并把当次构建的 `tokimo-sandbox-init` / `tokimo-tun-pump` 直接 bake 进 initrd；`rebake-initrd.sh` 再追加 `tokimo-sandbox-fuse`
 - **session 模式流程**：init.sh 加载模块 → mount `/dev/sda` → chroot → exec `tokimo-sandbox-init`
 - **位置**：`vm/initrd.img`
 
@@ -139,7 +139,7 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 ### 3.3 Rootfs（rootfs.vhdx）
 
-- **来源**：`vm-base.yml` 从 Debian 13 rootfs → `mkfs.ext4 -d` → `qemu-img convert -O vhdx`
+- **来源**：`vm.yml` 从 Debian 13 rootfs → `mkfs.ext4 -d` → `qemu-img convert -O vhdx`
 - **包含**：Debian 13 瘦身版、Node.js 24、Python 3.13、LibreOffice headless、ffmpeg 等
 - **位置**：`vm/rootfs.vhdx`（被服务按 session 克隆为独立副本，互不影响）
 
