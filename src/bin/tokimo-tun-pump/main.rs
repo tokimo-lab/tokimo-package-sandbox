@@ -42,8 +42,9 @@ mod imp {
     use std::time::Duration;
 
     /// Topology constants — must agree with `imp::netstack` on the host.
+    /// Sourced from `tokimo_package_sandbox::net_constants`.
     const TUN_NAME: &str = "tk0";
-    const VSOCK_HOST_CID: u32 = 2; // VMADDR_CID_HOST
+    const VSOCK_HOST_CID: u32 = tokimo_package_sandbox::net_constants::VMADDR_CID_HOST;
     const HOST_CONNECT_RETRY_MS: u64 = 250;
     const HOST_CONNECT_TIMEOUT_S: u64 = 30;
 

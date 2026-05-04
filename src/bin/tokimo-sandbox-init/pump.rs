@@ -23,14 +23,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 const TUN_NAME: &str = "tk0";
-const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
-const MTU: i32 = 1400;
-const IP4: [u8; 4] = [192, 168, 127, 2];
-const IP4_PREFIX: u8 = 24;
-const GW4: [u8; 4] = [192, 168, 127, 1];
-const IP6: [u16; 8] = [0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0002];
-const IP6_PREFIX: u8 = 64;
-const GW6: [u16; 8] = [0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0001];
+const GUEST_MAC: [u8; 6] = tokimo_package_sandbox::net_constants::GUEST_MAC;
+const MTU: i32 = tokimo_package_sandbox::net_constants::MTU as i32;
+const IP4: [u8; 4] = tokimo_package_sandbox::net_constants::GUEST_IP4_OCTETS;
+const IP4_PREFIX: u8 = tokimo_package_sandbox::net_constants::SUBNET4_PREFIX;
+const GW4: [u8; 4] = tokimo_package_sandbox::net_constants::HOST_IP4_OCTETS;
+const IP6: [u16; 8] = tokimo_package_sandbox::net_constants::GUEST_IP6_SEGMENTS;
+const IP6_PREFIX: u8 = tokimo_package_sandbox::net_constants::SUBNET6_PREFIX;
+const GW6: [u16; 8] = tokimo_package_sandbox::net_constants::HOST_IP6_SEGMENTS;
 
 /// Bring up tk0 and pump frames between it and `net_fd` until either side
 /// errors. Spawns two background threads and returns immediately.

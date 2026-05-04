@@ -30,6 +30,7 @@ pub(crate) mod shared_backend;
 
 pub mod protocol;
 pub mod svc_protocol;
+pub mod net_constants;
 
 // FUSE-over-vsock VFS bridge (cross-platform). See
 // plan/cross-platform-fuse-vfs.md.

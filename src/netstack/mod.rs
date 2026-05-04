@@ -62,25 +62,60 @@ use smoltcp::wire::{
 mod icmp;
 
 // ─── Topology constants ──────────────────────────────────────────────────────
+//
+// These are all derived from `crate::net_constants`, which is the single
+// source of truth shared with the guest-side pumps. The smoltcp-typed
+// re-exports below are kept because the rest of this module's code uses
+// smoltcp wire types directly.
+
+use crate::net_constants;
 
 /// Gateway (host) IP — what the guest sets as default route.
-pub const HOST_IP: Ipv4Address = Ipv4Address::new(192, 168, 127, 1);
+pub const HOST_IP: Ipv4Address = Ipv4Address::new(
+    net_constants::HOST_IP4_OCTETS[0],
+    net_constants::HOST_IP4_OCTETS[1],
+    net_constants::HOST_IP4_OCTETS[2],
+    net_constants::HOST_IP4_OCTETS[3],
+);
 /// Guest IP — assigned to the guest TUN interface by `init.sh`.
-pub const GUEST_IP: Ipv4Address = Ipv4Address::new(192, 168, 127, 2);
+pub const GUEST_IP: Ipv4Address = Ipv4Address::new(
+    net_constants::GUEST_IP4_OCTETS[0],
+    net_constants::GUEST_IP4_OCTETS[1],
+    net_constants::GUEST_IP4_OCTETS[2],
+    net_constants::GUEST_IP4_OCTETS[3],
+);
 /// Subnet prefix length.
-pub const SUBNET_PREFIX: u8 = 24;
+pub const SUBNET_PREFIX: u8 = net_constants::SUBNET4_PREFIX;
 /// Gateway MAC — synthetic, picked outside the IANA OUI space.
-pub const HOST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+pub const HOST_MAC: [u8; 6] = net_constants::HOST_MAC;
 /// Guest MAC — must match the MAC `tokimo-tun-pump` programs into tk0.
-pub const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+pub const GUEST_MAC: [u8; 6] = net_constants::GUEST_MAC;
 /// MTU advertised on the gateway interface.
-pub const MTU: usize = 1400;
+pub const MTU: usize = net_constants::MTU;
 
 // IPv6 topology — ULA addresses; guest gets v6 default route via HOST_IP6.
-pub const HOST_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0001);
+pub const HOST_IP6: Ipv6Address = Ipv6Address::new(
+    net_constants::HOST_IP6_SEGMENTS[0],
+    net_constants::HOST_IP6_SEGMENTS[1],
+    net_constants::HOST_IP6_SEGMENTS[2],
+    net_constants::HOST_IP6_SEGMENTS[3],
+    net_constants::HOST_IP6_SEGMENTS[4],
+    net_constants::HOST_IP6_SEGMENTS[5],
+    net_constants::HOST_IP6_SEGMENTS[6],
+    net_constants::HOST_IP6_SEGMENTS[7],
+);
 #[allow(dead_code)]
-pub const GUEST_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0x007f, 0, 0, 0, 0, 0, 0x0002);
-pub const SUBNET6_PREFIX: u8 = 64;
+pub const GUEST_IP6: Ipv6Address = Ipv6Address::new(
+    net_constants::GUEST_IP6_SEGMENTS[0],
+    net_constants::GUEST_IP6_SEGMENTS[1],
+    net_constants::GUEST_IP6_SEGMENTS[2],
+    net_constants::GUEST_IP6_SEGMENTS[3],
+    net_constants::GUEST_IP6_SEGMENTS[4],
+    net_constants::GUEST_IP6_SEGMENTS[5],
+    net_constants::GUEST_IP6_SEGMENTS[6],
+    net_constants::GUEST_IP6_SEGMENTS[7],
+);
+pub const SUBNET6_PREFIX: u8 = net_constants::SUBNET6_PREFIX;
 
 // ─── Egress policy & local-service routing ──────────────────────────────
 
