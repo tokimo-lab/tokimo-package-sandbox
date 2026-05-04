@@ -40,16 +40,16 @@
 
 #![cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as chan;
-use mio::net::UdpSocket as MioUdpSocket;
+use mio::net::{TcpStream as MioTcpStream, UdpSocket as MioUdpSocket};
 use mio::{Events, Interest, Poll, Token, Waker};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -147,13 +147,12 @@ pub struct LocalService {
     pub local_addr: SocketAddr,
 }
 
-/// I/O context: mio Registry + Waker + per-flow token allocator. Threaded
+/// I/O context: mio Registry + per-flow token allocator. Threaded
 /// through the dispatch chain so new flows can register their upstream
-/// sockets / wake signals with the main loop's `Poll`.
+/// sockets with the main loop's `Poll`.
 struct IoCtx<'a> {
     registry: &'a mio::Registry,
     next_token: &'a mut usize,
-    waker: &'a Arc<Waker>,
 }
 
 impl IoCtx<'_> {
@@ -282,20 +281,42 @@ struct TcpKey {
 
 struct TcpFlow {
     handle: SocketHandle,
-    upstream_to_guest_rx: chan::Receiver<Vec<u8>>,
-    guest_to_upstream_tx: chan::Sender<Vec<u8>>,
-    upstream_closed: Arc<AtomicBool>,
-    /// Set to true by tcp_proxy once the upstream TCP connection succeeds.
-    /// The main loop watches this to unpause the SYN-ACK.
-    upstream_ready: Arc<AtomicBool>,
-    last_activity: Instant,
-    closed: bool,
-    /// True once we have called sock.pause_synack(false).
-    synack_unpaused: bool,
-    /// Bytes received from upstream that could not be fully written into the
-    /// smoltcp TX buffer in one shot.  The usize is the already-written
-    /// offset.  Must be flushed before accepting new upstream buffers.
+    /// Upstream socket, registered with the main `Poll` (READABLE | WRITABLE).
+    upstream: MioTcpStream,
+    /// Token used to register `upstream` — kept only so we can deregister
+    /// on flow removal (mio `Registry::deregister` operates on the source,
+    /// the token isn't actually consulted, but we keep it for symmetry
+    /// with `UdpFlow` if we ever want a token→flow lookup).
+    #[allow(dead_code)]
+    token: Token,
+    state: TcpUpstreamState,
+    /// Bytes read from the guest's smoltcp socket waiting to be written
+    /// upstream once the kernel send buffer has room.
+    pending_to_upstream: VecDeque<Vec<u8>>,
+    /// Bytes read from upstream that did not all fit into the smoltcp TX
+    /// buffer last round; the `usize` is the already-written offset.  Must
+    /// be flushed before reading more from upstream.
     pending_to_guest: Option<(Vec<u8>, usize)>,
+    last_activity: Instant,
+    /// True once we have called `socket.close()` to FIN the guest.
+    closed: bool,
+    /// True once we have called `sock.pause_synack(false)`.
+    synack_unpaused: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpUpstreamState {
+    /// `mio::net::TcpStream::connect` returned; waiting for WRITABLE event
+    /// to confirm the kernel finished the 3-way handshake.
+    Connecting,
+    /// Upstream connected, both halves open.
+    Connected,
+    /// Upstream sent FIN (read returned 0).  We can still send guest→upstream
+    /// data until the guest also FINs; once `pending_to_guest` is drained we
+    /// `socket.close()` to relay the FIN to the guest.
+    UpstreamFinned,
+    /// Connect failed, RST, or fatal I/O error.  Drop the flow.
+    Failed,
 }
 
 /// State for one upstream UDP flow (keyed by full 4-tuple).
@@ -460,7 +481,6 @@ fn run(
         let mut io = IoCtx {
             registry: poll.registry(),
             next_token: &mut next_token,
-            waker: &waker,
         };
         let mut staged: Vec<Vec<u8>> = Vec::new();
         while let Ok(frame) = rx_in_rx.try_recv() {
@@ -502,39 +522,92 @@ fn run(
         for (key, flow) in tcp_flows.iter_mut() {
             let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
 
-            // Unpause SYN-ACK once upstream connect succeeds; RST if it failed.
-            if !flow.synack_unpaused {
-                if flow.upstream_ready.load(Ordering::Relaxed) {
-                    socket.pause_synack(false);
-                    flow.synack_unpaused = true;
-                } else if flow.upstream_closed.load(Ordering::Relaxed) {
-                    // Connect failed — abort the TCP handshake.
-                    socket.abort();
-                    tcp_to_remove.push(*key);
-                    continue;
+            // Promote Connecting → Connected/Failed once the kernel finishes
+            // the handshake. mio fires WRITABLE on first connect completion,
+            // but we re-check every iteration so a polling-without-event path
+            // (e.g. main loop woken by another flow) still makes progress.
+            if flow.state == TcpUpstreamState::Connecting {
+                match flow.upstream.take_error() {
+                    Ok(Some(_)) | Err(_) => flow.state = TcpUpstreamState::Failed,
+                    Ok(None) => match flow.upstream.peer_addr() {
+                        Ok(_) => flow.state = TcpUpstreamState::Connected,
+                        Err(ref e) if e.kind() == io::ErrorKind::NotConnected => {}
+                        Err(_) => flow.state = TcpUpstreamState::Failed,
+                    },
                 }
             }
 
-            // Only consume from the smoltcp RX buffer when the channel to the
-            // upstream-writer thread has room.  If we drain bytes from the
-            // socket unconditionally, smoltcp opens its receive window wide
-            // and the guest can flood us; the bytes then pile up in an
-            // unbounded Vec<u8> queue.  By leaving them in the smoltcp RX
-            // buffer instead, smoltcp shrinks the advertised window → natural
-            // TCP backpressure all the way to the guest NIC.
-            if socket.can_recv() && !flow.guest_to_upstream_tx.is_full() {
+            // Drive SYN-ACK release based on connect outcome.
+            if !flow.synack_unpaused {
+                match flow.state {
+                    TcpUpstreamState::Connected => {
+                        socket.pause_synack(false);
+                        flow.synack_unpaused = true;
+                    }
+                    TcpUpstreamState::Failed => {
+                        socket.abort();
+                        tcp_to_remove.push(*key);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Guest → upstream: drain smoltcp recv buffer into pending queue,
+            // then flush as much as the kernel will accept (non-blocking).
+            // Backpressure: stop pulling from smoltcp once ~256KiB is buffered
+            // so smoltcp can shrink the advertised window — same goal as the
+            // old `chan::bounded(64).is_full()` check.
+            let pending_bytes: usize = flow.pending_to_upstream.iter().map(|b| b.len()).sum();
+            if matches!(
+                flow.state,
+                TcpUpstreamState::Connected | TcpUpstreamState::UpstreamFinned
+            ) && socket.can_recv()
+                && pending_bytes < 256 * 1024
+            {
                 let _ = socket.recv(|buf| {
                     if !buf.is_empty() {
-                        let _ = flow.guest_to_upstream_tx.try_send(buf.to_vec());
+                        flow.pending_to_upstream.push_back(buf.to_vec());
                         flow.last_activity = now;
                     }
                     (buf.len(), ())
                 });
             }
-            // Flush any bytes that didn't fit in the smoltcp TX buffer last round.
+            while let Some(front) = flow.pending_to_upstream.front_mut() {
+                match flow.upstream.write(front) {
+                    Ok(0) => break,
+                    Ok(n) if n == front.len() => {
+                        flow.pending_to_upstream.pop_front();
+                        flow.last_activity = now;
+                    }
+                    Ok(n) => {
+                        front.drain(..n);
+                        flow.last_activity = now;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        flow.state = TcpUpstreamState::Failed;
+                        break;
+                    }
+                }
+            }
+            // If guest has FIN'd (smoltcp socket transitioned past Established
+            // into the close states) and we've drained all pending bytes,
+            // shut down the upstream write side so the peer sees EOF.
+            if flow.pending_to_upstream.is_empty()
+                && matches!(
+                    socket.state(),
+                    tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::Closed
+                )
+            {
+                let _ = flow.upstream.shutdown(std::net::Shutdown::Write);
+            }
+
+            // Upstream → guest: flush any leftover bytes first, then read
+            // more from the kernel (also non-blocking, edge-triggered drain).
             let still_pending = if let Some((buf, off)) = &mut flow.pending_to_guest {
                 match socket.send_slice(&buf[*off..]) {
-                    Ok(0) | Err(_) => true, // TX buffer still full — try again next round
+                    Ok(0) | Err(_) => true,
                     Ok(n) => {
                         *off += n;
                         flow.last_activity = now;
@@ -546,30 +619,55 @@ fn run(
             };
             if !still_pending {
                 flow.pending_to_guest = None;
-                // Only accept new upstream data once the pending buffer is clear.
-                while let Ok(buf) = flow.upstream_to_guest_rx.try_recv() {
-                    let mut off = 0;
-                    while off < buf.len() {
-                        match socket.send_slice(&buf[off..]) {
-                            Ok(0) | Err(_) => {
-                                flow.pending_to_guest = Some((buf, off));
+                if matches!(flow.state, TcpUpstreamState::Connected) {
+                    let mut up_buf = vec![0u8; 32 * 1024];
+                    loop {
+                        if !socket.can_send() {
+                            break;
+                        }
+                        match flow.upstream.read(&mut up_buf) {
+                            Ok(0) => {
+                                flow.state = TcpUpstreamState::UpstreamFinned;
                                 break;
                             }
-                            Ok(n) => off += n,
+                            Ok(n) => {
+                                let data = up_buf[..n].to_vec();
+                                let mut off = 0;
+                                while off < data.len() {
+                                    match socket.send_slice(&data[off..]) {
+                                        Ok(0) | Err(_) => {
+                                            flow.pending_to_guest = Some((data, off));
+                                            break;
+                                        }
+                                        Ok(m) => off += m,
+                                    }
+                                }
+                                if flow.pending_to_guest.is_some() {
+                                    break;
+                                }
+                                flow.last_activity = now;
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(_) => {
+                                flow.state = TcpUpstreamState::Failed;
+                                break;
+                            }
                         }
                     }
-                    if flow.pending_to_guest.is_some() {
-                        break; // TX buffer full — stop draining, preserve order
-                    }
-                    flow.last_activity = now;
                 }
             }
-            if flow.upstream_closed.load(Ordering::Relaxed) && !flow.closed {
+
+            // If upstream has fully closed and we've drained all bytes to the
+            // guest, FIN the guest side.
+            if matches!(flow.state, TcpUpstreamState::UpstreamFinned | TcpUpstreamState::Failed)
+                && flow.pending_to_guest.is_none()
+                && !flow.closed
+            {
                 socket.close();
                 flow.closed = true;
             }
             let st = socket.state();
-            let upstream_done = flow.upstream_closed.load(Ordering::Relaxed);
+            let upstream_done = matches!(flow.state, TcpUpstreamState::UpstreamFinned | TcpUpstreamState::Failed);
             let dead = matches!(st, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing)
                 || (upstream_done && matches!(st, tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::LastAck));
             let idle = now.duration_since(flow.last_activity) > idle_timeout;
@@ -578,9 +676,8 @@ fn run(
             }
         }
         for key in tcp_to_remove {
-            if let Some(flow) = tcp_flows.remove(&key) {
-                flow.upstream_closed.store(true, Ordering::Relaxed);
-                drop(flow.guest_to_upstream_tx);
+            if let Some(mut flow) = tcp_flows.remove(&key) {
+                let _ = poll.registry().deregister(&mut flow.upstream);
                 sockets.remove(flow.handle);
             }
         }
@@ -893,114 +990,55 @@ fn register_tcp_flow(
     }
     sock.set_nagle_enabled(false);
     sock.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
-    // Hold the SYN-ACK until tcp_proxy confirms the upstream connection is up.
-    // This prevents the guest from starting to send data before we know
-    // whether the upstream is reachable.
+    // Hold the SYN-ACK until the upstream connect completes.  This prevents
+    // the guest from starting to send data before we know whether the
+    // upstream is reachable.
     sock.pause_synack(true);
     let handle = sockets.add(sock);
 
-    let (u2g_tx, u2g_rx) = chan::bounded::<Vec<u8>>(64);
-    let (g2u_tx, g2u_rx) = chan::bounded::<Vec<u8>>(64);
-    let upstream_closed = Arc::new(AtomicBool::new(false));
-    let upstream_closed2 = Arc::clone(&upstream_closed);
-    let upstream_ready = Arc::new(AtomicBool::new(false));
-    let upstream_ready2 = Arc::clone(&upstream_ready);
-    let waker = Arc::clone(io.waker);
-
-    thread::Builder::new()
-        .name(format!("net-tcp-{}-{}", key.dst_ip, key.dst_port))
-        .spawn(move || tcp_proxy(upstream, u2g_tx, g2u_rx, upstream_closed2, upstream_ready2, waker))
-        .ok();
+    // Non-blocking connect: returns immediately, completion is signalled
+    // via a WRITABLE event from the main Poll once the kernel finishes the
+    // handshake (or via take_error()/peer_addr() returning failure).
+    let mut upstream_sock = match MioTcpStream::connect(upstream) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[netstack] connect {} fail: {}", upstream, e);
+            // Abort the listening socket so the guest sees RST instead of
+            // a hang. The listener is in Listen state — abort() is the
+            // smoltcp way to send a RST.
+            let s = sockets.get_mut::<tcp::Socket>(handle);
+            s.abort();
+            sockets.remove(handle);
+            return;
+        }
+    };
+    let token = io.alloc_token();
+    if let Err(e) = io
+        .registry
+        .register(&mut upstream_sock, token, Interest::READABLE | Interest::WRITABLE)
+    {
+        eprintln!("[netstack] tcp register {} fail: {}", upstream, e);
+        let s = sockets.get_mut::<tcp::Socket>(handle);
+        s.abort();
+        sockets.remove(handle);
+        return;
+    }
 
     tcp_flows.insert(
         key,
         TcpFlow {
             handle,
-            upstream_to_guest_rx: u2g_rx,
-            guest_to_upstream_tx: g2u_tx,
-            upstream_closed,
-            upstream_ready,
+            upstream: upstream_sock,
+            token,
+            state: TcpUpstreamState::Connecting,
+            pending_to_upstream: VecDeque::new(),
+            pending_to_guest: None,
             last_activity: Instant::now(),
             closed: false,
             synack_unpaused: false,
-            pending_to_guest: None,
         },
     );
     eprintln!("[netstack] tcp flow opened {} → {}", key.src_port, upstream);
-}
-
-fn tcp_proxy(
-    dst: SocketAddr,
-    u2g_tx: chan::Sender<Vec<u8>>,
-    g2u_rx: chan::Receiver<Vec<u8>>,
-    upstream_closed: Arc<AtomicBool>,
-    upstream_ready: Arc<AtomicBool>,
-    waker: Arc<Waker>,
-) {
-    let mut up = match TcpStream::connect_timeout(&dst, Duration::from_secs(8)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[netstack] connect {} fail: {}", dst, e);
-            upstream_closed.store(true, Ordering::Relaxed);
-            let _ = waker.wake();
-            return;
-        }
-    };
-    // Signal success *before* starting data transfer so the main loop
-    // can unpause the SYN-ACK as soon as possible.
-    upstream_ready.store(true, Ordering::Relaxed);
-    let _ = waker.wake();
-    let _ = up.set_nodelay(true);
-    let _ = up.set_read_timeout(Some(Duration::from_millis(200)));
-
-    let mut up_w = match up.try_clone() {
-        Ok(w) => w,
-        Err(_) => {
-            upstream_closed.store(true, Ordering::Relaxed);
-            let _ = waker.wake();
-            return;
-        }
-    };
-    let upstream_closed_w = Arc::clone(&upstream_closed);
-    let waker_w = Arc::clone(&waker);
-    let writer = thread::Builder::new()
-        .name(format!("net-tcp-w-{}", dst))
-        .spawn(move || {
-            while let Ok(buf) = g2u_rx.recv() {
-                if up_w.write_all(&buf).is_err() {
-                    break;
-                }
-            }
-            let _ = up_w.shutdown(std::net::Shutdown::Write);
-            upstream_closed_w.store(true, Ordering::Relaxed);
-            let _ = waker_w.wake();
-        })
-        .ok();
-
-    let mut buf = vec![0u8; 32 * 1024];
-    loop {
-        match up.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if u2g_tx.send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-                let _ = waker.wake();
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                if upstream_closed.load(Ordering::Relaxed) {
-                    break;
-                }
-                continue;
-            }
-            Err(_) => break,
-        }
-    }
-    upstream_closed.store(true, Ordering::Relaxed);
-    let _ = waker.wake();
-    if let Some(j) = writer {
-        let _ = j.join();
-    }
 }
 
 fn register_udp_flow(
