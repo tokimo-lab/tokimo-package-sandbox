@@ -144,6 +144,9 @@ export PATH=/home/tokimo/bin:/usr/local/bin:/usr/bin:/bin
 export PYTHONPATH=/home/tokimo/python_packages${PYTHONPATH:+:$PYTHONPATH}
 export PIP_TARGET=/home/tokimo/python_packages
 export npm_config_registry=https://registry.npmmirror.com
+# Redirect per-user .pyc writes away from /usr/lib (tokimo has no write
+# permission there).  Python 3.8+ honours this env var natively.
+export PYTHONPYCACHEPREFIX="/tmp/.pycache-${UID}"
 ENVEOF
 chmod +x /etc/profile.d/tokimo_env.sh
 
@@ -322,6 +325,14 @@ rm -rf \
 
 find / -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
 find / -name '*.pyc' -delete 2>/dev/null || true
+
+# Pre-compile Python stdlib .pyc files (as root) so the tokimo user never
+# needs to write into /usr/lib/python3* at runtime.  Run AFTER the general
+# pyc cleanup so only stdlib files are added back, keeping image size lean.
+# -q suppresses per-file output; -j 0 uses all available cores; || true
+# prevents individual compilation failures from aborting the build.
+PYLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))') \
+  && python3 -m compileall -q -j 0 "$PYLIB" 2>/dev/null || true
 
 echo "--- verification ---"
 node --version
