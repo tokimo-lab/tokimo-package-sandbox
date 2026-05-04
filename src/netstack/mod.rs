@@ -398,21 +398,19 @@ fn run(
         }
     })?;
 
-    let shutdown_w = Arc::clone(&shutdown);
+    // Writer thread: blocks on `recv()` until either a frame arrives or all
+    // senders are dropped (which is how shutdown propagates — no time-based
+    // poll needed). The shared `Mutex<write_half>` is only here so the main
+    // function can `drop(writer)` at the end to be sure no other reference
+    // outlives the loop; the writer thread itself is the only locker.
     let writer = Arc::new(Mutex::new(write_half));
     let writer_thread = Arc::clone(&writer);
     thread::Builder::new().name("netstack-tx".into()).spawn(move || {
-        while !shutdown_w.load(Ordering::Relaxed) {
-            match tx_out_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(frame) => {
-                    let mut w = writer_thread.lock().unwrap();
-                    if let Err(e) = write_frame(&mut *w, &frame) {
-                        eprintln!("[netstack-tx] write end: {e}");
-                        break;
-                    }
-                }
-                Err(chan::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
+        while let Ok(frame) = tx_out_rx.recv() {
+            let mut w = writer_thread.lock().unwrap();
+            if let Err(e) = write_frame(&mut *w, &frame) {
+                eprintln!("[netstack-tx] write end: {e}");
+                break;
             }
         }
     })?;
