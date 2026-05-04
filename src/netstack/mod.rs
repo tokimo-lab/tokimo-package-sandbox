@@ -754,7 +754,7 @@ fn register_tcp_flow(
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
     let listen_ep = IpListenEndpoint {
-        addr: Some(key.dst_ip),
+        addr: None, // any_ip=true makes this match any dst IP; None is more reliable than Some(key.dst_ip)
         port: key.dst_port,
     };
     if let Err(e) = sock.listen(listen_ep) {
