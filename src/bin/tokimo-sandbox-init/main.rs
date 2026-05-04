@@ -221,6 +221,17 @@ fn run() -> Result<(), String> {
         if let Err(e) = chroot("/mnt/work") {
             return Err(format!("chroot /mnt/work: {e}"));
         }
+
+        // Ensure /home/tokimo and /home/tokimo/agents exist and are owned by
+        // uid=1000:gid=1000 so subsequent unprivileged spawn_shell calls
+        // (which drop to uid=1000) can create per-agent workspace
+        // directories under /home/tokimo/agents/<sanitized>.
+        match ensure_tokimo_home() {
+            Ok(()) => {
+                eprintln!("[tokimo-sandbox-init] ensured /home/tokimo (uid=1000:gid=1000)");
+            }
+            Err(e) => eprintln!("[tokimo-sandbox-init] WARN: ensure_tokimo_home: {e}"),
+        }
     } else if !pre_chrooted && bwrap_cli.as_ref().map(|c| c.mount_sysfs).unwrap_or(false) {
         // bwrap + Blocked mode: host provides an empty /sys; mount fresh
         // sysfs here so `/sys/class/net` is filtered by our new netns.
@@ -551,6 +562,23 @@ fn chroot(path: &str) -> Result<(), String> {
     if unsafe { libc::chroot(p.as_ptr()) } != 0 {
         return Err(format!("chroot {path}: {}", std::io::Error::last_os_error()));
     }
+    Ok(())
+}
+
+/// Ensure `/home/tokimo` and `/home/tokimo/agents` exist and are owned by
+/// uid=1000:gid=1000. `/home` itself stays root:root 0755.
+#[cfg(target_os = "linux")]
+fn ensure_tokimo_home() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::chown;
+    for path in ["/home", "/home/tokimo", "/home/tokimo/agents"] {
+        std::fs::create_dir_all(path)?;
+    }
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions("/home/tokimo", perms.clone())?;
+    std::fs::set_permissions("/home/tokimo/agents", perms)?;
+    chown("/home/tokimo", Some(1000), Some(1000))?;
+    chown("/home/tokimo/agents", Some(1000), Some(1000))?;
     Ok(())
 }
 
