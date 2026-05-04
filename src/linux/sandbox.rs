@@ -657,7 +657,7 @@ impl SandboxBackend for LinuxBackend {
         }
 
         let shell_info = init_client
-            .open_shell(&["/bin/bash"], &[], None)
+            .open_shell(&["/bin/bash".to_string()], &[], None)
             .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
 
         let init_client = Arc::new(init_client);
@@ -820,9 +820,8 @@ impl SandboxBackend for LinuxBackend {
             None => {
                 // Pipes mode. Use OpenShell (the existing path) when argv is
                 // exactly the default; otherwise use Spawn { Pipes }.
-                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 let shell_info = client
-                    .open_shell(&argv_refs, &env, cwd.as_deref())
+                    .open_shell(&argv, &env, cwd.as_deref())
                     .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
                 let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
                 let job_id = JobId(format!("j{}", g.next_job_id));
@@ -838,9 +837,10 @@ impl SandboxBackend for LinuxBackend {
                 Ok(job_id)
             }
             Some((rows, cols)) => {
-                let (info, master_fd) = client
+                let (info, master_fd_opt) = client
                     .spawn_pty(&argv, &env, cwd.as_deref(), rows, cols)
                     .map_err(|e| Error::other(format!("init spawn_pty failed: {e}")))?;
+                let master_fd = master_fd_opt.ok_or_else(|| Error::other("PTY spawn did not return master fd"))?;
                 // Dup the master fd for the host-side reader thread; the
                 // original lives in JobSpawnInfo so write_stdin can use it.
                 let dup_raw = unsafe { libc::dup(master_fd.as_raw_fd()) };

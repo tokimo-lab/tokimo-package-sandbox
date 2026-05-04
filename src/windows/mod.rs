@@ -23,6 +23,7 @@
 
 pub(crate) mod client;
 pub mod init_client;
+pub(crate) mod init_transport;
 pub(crate) mod ov_pipe;
 pub(crate) mod safe_path;
 pub(crate) mod sandbox;

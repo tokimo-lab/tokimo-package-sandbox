@@ -349,10 +349,13 @@ impl SandboxBackend for MacosBackend {
                 .init
                 .open_shell(&argv, &opts.env, opts.cwd.as_deref())
                 .map_err(|e| Error::other(format!("open_shell: {e}")))?,
-            Some((rows, cols)) => rs
-                .init
-                .spawn_pty(&argv, &opts.env, opts.cwd.as_deref(), rows, cols)
-                .map_err(|e| Error::other(format!("spawn_pty: {e}")))?,
+            Some((rows, cols)) => {
+                let (shell_info, _) = rs
+                    .init
+                    .spawn_pty(&argv, &opts.env, opts.cwd.as_deref(), rows, cols)
+                    .map_err(|e| Error::other(format!("spawn_pty: {e}")))?;
+                shell_info
+            }
         };
         rs.shells.insert(shell_info.child_id.clone());
         Ok(JobId(shell_info.child_id))

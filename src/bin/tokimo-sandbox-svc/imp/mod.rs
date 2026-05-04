@@ -1388,14 +1388,15 @@ fn handle_spawn_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
     let cwd = p.cwd;
 
     let shell_info = match (p.pty_rows, p.pty_cols) {
-        (Some(rows), Some(cols)) => init
-            .spawn_pty(&argv, &env, cwd.as_deref(), rows, cols)
-            .map_err(|e| RpcError::new("spawn_pty", e.to_string()))?,
-        _ => {
-            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            init.spawn_pipes(&argv_refs, &env, cwd.as_deref())
-                .map_err(|e| RpcError::new("spawn_pipes", e.to_string()))?
+        (Some(rows), Some(cols)) => {
+            let (info, _) = init
+                .spawn_pty(&argv, &env, cwd.as_deref(), rows, cols)
+                .map_err(|e| RpcError::new("spawn_pty", e.to_string()))?;
+            info
         }
+        _ => init
+            .spawn_pipes(&argv, &env, cwd.as_deref())
+            .map_err(|e| RpcError::new("spawn_pipes", e.to_string()))?,
     };
     let child_id = shell_info.child_id;
 

@@ -23,6 +23,7 @@
 mod api;
 mod backend;
 mod error;
+pub mod init_client;
 mod platform;
 pub mod session_registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
