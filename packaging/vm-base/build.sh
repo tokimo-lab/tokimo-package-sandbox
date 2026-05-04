@@ -201,7 +201,13 @@ rm -rf /usr/bin/scalar /usr/share/man/man1/scalar* 2>/dev/null || true
 apt-get remove -y dirmngr gpgsm 2>/dev/null || true
 
 rm -rf /usr/share/vim/vim*/doc /usr/share/vim/vim*/tutor
-find /usr/share/vim/vim*/syntax -type f ! -name 'markdown.vim' ! -name 'text.vim' \
+# Vim syntax/: keep the dispatcher framework AND a curated set of language
+# syntax files. The dispatcher files are sourced unconditionally by
+# defaults.vim — without them, `vim <file>` errors out with E484.
+find /usr/share/vim/vim*/syntax -type f \
+  ! -name 'syntax.vim' ! -name 'synload.vim' ! -name 'syncolor.vim' \
+  ! -name 'nosyntax.vim' ! -name 'manual.vim' \
+  ! -name 'markdown.vim' ! -name 'text.vim' \
   ! -name 'help.vim' ! -name 'vim.vim' ! -name 'viminfo.vim' \
   ! -name 'sh.vim' ! -name 'bash.vim' ! -name 'python.vim' \
   ! -name 'json.vim' ! -name 'yaml.vim' ! -name 'xml.vim' \
