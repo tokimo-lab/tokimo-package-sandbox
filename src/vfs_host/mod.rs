@@ -912,7 +912,7 @@ mod parking_lot_compat {
 mod tests {
     use super::*;
     use crate::vfs_impls::{LocalDirVfs, MemFsVfs};
-    use crate::vfs_protocol::Errno;
+    use crate::vfs_protocol::{Errno, PROTOCOL_VERSION};
     use std::sync::Arc;
     use std::time::Duration;
 
