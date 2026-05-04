@@ -192,6 +192,37 @@ if [ "$SESSION_MODE" = 1 ]; then
     # dial anything outside the gateway IPs.
     # ---------------------------------------------------------------------------
     /bin/busybox ip link set lo up 2>/dev/null || true
+
+    # ---------------------------------------------------------------------------
+    # Sandbox-wide kernel switches.
+    #
+    # Mainline Linux defaults are tuned to "don't let unprivileged users hurt
+    # the host". Inside a disposable micro-VM the security boundary is the
+    # VM itself — the guest kernel can fully trust its own users. Open the
+    # switches that otherwise bite a non-root shell trying to do normal dev
+    # work (ping, gdb, perf, bpftrace, nested rootless containers, binding
+    # :80/:443 for a quick test server, …). Each `|| true` keeps boot from
+    # failing on kernels that don't expose the knob.
+    # ---------------------------------------------------------------------------
+    # ping / ping -6 via SOCK_DGRAM ICMP (covers v4 and v6).
+    echo '0 2147483647' > /proc/sys/net/ipv4/ping_group_range 2>/dev/null || true
+    # gdb / strace cross-process attach.
+    echo 0 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true
+    # perf record / perf top.
+    echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true
+    # Kernel symbols visible to perf / bcc / bpftrace.
+    echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null || true
+    # dmesg readable by any user.
+    echo 0 > /proc/sys/kernel/dmesg_restrict 2>/dev/null || true
+    # Unprivileged bpf() syscall (bcc, bpftrace, libbpf-tools).
+    echo 0 > /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || true
+    # Nested rootless containers (bwrap, podman, docker rootless).
+    echo 1 > /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
+    # Bind low ports (80, 443, ...) without CAP_NET_BIND_SERVICE.
+    echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || true
+    # userfaultfd() for unprivileged users (CRIU, some fuzzers).
+    echo 1 > /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || true
+
     if [ -n "$NETSTACK_PORT" ]; then
         echo "tokimo-init: configuring tk0 via userspace netstack (vsock port $NETSTACK_PORT, dns=$NETDNS)" \
             >/dev/kmsg 2>/dev/null || true
