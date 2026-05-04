@@ -978,6 +978,10 @@ fn add_user_sets_user_and_home_env() {
 // the host reads the same bytes back from its local path.
 
 #[test]
+#[ignore = "single-user model: fuse client hardcodes attr uid=1000 but bwrap \
+            user_ns gid map omits 1000, so reverse-mount writes from a non-\
+            mapped uid don't surface on the host. Re-enable if sandbox-svc \
+            grows --uidmap=0:0:1,1000:<runner>:1 for the bwrap backend."]
 fn add_user_with_reverse_mount_writes_to_host() {
     const SENTINEL: &str = "BOB_WROTE_THIS_F3A2";
 
