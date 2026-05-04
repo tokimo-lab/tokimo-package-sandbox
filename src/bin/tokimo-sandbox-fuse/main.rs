@@ -177,13 +177,6 @@ mod linux {
             MountOption::DefaultPermissions,
             MountOption::AllowOther,
             MountOption::NoAtime,
-            // Force-own mount as tokimo (uid=1000, gid=1000). The vfs_host returns
-            // uid=0 because it cannot map host (Windows / macOS) ACLs to a meaningful
-            // Linux uid; with the single-user model all guest processes run as
-            // tokimo:tokimo, so spoofing ownership at mount time gives them
-            // unrestricted access to their own workspace.
-            MountOption::CUSTOM("uid=1000".to_string()),
-            MountOption::CUSTOM("gid=1000".to_string()),
         ];
         if args.read_only {
             opts.push(MountOption::RO);
@@ -541,8 +534,13 @@ mod linux {
             kind,
             perm: (a.mode & 0o7777) as u16,
             nlink: a.nlink,
-            uid: a.uid,
-            gid: a.gid,
+            // Single-user sandbox model: all guest processes run as tokimo
+            // (uid=1000, gid=1000). vfs_host on Windows/macOS returns uid=0
+            // because it can't map host ACLs to a Linux uid, which would make
+            // the mount unwritable by tokimo with DefaultPermissions enabled.
+            // Override here so guest processes see themselves as the owner.
+            uid: 1000,
+            gid: 1000,
             rdev: 0,
             blksize: 4096,
             flags: 0,
