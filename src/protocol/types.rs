@@ -118,48 +118,6 @@ pub enum Op {
         #[serde(default = "default_true")]
         kill_all: bool,
     },
-    /// Register a named identity inside the shared init container and
-    /// spawn a bash shell scoped to that identity.
-    ///
-    /// `home` is the absolute guest-side directory used as the user's
-    /// HOME (and default cwd). Init `mkdir -p`s it; if it already exists
-    /// (e.g. a host directory was pre-mounted there via `add_mount`), the
-    /// existing mount point is reused.
-    ///
-    /// Injected env (in order, lowest precedence first):
-    ///   * USER, LOGNAME = `user_id`
-    ///   * HOME = `home`
-    ///   * PS1 = `\u@tokimo:\w$ `
-    ///   * MAIL = /var/mail/`user_id`
-    ///   * `env_overlay` (highest precedence; user-supplied)
-    ///
-    /// If `real_user` is true, init runs `useradd -M -d <home> -s
-    /// /bin/bash <user_id>` (idempotent) and execs the shell as that
-    /// uid in shared group `tokimo-users` (gid 1000). On `useradd`
-    /// failure init falls back to root with USER/LOGNAME env set, and
-    /// reports the warning via stderr.
-    ///
-    /// The reply is `Reply::Spawn` carrying the shell's `child_id`.
-    AddUser {
-        id: String,
-        user_id: String,
-        home: String,
-        #[serde(default)]
-        cwd: Option<String>,
-        #[serde(default)]
-        env_overlay: Vec<(String, String)>,
-        #[serde(default = "default_true")]
-        real_user: bool,
-    },
-    /// Remove a previously-added user: SIGKILL all shells owned by
-    /// `user_id` and (if `real_user` was used) `userdel` the account.
-    RemoveUser { id: String, user_id: String },
-    /// Rename a previously-added user inside the guest. Init runs
-    /// `userdel <old>` and then `useradd -M -d /home/<new> --badname <new>`.
-    /// Existing shells are left running with the *old* uid (kernel-level
-    /// uid is fixed at exec); the host should close & reopen any shells
-    /// after a successful rename.
-    RenameUser { id: String, old: String, new: String },
     /// Dynamic bind mount inside the container. `source` must be a path
     /// already visible inside the container (e.g., pre-mounted host dir).
     /// `target` is the mount point created by init.
@@ -323,9 +281,6 @@ pub fn default_features() -> Vec<String> {
         "signal".into(),
         "killpg".into(),
         "openshell".into(),
-        "adduser".into(),
-        "removeuser".into(),
-        "renameuser".into(),
         "bindmount".into(),
         "unmount".into(),
         "dynamic_mount".into(),

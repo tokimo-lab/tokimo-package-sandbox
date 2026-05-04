@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 use crate::svc_protocol::{
-    AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult,
-    JobIdResult, ListSessionsResult, RemoveMountParams, RemoveUserParams, RenameUserParams, ResizeShellParams,
-    SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, ListSessionsResult,
+    RemoveMountParams, ResizeShellParams, SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams,
+    WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -206,33 +206,6 @@ impl SandboxBackend for WindowsBackend {
     fn remove_mount(&self, name: &str) -> Result<()> {
         let p = RemoveMountParams { name: name.to_string() };
         self.call(method::REMOVE_MOUNT, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
-        Ok(())
-    }
-
-    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
-        let p = AddUserParams {
-            user_id: user_id.to_string(),
-            opts,
-        };
-        let v = self.call(method::ADD_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
-        let r: AddUserResult = serde_json::from_value(v)?;
-        Ok(JobId(r.job_id))
-    }
-
-    fn remove_user(&self, user_id: &str) -> Result<()> {
-        let p = RemoveUserParams {
-            user_id: user_id.to_string(),
-        };
-        self.call(method::REMOVE_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
-        Ok(())
-    }
-
-    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
-        let p = RenameUserParams {
-            old: old.to_string(),
-            new: new.to_string(),
-        };
-        self.call(method::RENAME_USER, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
         Ok(())
     }
 

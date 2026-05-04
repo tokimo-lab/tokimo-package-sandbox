@@ -161,7 +161,7 @@ StreamDevice (smoltcp) on host
 | VSOCK stream (guest listens) | macOS VZ | Protocol bridge (Stdout/Write events) |
 | VSOCK stream (guest connects) | Windows HCS | Protocol bridge (Stdout/Write events) |
 
-Capabilities: `Pipes` and `Pty` stdio modes, `Resize`, `Signal`, `Killpg`, `OpenShell`, `AddUser`/`RemoveUser`, `MountFuse`/`UnmountFuse` (FUSE-over-vsock/socketpair).
+Capabilities: `Pipes` and `Pty` stdio modes, `Resize`, `Signal`, `Killpg`, `OpenShell`, `MountFuse`/`UnmountFuse` (FUSE-over-vsock/socketpair).
 
 ## Quick start
 

@@ -267,49 +267,6 @@ impl WinInitClient {
         self.ack_op(&id, op)
     }
 
-    /// AddUser → returns child_id of the per-user bash shell.
-    pub fn add_user(
-        &self,
-        user_id: &str,
-        home: &str,
-        cwd: Option<&str>,
-        env_overlay: &[(String, String)],
-        real_user: bool,
-    ) -> Result<SpawnInfo> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::AddUser {
-            id: id.clone(),
-            user_id: user_id.into(),
-            home: home.into(),
-            cwd: cwd.map(str::to_string),
-            env_overlay: env_overlay.to_vec(),
-            real_user,
-        };
-        self.spawn_ack(&id, op)
-    }
-
-    /// RemoveUser — best-effort SIGKILL + userdel inside the guest.
-    pub fn remove_user(&self, user_id: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::RemoveUser {
-            id: id.clone(),
-            user_id: user_id.into(),
-        };
-        self.ack_op(&id, op)
-    }
-
-    /// RenameUser — `userdel <old>` + `useradd --badname <new>` inside
-    /// the guest. Best-effort.
-    pub fn rename_user(&self, old: &str, new: &str) -> Result<()> {
-        let id = next_id(&self.inner.counter);
-        let op = Op::RenameUser {
-            id: id.clone(),
-            old: old.into(),
-            new: new.into(),
-        };
-        self.ack_op(&id, op)
-    }
-
     pub fn close_child(&self, child_id: &str) -> Result<()> {
         let id = next_id(&self.inner.counter);
         let op = Op::Close {

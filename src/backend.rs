@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::error::Result;
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -53,15 +53,6 @@ pub trait SandboxBackend: Send + Sync + 'static {
     // -- Dynamic mount management -------------------------------------
     fn add_mount(&self, mount: Mount) -> Result<()>;
     fn remove_mount(&self, name: &str) -> Result<()>;
-
-    // -- User management ----------------------------------------------
-    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId>;
-    fn remove_user(&self, user_id: &str) -> Result<()>;
-    /// Rename a previously-added user. Best-effort: returns Ok even
-    /// if the old account didn't exist on the guest. The new id must
-    /// pass `validate_user_id`. Existing shells are NOT migrated;
-    /// callers should close & reopen any per-user shells after rename.
-    fn rename_user(&self, old: &str, new: &str) -> Result<()>;
 
     // -- Management / introspection -----------------------------------
     /// Enumerate sessions tracked by the backend. See

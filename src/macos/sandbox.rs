@@ -24,7 +24,7 @@ use std::time::Duration;
 use arcbox_vz::VirtualMachine;
 use tokio::runtime::Runtime;
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -517,62 +517,6 @@ impl SandboxBackend for MacosBackend {
             return Err(e);
         }
         Ok(())
-    }
-
-    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-        let home = opts
-            .home
-            .to_str()
-            .ok_or_else(|| Error::other(format!("non-UTF-8 home: {:?}", opts.home)))?
-            .to_string();
-        let cwd = opts
-            .cwd
-            .as_ref()
-            .map(|p| {
-                p.to_str()
-                    .ok_or_else(|| Error::other(format!("non-UTF-8 cwd: {p:?}")))
-                    .map(str::to_string)
-            })
-            .transpose()?;
-        let info = init
-            .add_user(user_id, &home, cwd.as_deref(), &opts.env, opts.real_user)
-            .map_err(|e| Error::other(format!("add_user: {e}")))?;
-        let mut state = self.state.lock().unwrap();
-        if let State::Running(rs) = &mut *state {
-            rs.shells.insert(info.child_id.clone());
-        }
-        Ok(JobId(info.child_id))
-    }
-
-    fn remove_user(&self, user_id: &str) -> Result<()> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-        init.remove_user(user_id)
-            .map_err(|e| Error::other(format!("remove_user: {e}")))
-    }
-
-    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
-        let init = {
-            let state = self.state.lock().unwrap();
-            match &*state {
-                State::Running(rs) => rs.init.clone(),
-                _ => return Err(Error::VmNotRunning),
-            }
-        };
-        init.rename_user(old, new)
-            .map_err(|e| Error::other(format!("rename_user: {e}")))
     }
 
     fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {

@@ -161,7 +161,7 @@ StreamDevice（smoltcp，宿主侧）
 | VSOCK 流（客机监听） | macOS VZ | 协议桥接（Stdout/Write 事件） |
 | VSOCK 流（客机连接） | Windows HCS | 协议桥接（Stdout/Write 事件） |
 
-能力：`Pipes` 和 `Pty` stdio 模式、`Resize`、`Signal`、`Killpg`、`OpenShell`、`AddUser`/`RemoveUser`、`MountFuse`/`UnmountFuse`（FUSE-over-vsock/socketpair）。
+能力：`Pipes` 和 `Pty` stdio 模式、`Resize`、`Signal`、`Killpg`、`OpenShell`、`MountFuse`/`UnmountFuse`（FUSE-over-vsock/socketpair）。
 
 ## 快速开始
 

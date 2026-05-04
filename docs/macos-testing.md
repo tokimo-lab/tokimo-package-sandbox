@@ -73,8 +73,7 @@ reaps the fuse child. The shared name is tombstoned host-side.
 This replaces the previous virtio-fs + APFS-clone approach as well as
 the short-lived NFSv3-over-smoltcp transport. **Reverse mounts work
 bidirectionally on macOS**: guest writes to a `rw` share land directly
-in the host path, just like Linux/Windows. The integration test
-`add_user_with_reverse_mount_writes_to_host` is not ignored on macOS.
+in the host path, just like Linux/Windows.
 
 `EgressPolicy::Blocked` blocks all upstream traffic; the FUSE channel
 runs over vsock and is independent of the netstack's

@@ -48,7 +48,7 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use crate::api::{AddUserOpts, ConfigureParams, Event, JobId, Mount, ShellOpts};
+use crate::api::{ConfigureParams, Event, JobId, Mount, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
@@ -250,18 +250,6 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
         self.get()?.remove_mount(name)
     }
 
-    fn add_user(&self, user_id: &str, opts: AddUserOpts) -> Result<JobId> {
-        self.get()?.add_user(user_id, opts)
-    }
-
-    fn remove_user(&self, user_id: &str) -> Result<()> {
-        self.get()?.remove_user(user_id)
-    }
-
-    fn rename_user(&self, old: &str, new: &str) -> Result<()> {
-        self.get()?.rename_user(old, new)
-    }
-
     fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
         let snap: Vec<Arc<B>> = self.registry.lock().unwrap().values().cloned().collect();
         let mut out = Vec::new();
@@ -400,15 +388,6 @@ mod tests {
             Ok(())
         }
         fn remove_mount(&self, _n: &str) -> Result<()> {
-            Ok(())
-        }
-        fn add_user(&self, _u: &str, _o: AddUserOpts) -> Result<JobId> {
-            Err(Error::not_implemented("fake"))
-        }
-        fn remove_user(&self, _u: &str) -> Result<()> {
-            Ok(())
-        }
-        fn rename_user(&self, _o: &str, _n: &str) -> Result<()> {
             Ok(())
         }
         fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {

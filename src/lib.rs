@@ -49,8 +49,7 @@ pub(crate) mod macos;
 pub(crate) mod windows;
 
 pub use api::{
-    AddUserOpts, ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, SessionDetails, SessionSummary,
-    ShellOpts,
+    ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, SessionDetails, SessionSummary, ShellOpts,
 };
 pub use backend::SandboxBackend;
 pub use error::{Error, Result};

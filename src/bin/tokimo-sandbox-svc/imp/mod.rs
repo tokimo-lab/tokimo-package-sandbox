@@ -52,10 +52,9 @@ use std::collections::HashSet;
 use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddMountParams, AddUserParams, AddUserResult, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult,
-    JobIdResult, ListSessionsResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, RemoveUserParams,
-    RenameUserParams, ResizeShellParams, RootfsSpec, RpcError, SessionInfoResult, SessionNameParams, SignalShellParams,
-    SpawnShellParams, WriteStdinParams, encode_frame, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult,
+    ListSessionsResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, ResizeShellParams, RootfsSpec, RpcError,
+    SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::vfs_host::FuseHost;
 use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
@@ -837,21 +836,6 @@ fn dispatch(
             let p: RemoveMountParams =
                 serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             handle_remove_mount(conn, p, sessions)
-        }
-        method::ADD_USER => {
-            let p: AddUserParams =
-                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_add_user(conn, p, sessions)
-        }
-        method::REMOVE_USER => {
-            let p: RemoveUserParams =
-                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_remove_user(conn, p, sessions)
-        }
-        method::RENAME_USER => {
-            let p: RenameUserParams =
-                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
-            handle_rename_user(conn, p, sessions)
         }
 
         method::LIST_SESSIONS => handle_list_sessions(sessions),
@@ -1640,75 +1624,6 @@ fn handle_remove_mount(
         st.fuse_mount_names.remove(&name);
     }
 
-    Ok(json!({}))
-}
-
-fn handle_add_user(conn: &Arc<Connection>, p: AddUserParams, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
-    let AddUserParams { user_id, opts } = p;
-    let init = require_init(conn, sessions)?;
-
-    let home = opts
-        .home
-        .to_str()
-        .ok_or_else(|| RpcError::new("bad_params", format!("non-UTF-8 home: {:?}", opts.home)))?
-        .to_string();
-    let cwd = opts
-        .cwd
-        .as_ref()
-        .map(|p| {
-            p.to_str()
-                .ok_or_else(|| RpcError::new("bad_params", format!("non-UTF-8 cwd: {p:?}")))
-                .map(str::to_string)
-        })
-        .transpose()?;
-
-    let info = init
-        .add_user(&user_id, &home, cwd.as_deref(), &opts.env, opts.real_user)
-        .map_err(|e| RpcError::new("add_user", e.to_string()))?;
-    let child_id = info.child_id;
-
-    // Per-child poller so stdout/stderr/exit flow back to subscribers.
-    let finished = Arc::new(AtomicBool::new(false));
-    let joiner = {
-        let conn_w = Arc::clone(conn);
-        let init_w = Arc::clone(&init);
-        let id_w = child_id.clone();
-        let fin_w = Arc::clone(&finished);
-        thread::spawn(move || child_poller(conn_w, init_w, id_w, fin_w))
-    };
-    {
-        let shared = get_session(conn, sessions)?;
-        let mut st = shared.state.lock().unwrap();
-        st.children.insert(
-            child_id.clone(),
-            ChildEntry {
-                _joiner: joiner,
-                finished,
-            },
-        );
-    }
-    Ok(serde_json::to_value(AddUserResult { job_id: child_id }).unwrap())
-}
-
-fn handle_remove_user(
-    conn: &Arc<Connection>,
-    p: RemoveUserParams,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let init = require_init(conn, sessions)?;
-    init.remove_user(&p.user_id)
-        .map_err(|e| RpcError::new("remove_user", e.to_string()))?;
-    Ok(json!({}))
-}
-
-fn handle_rename_user(
-    conn: &Arc<Connection>,
-    p: RenameUserParams,
-    sessions: &WindowsRegistry,
-) -> Result<Value, RpcError> {
-    let init = require_init(conn, sessions)?;
-    init.rename_user(&p.old, &p.new)
-        .map_err(|e| RpcError::new("rename_user", e.to_string()))?;
     Ok(json!({}))
 }
 

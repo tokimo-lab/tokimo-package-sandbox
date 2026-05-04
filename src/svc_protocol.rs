@@ -106,9 +106,6 @@ pub mod method {
     pub const SEND_GUEST_RESPONSE: &str = "sendGuestResponse";
     pub const ADD_MOUNT: &str = "addMount";
     pub const REMOVE_MOUNT: &str = "removeMount";
-    pub const ADD_USER: &str = "addUser";
-    pub const REMOVE_USER: &str = "removeUser";
-    pub const RENAME_USER: &str = "renameUser";
 
     // Management / introspection ops (additive, do not require a
     // PROTOCOL_VERSION bump — old clients simply don't call them).
@@ -237,28 +234,6 @@ pub struct AddMountParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveMountParams {
     pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddUserParams {
-    pub user_id: String,
-    pub opts: crate::AddUserOpts,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoveUserParams {
-    pub user_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenameUserParams {
-    pub old: String,
-    pub new: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddUserResult {
-    pub job_id: String,
 }
 
 /// Wire result for `listSessions`.
