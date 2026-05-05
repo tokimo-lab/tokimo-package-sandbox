@@ -297,9 +297,10 @@ sudo apt install bubblewrap
 # Build init binary so bwrap can exec it
 cargo build --bin tokimo-sandbox-init
 
-# Full integration suite (34 tests). --test-threads=1 keeps bwrap
-# user-namespace creation rate sane and avoids cross-test PATH races.
-PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+# Full integration suite (42 tests across 13 files in tests/).
+# --test-threads=1 keeps bwrap user-namespace creation rate sane.
+# See tests/README.md for per-file inventory and platform docs.
+PATH="$PWD/target/debug:$PATH" cargo test -- --test-threads=1
 ```
 
 ```bash
@@ -321,7 +322,7 @@ ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 # 3. Run. --test-threads=1 is required (the VZ dispatch queue cannot
 #    handle parallel vm.start() calls from one process; BOOT_LOCK
 #    enforces it inside the backend too).
-cargo test --test sandbox_integration -- --test-threads=1
+cargo test -- --test-threads=1
 ```
 
 See `docs/macos-testing.md` for the full setup walkthrough.

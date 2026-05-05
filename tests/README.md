@@ -1,14 +1,86 @@
 # Integration tests
 
-Cross-cutting tests for the public `Sandbox` API live in
-[sandbox_integration.rs](sandbox_integration.rs). They exercise the **real**
+Cross-cutting tests for the public `Sandbox` API. They exercise the **real**
 guest VM (or sandbox process) on each platform — no mocks, no in-process
 fakes.
 
-The test file itself is **platform-agnostic source** (it only depends on the
-public crate API), but the runtime requirements differ per OS. **Each
-platform owner is responsible for porting and maintaining their own
-test runner script under `scripts/`.** Currently only Windows has one.
+The test source is **platform-agnostic** (it only depends on the public crate
+API), but the runtime requirements differ per OS. **Each platform owner is
+responsible for porting and maintaining their own test runner script under
+`scripts/`.** Currently only Windows has one.
+
+## File layout
+
+```
+tests/
+├── common/mod.rs          — shared helpers (SandboxGuard, config, drain_until, …)
+├── lifecycle.rs           — start/stop, shell_id before/after lifecycle
+├── shell.rs               — stdout echo, env leak, multi-command
+├── fuse_mount.rs          — host↔guest FUSE visibility, dynamic add/remove
+├── network.rs             — NetworkPolicy Blocked/AllowAll, IPv4/IPv6, diagnostics
+├── netstack_stress.rs     — curl loops, PTY full-output, HTTPS throughput
+├── concurrency.rs         — status RPC under load, bash background jobs
+├── signal.rs              — SIGINT delivery via interrupt_shell
+├── multi_session.rs       — concurrent sessions, distinct VM isolation
+├── multi_shell.rs         — spawn/close/signal/list_shells lifecycle
+├── pty.rs                 — PTY size, resize, Ctrl-C, ANSI escape passthrough
+├── shared_session.rs      — SharedBackend registry: same/different session_id
+├── rootfs.rs              — packaged rootfs tool versions (node, python)
+├── macos_nfs.rs           — macOS-only NFS dynamic mount write-back
+└── README.md              — this file
+```
+
+Each `.rs` file compiles as a separate integration test crate. Run all of
+them at once with `cargo test` (no `--test` flag needed).
+
+## Test inventory
+
+35 tests (+ platform-specific), all currently green:
+
+| # | File | Test | What it asserts |
+|---|------|------|-----------------|
+| 1 | lifecycle | `lifecycle_start_and_stop` | `configure → start_vm → stop_vm` round-trip clean |
+| 2 | lifecycle | `shell_id_before_start` | `shell_id()` errors before `start_vm` |
+| 3 | lifecycle | `shell_id_after_stop_is_error` | `shell_id()` errors after `stop_vm` |
+| 4 | shell | `shell_env_does_not_leak_init_control_vars` | init control vars not visible in shell env |
+| 5 | shell | `shell_stdout_echo` | `write_stdin("echo X\n")` → guest emits `X` on event stream |
+| 6 | shell | `shell_runs_multiple_commands` | `pwd` / `uname -a` / `id` output captured |
+| 7 | fuse_mount | `fuse_host_file_visible_in_guest` | Host sentinel file visible via `cat` in guest |
+| 8 | fuse_mount | `fuse_dynamic_add_remove` | `add_mount` exposes content; `remove_mount` retracts it |
+| 9 | concurrency | `status_rpcs_during_blocking_shell` | `is_running()` returns under load (5 calls in <2 s) |
+| 10 | concurrency | `concurrent_commands_in_single_shell` | `(sleep 2; echo A) & (sleep 5; echo B) & wait` finishes in ~5s |
+| 11 | signal | `signal_shell_delivers_sigint` | `interrupt_shell` → `Event::Exit { signal: Some(2) }` |
+| 12 | multi_session | `multi_session_concurrent` | Two parallel sessions, no cross-talk |
+| 13 | multi_session | `distinct_session_ids_get_distinct_vms` | Different session_id → isolated VMs |
+| 14 | multi_shell | `multi_shell_isolated_streams` | Two shells' stdout streams don't leak into each other |
+| 15 | multi_shell | `multi_shell_independent_signals` | `signal_shell(A, SIGINT)` kills only A; B stays alive |
+| 16 | multi_shell | `list_shells_tracks_lifecycle` | `list_shells()` tracks spawn/close correctly |
+| 17 | pty | `pty_shell_reports_correct_size` | `stty size` reports configured rows/cols |
+| 18 | pty | `pty_shell_resize_propagates` | `resize_shell` → `stty size` reflects new dimensions |
+| 19 | pty | `pty_shell_ctrl_c_does_not_kill_shell` | Ctrl-C in PTY kills foreground job, not the shell |
+| 20 | pty | `pty_shell_color_escape_codes_pass_through` | ANSI color escapes preserved byte-for-byte |
+| 21 | shared_session | `shared_session_two_handles_see_same_shell` | Same session_id → shared boot shell |
+| 22 | shared_session | `shared_session_writes_visible_via_other_handle` | Handle B's write visible on handle A's event stream |
+| 23 | shared_session | `stop_from_one_handle_tears_down_for_others` | `stop_vm` on one handle → all handles see `not running` |
+| 24 | shared_session | `empty_session_id_is_not_shared` | Empty session_id → untracked, isolated VMs |
+| 25 | rootfs | `rootfs_node_version` | Packaged rootfs has Node 24.x |
+| 26 | rootfs | `rootfs_python_version` | Packaged rootfs has Python 3.x |
+| 27 | network | `network_blocked_only_loopback` | Blocked → 2 links (lo+tk0), egress denied |
+| 28 | network | `network_allow_all_has_nic` | AllowAll → ≥2 links, egress to 1.1.1.1:53 succeeds |
+| 29 | network | `network_allow_all_icmpv4_ping` | ICMPv4 ping `#[ignore]` |
+| 30 | network | `network_allow_all_ipv6_tcp` | IPv6 TCP to 2606:4700:4700::1111:53 |
+| 31 | network | `network_allow_all_icmpv6_ping` | ICMPv6 ping |
+| 32 | network | `network_allow_all_tcp_recv_payload` | v4 HTTP GET → HTTP 200 + ≥500B body |
+| 33 | network | `network_allow_all_tcp_recv_payload_ipv6` | v6 HTTP GET → HTTP status + ≥200B body |
+| 34 | network | `network_allow_all_tcp_recv_payload_ipv6_repeat` | v6 HTTP ×5 sequential |
+| 35 | network | `network_allow_all_dns_then_tcp_v6_repeat` | DNS+TCP v6 ×3 sequential |
+| 36 | network | `network_allow_all_dns_then_tcp_v6_long_sequence` | DNS+TCP v6 ×10 with 1s pause |
+| 37 | network | `network_allow_all_ipv6_diag` | IPv6 diagnostic `#[ignore]` |
+| 38 | network | `network_allow_all_diag` | v4 diagnostic `#[ignore]` |
+| 39 | netstack_stress | `network_allow_all_curl_v6_baidu_loop` | `curl -6` baidu ×10 |
+| 40 | netstack_stress | `network_allow_all_curl_v6_baidu_pty_full_output` | PTY + `curl -6` baidu ×30 full output |
+| 41 | netstack_stress | `netstack_https_throughput` | HTTPS throughput ×10 `#[ignore]` |
+| 42 | macos_nfs | `nfs_dynamic_mount_writes_to_host` | macOS NFS guest→host write-back `#[cfg(target_os)]` |
 
 ## Windows
 
@@ -33,9 +105,9 @@ sudo pwsh scripts\test-integration.ps1
 The script:
 
 1. Checks that the current shell has admin rights via sudo (exits with code 87 if not).
-2. Builds `tokimo-sandbox-svc.exe` and the integration test binary.
+2. Builds `tokimo-sandbox-svc.exe` and the integration test binaries.
 3. Launches `tokimo-sandbox-svc.exe --console` (logs → `target/integration/svc.log`).
-4. Runs `cargo test --test sandbox_integration` (logs → `target/integration/test.log`).
+4. Runs `cargo test` (logs → `target/integration/test.log`).
 5. Cleans up the service process.
 
 From a normal shell (Claude Code, CI, etc.):
@@ -52,7 +124,7 @@ in order from a normal shell, then run with sudo:
 
 | Edited file path | Required rebuild step | Why |
 |---|---|---|
-| `src/lib.rs`, `src/api.rs`, `src/windows/**`, `src/svc_protocol.rs`, `src/shared_backend.rs`, `src/bin/tokimo-sandbox-svc/**`, `tests/**` | (none — `test-integration.ps1` rebuilds these) | The wrapper script invokes `cargo build` and `cargo test` which produce `target/debug/tokimo-sandbox-svc.exe` + the test binary. |
+| `src/lib.rs`, `src/api.rs`, `src/windows/**`, `src/svc_protocol.rs`, `src/shared_backend.rs`, `src/bin/tokimo-sandbox-svc/**`, `tests/**` | (none — `test-integration.ps1` rebuilds these) | The wrapper script invokes `cargo build` and `cargo test` which produce `target/debug/tokimo-sandbox-svc.exe` + the test binaries. |
 | `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`, `packaging/vm-base/init.sh` | **`pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm`** | The init binary runs **inside the guest VM**, not on Windows. It must be cross-compiled to `x86_64-unknown-linux-musl` and packed into `vm/initrd.img`. `cargo build` alone does not do this. |
 | Anything else in `src/` (lib code shared by both sides) | Both of the above | The lib is linked into both `tokimo-sandbox-svc.exe` (host) and `tokimo-sandbox-init` (guest). |
 
@@ -151,13 +223,19 @@ Direct invocation (skip the wrapper, e.g. when you already have the service
 running and a sudo terminal):
 
 ```powershell
-sudo cargo test --test sandbox_integration -- --nocapture
+sudo cargo test -- --nocapture
+```
+
+To run a single test file:
+
+```powershell
+sudo cargo test --test network -- --nocapture
 ```
 
 To run a single test:
 
 ```powershell
-sudo cargo test --test sandbox_integration <test_name> -- --nocapture
+sudo cargo test --test network network_blocked_only_loopback -- --nocapture
 ```
 
 **Important:** `cargo test` rebuilds the lib and relinks all dependent
@@ -174,32 +252,9 @@ will fail with `Access is denied`. Kill the service first, or use
 | `C:\tokimo-debug\last-vm-com2.log` | Last guest kernel kmsg (COM2) |
 | `C:\tokimo-debug\last-vm-tunnel.log` | Last init-control tunnel byte log |
 
-### Test inventory
-
-16 tests (+ platform-specific), all currently green (~98 s wall):
-
-| # | Name | What it asserts |
-|---|------|-----------------|
-| 1 | `lifecycle_start_and_stop` | `configure → start_vm → stop_vm` round-trip clean |
-| 2 | `shell_id_before_start` | `shell_id()` errors before `start_vm` |
-| 3 | `shell_id_after_stop_is_error` | `shell_id()` errors after `stop_vm` |
-| 4 | `shell_stdout_echo` | `write_stdin("echo X\n")` → guest emits `X` on the event stream |
-| 5 | `shell_runs_multiple_commands` | `pwd` / `uname -a` / `id` output captured |
-| 6 | `fuse_host_file_visible_in_guest` | Host writes sentinel file → guest `cat` returns same bytes (real I/O) |
-| 7 | `status_rpcs_during_blocking_shell` | `status()` returns under load (5 calls in <2 s while shell is busy) |
-| 8 | `multi_session_concurrent` | Two parallel sessions each run a marker — no cross-talk |
-| 9 | `fuse_dynamic_add_remove` | `add_mount` after start exposes content; `remove_mount` retracts it |
-| 10 | `signal_shell_delivers_sigint` | `signal_shell(boot, 2)` produces `Event::Exit { signal: Some(2) }` for the boot shell |
-| 11 | `network_blocked_only_loopback` | `NetworkPolicy::Blocked` → `/sys/class/net/` only `lo`; bash `/dev/tcp/1.1.1.1/53` times out |
-| 12 | `network_allow_all_has_nic` | `NetworkPolicy::AllowAll` → non-`lo` NIC enumerated **and** `bash exec 3<>/dev/tcp/1.1.1.1/53` succeeds (cross-platform egress capability check; the previous Windows-only HCN 192.168.127.0/24 subnet assertion was dropped so Linux bwrap + macOS VZ pass without backend-specific carve-outs) |
-| 13 | `concurrent_commands_in_single_shell` | `(sleep 2; echo A) & (sleep 5; echo B) & wait` finishes in <7 s wall (parallel, not sequential) and both stdout markers appear |
-| 14 | `multi_shell_isolated_streams` | `spawn_shell()` yields a fresh `JobId`; `write_stdin` to two shells produces stdout events tagged correctly — neither stream leaks the other's marker |
-| 15 | `multi_shell_independent_signals` | `signal_shell(A, SIGINT)` kills only A; B remains responsive (`echo` round-trip) until `close_shell(B)` |
-| 16 | `list_shells_tracks_lifecycle` | `list_shells()` reports `[boot]` initially; grows to 3 after two `spawn_shell()`; shrinks after `close_shell()` — set ops are synchronous, no event wait needed |
-
 ### Cross-platform portability of the test source
 
-The file uses only public API types. Caveats per backend:
+The files use only public API types. Caveats per backend:
 
 - **`Mount`**: all three backends use FUSE — Linux via
   FUSE-over-socketpair, macOS and Windows via FUSE-over-vsock. The
@@ -209,8 +264,8 @@ The file uses only public API types. Caveats per backend:
   written against observable behavior, not a specific transport.
 - **`NetworkPolicy::AllowAll`**: each backend chooses its own egress
   path (Windows HCN NAT, Linux shared host netns, macOS bridged NAT
-  via vmnet). Test 12 only asserts capability — link enumeration plus
-  outbound TCP to `1.1.1.1:53`.
+  via vmnet). Network tests only assert capability — link enumeration
+  plus outbound TCP to `1.1.1.1:53`.
 - **`NetworkPolicy::Blocked`**: Windows simply omits the `NetworkAdapter`
   device from the HCS schema — kernel sees no NIC. macOS does the same
   (omits `VZNetworkDeviceConfiguration` from the VM config). Linux
@@ -236,12 +291,24 @@ The file uses only public API types. Caveats per backend:
 ```bash
 # From repo root.
 cargo build --bin tokimo-sandbox-init
-PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+PATH="$PWD/target/debug:$PATH" cargo test -- --test-threads=1
 ```
 
 `--test-threads=1` is recommended (each test spawns its own bwrap +
 init pair; the bwrap default user-namespace creation rate is
 self-throttling under heavy parallelism).
+
+To run a single test file:
+
+```bash
+PATH="$PWD/target/debug:$PATH" cargo test --test network -- --test-threads=1 --nocapture
+```
+
+To run a single test:
+
+```bash
+PATH="$PWD/target/debug:$PATH" cargo test --test network network_blocked_only_loopback -- --test-threads=1 --nocapture
+```
 
 ### Backend implementation notes
 
@@ -319,7 +386,7 @@ See [`docs/macos-testing.md`](../docs/macos-testing.md) for full details.
 ### Run
 
 ```sh
-cargo test --test sandbox_integration -- --test-threads=1
+cargo test -- --test-threads=1
 ```
 
 `--test-threads=1` is required: the VZ dispatch queue does not tolerate
@@ -328,10 +395,16 @@ also takes a process-wide `BOOT_LOCK` mutex around `vm.build()` /
 `vm.start()`, but the integration suite shares one host process, so
 parallel test threads would still serialize on it and time out.
 
+To run a single test file:
+
+```sh
+cargo test --test network -- --test-threads=1 --nocapture
+```
+
 To run a single test:
 
 ```sh
-cargo test --test sandbox_integration <test_name> -- --test-threads=1 --nocapture
+cargo test --test network network_blocked_only_loopback -- --test-threads=1 --nocapture
 ```
 
 ### Backend implementation notes
@@ -348,7 +421,7 @@ knowing when porting tests or debugging:
     `remove_mount` create/destroy bind mounts inside this pool
     via init RPCs, exposing the same `host_path → guest_path` contract
     as the Windows FUSE-over-vsock backend. The transport differs
-    (virtio-fs vs FUSE), but tests 6 and 9 pass because they target
+    (virtio-fs vs FUSE), but fuse_mount tests pass because they target
     observable behavior.
 - **Network policy.**
   * `AllowAll` → `VZNetworkDeviceConfiguration::nat()` (vmnet-backed).
@@ -357,8 +430,8 @@ knowing when porting tests or debugging:
     `192.168.127.0/24` that `init.sh` hard-codes for Hyper-V. After the
     init handshake, the backend therefore runs busybox `udhcpc` inside
     the guest (with an inline `/tmp/udhcpc.sh` lease-apply script) to
-    pick up the actual lease + default route. Only then does test 12's
-    egress to `1.1.1.1:53` succeed.
+    pick up the actual lease + default route. Only then does the egress
+    test to `1.1.1.1:53` succeed.
   * `Blocked` → no `NetworkDeviceConfiguration` is added to the VM
     config. The guest sees no NIC at all (analogous to Windows
     omitting the HCS NetworkAdapter device).
@@ -378,13 +451,6 @@ knowing when porting tests or debugging:
   `TOKIMO_SANDBOX_PRE_CHROOTED=1` shortcut to skip its own
   mount/chroot setup. The strict PID-1 handshake check is satisfied
   natively because init really is PID 1 inside the guest.
-
-### Test inventory
-
-All 16 tests pass (~25 s wall on M-series, single-threaded). The
-inventory is identical to the Windows table above; behavioral
-differences are limited to the mount mechanism (virtio-fs not FUSE)
-and the egress path (vmnet NAT not HCN NAT).
 
 ## Editing tests
 
@@ -410,3 +476,6 @@ Conventions used by the existing suite:
   PATH when the chroot is entered without a login shell.
 - Use `/sys/class/net/` over `ip link show` — the `iproute2` tools live in
   `/sbin` which is **not** in the chroot's default PATH.
+- Shared helpers live in `tests/common/mod.rs`. Each test file includes
+  `mod common;` at the top. Add new helpers there rather than duplicating
+  across files.
