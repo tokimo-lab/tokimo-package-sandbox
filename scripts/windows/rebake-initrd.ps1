@@ -1,20 +1,21 @@
 #!/usr/bin/env pwsh
-# rebake-initrd.ps1 — local dev convenience.
+# rebake-initrd.ps1 — local dev convenience for rebuilding vm/initrd.img
+# on Windows. Thin wrapper that delegates to scripts/linux/rebake-initrd.sh
+# inside WSL — that script in turn cross-compiles the three guest musl
+# binaries and calls packaging/vm/scripts/rebake-initrd.sh to swap them
+# (plus init.sh) into a copy of the base initrd.
 #
-# Rebuilds vm/initrd.img after editing Rust sources for tokimo-sandbox-init,
-# without touching debootstrap / kernel / rootfs (those come from the latest
-# vm-v* release pulled by fetch-vm.ps1).
+# Pipeline: see scripts/linux/rebake-initrd.sh for the canonical flow.
 #
-# Pipeline:
-#   1. cargo build --release --target x86_64-unknown-linux-musl --bin tokimo-sandbox-init
-#   2. WSL bash packaging/vm/scripts/rebake-initrd.sh \
-#         --base   <BaseInitrd>      (default: vm/initrd.img — must already exist)
-#         --init-bin target/x86_64-unknown-linux-musl/release/tokimo-sandbox-init
-#         --out    target/vm-rebake/initrd.img
-#   3. Optional: -InstallToVm copies the rebaked initrd over vm/initrd.img and
-#      writes vm/.rebaked so the user knows this isn't a clean release artifact.
+# Usage:
+#   pwsh scripts/windows/rebake-initrd.ps1                  # full rebake
+#   pwsh scripts/windows/rebake-initrd.ps1 -SkipBuild       # use existing build
+#   pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm     # overwrite vm/initrd.img
+#   pwsh scripts/windows/rebake-initrd.ps1 -Arch arm64      # cross-target
+#   pwsh scripts/windows/rebake-initrd.ps1 -BaseInitrd path # custom base
 #
-# Requires WSL with a Linux distro that has cpio, gzip, and bash.
+# Requires WSL with a Linux distro that has cargo (or rustup), bash, cpio,
+# gzip and (for the vermagic self-check) kmod's modinfo.
 
 param(
     [string]$BaseInitrd,
@@ -26,70 +27,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$rustTarget = if ($Arch -eq "amd64") { "x86_64-unknown-linux-musl" } else { "aarch64-unknown-linux-musl" }
-$initBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-sandbox-init"
-$tunPumpBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-tun-pump"
-$fuseBinPath = Join-Path $repoRoot "target\$rustTarget\release\tokimo-sandbox-fuse"
 
-if (-not $BaseInitrd) {
-    $BaseInitrd = Join-Path $repoRoot "vm\initrd.img"
-}
-if (-not (Test-Path $BaseInitrd)) {
-    throw "Base initrd not found: $BaseInitrd. Run scripts/fetch-vm.ps1 first."
-}
-
-# Sanity: WSL available?
 $wsl = Get-Command wsl -ErrorAction SilentlyContinue
 if (-not $wsl) {
-    throw "wsl.exe not found. Install WSL or run packaging/vm/scripts/rebake-initrd.sh from a Linux shell directly."
+    throw "wsl.exe not found. Install WSL or run scripts/linux/rebake-initrd.sh from a Linux shell directly."
 }
-
-if (-not $SkipBuild) {
-    Write-Host "==> cargo build --release --target $rustTarget --bins (init + tun-pump + fuse)" -ForegroundColor Cyan
-    Push-Location $repoRoot
-    try {
-        & wsl bash -c "cd `"`$(wslpath -a '$($repoRoot -replace '\\','/')')`" && cargo build --release --target $rustTarget --bin tokimo-sandbox-init --bin tokimo-tun-pump --bin tokimo-sandbox-fuse"
-        if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-    } finally {
-        Pop-Location
-    }
-}
-
-if (-not (Test-Path $initBinPath)) {
-    throw "init binary not found after build: $initBinPath"
-}
-if (-not (Test-Path $tunPumpBinPath)) {
-    throw "tun-pump binary not found after build: $tunPumpBinPath"
-}
-if (-not (Test-Path $fuseBinPath)) {
-    throw "fuse binary not found after build: $fuseBinPath"
-}
-
-$outDir = Join-Path $repoRoot "target\vm-rebake"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$outImg = Join-Path $outDir "initrd.img"
 
 function To-Wsl([string]$p) {
-    & wsl wslpath -a ($p -replace '\\','/')
+    return (& wsl wslpath -a ($p -replace '\\','/')).Trim()
 }
 
-$baseW = To-Wsl $BaseInitrd
-$initW = To-Wsl $initBinPath
-$tunW  = To-Wsl $tunPumpBinPath
-$fuseW = To-Wsl $fuseBinPath
-$outW  = To-Wsl $outImg
-$scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm\scripts\rebake-initrd.sh")
-$initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-base\init.sh")
+$repoRootW = To-Wsl $repoRoot
+$scriptW = "$repoRootW/scripts/linux/rebake-initrd.sh"
 
-Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW --out $outW" -ForegroundColor Cyan
-& wsl bash $scriptW --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW --out $outW
-if ($LASTEXITCODE -ne 0) { throw "rebake failed" }
-
-Write-Host "==> rebaked initrd: $outImg ($([math]::Round((Get-Item $outImg).Length/1MB,2)) MB)" -ForegroundColor Green
-
-if ($InstallToVm) {
-    $target = Join-Path $repoRoot "vm\initrd.img"
-    Copy-Item -Force $outImg $target
-    Set-Content -Path (Join-Path $repoRoot "vm\.rebaked") -Value "rebaked from $($BaseInitrd) at $(Get-Date -Format o)"
-    Write-Host "==> installed to $target (vm/.rebaked marker written)" -ForegroundColor Green
+$wslArgs = @("--arch", $Arch)
+if ($SkipBuild)    { $wslArgs += "--skip-build" }
+if ($InstallToVm)  { $wslArgs += "--install-to-vm" }
+if ($BaseInitrd) {
+    $wslArgs += "--base"
+    $wslArgs += (To-Wsl $BaseInitrd)
 }
+
+Write-Host "==> wsl bash $scriptW $($wslArgs -join ' ')" -ForegroundColor Cyan
+& wsl bash $scriptW @wslArgs
+if ($LASTEXITCODE -ne 0) { throw "rebake failed (exit $LASTEXITCODE)" }
