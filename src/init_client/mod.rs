@@ -67,6 +67,10 @@ pub(crate) struct Shared {
     #[cfg(unix)]
     pub(crate) reply_fds: HashMap<String, std::os::fd::OwnedFd>,
     pub(crate) eof: bool,
+    /// Set when reader_loop exits, describing why the transport closed.
+    /// Populated even on clean EOF so callers can distinguish "guest closed
+    /// gracefully" vs "connection reset" vs "I/O error".
+    pub(crate) eof_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +407,8 @@ impl<S: TransportSend> InitClient<S> {
                 };
             }
             if g.eof {
-                return Err(Error::exec("init connection closed before reply"));
+                let reason = g.eof_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                return Err(Error::exec(format!("init connection closed before reply ({reason})")));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -650,7 +655,8 @@ impl<S: TransportSend> InitClient<S> {
                 return Ok(r);
             }
             if g.eof {
-                return Err(Error::exec("init connection closed before reply"));
+                let reason = g.eof_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                return Err(Error::exec(format!("init connection closed before reply ({reason})")));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -685,7 +691,8 @@ impl<S: TransportSend> InitClient<S> {
                 return Ok((r, fd));
             }
             if g.eof {
-                return Err(Error::exec("init connection closed before reply"));
+                let reason = g.eof_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                return Err(Error::exec(format!("init connection closed before reply ({reason})")));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -733,22 +740,15 @@ pub enum DrainedEvent {
 // ---------------------------------------------------------------------------
 
 fn reader_loop<R: TransportRecv>(mut recv: R, state: Arc<(Mutex<Shared>, Condvar)>) {
-    loop {
+    let exit_reason = loop {
         match recv.recv_frame() {
-            Ok(None) => break,
-            Err(_) => {
-                let (lock, cv) = &*state;
-                if let Ok(mut g) = lock.lock() {
-                    g.eof = true;
-                }
-                cv.notify_all();
-                break;
-            }
+            Ok(None) => break "transport returned Ok(None) (clean half-close)".to_string(),
+            Err(e) => break format!("transport recv error: {e}"),
             Ok(Some(received)) => {
                 let (lock, cv) = &*state;
                 let mut g = match lock.lock() {
                     Ok(g) => g,
-                    Err(_) => break,
+                    Err(_) => break "failed to acquire lock (poisoned)".to_string(),
                 };
                 match received.frame {
                     Frame::Reply(r) => {
@@ -779,10 +779,12 @@ fn reader_loop<R: TransportRecv>(mut recv: R, state: Arc<(Mutex<Shared>, Condvar
                 cv.notify_all();
             }
         }
-    }
+    };
+    eprintln!("[tokimo-init-client] reader_loop exiting: {exit_reason}");
     let (lock, cv) = &*state;
     if let Ok(mut g) = lock.lock() {
         g.eof = true;
+        g.eof_reason = Some(exit_reason);
         cv.notify_all();
     }
 }
