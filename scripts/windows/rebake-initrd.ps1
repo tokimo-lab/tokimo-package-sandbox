@@ -80,15 +80,9 @@ $fuseW = To-Wsl $fuseBinPath
 $outW  = To-Wsl $outImg
 $scriptW = To-Wsl (Join-Path $repoRoot "packaging\vm\scripts\rebake-initrd.sh")
 $initShW = To-Wsl (Join-Path $repoRoot "packaging\vm-base\init.sh")
-$extrasDir = Join-Path $repoRoot "packaging\vm\extras"
-$extrasArgs = @()
-if (Test-Path $extrasDir) {
-    $extrasW = To-Wsl $extrasDir
-    $extrasArgs = @("--extras-dir", $extrasW)
-}
 
-Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW $($extrasArgs -join ' ') --out $outW" -ForegroundColor Cyan
-& wsl bash $scriptW --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW @extrasArgs --out $outW
+Write-Host "==> rebake-initrd.sh --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW --out $outW" -ForegroundColor Cyan
+& wsl bash $scriptW --base $baseW --init-bin $initW --tun-pump-bin $tunW --fuse-bin $fuseW --init-sh $initShW --out $outW
 if ($LASTEXITCODE -ne 0) { throw "rebake failed" }
 
 Write-Host "==> rebaked initrd: $outImg ($([math]::Round((Get-Item $outImg).Length/1MB,2)) MB)" -ForegroundColor Green
