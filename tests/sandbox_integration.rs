@@ -1019,6 +1019,126 @@ done; echo CURL_LOOP_END\n";
     );
 }
 
+// User-reported repro #2: same as curl_v6_baidu_loop but uses a PTY shell
+// AND lets curl print the FULL ~640KB Baidu home page to stdout (no
+// `-s -o /dev/null`). 30 iterations with 2s sleep. This stresses the
+// init→host stdout streaming path under sustained large bursts, which
+// is what the human repro actually does (curl in a Terminal app PTY,
+// no output redirection). The user reports the sandbox occasionally
+// "freezes" after one of these curls, after which `spawn_shell` on a
+// new shell returns "init connection closed before reply".
+#[test]
+fn network_allow_all_curl_v6_baidu_pty_full_output() {
+    let mut cfg = config("net-curl-v6-baidu-pty");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    // Spawn a real PTY shell (mirroring the human-facing terminal),
+    // not the default pipes shell.
+    let shell = sb
+        .spawn_shell(ShellOpts {
+            pty: Some((40, 132)),
+            ..Default::default()
+        })
+        .expect("spawn pty shell");
+
+    // Confirm curl is present.
+    sb.write_stdin(
+        &shell,
+        b"command -v curl >/dev/null && echo CURL_OK || echo CURL_MISSING\necho CURL_PROBE_END\n",
+    )
+    .unwrap();
+    let curl_check = drain_until_for_id(&rx, &shell, "CURL_PROBE_END", Duration::from_secs(15));
+    if !curl_check.contains("CURL_OK") {
+        eprintln!("curl not in rootfs (got: {curl_check:?}), skipping");
+        sb.close_shell(&shell).ok();
+        return;
+    }
+
+    // Disable PTY echo — we drain output by needle, and an echoed command
+    // line containing the needle would falsely complete drain_until early.
+    // Two writes so stty -echo has actually applied before we write the
+    // marker (otherwise the input echo of "ECHO_OFF" matches the needle
+    // before stty takes effect).
+    sb.write_stdin(&shell, b"stty -echo\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    sb.write_stdin(&shell, b"echo ECHO_OFF_NOW\n").unwrap();
+    drain_until_for_id(&rx, &shell, "ECHO_OFF_NOW", Duration::from_secs(5));
+
+    // 30 iterations, FULL OUTPUT (no -s -o /dev/null), 2s pause between.
+    // Add an inline echo of size after each curl so we can count
+    // successes (curl exits 0 on a complete fetch).
+    let probe = b"for i in $(seq 1 30); do \
+timeout 30 curl -6 http://www.baidu.com/ > /tmp/out_$i 2>/dev/null && \
+printf \"ITER=%s OK BYTES=%s\\n\" \"$i\" \"$(wc -c < /tmp/out_$i)\" || \
+printf \"ITER=%s FAIL=%s\\n\" \"$i\" \"$?\"; \
+cat /tmp/out_$i; rm -f /tmp/out_$i; \
+sleep 2; \
+done; echo CURL_PTY_LOOP_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    // Generous timeout: 30 * (curl ~2s + sleep 2s) ≈ 120s + slack.
+    let out = drain_until_for_id(&rx, &shell, "CURL_PTY_LOOP_END", Duration::from_secs(360));
+
+    // Surface diagnostics regardless of pass/fail.
+    let success = out
+        .lines()
+        .filter(|l| l.contains("OK BYTES=") && !l.contains("BYTES=0"))
+        .count();
+    let fail = out.lines().filter(|l| l.contains("FAIL=")).count();
+    eprintln!(
+        "=== CURL v6 BAIDU PTY FULL-OUTPUT LOOP === successes={success} failures={fail} reached_end={}",
+        out.contains("CURL_PTY_LOOP_END")
+    );
+
+    // Try a control command on the SAME pty after the loop, to
+    // detect mid-test sandbox hang. If init has died, this echo will
+    // never come back (test will already have failed at drain_until).
+    sb.write_stdin(&shell, b"echo POST_LOOP_PROBE\n").unwrap();
+    let post = drain_until_for_id(&rx, &shell, "POST_LOOP_PROBE", Duration::from_secs(10));
+
+    // Also probe whether spawning a NEW shell still works — this is the
+    // exact failure mode the user reports ("init connection closed
+    // before reply" on a brand-new spawn_shell call after a heavy v6
+    // curl session).
+    let new_shell_result = sb.spawn_shell(ShellOpts::default());
+
+    sb.close_shell(&shell).ok();
+    if let Ok(ns) = &new_shell_result {
+        sb.close_shell(ns).ok();
+    }
+    sb.stop_vm().ok();
+
+    assert!(
+        out.contains("CURL_PTY_LOOP_END"),
+        "shell hung mid-loop (no end marker): successes={success}, last 2KB of output:\n{}",
+        &out[out.len().saturating_sub(2048)..]
+    );
+    assert!(
+        post.contains("POST_LOOP_PROBE"),
+        "post-loop probe never echoed — pty stuck: {post:?}"
+    );
+    assert!(
+        new_shell_result.is_ok(),
+        "spawn_shell on a fresh shell after heavy v6 curl loop failed (this IS the user-reported regression): {:?}",
+        new_shell_result.err()
+    );
+    assert!(
+        success >= 25,
+        "expected >=25 successful curl iterations out of 30, got {success} (failures={fail})\nfull output tail:\n{}",
+        &out[out.len().saturating_sub(4096)..]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. Concurrent commands inside a single VM (single shell, bash background)
 // ---------------------------------------------------------------------------
