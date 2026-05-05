@@ -86,8 +86,10 @@ scripts\windows\test-integration.ps1 -SkipBuild
 
 The FUSE-over-vsock mount channel requires the `tokimo-sandbox-fuse`
 binary to be present inside the guest VM at `/bin/tokimo-sandbox-fuse`.
-The `rebake-initrd.ps1` script cross-compiles and installs it
-automatically (via `--fuse-bin`). If you see
+The `rebake-initrd.ps1` script cross-compiles all three guest binaries
+(`tokimo-sandbox-init`, `tokimo-tun-pump`, `tokimo-sandbox-fuse`) and
+swaps them into the initrd via the underlying
+`packaging/vm/scripts/rebake-initrd.sh`. If you see
 `spawn tokimo-sandbox-fuse: No such file or directory` in test output,
 the initrd is stale — re-run `rebake-initrd.ps1 -InstallToVm`.
 

@@ -228,6 +228,33 @@ ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
 ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
+### Local initrd rebake (after editing init.sh or guest binaries)
+
+The published initrd is built by CI (`vm.yml` → `build.sh`) and is the
+single source of truth for kernel + modules + rootfs. When iterating on
+`init.sh` or the three musl guest binaries (`tokimo-sandbox-init`,
+`tokimo-tun-pump`, `tokimo-sandbox-fuse`) you can swap them into a copy
+of the published initrd without re-running the full pipeline:
+
+```sh
+# Linux
+scripts/linux/rebake-initrd.sh --install-to-vm
+
+# macOS (exec's the Linux script — guest bins are always Linux musl)
+scripts/macos/rebake-initrd.sh --install-to-vm
+```
+
+```powershell
+# Windows (pwsh → wsl bash)
+pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
+```
+
+All three accept the same flags: `--skip-build`, `--install-to-vm`,
+`--arch amd64|arm64`, `--base <path>`. The rebake never touches
+`/modules/` — kernel modules ship from CI with vermagic locked to the
+shipped `vmlinuz`, and the script verifies this with a vermagic
+self-check on the just-built initrd.
+
 ### macOS code signing
 
 Register the codesign cargo runner in your local `.cargo/config.toml`:

@@ -228,6 +228,31 @@ ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
 ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
 ```
 
+### 本地 rebake initrd（修改 init.sh 或 guest 二进制后）
+
+发布的 initrd 由 CI (`vm.yml` → `build.sh`) 构建，是 kernel + modules
++ rootfs 的唯一权威来源。当你在迭代 `init.sh` 或三个 musl 业务二进制
+（`tokimo-sandbox-init`、`tokimo-tun-pump`、`tokimo-sandbox-fuse`）时，
+不需要重跑完整流水线，只需把它们换进发布版 initrd 的副本：
+
+```sh
+# Linux
+scripts/linux/rebake-initrd.sh --install-to-vm
+
+# macOS（exec 上面那个 — guest 二进制始终是 Linux musl）
+scripts/macos/rebake-initrd.sh --install-to-vm
+```
+
+```powershell
+# Windows（pwsh → wsl bash 上面那个）
+pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
+```
+
+三个入口接受同一组 flag：`--skip-build`、`--install-to-vm`、
+`--arch amd64|arm64`、`--base <path>`。Rebake 永远不会动 `/modules/`
+—— 内核模块从 CI 出来时 vermagic 已与 `vmlinuz` 严格匹配，脚本最后会对
+刚生成的 initrd 跑 vermagic 自检确认。
+
 ### macOS 代码签名
 
 在本地 `.cargo/config.toml` 中注册签名 cargo runner：

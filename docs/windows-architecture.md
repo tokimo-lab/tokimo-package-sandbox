@@ -131,7 +131,7 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 ### 3.2 Initrd（initrd.img）
 
-- **来源**：`vm.yml` 单一工作流：`build.sh` 用 debootstrap 打基础 rootfs + busybox initrd（含 Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse 等共 ~19 个 .ko，外加 `init.sh` 挂载/chroot 流程），并把当次构建的 `tokimo-sandbox-init` / `tokimo-tun-pump` 直接 bake 进 initrd；`rebake-initrd.sh` 再追加 `tokimo-sandbox-fuse`
+- **来源**：`vm.yml` 单一工作流：`build.sh` 用 debootstrap 打基础 rootfs + busybox initrd（含 Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse, tun 等共 ~30 个 .ko，外加 `init.sh` 挂载/chroot 流程），并把当次构建的 `tokimo-sandbox-init` / `tokimo-tun-pump` / `tokimo-sandbox-fuse` 在同一步直接 bake 进 initrd（参见 §3.6）
 - **session 模式流程**：init.sh 加载模块 → mount `/dev/sda` → chroot → exec `tokimo-sandbox-init`
 - **位置**：`vm/initrd.img`
 
@@ -157,6 +157,63 @@ tokimo.session=1 tokimo.work_port=50002 tokimo.init_port=<per-session-port>
 ```
 
 `tokimo.init_port` 是本 session 专属的 vsock 端口（由 `alloc_session_init_port()` 分配），guest init 以此端口连回 host。
+
+### 3.6 VM Image Lifecycle（构建—发布—本地迭代）
+
+镜像三件套（vmlinuz / initrd.img / rootfs）的"唯一来源"是 `.github/workflows/vm.yml`：
+
+```
+                    ┌────────────── packaging/vm-base/build.sh ──────────────┐
+                    │ debian:13 容器 → apt install linux-image-${ARCH}        │
+                    │  ├─ /boot/vmlinuz-*           → vmlinuz                │
+                    │  ├─ resolve_deps + modinfo 收集 ~30 个 .ko             │
+                    │  │   (hv_vmbus / hv_storvsc / vsock / 9p / ext4 /      │
+                    │  │    tun / nfs / ...) → /var/cache/tokimo-kmods       │
+vm-v* tag (push)    │  ├─ initrd: busybox + init.sh + 三个 musl 业务二进制   │
+─────────────────►  │  │   (TOKIMO_INIT_BIN / TOKIMO_TUN_PUMP_BIN /          │
+                    │  │    TOKIMO_FUSE_BIN) + /modules/*.ko +               │
+                    │  │   /etc/tokimo-vm-info (KERNEL=$KVER)                │
+                    │  └─ rootfs: 从同一容器 docker export                    │
+                    └───────────────────────────────────────────────────────┘
+                                              │
+                              GitHub Release (vm-v*)
+                                              │
+                          ┌───────────────────┼───────────────────┐
+                          ▼                   ▼                   ▼
+                  scripts/linux/         scripts/macos/      scripts/windows/
+                  fetch-vm.sh            (symlink to         fetch-vm.ps1
+                                         arm64 dir)
+                          │                   │                   │
+                          └─────────► <repo>/vm/ ◄────────────────┘
+                                  vmlinuz / initrd.img /
+                                  {rootfs/, rootfs.vhdx}
+```
+
+#### 关键不变量
+
+1. **CI 是模块的唯一权威**：`/modules/*.ko` 的 vermagic 必须与同一 `linux-image-${ARCH}` 包里的 `vmlinuz` 完全匹配。CI 在同一容器同一刻完成两件事 → 永不漂移。
+2. **本地 rebake 永远不动 `/modules/`**：[`packaging/vm/scripts/rebake-initrd.sh`](../packaging/vm/scripts/rebake-initrd.sh) 只换 `/init` + 三个业务二进制（`/bin/tokimo-sandbox-{init,fuse}`、`/bin/tokimo-tun-pump`），从不解包模块。本地开发机没有匹配 vermagic 的 kernel-headers，硬要替换 `tun.ko` 之类只会得到 `insmod: EINVAL`。
+3. **vermagic 自检**：rebake 脚本的最后一步从刚生成的 initrd 里抽出 `hv_vmbus.ko`（或回退到 `virtio_net.ko`）跑 `modinfo -F vermagic`，并把结果以 `==> rebake: vermagic = ...` 形式输出。可选地通过 `TOKIMO_EXPECTED_VERMAGIC` 环境变量在 mismatch 时硬失败。
+4. **运行时兜底**：`tokimo-tun-pump` 启动时读取 `/proc/sys/kernel/osrelease`（= `uname -r`）与 `/etc/tokimo-vm-info` 的 `KERNEL=` 行对比；mismatch 时往 stderr（→ kmsg → `C:\tokimo-debug\last-vm-com2.log`）打 loud warning，让任何未来漂移在第一行启动日志就暴露。
+
+#### 本地迭代入口
+
+只在改了 `init.sh` 或三个业务二进制（init / tun-pump / fuse）时才需要 rebake：
+
+```bash
+# Linux
+scripts/linux/rebake-initrd.sh --install-to-vm
+
+# macOS（本质是 exec 上面那个，guest 二进制始终是 Linux musl）
+scripts/macos/rebake-initrd.sh --install-to-vm
+
+# Windows（pwsh → wsl bash 上面那个）
+pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
+```
+
+三个入口接受同一组 flag：`--skip-build`（跳过 cargo 构建）、`--install-to-vm`（覆盖 `vm/initrd.img`）、`--arch amd64|arm64`（默认宿主架构）、`--base <path>`（默认 `<repo>/vm/initrd.img`）。
+
+> 改了 `/modules/` 里的内核模块？请重发 `vm-v*` tag 让 CI 重建 initrd —— 本地无法保证 vermagic 一致。
 
 ---
 
