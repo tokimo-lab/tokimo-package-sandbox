@@ -713,6 +713,12 @@ fn run(
         }
         for key in tcp_to_remove {
             if let Some(mut flow) = tcp_flows.remove(&key) {
+                eprintln!(
+                    "[netstack] tcp flow sport={} closed (state={:?}, smoltcp={:?})",
+                    key.src_port,
+                    flow.state,
+                    sockets.get::<tcp::Socket>(flow.handle).state()
+                );
                 let _ = poll.registry().deregister(&mut flow.upstream);
                 sockets.remove(flow.handle);
             }

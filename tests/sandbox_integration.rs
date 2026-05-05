@@ -810,6 +810,215 @@ echo FIRSTLINE=$(printf %s \"$out\" | head -n1); \
     );
 }
 
+// Repeated IPv6 requests in sequence: `curl -6` against the same upstream a
+// few times in a row used to hang after the first or second response. The
+// regression repro is `for i in 1..=3 { GET / } | wait`. Each iteration
+// must produce a real HTTP status line. Cloudflare 1.1.1.1:80 returns a
+// 301 redirect page (~380 bytes) so we can assert N successful HTTP/1.x
+// status lines.
+#[test]
+fn network_allow_all_tcp_recv_payload_ipv6_repeat() {
+    let mut cfg = config("net-rx6-repeat");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    // Five sequential connections (new src port each) to the same v6 upstream.
+    let probe = b"for i in 1 2 3 4 5; do \
+timeout 15 bash -c \"exec 3<>/dev/tcp/2606:4700:4700::1111/80; \
+printf 'GET / HTTP/1.0\\r\\nHost: 1.1.1.1\\r\\n\\r\\n' >&3; \
+out=\\$(cat <&3); \
+echo ITER=\\$i BYTES=\\${#out} FIRSTLINE=\\$(printf %s \\\"\\$out\\\" | head -n1)\"; \
+done; echo RX6R_PROBE_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "RX6R_PROBE_END", Duration::from_secs(120));
+    sb.stop_vm().ok();
+    eprintln!("=== RX6 REPEAT OUTPUT ===\n{out}\n=== END ===");
+    let success_iters = out
+        .lines()
+        .filter(|l| l.contains("HTTP/1.0 ") || l.contains("HTTP/1.1 "))
+        .count();
+    assert!(
+        success_iters >= 5,
+        "expected 5 HTTP status lines across iterations, got {success_iters}: {out:?}"
+    );
+}
+
+// Multi-request hang reported by users running `curl -6 www.baidu.com`
+// twice — the first request returns a response, the second hangs. The
+// observable difference vs `tcp_recv_payload_ipv6_repeat` (which already
+// passes) is that this exercises the DNS path: each curl invocation does
+// a fresh getaddrinfo, which goes through the netstack as a UDP flow.
+// We approximate that here without bundling curl by issuing two
+// sequential `getent ahostsv6` lookups followed by a TCP fetch each.
+#[test]
+fn network_allow_all_dns_then_tcp_v6_repeat() {
+    let mut cfg = config("net-dns-rx6-repeat");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    let probe = b"for i in 1 2 3; do \
+addr=$(getent ahostsv6 cloudflare.com 2>/dev/null | awk 'NR==1{print $1}'); \
+echo ITER=$i ADDR=$addr; \
+[ -z \"$addr\" ] && { echo ITER=$i NO_DNS; continue; }; \
+timeout 15 bash -c \"exec 3<>/dev/tcp/$addr/80; \
+printf 'GET / HTTP/1.0\\r\\nHost: cloudflare.com\\r\\n\\r\\n' >&3; \
+out=\\$(cat <&3); \
+echo ITER=$i BYTES=\\${#out} FIRSTLINE=\\$(printf %s \\\"\\$out\\\" | head -n1)\"; \
+done; echo DNSRX6_PROBE_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "DNSRX6_PROBE_END", Duration::from_secs(120));
+    sb.stop_vm().ok();
+    eprintln!("=== DNS+RX6 REPEAT OUTPUT ===\n{out}\n=== END ===");
+    let success_iters = out
+        .lines()
+        .filter(|l| l.contains("HTTP/1.0 ") || l.contains("HTTP/1.1 "))
+        .count();
+    assert!(
+        success_iters >= 3,
+        "expected 3 HTTP status lines across DNS+TCP iterations, got {success_iters}: {out:?}"
+    );
+}
+
+// 10 sequential v6 requests with a 1 s pause between, mimicking the
+// real-world repro of `curl -6 www.baidu.com` looping. Each iteration
+// resolves the host (UDP DNS flow), opens a fresh TCP flow, sends GET,
+// drains response, closes. The pause gives the netstack a chance to
+// reap idle flows. The bug we are guarding against is the hvsock /
+// shell-pty channel (or some downstream component) silently truncating
+// output and then hanging the shell mid-stream after a handful of
+// large bursts.
+#[test]
+fn network_allow_all_dns_then_tcp_v6_long_sequence() {
+    let mut cfg = config("net-dns-rx6-long");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    let probe = b"for i in 1 2 3 4 5 6 7 8 9 10; do \
+addr=$(getent ahostsv6 cloudflare.com 2>/dev/null | awk 'NR==1{print $1}'); \
+[ -z \"$addr\" ] && { echo ITER=$i NO_DNS; sleep 1; continue; }; \
+timeout 15 bash -c \"exec 3<>/dev/tcp/$addr/80; \
+printf 'GET / HTTP/1.0\\r\\nHost: cloudflare.com\\r\\n\\r\\n' >&3; \
+out=\\$(cat <&3); \
+echo ITER=$i BYTES=\\${#out} FIRSTLINE=\\$(printf %s \\\"\\$out\\\" | head -n1)\"; \
+sleep 1; \
+done; echo LONGRX6_PROBE_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "LONGRX6_PROBE_END", Duration::from_secs(180));
+    sb.stop_vm().ok();
+    eprintln!("=== DNS+RX6 LONG OUTPUT ===\n{out}\n=== END ===");
+    let success_iters = out
+        .lines()
+        .filter(|l| l.contains("HTTP/1.0 ") || l.contains("HTTP/1.1 "))
+        .count();
+    // We tolerate a few iters where DNS gave only v4 (Happy Eyeballs in
+    // libc); but at least 8 of 10 must complete cleanly.
+    assert!(
+        success_iters >= 8,
+        "expected >=8 HTTP status lines across 10 iterations, got {success_iters}: {out:?}"
+    );
+    // Crucially: the END marker must arrive — proves the shell didn't
+    // hang mid-stream (which is the actual user-visible regression).
+    assert!(
+        out.contains("LONGRX6_PROBE_END"),
+        "shell hung before reaching loop end marker: {out:?}"
+    );
+}
+
+// User-reported repro: `curl -6 www.baidu.com` 10 times with 1-2 s
+// between, observed to truncate output mid-stream and hang the shell
+// after a handful of iterations. This test reproduces the exact human
+// invocation rather than going via /dev/tcp, in case the bug is in
+// how curl interacts with the netstack or pty.
+#[test]
+fn network_allow_all_curl_v6_baidu_loop() {
+    let mut cfg = config("net-curl-v6-baidu");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    // Confirm curl exists in the rootfs first; otherwise the test is a
+    // no-op (we'd be measuring `command not found` not the real path).
+    sb.write_stdin(
+        &shell,
+        b"command -v curl >/dev/null && echo CURL_OK || echo CURL_MISSING\necho CURL_PROBE_END\n",
+    )
+    .unwrap();
+    let curl_check = drain_until(&rx, &shell, "CURL_PROBE_END", Duration::from_secs(15));
+    if !curl_check.contains("CURL_OK") {
+        eprintln!("curl not in rootfs (got: {curl_check:?}), skipping");
+        return;
+    }
+
+    // Loop: 10 sequential `curl -6 www.baidu.com -s -o /dev/null -w
+    // "ITER=$i HTTP=%{http_code} BYTES=%{size_download}\n"`. We pause
+    // 1.5 s between to mimic the human cadence.
+    let probe = b"for i in 1 2 3 4 5 6 7 8 9 10; do \
+timeout 20 curl -6 -s -o /dev/null \
+-w \"ITER=$i HTTP=%{http_code} BYTES=%{size_download}\\n\" \
+http://www.baidu.com/ || echo \"ITER=$i CURL_FAIL=$?\"; \
+sleep 1; \
+done; echo CURL_LOOP_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "CURL_LOOP_END", Duration::from_secs(240));
+    sb.stop_vm().ok();
+    eprintln!("=== CURL v6 BAIDU LOOP OUTPUT ===\n{out}\n=== END ===");
+    assert!(
+        out.contains("CURL_LOOP_END"),
+        "shell hung before reaching loop end marker: {out:?}"
+    );
+    let success = out
+        .lines()
+        .filter(|l| l.contains("HTTP=") && !l.contains("HTTP=000"))
+        .count();
+    assert!(
+        success >= 8,
+        "expected >=8 successful curl iterations, got {success}: {out:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. Concurrent commands inside a single VM (single shell, bash background)
 // ---------------------------------------------------------------------------
