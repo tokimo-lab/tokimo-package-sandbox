@@ -64,6 +64,54 @@ pub fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Write the entire `buf` to `fd`, handling both short writes and `EAGAIN`
+/// from non-blocking fds.
+///
+/// On `EAGAIN` / `EWOULDBLOCK`, blocks via `poll(2)` waiting for `POLLOUT`
+/// (with `POLLERR`/`POLLHUP` also surfacing as broken-pipe errors). This is
+/// the correct primitive when a wire-protocol frame must be written
+/// atomically to a non-blocking socket: returning early on EAGAIN would
+/// desync the receiver's length-prefixed framing.
+///
+/// EINTR is retried internally.
+pub fn write_all_nb(fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::write(fd, buf[off..].as_ptr().cast(), buf.len() - off) };
+        if n >= 0 {
+            off += n as usize;
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                // Wait until the fd is writable (or has errored) before retrying.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let pr = unsafe { libc::poll(&mut pfd as *mut _, 1, -1) };
+                if pr < 0 {
+                    let pe = io::Error::last_os_error();
+                    if pe.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(pe);
+                }
+                if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                // POLLOUT (or spurious wake) — loop and retry the write.
+                continue;
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Nonblocking read with automatic EINTR retry.
 ///
 /// Returns:

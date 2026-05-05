@@ -131,7 +131,7 @@ impl State {
                 }
             };
             let write_fd = client.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(client_fd);
-            let _ = raw_io::write_once(write_fd, &data);
+            let _ = raw_io::write_all_nb(write_fd, &data);
         } else {
             let bf = unsafe { BorrowedFd::borrow_raw(client_fd) };
             let _ = send_frame_seqpacket(bf, frame, fd);
@@ -245,7 +245,7 @@ fn run_loop_inner(
             {
                 let wfd = c.write_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(c.fd.as_raw_fd());
                 let marker = b"HBHBHBHBHB";
-                let _ = raw_io::write_once(wfd, marker);
+                let _ = raw_io::write_all_nb(wfd, marker);
             }
         }
 
