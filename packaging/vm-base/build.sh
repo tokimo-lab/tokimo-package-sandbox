@@ -32,12 +32,13 @@ ROOTFS_DIR="$OUTPUT_DIR/rootfs"
 ROOTFS_TAR="$PROJECT_DIR/rootfs.tar"
 BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod udhcpc ip"
 
-# Optional: path to a prebuilt static `tokimo-sandbox-init` (musl) that
-# will be baked into the initrd at /bin/tokimo-sandbox-init. The init.sh
-# expects this binary in session-mode (Windows HCS). If unset, the boot
-# bundle will be one-shot capable only.
+# Optional: paths to prebuilt static (musl) guest binaries that will be
+# baked into the initrd. CI always sets all three; local one-off invocations
+# may omit them and the resulting initrd will be missing the corresponding
+# pieces (boot will fail with "missing /bin/tokimo-sandbox-init" etc.).
 TOKIMO_INIT_BIN="${TOKIMO_INIT_BIN:-}"
 TOKIMO_TUN_PUMP_BIN="${TOKIMO_TUN_PUMP_BIN:-}"
+TOKIMO_FUSE_BIN="${TOKIMO_FUSE_BIN:-}"
 
 echo "==> [1/6] Cleaning old build..."
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
@@ -463,6 +464,49 @@ elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-tun-pump" ]; then
 else
     echo "    NOTE: tokimo-tun-pump not provided; userspace netstack disabled."
 fi
+
+# --- bake tokimo-sandbox-fuse (Linux-only static musl) into initrd ---
+# FUSE-over-vsock dynamic mount transport. init.sh spawns this once the
+# guest mounts /work; it serves directory ops back to the host.
+if [ -n "$TOKIMO_FUSE_BIN" ] && [ -f "$TOKIMO_FUSE_BIN" ]; then
+    echo "    embedding tokimo-sandbox-fuse: $TOKIMO_FUSE_BIN ($(du -sh "$TOKIMO_FUSE_BIN" | cut -f1))"
+    cp "$TOKIMO_FUSE_BIN" "$INITRD_DIR/bin/tokimo-sandbox-fuse"
+    chmod +x "$INITRD_DIR/bin/tokimo-sandbox-fuse"
+elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-sandbox-fuse" ]; then
+    echo "    embedding tokimo-sandbox-fuse from initrd-prep/"
+    cp "$PROJECT_DIR/initrd-prep/tokimo-sandbox-fuse" "$INITRD_DIR/bin/tokimo-sandbox-fuse"
+    chmod +x "$INITRD_DIR/bin/tokimo-sandbox-fuse"
+else
+    echo "    NOTE: tokimo-sandbox-fuse not provided; FUSE-over-vsock dynamic mounts disabled."
+fi
+
+# --- write /etc/tokimo-vm-info -------------------------------------------
+# Lightweight sidecar so guest binaries (notably tokimo-tun-pump) can
+# verify they're running on the kernel they were baked against. The
+# kernel release is read from the kernel modules directory inside the
+# build container — that's the canonical version that ships in vmlinuz.
+mkdir -p "$INITRD_DIR/etc"
+cat > "$INITRD_DIR/etc/tokimo-vm-info" <<TOKIMO_VM_INFO
+KERNEL=$(docker exec "$CONTAINER_NAME" sh -c 'ls /lib/modules | head -1')
+ARCH=${ARCH}
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TOKIMO_VM_INFO
+echo "    /etc/tokimo-vm-info:"
+sed 's/^/        /' "$INITRD_DIR/etc/tokimo-vm-info"
+
+# --- write /etc/tokimo-vm-info -------------------------------------------
+# Lightweight sidecar so guest binaries (notably tokimo-tun-pump) can
+# verify they're running on the kernel they were baked against. The
+# kernel release is read from the kernel modules directory inside the
+# build container — that's the canonical version that ships in vmlinuz.
+mkdir -p "$INITRD_DIR/etc"
+cat > "$INITRD_DIR/etc/tokimo-vm-info" <<TOKIMO_VM_INFO
+KERNEL=$(docker exec "$CONTAINER_NAME" sh -c 'ls /lib/modules | head -1')
+ARCH=${ARCH}
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TOKIMO_VM_INFO
+echo "    /etc/tokimo-vm-info:"
+sed 's/^/        /' "$INITRD_DIR/etc/tokimo-vm-info"
 
 echo "    packing initrd..."
 ( cd "$INITRD_DIR" && find . | cpio -o -H newc 2>/dev/null ) | gzip -9 > "$OUTPUT_DIR/initrd.img"
