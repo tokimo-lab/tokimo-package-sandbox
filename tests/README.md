@@ -16,29 +16,29 @@ test runner script under `scripts/`.** Currently only Windows has one.
 
 | Requirement | Why |
 |---|---|
-| **Administrator** | HCS / HCN (Hyper-V Host Compute Service / Network) require SYSTEM-level access. The library connects to `\\.\pipe\tokimo-sandbox-svc` which is owned by the SYSTEM-level service. |
+| **sudo** | HCS / HCN (Hyper-V Host Compute Service / Network) require SYSTEM-level access. The library connects to `\\.\pipe\tokimo-sandbox-svc` which is owned by the SYSTEM-level service. Use `sudo` to elevate. |
 | **Hyper-V feature enabled** | `Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All` must report `Enabled`. |
 | **PowerShell 7 (`pwsh.exe`)** | The wrapper script uses strict mode and fails on `cargo`'s stderr-on-success under Windows PowerShell 5.1 (`$ErrorActionPreference='Stop'` + `NativeCommandError`). PS 7 handles it correctly. Path: `C:\Program Files\PowerShell\7\pwsh.exe`. |
 | **VM artifacts in `vm/`** | `vm/vmlinuz`, `vm/initrd.img`, `vm/rootfs.vhdx` must exist. Pull via `pwsh scripts/windows/fetch-vm.ps1`. |
 | **`tokimo-sandbox-svc` running** | Either as an installed service (`tokimo-sandbox-svc.exe --install`) or in console mode (`tokimo-sandbox-svc.exe --console`). The runner script auto-launches console mode when needed. |
-| **WAN NIC `Forwarding=Enabled`** | Required for `network_allow_all_has_nic`. HCN's NAT network only enables IP forwarding on its own `vEthernet (tokimo-sandbox-nat)` adapter; the host's WAN-facing physical NIC defaults to `Forwarding=Disabled`, which causes reverse-NAT'd return packets to be misrouted out the WAN instead of into the NAT vSwitch. The guest then never sees a SYN-ACK and `bash exec 3<>/dev/tcp/...` hangs past 5 s with probe text `NET_PROBE_DONE`. Fix (elevated, one-shot, no reboot): `Set-NetIPInterface -InterfaceAlias '<WAN-alias>' -Forwarding Enabled`. See [docs/network-allow-all-failure-investigation.md](../docs/network-allow-all-failure-investigation.md) for the full pktmon trace. |
+| **WAN NIC `Forwarding=Enabled`** | Required for `network_allow_all_has_nic`. HCN's NAT network only enables IP forwarding on its own `vEthernet (tokimo-sandbox-nat)` adapter; the host's WAN-facing physical NIC defaults to `Forwarding=Disabled`, which causes reverse-NAT'd return packets to be misrouted out the WAN instead of into the NAT vSwitch. The guest then never sees a SYN-ACK and `bash exec 3<>/dev/tcp/...` hangs past 5 s with probe text `NET_PROBE_DONE`. Fix (sudo, one-shot, no reboot): `Set-NetIPInterface -InterfaceAlias '<WAN-alias>' -Forwarding Enabled`. See [docs/network-allow-all-failure-investigation.md](../docs/network-allow-all-failure-investigation.md) for the full pktmon trace. |
 
 ### Run
 
 ```powershell
-# From repo root, in an elevated pwsh (or use sudo).
+# From repo root, with sudo.
 sudo pwsh scripts\test-integration.ps1
 ```
 
 The script:
 
-1. Checks that the current shell is elevated (exits with code 87 if not).
+1. Checks that the current shell has admin rights via sudo (exits with code 87 if not).
 2. Builds `tokimo-sandbox-svc.exe` and the integration test binary.
 3. Launches `tokimo-sandbox-svc.exe --console` (logs → `target/integration/svc.log`).
 4. Runs `cargo test --test sandbox_integration` (logs → `target/integration/test.log`).
 5. Cleans up the service process.
 
-From a non-admin shell (Claude Code, CI, etc.):
+From a normal shell (Claude Code, CI, etc.):
 
 ```powershell
 sudo pwsh scripts\test-integration.ps1
@@ -151,13 +151,13 @@ Direct invocation (skip the wrapper, e.g. when you already have the service
 running and a sudo terminal):
 
 ```powershell
-cargo test --test sandbox_integration -- --nocapture
+sudo cargo test --test sandbox_integration -- --nocapture
 ```
 
 To run a single test:
 
 ```powershell
-cargo test --test sandbox_integration <test_name> -- --nocapture
+sudo cargo test --test sandbox_integration <test_name> -- --nocapture
 ```
 
 **Important:** `cargo test` rebuilds the lib and relinks all dependent

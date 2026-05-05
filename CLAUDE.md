@@ -273,10 +273,10 @@ These two are in `Cargo.toml` `[target.'cfg(target_os = "windows")'.dependencies
 cargo build
 
 # Console mode (dev, sudo required — runs in foreground, no SCM)
-cargo run --bin tokimo-sandbox-svc -- --console
+sudo cargo run --bin tokimo-sandbox-svc -- --console
 
-# Install as SCM service (admin, registers as "tokimo-sandbox-svc")
-.\target\debug\tokimo-sandbox-svc.exe --install
+# Install as SCM service (sudo, registers as "tokimo-sandbox-svc")
+sudo .\target\debug\tokimo-sandbox-svc.exe --install
 # Uninstall
 .\target\debug\tokimo-sandbox-svc.exe --uninstall
 

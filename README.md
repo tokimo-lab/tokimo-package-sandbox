@@ -124,7 +124,7 @@ Sandbox (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (SYSTEM)
                                               └─ NAT → host network
 ```
 
-- **SYSTEM service** manages VMs on behalf of non-admin users. One-time install via `--install` or MSIX.
+- **SYSTEM service** manages VMs on behalf of unprivileged users. One-time install via `sudo ... --install` or MSIX.
 - **Per-session isolation:** Each session gets a unique VHDX clone and HvSocket service GUID, supporting concurrent sessions.
 - **Networking:** `AllowAll` uses the same **userspace smoltcp netstack** as macOS. `Blocked` sets `tokimo.net=blocked` in kernel cmdline.
 - **PTY:** Same as macOS — master in guest, I/O bridged through protocol.
@@ -201,7 +201,7 @@ sb.stop_vm().unwrap();
 |---|---|
 | **Linux** | `sudo apt install bubblewrap` — no root at runtime. VM artifacts under `<repo>/vm/` (rootfs is bind-mounted into bwrap). |
 | **macOS** | macOS 13+, Apple Silicon. VM artifacts under `<repo>/vm/` (see below). Code-sign with `com.apple.security.virtualization` entitlement. |
-| **Windows** | "Virtual Machine Platform" enabled (Win 10 1903+). One-time admin to install service. VM artifacts under `<repo>/vm/`. |
+| **Windows** | "Virtual Machine Platform" enabled (Win 10 1903+). One-time `sudo` to install service. VM artifacts under `<repo>/vm/`. |
 
 ### VM artifacts (all platforms)
 
@@ -268,10 +268,10 @@ runner = "scripts/macos/codesign-and-run.sh"
 
 ```powershell
 # Development — foreground, no SCM
-cargo run --bin tokimo-sandbox-svc -- --console
+sudo cargo run --bin tokimo-sandbox-svc -- --console
 
-# Development — persistent SCM service (admin)
-.\target\debug\tokimo-sandbox-svc.exe --install
+# Development — persistent SCM service (sudo)
+sudo .\target\debug\tokimo-sandbox-svc.exe --install
 
 # Production — MSIX
 pwsh scripts/windows/build-msix.ps1
@@ -357,8 +357,8 @@ PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-t
 # macOS
 cargo test --test sandbox_integration -- --test-threads=1
 
-# Windows (elevated, service running)
-cargo test --test sandbox_integration -- --nocapture
+# Windows (sudo, service running)
+sudo cargo test --test sandbox_integration -- --nocapture
 ```
 
 `--test-threads=1` is required on Linux (bwrap rate limits) and macOS (VZ dispatch queue serializes VM starts). Windows runs with concurrency.

@@ -124,7 +124,7 @@ Sandbox（库） ──命名管道──▶ tokimo-sandbox-svc.exe（SYSTEM）
                                      └─ NAT → 宿主网络
 ```
 
-- **SYSTEM 服务**代表非管理员用户管理虚拟机。通过 `--install` 或 MSIX 一次性安装。
+- **SYSTEM 服务**代表非特权用户管理虚拟机。通过 `sudo ... --install` 或 MSIX 一次性安装。
 - **每会话隔离：** 每个会话获得独立的 VHDX 克隆和 HvSocket 服务 GUID，支持并发会话。
 - **网络：** `AllowAll` 使用与 macOS 相同的 **smoltcp 用户态网络栈**。`Blocked` 在内核参数中设置 `tokimo.net=blocked`。
 - **PTY：** 与 macOS 相同——主 fd 留在客机，I/O 通过协议桥接。
@@ -201,7 +201,7 @@ sb.stop_vm().unwrap();
 |---|---|
 | **Linux** | `sudo apt install bubblewrap` — 运行时不需要 root。需要 `<repo>/vm/` 下的虚拟机产物（rootfs 会被绑定进 bwrap）。 |
 | **macOS** | macOS 13+，Apple Silicon。需要 `<repo>/vm/` 下的虚拟机产物（见下方）。代码签名需要 `com.apple.security.virtualization` 权限。 |
-| **Windows** | 启用"虚拟机平台"（Win 10 1903+）。一次性管理员权限安装服务。需要 `<repo>/vm/下的虚拟机产物。 |
+| **Windows** | 启用"虚拟机平台"（Win 10 1903+）。一次性 `sudo` 安装服务。需要 `<repo>/vm/` 下的虚拟机产物。 |
 
 ### 虚拟机产物（所有平台）
 
@@ -266,10 +266,10 @@ runner = "scripts/macos/codesign-and-run.sh"
 
 ```powershell
 # 开发 — 前台运行，无 SCM
-cargo run --bin tokimo-sandbox-svc -- --console
+sudo cargo run --bin tokimo-sandbox-svc -- --console
 
-# 开发 — 持久化 SCM 服务（需要管理员）
-.\target\debug\tokimo-sandbox-svc.exe --install
+# 开发 — 持久化 SCM 服务（sudo）
+sudo .\target\debug\tokimo-sandbox-svc.exe --install
 
 # 生产 — MSIX
 pwsh scripts/windows/build-msix.ps1
@@ -355,8 +355,8 @@ PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-t
 # macOS
 cargo test --test sandbox_integration -- --test-threads=1
 
-# Windows（提升权限，服务运行中）
-cargo test --test sandbox_integration -- --nocapture
+# Windows（sudo，服务运行中）
+sudo cargo test --test sandbox_integration -- --nocapture
 ```
 
 Linux（bwrap 速率限制）和 macOS（VZ 调度队列串行化虚拟机启动）必须使用 `--test-threads=1`。Windows 支持并发。

@@ -347,15 +347,15 @@ pwsh scripts\fetch-vm.ps1
 # 构建
 cargo build --bin tokimo-sandbox-svc
 
-# 以管理员 PowerShell 启动（前台，Ctrl+C 停止）
-.\target\debug\tokimo-sandbox-svc.exe --console
+# 用 sudo 启动（前台，Ctrl+C 停止）
+sudo .\target\debug\tokimo-sandbox-svc.exe --console
 ```
 
 另开一个普通 PowerShell 运行测试：
 
 ```powershell
 # 并发跑全部 14 个 session 集成测试
-cargo test --test session -- --test-threads=4
+sudo cargo test --test session -- --test-threads=4
 
 # 期望: test result: ok. 14 passed; 0 failed; ... finished in ~16s
 ```
@@ -365,8 +365,8 @@ cargo test --test session -- --test-threads=4
 ### 7.3 服务模式（SCM）
 
 ```powershell
-# 安装（管理员，一次性；注册为 tokimo-sandbox-svc，AutoStart，LocalSystem）
-.\target\debug\tokimo-sandbox-svc.exe --install
+# 安装（sudo，一次性；注册为 tokimo-sandbox-svc，AutoStart，LocalSystem）
+sudo .\target\debug\tokimo-sandbox-svc.exe --install
 
 # 验证状态
 Get-Service tokimo-sandbox-svc   # 应该 Running

@@ -194,6 +194,6 @@ Minimal features: `rt-multi-thread`, `io-util`, `sync`.
 1. `cargo build` — ensure everything compiles.
 2. `cargo test --lib` — unit tests pass.
 3. `cargo test --bin tokimo-sandbox-svc --lib` — service unit tests pass.
-4. Manual test: `cargo run --bin tokimo-sandbox-svc -- --console`, create a sandbox with mounts, verify FUSE mounts appear in guest via `mount | grep fuse`.
+4. Manual test: `sudo cargo run --bin tokimo-sandbox-svc -- --console`, create a sandbox with mounts, verify FUSE mounts appear in guest via `mount | grep fuse`.
 5. Dynamic mount test: call `add_mount` at runtime, verify the new mount appears.
 6. Dynamic unmount test: call `remove_mount`, verify it's gone.
