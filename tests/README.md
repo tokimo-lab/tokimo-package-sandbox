@@ -26,8 +26,8 @@ test runner script under `scripts/`.** Currently only Windows has one.
 ### Run
 
 ```powershell
-# From repo root, in an elevated (Administrator) pwsh.
-pwsh scripts\test-integration.ps1
+# From repo root, in an elevated pwsh (or use sudo).
+sudo pwsh scripts\test-integration.ps1
 ```
 
 The script:
@@ -41,14 +41,14 @@ The script:
 From a non-admin shell (Claude Code, CI, etc.):
 
 ```powershell
-Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\test-integration.ps1' -Verb RunAs -Wait
+sudo pwsh scripts\test-integration.ps1
 ```
 
 ### Correct end-to-end procedure (after editing source)
 
 The integration suite spans **three** build artifacts; if any of them is
 stale, tests run against old code and fail mysteriously. Always do these
-in order from a non-admin shell, then run the elevated script:
+in order from a normal shell, then run with sudo:
 
 | Edited file path | Required rebuild step | Why |
 |---|---|---|
@@ -69,7 +69,7 @@ you will hit this.
 **Safe manual workflow:**
 
 ```powershell
-# 1. Kill service + leftover VMs (admin).
+# 1. Kill service + leftover VMs (sudo).
 Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
 hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
     if ($_ -match '([0-9A-F-]{36})') { hcsdiag.exe kill $matches[1] }
@@ -98,14 +98,14 @@ will block both the rebake step and the next test run. Each test
 session leaks a VM if the service is killed without `stopVm`. After a
 few rounds you can have dozens of orphan VMs consuming gigabytes of RAM.
 
-**Check what's running** (admin pwsh):
+**Check what's running** (sudo pwsh):
 
 ```powershell
 hcsdiag.exe list            # shows all HCS compute systems
 (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB  # free GB
 ```
 
-**Kill all tokimo VMs** (admin pwsh — `hcsdiag kill` takes the compute
+**Kill all tokimo VMs** (sudo pwsh — `hcsdiag kill` takes the compute
 system **name**, not the GUID):
 
 ```powershell
@@ -125,7 +125,7 @@ hcsdiag.exe list | Select-String 'tokimo-sess'
 
 1. **Edit source.**
 2. **If you touched `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`,
-   or `packaging/vm-base/init.sh`:** rebake (admin required to release
+   or `packaging/vm-base/init.sh`:** rebake (sudo required to release
    `vm/initrd.img` lock from leftover VMs).
    ```powershell
    # Kill leftover VMs first if Copy-Item fails with "cannot access".
@@ -135,18 +135,18 @@ hcsdiag.exe list | Select-String 'tokimo-sess'
    Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Stop-Process -Force
    pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm
    ```
-3. **Run the elevated wrapper** (do NOT pass `-SkipBuild`; cargo test
+3. **Run the wrapper with sudo** (do NOT pass `-SkipBuild`; cargo test
    will trigger a relink that races with the running svc.exe if its
    binary on disk is older than the lib).
    ```powershell
-   Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','scripts\windows\test-integration.ps1' -Verb RunAs -Wait
+   sudo pwsh scripts\windows\test-integration.ps1
    ```
 4. **Read results** from `target/integration/test.log` (the wrapper's
    own console output is lost when its window closes; capture it with
    `-Command "Start-Transcript ...; & ...; Stop-Transcript"` if needed).
 
 Direct invocation (skip the wrapper, e.g. when you already have the service
-running and an elevated terminal):
+running and a sudo terminal):
 
 ```powershell
 cargo test --test sandbox_integration -- --nocapture
