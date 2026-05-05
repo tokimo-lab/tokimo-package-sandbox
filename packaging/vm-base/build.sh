@@ -486,6 +486,21 @@ fi
 # kernel release is read from the kernel modules directory inside the
 # build container — that's the canonical version that ships in vmlinuz.
 mkdir -p "$INITRD_DIR/etc"
+KVER_FOR_INFO=$(docker exec "$CONTAINER_NAME" sh -c 'ls /lib/modules | head -1')
+cat > "$INITRD_DIR/etc/tokimo-vm-info" <<TOKIMO_VM_INFO
+KERNEL=${KVER_FOR_INFO}
+ARCH=${ARCH}
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TOKIMO_VM_INFO
+echo "    /etc/tokimo-vm-info:"
+sed 's/^/        /' "$INITRD_DIR/etc/tokimo-vm-info"
+
+# --- write /etc/tokimo-vm-info -------------------------------------------
+# Lightweight sidecar so guest binaries (notably tokimo-tun-pump) can
+# verify they're running on the kernel they were baked against. The
+# kernel release is read from the kernel modules directory inside the
+# build container — that's the canonical version that ships in vmlinuz.
+mkdir -p "$INITRD_DIR/etc"
 cat > "$INITRD_DIR/etc/tokimo-vm-info" <<TOKIMO_VM_INFO
 KERNEL=$(docker exec "$CONTAINER_NAME" sh -c 'ls /lib/modules | head -1')
 ARCH=${ARCH}

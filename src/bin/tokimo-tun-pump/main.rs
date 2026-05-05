@@ -55,6 +55,14 @@ mod imp {
             .parse()
             .map_err(|e| format!("bad port: {e}"))?;
 
+        // 0. Sanity-check that the kernel we're running on matches the
+        //    one this initrd was baked against. Mismatch => /modules/*.ko
+        //    have the wrong vermagic and `insmod tun.ko` will quietly
+        //    fail in init.sh, which we'd otherwise only notice when
+        //    `open_tap` below errors with ENODEV. Surface the underlying
+        //    cause loud-and-clear so future drift is obvious.
+        check_kernel_vermagic();
+
         // 1. Create /dev/net/tun device node if it doesn't exist (initrd
         //    may not have it pre-created until tun.ko is loaded).
         ensure_tun_devnode()?;
@@ -124,6 +132,40 @@ mod imp {
         let _ = t2.join();
         eprintln!("[tun-pump] both directions ended, exiting");
         Ok(())
+    }
+
+    /// Compare the running kernel (`/proc/sys/kernel/osrelease`, which is
+    /// just `uname -r` without the syscall) against the `KERNEL=` line in
+    /// `/etc/tokimo-vm-info` (written by `packaging/vm-base/build.sh`). On
+    /// mismatch, emit a loud warning to stderr — init.sh redirects our
+    /// stderr to /dev/kmsg, which the host captures into
+    /// `C:\tokimo-debug\last-vm-com2.log`, so this surfaces as the very
+    /// first symptom when an initrd's modules drift from its vmlinuz.
+    fn check_kernel_vermagic() {
+        let running = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|s| s.trim().to_string());
+        let baked = std::fs::read_to_string("/etc/tokimo-vm-info").ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("KERNEL=").map(|v| v.trim().to_string()))
+        });
+        match (running.as_deref(), baked.as_deref()) {
+            (Some(r), Some(b)) if r == b => {
+                eprintln!("[tun-pump] kernel/initrd match: {r}");
+            }
+            (Some(r), Some(b)) => {
+                eprintln!(
+                    "[tun-pump] WARN: kernel/initrd vermagic mismatch — running={r}, baked={b}; \
+                     tun.ko insmod likely failed and tk0 will not exist"
+                );
+            }
+            (Some(r), None) => {
+                eprintln!("[tun-pump] note: running kernel {r}; /etc/tokimo-vm-info absent (older initrd)");
+            }
+            (None, _) => {
+                eprintln!("[tun-pump] note: could not read /proc/sys/kernel/osrelease");
+            }
+        }
     }
 
     fn ensure_tun_devnode() -> Result<(), String> {
