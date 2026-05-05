@@ -435,6 +435,15 @@ fn open_pipe(timeout: Duration) -> Result<OvPipe> {
                     let _ = unsafe { WaitNamedPipeW(&pipe_name_w, ms) };
                     continue;
                 }
+                // ERROR_FILE_NOT_FOUND (0x02): pipe doesn't exist — the
+                // service isn't running. No point retrying.
+                if last.0 == 0x02 {
+                    return Err(Error::other(format!(
+                        "CreateFileW {}: WIN32 0x{:08X} (is tokimo-sandbox-svc running?)",
+                        super::PIPE_NAME,
+                        last.0
+                    )));
+                }
                 if Instant::now() >= deadline {
                     return Err(Error::other(format!(
                         "CreateFileW {}: WIN32 0x{:08X}",

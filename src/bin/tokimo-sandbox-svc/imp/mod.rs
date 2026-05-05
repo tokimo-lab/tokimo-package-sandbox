@@ -29,6 +29,9 @@ use windows::Win32::Security::WinTrust::{
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
+use windows::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+};
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
@@ -38,7 +41,7 @@ use windows::Win32::System::Threading::{
     CreateEventW, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     WaitForSingleObject,
 };
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
@@ -163,6 +166,23 @@ fn run_console() {
         }
     );
     println!("Waiting for connections... (Ctrl+C to stop)");
+
+    // Register a console control handler so Ctrl+C / Ctrl+Break / close /
+    // logoff / shutdown set the SHUTDOWN flag instead of killing the process
+    // immediately. This gives pipe_server_loop a chance to tear down VMs.
+    unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                BOOL(1) // TRUE — handled
+            }
+            _ => BOOL(0), // FALSE — not handled, let default run
+        }
+    }
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), true);
+    }
+
     pipe_server_loop(true);
 }
 
@@ -414,7 +434,13 @@ fn pipe_server_loop(console_mode: bool) {
             continue;
         }
         if last == 997 {
-            unsafe { WaitForSingleObject(connect_evt, u32::MAX) };
+            // Use a finite timeout so the SHUTDOWN flag is checked periodically.
+            // An infinite wait would prevent graceful teardown on Ctrl+C / console close.
+            if unsafe { WaitForSingleObject(connect_evt, 1000) } == windows::Win32::Foundation::WAIT_EVENT(258) {
+                let _ = unsafe { CloseHandle(connect_evt) };
+                let _ = unsafe { CloseHandle(pipe) };
+                continue;
+            }
         }
         let _ = unsafe { CloseHandle(connect_evt) };
 
@@ -423,6 +449,16 @@ fn pipe_server_loop(console_mode: bool) {
         std::thread::spawn(move || {
             handle_client(HANDLE(pipe_ptr as *mut _), sessions_clone);
         });
+    }
+
+    // Teardown all running sessions so Hyper-V VMs are not orphaned.
+    slog!("[svc] shutting down — tearing down all sessions");
+    for (id, shared) in sessions.entries() {
+        let mut st = shared.state.lock().unwrap();
+        if st.running {
+            slog!("[svc] tearing down session {id}");
+            teardown_session(&mut st);
+        }
     }
 }
 
@@ -1102,16 +1138,26 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         netstack_port,
     );
 
+    let t0 = std::time::Instant::now();
+
     let api = hcs::HcsApi::init().map_err(|e| RpcError::new("hcs_init", e))?;
+    slog!("[start_vm] hcs_init: {}ms", t0.elapsed().as_millis());
+
+    let t1 = std::time::Instant::now();
     let cs = api
         .create_compute_system(&vm_id, &cfg_json)
         .map_err(|e| RpcError::new("hcs_create", e))?;
+    slog!("[start_vm] hcs_create_compute_system: {}ms", t1.elapsed().as_millis());
+
+    let t2 = std::time::Instant::now();
     if let Err(e) = api.start_compute_system(cs) {
         api.close_compute_system(cs);
         return Err(RpcError::new("hcs_start", e));
     }
+    slog!("[start_vm] hcs_start_compute_system: {}ms", t2.elapsed().as_millis());
 
     // Accept the guest's init connection.
+    let t3 = std::time::Instant::now();
     let hv = match hvsock::accept_guest(&init_listener, Duration::from_secs(60)) {
         Ok(s) => s,
         Err(e) => {
@@ -1120,6 +1166,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             return Err(RpcError::new("hvsock_accept", e.to_string()));
         }
     };
+    slog!("[start_vm] hvsock_accept_init: {}ms", t3.elapsed().as_millis());
     drop(init_listener);
 
     let hv_writer = match hv.try_clone() {
@@ -1140,12 +1187,15 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                 return Err(RpcError::new("init_client", e.to_string()));
             }
         };
+    let t4 = std::time::Instant::now();
     init.hello().map_err(|e| RpcError::new("init_hello", e.to_string()))?;
+    slog!("[start_vm] init_hello: {}ms", t4.elapsed().as_millis());
 
     // Accept the netstack connection. Always present now — the guest's
     // `tokimo-tun-pump` connects from inside the VM after init.sh brings
     // up tk0. We accept AFTER init.hello() so a slow netstack accept
     // doesn't block the init handshake; the pump retries connect for ~30s.
+    let t5 = std::time::Instant::now();
     let netstack_shutdown = if let Some(listener) = netstack_listener {
         match hvsock::accept_guest(&listener, Duration::from_secs(30)) {
             Ok(net_sock) => {
@@ -1180,6 +1230,8 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     } else {
         None
     };
+    slog!("[start_vm] netstack_accept: {}ms", t5.elapsed().as_millis());
+    slog!("[start_vm] total: {}ms", t0.elapsed().as_millis());
 
     // Set up FUSE-over-vsock host for user mounts.
     let fuse_host: Arc<FuseHost> = Arc::new(FuseHost::new());

@@ -700,6 +700,117 @@ echo DIAG_DONE\n";
 }
 
 // ---------------------------------------------------------------------------
+// 8.f TCP RX PAYLOAD — verifies the netstack carries non-trivial response
+// bytes back to the guest. The existing `network_allow_all_has_nic` only
+// asserts SYN/ACK round-trip via `bash exec 3<>/dev/tcp/.../53` which sends
+// & receives nothing. Real-world `curl http://...` exposes a separate bug:
+// the upstream→guest direction was observed to RST mid-stream after a
+// successful connect+send.
+//
+// This test runs HTTP/1.0 against `http://example.com` (small ~1.2KB body,
+// stable, no TLS to confuse smoltcp) and asserts the response header
+// contains `HTTP/1.0 200`.
+// ---------------------------------------------------------------------------
+#[test]
+fn network_allow_all_tcp_recv_payload() {
+    let mut cfg = config("net-rx");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    // Use raw bash /dev/tcp to avoid relying on curl in rootfs.
+    // Send minimal HTTP/1.0 request, read response with `cat` until peer
+    // closes (server signals EOF), then count bytes + check status line.
+    let probe = b"timeout 15 bash -c '\
+exec 3<>/dev/tcp/93.184.216.34/80; \
+printf \"GET / HTTP/1.0\\r\\nHost: example.com\\r\\n\\r\\n\" >&3; \
+out=$(cat <&3); \
+echo BYTES=${#out}; \
+echo FIRSTLINE=$(printf %s \"$out\" | head -n1); \
+' && echo RX_DONE_OK || echo RX_DONE_FAIL\necho RX_PROBE_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "RX_PROBE_END", Duration::from_secs(30));
+    sb.stop_vm().ok();
+    eprintln!("=== RX PROBE OUTPUT ===\n{out}\n=== END ===");
+    assert!(
+        out.contains("HTTP/1.0 200") || out.contains("HTTP/1.1 200"),
+        "no HTTP 200 status line in response: {out:?}"
+    );
+    // example.com body is ~1.2KB; assert we got at least a few hundred bytes.
+    assert!(
+        out.lines().any(|l| {
+            l.strip_prefix("BYTES=")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .is_some_and(|n| n >= 500)
+        }),
+        "BYTES line missing or <500: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.g IPv6 TCP RX PAYLOAD — the v4 sibling above (`tcp_recv_payload`)
+// covers the v4 path; this one verifies the same upstream→guest data flow
+// works over IPv6. Real-world repro: `curl http://www.baidu.com` from inside
+// the VM resolved to IPv6, connected fine, sent the request, and then got
+// `Empty reply from server` — the v6 path was RST'ing mid-response while
+// v4 worked.
+//
+// Target: Cloudflare 1.1.1.1 over its IPv6 literal (2606:4700:4700::1111)
+// on port 80. It's the same dual-stack endpoint we already use for
+// `host_has_ipv6` and `network_allow_all_ipv6_tcp`; on port 80 it serves
+// a stable 301-redirect page (~380 bytes) that proves real upstream→guest
+// payload transfer.
+// ---------------------------------------------------------------------------
+#[test]
+fn network_allow_all_tcp_recv_payload_ipv6() {
+    let mut cfg = config("net-rx6");
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    if !host_has_ipv6() {
+        eprintln!("host has no IPv6 connectivity, skipping");
+        return;
+    }
+
+    // Bash /dev/tcp/HOST/PORT accepts a numeric IPv6 literal (no brackets).
+    let probe = b"timeout 15 bash -c '\
+exec 3<>/dev/tcp/2606:4700:4700::1111/80; \
+printf \"GET / HTTP/1.0\\r\\nHost: 1.1.1.1\\r\\n\\r\\n\" >&3; \
+out=$(cat <&3); \
+echo BYTES=${#out}; \
+echo FIRSTLINE=$(printf %s \"$out\" | head -n1); \
+' && echo RX6_DONE_OK || echo RX6_DONE_FAIL\necho RX6_PROBE_END\n";
+    sb.write_stdin(&shell, probe).unwrap();
+    let out = drain_until(&rx, &shell, "RX6_PROBE_END", Duration::from_secs(30));
+    sb.stop_vm().ok();
+    eprintln!("=== RX6 PROBE OUTPUT ===\n{out}\n=== END ===");
+    assert!(
+        out.contains("HTTP/1.0 ") || out.contains("HTTP/1.1 "),
+        "no HTTP status line in IPv6 response: {out:?}"
+    );
+    // 1.1.1.1 :80 returns ~380 bytes (301 redirect page); assert ≥200.
+    assert!(
+        out.lines().any(|l| {
+            l.strip_prefix("BYTES=")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .is_some_and(|n| n >= 200)
+        }),
+        "BYTES line missing or <200 on IPv6 path: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 9. Concurrent commands inside a single VM (single shell, bash background)
 // ---------------------------------------------------------------------------
 //

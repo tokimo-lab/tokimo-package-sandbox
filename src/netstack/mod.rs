@@ -528,12 +528,27 @@ fn run(
             // (e.g. main loop woken by another flow) still makes progress.
             if flow.state == TcpUpstreamState::Connecting {
                 match flow.upstream.take_error() {
-                    Ok(Some(_)) | Err(_) => flow.state = TcpUpstreamState::Failed,
-                    Ok(None) => match flow.upstream.peer_addr() {
-                        Ok(_) => flow.state = TcpUpstreamState::Connected,
-                        Err(ref e) if e.kind() == io::ErrorKind::NotConnected => {}
-                        Err(_) => flow.state = TcpUpstreamState::Failed,
-                    },
+                    Ok(Some(_)) | Err(_) => {
+                        flow.state = TcpUpstreamState::Failed;
+                    }
+                    Ok(None) => {
+                        // On Windows, mio's `peer_addr()` returns Ok the
+                        // moment `TcpStream::connect()` returns — Windows
+                        // `getpeername` reports the bound destination, not
+                        // whether the SYN/ACK has actually completed. To
+                        // know the true state we probe with a zero-byte
+                        // write: ENOTCONN means still connecting, anything
+                        // else (Ok(0) or WouldBlock) means the kernel has
+                        // accepted the socket as connected.
+                        match flow.upstream.write(&[]) {
+                            Ok(_) => flow.state = TcpUpstreamState::Connected,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                flow.state = TcpUpstreamState::Connected;
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::NotConnected => {}
+                            Err(_) => flow.state = TcpUpstreamState::Failed,
+                        }
+                    }
                 }
             }
 
@@ -585,6 +600,17 @@ fn run(
                         flow.last_activity = now;
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    // On Windows, mio's `peer_addr()` returns Ok for a still-
+                    // connecting TcpStream (Windows getpeername reports the
+                    // bound destination, not the actual handshake state).
+                    // That promotes our flow to `Connected` before the
+                    // kernel finishes the SYN/ACK, so the very first write
+                    // surfaces as ENOTCONN even though the connection will
+                    // succeed shortly. Treat ENOTCONN as transient — leave
+                    // the data queued and retry next iteration; mio will
+                    // wake us with a WRITABLE event once the connection is
+                    // truly ready.
+                    Err(ref e) if e.kind() == io::ErrorKind::NotConnected => break,
                     Err(_) => {
                         flow.state = TcpUpstreamState::Failed;
                         break;
@@ -667,9 +693,19 @@ fn run(
                 flow.closed = true;
             }
             let st = socket.state();
-            let upstream_done = matches!(flow.state, TcpUpstreamState::UpstreamFinned | TcpUpstreamState::Failed);
-            let dead = matches!(st, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing)
-                || (upstream_done && matches!(st, tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::LastAck));
+            // Only consider a flow dead once smoltcp has fully completed its
+            // close handshake (Closed / TimeWait / Closing). Removing a
+            // socket while it is still in FinWait1 / FinWait2 / LastAck —
+            // even if our upstream is finished — causes smoltcp to emit
+            // RST instead of letting the queued data + FIN drain to the
+            // guest, which manifests as `Recv failure: connection reset by
+            // peer` for any response the guest had not yet read.
+            //
+            // The smoltcp socket has its own 60 s timeout (`set_timeout`)
+            // covering the case where the guest never finishes the close
+            // handshake; combined with `idle_timeout` (120 s) below this
+            // is sufficient backstop without sending spurious RSTs.
+            let dead = matches!(st, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Closing);
             let idle = now.duration_since(flow.last_activity) > idle_timeout;
             if dead || idle {
                 tcp_to_remove.push(*key);
