@@ -5,6 +5,46 @@ use std::time::Duration;
 use common::{SandboxGuard, config, drain_until, workspace_dir};
 use tokimo_package_sandbox::{Mount, Sandbox};
 
+const SLIDE_NAMES: &[&str] = &["slide-1.jpg", "slide-2.jpg", "slide-3.jpg"];
+
+fn seed_slide_files(label: &str) -> std::path::PathBuf {
+    let ws = workspace_dir(label);
+    for name in SLIDE_NAMES {
+        std::fs::write(ws.join(name), b"fake-jpeg").expect("write seed file");
+    }
+    ws
+}
+
+fn cleanup_slide_files(ws: &std::path::Path) {
+    for name in SLIDE_NAMES {
+        let _ = std::fs::remove_file(ws.join(name));
+    }
+}
+
+fn run_sandbox_command(label: &str, command: &[u8], marker: &str) -> String {
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config(label)).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    sb.write_stdin(&shell, command).unwrap();
+    let captured = drain_until(&rx, &shell, marker, Duration::from_secs(30));
+
+    sb.stop_vm().ok();
+    captured
+}
+
+fn assert_all_slide_names(captured: &str) {
+    for name in SLIDE_NAMES {
+        assert!(
+            captured.contains(name),
+            "expected {name} in output. captured: {captured:?}"
+        );
+    }
+}
+
 #[test]
 fn fuse_host_file_visible_in_guest() {
     const FNAME: &str = "tokimo_sentinel.txt";
@@ -111,18 +151,7 @@ fn fuse_glob_no_io_error() {
         std::fs::write(ws.join(name), b"fake-jpeg").expect("write seed file");
     }
 
-    let sb = Sandbox::connect().expect("connect");
-    sb.configure(config(label)).expect("configure");
-    let rx = sb.subscribe().expect("subscribe");
-    sb.start_vm().expect("start_vm");
-    let _guard = SandboxGuard(sb.clone());
-    let shell = sb.shell_id().expect("shell_id");
-
-    sb.write_stdin(&shell, b"ls /work/slide-*.jpg 2>&1; echo GLOB_DONE_A1B2\n")
-        .unwrap();
-    let captured = drain_until(&rx, &shell, MARKER, Duration::from_secs(30));
-
-    sb.stop_vm().ok();
+    let captured = run_sandbox_command(label, b"ls /work/slide-*.jpg 2>&1; echo GLOB_DONE_A1B2\n", MARKER);
 
     for name in &["slide-01.jpg", "slide-02.jpg", "slide-03.jpg"] {
         let _ = std::fs::remove_file(ws.join(name));
@@ -135,5 +164,66 @@ fn fuse_glob_no_io_error() {
     assert!(
         captured.contains("slide-01.jpg"),
         "expected slide-01.jpg in ls output. captured: {captured:?}"
+    );
+}
+
+#[test]
+fn fuse_bash_echo_glob_expands() {
+    const MARKER: &str = "BASH_ECHO_GLOB_DONE_C3D4";
+
+    let label = "fusebashechoglob";
+    let ws = seed_slide_files(label);
+    let captured = run_sandbox_command(
+        label,
+        b"bash -c 'cd /work && echo slide-*.jpg'; echo BASH_ECHO_GLOB_DONE_C3D4\n",
+        MARKER,
+    );
+    cleanup_slide_files(&ws);
+
+    assert_all_slide_names(&captured);
+    assert!(
+        !captured.contains("slide-*.jpg"),
+        "bash echoed the literal glob instead of expanding it. captured: {captured:?}"
+    );
+}
+
+#[test]
+fn fuse_bash_dash_c_ls_glob() {
+    const MARKER: &str = "BASH_LS_GLOB_DONE_E5F6";
+
+    let label = "fusebashlsglob";
+    let ws = seed_slide_files(label);
+    let captured = run_sandbox_command(
+        label,
+        b"bash -c 'ls /work/slide-*.jpg' 2>&1; echo BASH_LS_GLOB_DONE_E5F6\n",
+        MARKER,
+    );
+    cleanup_slide_files(&ws);
+
+    assert!(
+        !captured.contains("Input/output error"),
+        "bash ls glob produced an I/O error. captured: {captured:?}"
+    );
+    assert_all_slide_names(&captured);
+}
+
+#[test]
+fn fuse_bash_glob_no_match() {
+    const MARKER: &str = "BASH_GLOB_NO_MATCH_DONE_A7B8";
+
+    let label = "fusebashglobnomatch";
+    let captured = run_sandbox_command(
+        label,
+        b"bash -c 'ls /work/nonexistent-*.jpg' 2>&1 || true; echo BASH_GLOB_NO_MATCH_DONE_A7B8\n",
+        MARKER,
+    );
+
+    assert!(
+        captured.contains("No such file") || captured.contains("cannot access"),
+        "expected ENOENT-ish ls error for unmatched glob literal. captured: {captured:?}"
+    );
+    assert!(
+        !captured.contains("Input/output error"),
+        "unmatched glob literal produced an I/O error. captured: {captured:?}"
     );
 }
