@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{SandboxGuard, config, drain_until, drain_until_for_id};
+use common::{SandboxGuard, config, drain_until_for_id};
 use tokimo_package_sandbox::{Event, Sandbox, ShellOpts};
 
 #[test]

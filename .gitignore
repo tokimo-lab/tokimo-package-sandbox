@@ -8,8 +8,10 @@ Cargo.lock
 /.test-rootfs/
 # Windows VM artifacts (downloaded by scripts/fetch-vm.ps1)
 /vm/
-# Compiled init binary (built by scripts/build-vm-local.ps1)
+# Compiled guest binaries (built by packaging/vm-local/build-init-bin.sh)
 /packaging/vm-local/tokimo-sandbox-init
+/packaging/vm-local/tokimo-tun-pump
+/packaging/vm-local/tokimo-sandbox-fuse
 # IDE / agent config (per-developer)
 /.claude/
 /.ida-mcp/

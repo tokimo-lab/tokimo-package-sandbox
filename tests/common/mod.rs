@@ -1,4 +1,5 @@
 //! Shared helpers for integration tests.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;

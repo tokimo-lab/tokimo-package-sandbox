@@ -1,49 +1,153 @@
 #!/usr/bin/env bash
-# Build minimal Tokimo VM artifacts (vmlinuz + initrd.img + rootfs.vhdx)
-# entirely inside a debian:13 container. No external rootfs needed.
+# Build Tokimo VM artifacts (vmlinuz + initrd.img + rootfs) entirely inside
+# a debian:13 container. Mirrors the CI pipeline (packaging/vm-base/build.sh)
+# but runs as a single-pass script inside one container.
 #
-# Run via: scripts/build-vm-local.ps1 (Windows orchestrator).
+# Run via: scripts/build-vm-local.ps1 (Windows) or scripts/build-vm-local.sh (macOS).
+#
+# Usage: build-in-docker.sh [--arch amd64|arm64] [--format vhdx|dir]
+#   --arch     Target architecture (default: amd64)
+#   --format   Rootfs output format: vhdx (Windows) or dir (macOS, default: vhdx)
 #
 # Inputs:
-#   /vm-base/init.sh            (from packaging/vm-base/, mounted read-only)
-#   /vm-base/vsock9p.c          (from packaging/vm-base/, mounted read-only)
-#   /work/tokimo-sandbox-init   (musl static, prebuilt, in packaging/vm-local/)
+#   /vm-base/init.sh              (from packaging/vm-base/, mounted read-only)
+#   /vm-base/vsock9p.c            (from packaging/vm-base/, mounted read-only)
+#   /work/tokimo-sandbox-init     (musl static, prebuilt)
+#   /work/tokimo-tun-pump         (musl static, prebuilt)
+#   /work/tokimo-sandbox-fuse     (musl static, prebuilt)
 #
 # Outputs (placed in /out):
 #   /out/vmlinuz
 #   /out/initrd.img
-#   /out/rootfs.vhdx
+#   /out/rootfs.vhdx  (format=vhdx)
+#   /out/rootfs/       (format=dir)
 
 set -euo pipefail
+
+ARCH="amd64"
+FORMAT="vhdx"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --arch)   ARCH="$2";   shift 2 ;;
+        --format) FORMAT="$2"; shift 2 ;;
+        *) echo "build-in-docker: unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+case "$ARCH" in
+    amd64) KERNEL_PKG="linux-image-amd64"; DEB_MULTIARCH="x86_64-linux-gnu" ;;
+    arm64) KERNEL_PKG="linux-image-arm64";  DEB_MULTIARCH="aarch64-linux-gnu" ;;
+    *) echo "build-in-docker: unsupported arch $ARCH" >&2; exit 1 ;;
+esac
 
 WORK=/work
 OUT=/out
 mkdir -p "$OUT"
 
-BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod"
+BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod udhcpc ip"
 
-echo "==> [1/6] apt install build deps"
+# ---------------------------------------------------------------------------
+# [1/6] Install packages (mirrors CI: kernel + busybox + runtimes)
+# ---------------------------------------------------------------------------
+echo "==> [1/6] install packages (arch=$ARCH, format=$FORMAT)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+apt-get install -y --no-install-recommends ca-certificates curl >/dev/null
+apt-get update -qq
+
+# Core packages — same as CI but without the heavyweight office/media tools.
 apt-get install -y --no-install-recommends \
-    ca-certificates \
-    linux-image-amd64 kmod \
+    gnupg vim nano less procps \
+    wget git jq unzip zip bzip2 xz-utils zstd \
+    iputils-ping rsync dnsutils \
+    python3 python3-pip python3-venv \
+    bash-completion \
     busybox-static \
-    bash coreutils util-linux \
     gcc libc6-dev \
-    e2fsprogs qemu-utils \
-    xz-utils cpio gzip \
+    kmod \
+    "$KERNEL_PKG" \
     >/dev/null
 
+# Node.js 24 (same as CI)
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null 2>&1
+apt-get install -y --no-install-recommends nodejs >/dev/null
+
+# tokimo user (same as CI)
+groupadd -g 1000 tokimo 2>/dev/null || true
+useradd -m -u 1000 -g 1000 -s /bin/bash -d /home/tokimo tokimo 2>/dev/null || true
+
+# pip packages (same as CI)
+mkdir -p /home/tokimo/python_packages
+pip3 install --break-system-packages --target=/home/tokimo/python_packages \
+    requests ipython rich \
+    pypdf pdfplumber reportlab pdf2image \
+    pandas openpyxl Pillow >/dev/null 2>&1
+
+ln -sf ../../bin/python3 /usr/local/bin/python
+
+# Environment setup (same as CI)
+cat > /etc/profile.d/tokimo_env.sh << 'ENVEOF'
+export HOME=/home/tokimo
+export USER=tokimo
+export LOGNAME=tokimo
+export PATH=/home/tokimo/bin:/usr/local/bin:/usr/bin:/bin
+export PYTHONPATH=/home/tokimo/python_packages${PYTHONPATH:+:$PYTHONPATH}
+export PIP_TARGET=/home/tokimo/python_packages
+export PYTHONPYCACHEPREFIX="/tmp/.pycache-${UID}"
+ENVEOF
+chmod +x /etc/profile.d/tokimo_env.sh
+
+cat > /etc/bash.bashrc << 'BASHRCEOF'
+for f in /etc/profile.d/*.sh; do [ -r "$f" ] && . "$f"; done
+unset f
+[ -f ~/.bashrc ] && . ~/.bashrc
+BASHRCEOF
+
+cat > /home/tokimo/.bashrc << 'DOTBASHRC'
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+PS1='[\[\033[35;1m\]\u\[\033[0m\]@\[\033[31;1m\]TokimoOS\[\033[0m\]:\[\033[32;1m\]$PWD\[\033[0m\]]\$ '
+alias ls='ls --color=auto'
+alias ll='ls -lah --color=auto'
+DOTBASHRC
+
+cat > /home/tokimo/.bash_profile << 'DOTPROFILE'
+[ -f ~/.bashrc ] && . ~/.bashrc
+DOTPROFILE
+
+echo 'TokimoOS' > /etc/hostname
+cat > /etc/os-release << 'OSEOF'
+PRETTY_NAME="TokimoOS 1.0"
+NAME="TokimoOS"
+ID=tokimoos
+ID_LIKE=debian
+VERSION_ID="1.0"
+OSEOF
+
+chown -R tokimo:tokimo /home/tokimo
+
+echo "--- verification ---"
+node --version
+python3 --version
+
+# ---------------------------------------------------------------------------
+# [2/6] compile vsock9p
+# ---------------------------------------------------------------------------
 echo "==> [2/6] compile vsock9p"
 gcc -static -O2 -o /tmp/vsock9p /vm-base/vsock9p.c
 ls -lh /tmp/vsock9p
 
+# ---------------------------------------------------------------------------
+# [3/6] extract kernel
+# ---------------------------------------------------------------------------
 echo "==> [3/6] extract kernel"
 KERNEL_PATH=$(ls /boot/vmlinuz-* | head -1)
 cp "$KERNEL_PATH" "$OUT/vmlinuz"
 ls -lh "$OUT/vmlinuz"
 
+# ---------------------------------------------------------------------------
+# [4/6] build initrd
+# ---------------------------------------------------------------------------
 echo "==> [4/6] build initrd"
 INITRD=/tmp/initrd
 rm -rf "$INITRD"
@@ -63,18 +167,20 @@ chmod +x "$INITRD/init"
 cp /tmp/vsock9p "$INITRD/bin/vsock9p"
 chmod +x "$INITRD/bin/vsock9p"
 
-cp "$WORK/tokimo-sandbox-init" "$INITRD/bin/tokimo-sandbox-init"
-chmod +x "$INITRD/bin/tokimo-sandbox-init"
+for bin in tokimo-sandbox-init tokimo-tun-pump tokimo-sandbox-fuse; do
+    cp "$WORK/$bin" "$INITRD/bin/$bin"
+    chmod +x "$INITRD/bin/$bin"
+done
 
 KVER=$(ls /lib/modules | head -1)
-# Copy each named module + all its transitive dependencies. We use modinfo
-# to walk deps. Modules are placed flat under /modules/ so init.sh insmod
-# can find them by basename.
-KMOD_LIST="hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4"
+KMOD_LIST="hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun"
+if [ "$ARCH" = "arm64" ]; then
+    KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
+fi
+KMOD_LIST="$KMOD_LIST sunrpc auth_rpcgss lockd grace nfs_acl nfs nfsv3"
 
 resolve_deps() {
-    local mod="$1"
-    local seen="$2"
+    local mod="$1" seen="$2"
     case " $seen " in *" $mod "*) echo "$seen"; return 0;; esac
     seen="$seen $mod"
     local depline
@@ -105,134 +211,92 @@ for m in $ALL_MODS; do
     esac
 done
 echo "    modules: $(ls "$INITRD/modules" | wc -l) files"
-ls "$INITRD/modules" | sort
 
 ( cd "$INITRD" && find . | cpio -o -H newc 2>/dev/null ) | gzip -9 > "$OUT/initrd.img"
 ls -lh "$OUT/initrd.img"
 
-echo "==> [5/6] build minimal rootfs"
-ROOTFS=/tmp/rootfs
+# ---------------------------------------------------------------------------
+# [5/6] Slim down the container filesystem (mirrors CI)
+# ---------------------------------------------------------------------------
+echo "==> [5/6] slim down rootfs"
+
+# Remove build-only / dev packages
+rm -rf /usr/include
+rm -rf /usr/share/man /usr/share/doc /usr/share/locale /usr/share/info
+rm -rf /usr/share/lintian /usr/share/common-licenses
+rm -rf /usr/share/gcc* /usr/share/perl*
+rm -rf /usr/share/icons /usr/share/pixmaps /usr/share/applications /usr/share/menu
+rm -rf /usr/share/keyrings /usr/share/cmake /usr/share/zsh /usr/share/fish
+rm -rf /usr/share/python-wheels
+rm -rf /usr/share/vim/vim*/doc /usr/share/vim/vim*/tutor
+rm -rf /usr/lib/systemd /usr/lib/init /etc/systemd /etc/init.d
+rm -rf /var/lib/systemd /usr/lib/tmpfiles.d /usr/lib/sysctl.d
+rm -rf /usr/lib/udev /etc/udev 2>/dev/null || true
+rm -rf /usr/share/polkit-1
+rm -rf /usr/share/gdb /usr/share/gitweb /usr/share/tabset
+rm -rf /etc/pam.d /etc/pam.conf /etc/security /usr/share/pam*
+rm -rf /var/lib/pam
+rm -rf /etc/cron* /etc/logrotate.d /etc/logcheck
+rm -rf /usr/lib/lsb /usr/lib/valgrind /usr/lib/mime
+
+# Remove gcc (build-time only)
+rm -rf /usr/bin/gcc* /usr/bin/cpp* /usr/bin/c++* \
+       /usr/lib/gcc-cross /usr/libexec/gcc* 2>/dev/null || true
+
+# Keep terminfo only for xterm
+find /usr/share/terminfo -type f ! -path '*/xterm*' -delete 2>/dev/null || true
+find /usr/share/terminfo -type d -empty -delete 2>/dev/null || true
+
+# Keep zoneinfo minimal
+find /usr/share/zoneinfo -type f \
+    ! -path '*/Asia/*' ! -name 'UTC' ! -name 'PRC' ! -name 'posixrules' \
+    -delete 2>/dev/null || true
+find /usr/share/zoneinfo -type d -empty -delete 2>/dev/null || true
+
+# Remove kernel modules from rootfs (initrd carries them)
+find /lib/modules -name '*.ko*' -delete 2>/dev/null || true
+rm -rf /lib/modules/*/kernel 2>/dev/null || true
+
+# Clean caches
+apt-get clean 2>/dev/null || true
+rm -rf /var/lib/apt/lists/* /var/cache/apt /var/log/apt /var/log/*.log
+rm -rf /root/.npm /root/.cache /home/tokimo/.cache
+find / -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+find / -name '*.pyc' -delete 2>/dev/null || true
+
+du -sh /
+
+# ---------------------------------------------------------------------------
+# [6/6] Export rootfs
+# ---------------------------------------------------------------------------
+# Stage the rootfs by copying real directories only (skip /proc, /sys, /dev, /tmp
+# which are virtual mounts inside the container).
+ROOTFS=/tmp/rootfs-stage
 rm -rf "$ROOTFS"
-mkdir -p "$ROOTFS"/{bin,sbin,etc,lib,lib64,usr,proc,sys,dev,run,tmp,home/tokimo,root,mnt/work,var}
-
-# Use rsync-style copy of just what we need from the builder filesystem:
-# bash, busybox, coreutils, util-linux + their lib deps. We copy whole /usr,
-# /bin, /sbin, /lib, /lib64, /etc and then prune.
-cp -a /bin/. "$ROOTFS/bin/"
-cp -a /sbin/. "$ROOTFS/sbin/"
-cp -a /lib/. "$ROOTFS/lib/"
-[ -d /lib64 ] && cp -a /lib64/. "$ROOTFS/lib64/" || true
-cp -a /usr "$ROOTFS/" || true
-cp -a /etc "$ROOTFS/" || true
-mkdir -p "$ROOTFS/var/log" "$ROOTFS/var/tmp"
-
-# Aggressive slim-down.
-rm -rf \
-    "$ROOTFS"/usr/include \
-    "$ROOTFS"/usr/share/man \
-    "$ROOTFS"/usr/share/doc \
-    "$ROOTFS"/usr/share/locale \
-    "$ROOTFS"/usr/share/info \
-    "$ROOTFS"/usr/share/lintian \
-    "$ROOTFS"/usr/share/common-licenses \
-    "$ROOTFS"/usr/share/gcc* \
-    "$ROOTFS"/usr/share/perl* \
-    "$ROOTFS"/usr/share/icons \
-    "$ROOTFS"/usr/share/pixmaps \
-    "$ROOTFS"/usr/share/applications \
-    "$ROOTFS"/usr/share/menu \
-    "$ROOTFS"/usr/share/keyrings \
-    "$ROOTFS"/usr/share/cmake \
-    "$ROOTFS"/usr/share/zsh \
-    "$ROOTFS"/usr/share/fish \
-    "$ROOTFS"/usr/share/python-wheels \
-    "$ROOTFS"/var/cache/apt \
-    "$ROOTFS"/var/lib/apt/lists \
-    "$ROOTFS"/var/log/* \
-    "$ROOTFS"/usr/lib/gcc \
-    "$ROOTFS"/usr/lib/systemd \
-    "$ROOTFS"/usr/lib/init \
-    "$ROOTFS"/usr/lib/lsb \
-    "$ROOTFS"/usr/lib/valgrind \
-    "$ROOTFS"/usr/lib/mime \
-    "$ROOTFS"/usr/lib/x86_64-linux-gnu/libreoffice* \
-    "$ROOTFS"/usr/lib/x86_64-linux-gnu/perl* \
-    "$ROOTFS"/usr/lib/perl* \
-    "$ROOTFS"/etc/perl \
-    "$ROOTFS"/etc/systemd \
-    "$ROOTFS"/etc/init.d \
-    "$ROOTFS"/etc/cron* \
-    "$ROOTFS"/etc/logrotate.d \
-    "$ROOTFS"/etc/pam.d \
-    "$ROOTFS"/etc/pam.conf \
-    "$ROOTFS"/etc/security \
-    "$ROOTFS"/usr/share/pam* \
-    2>/dev/null || true
-
-# Drop kernel modules from rootfs (initrd carries the ones we need).
-rm -rf "$ROOTFS"/lib/modules 2>/dev/null || true
-rm -rf "$ROOTFS"/usr/lib/modules 2>/dev/null || true
-
-# Remove gcc / cpp / static libs (only used at build time inside rootfs).
-rm -rf "$ROOTFS"/usr/bin/gcc* "$ROOTFS"/usr/bin/cpp* "$ROOTFS"/usr/bin/c++* \
-       "$ROOTFS"/usr/lib/gcc-cross "$ROOTFS"/usr/libexec/gcc* 2>/dev/null || true
-
-# Keep terminfo only for xterm (bash readline).
-find "$ROOTFS/usr/share/terminfo" -type f ! -path '*/xterm*' -delete 2>/dev/null || true
-find "$ROOTFS/usr/share/terminfo" -type d -empty -delete 2>/dev/null || true
-
-# Keep zoneinfo minimal.
-find "$ROOTFS/usr/share/zoneinfo" -type f ! -name 'UTC' ! -name 'PRC' \
-    ! -path '*/Asia/Shanghai' -delete 2>/dev/null || true
-find "$ROOTFS/usr/share/zoneinfo" -type d -empty -delete 2>/dev/null || true
-
-# Set up /etc/passwd, /etc/group with tokimo user.
-cat > "$ROOTFS/etc/passwd" << 'EOF'
-root:x:0:0:root:/root:/bin/bash
-tokimo:x:1000:1000:tokimo:/home/tokimo:/bin/bash
-nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
-EOF
-cat > "$ROOTFS/etc/group" << 'EOF'
-root:x:0:
-tokimo:x:1000:
-nogroup:x:65534:
-EOF
-echo 'TokimoOS' > "$ROOTFS/etc/hostname"
-cat > "$ROOTFS/etc/os-release" << 'EOF'
-PRETTY_NAME="TokimoOS minimal 1.0"
-NAME="TokimoOS"
-ID=tokimoos
-ID_LIKE=debian
-VERSION_ID="1.0"
-EOF
-
-# Make sure /home/tokimo exists with reasonable defaults.
-mkdir -p "$ROOTFS/home/tokimo"
-cat > "$ROOTFS/home/tokimo/.bashrc" << 'EOF'
-export HOME=/home/tokimo
-export USER=tokimo
-export PATH=/usr/local/bin:/usr/bin:/bin
-EOF
-chown -R 1000:1000 "$ROOTFS/home/tokimo"
-
-# Add busybox applets to rootfs as fallback symlinks.
-cp /bin/busybox "$ROOTFS/bin/busybox" 2>/dev/null || true
-for a in $BUSYBOX_APPLETS; do
-    [ -e "$ROOTFS/bin/$a" ] || ln -sf busybox "$ROOTFS/bin/$a"
+mkdir -p "$ROOTFS"
+for d in bin sbin etc lib lib64 usr home root mnt opt run srv var; do
+    [ -d "/$d" ] && cp -a "/$d" "$ROOTFS/" 2>/dev/null || true
 done
+mkdir -p "$ROOTFS"/{proc,sys,dev,mnt/work,tmp}
 
-du -sh "$ROOTFS"
+# Pre-compile Python stdlib .pyc (mirrors CI)
+PYLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))' 2>/dev/null) \
+    && python3 -m compileall -q -j 0 "$PYLIB" 2>/dev/null || true
 
-echo "==> [6/6] mkfs.ext4 + qemu-img convert → vhdx"
 ROOTFS_SIZE_M=$(du -sm "$ROOTFS" | cut -f1)
-IMG_SIZE_M=$((ROOTFS_SIZE_M + 256))
-echo "    rootfs ${ROOTFS_SIZE_M}M, image ${IMG_SIZE_M}M"
 
-qemu-img create -f raw /tmp/rootfs.img ${IMG_SIZE_M}M >/dev/null
-mkfs.ext4 -F -L tokimo-rootfs -d "$ROOTFS" /tmp/rootfs.img >/dev/null
-
-qemu-img convert -f raw -O vhdx -o subformat=dynamic /tmp/rootfs.img "$OUT/rootfs.vhdx"
-ls -lh "$OUT/rootfs.vhdx"
+if [ "$FORMAT" = "vhdx" ]; then
+    echo "==> [6/6] mkfs.ext4 + qemu-img convert -> vhdx (rootfs ~${ROOTFS_SIZE_M}M)"
+    IMG_SIZE_M=$((ROOTFS_SIZE_M + 256))
+    qemu-img create -f raw /tmp/rootfs.img "${IMG_SIZE_M}M" >/dev/null
+    mkfs.ext4 -F -L tokimo-rootfs -d "$ROOTFS" /tmp/rootfs.img >/dev/null
+    qemu-img convert -f raw -O vhdx -o subformat=dynamic /tmp/rootfs.img "$OUT/rootfs.vhdx"
+    ls -lh "$OUT/rootfs.vhdx"
+else
+    echo "==> [6/6] copy rootfs directory (rootfs ~${ROOTFS_SIZE_M}M)"
+    cp -a "$ROOTFS" "$OUT/rootfs"
+    ls -lh "$OUT/rootfs"
+fi
 
 echo ""
 echo "==> Done. Outputs:"
