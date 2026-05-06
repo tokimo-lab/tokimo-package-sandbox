@@ -54,6 +54,14 @@ fn relative_under(path: &Path) -> &Path {
     path.strip_prefix("/").unwrap_or(path)
 }
 
+fn local_stat_error(err: std::io::Error) -> VfsError {
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(123) {
+        return VfsError::NotFound;
+    }
+    VfsError::from(err)
+}
+
 // ===========================================================================
 // LocalDirVfs
 // ===========================================================================
@@ -98,7 +106,7 @@ impl VfsReader for LocalDirVfs {
 
     async fn stat(&self, path: &Path) -> VfsResult<VfsFileInfo> {
         let host = self.host_join(path)?;
-        let md = tokio::fs::metadata(&host).await?;
+        let md = tokio::fs::metadata(&host).await.map_err(local_stat_error)?;
         let name = host
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -580,6 +588,15 @@ mod tests {
         let vfs = LocalDirVfs::new(dir.path());
         let err = vfs.stat(Path::new("/../../etc/passwd")).await.unwrap_err();
         assert!(matches!(err, VfsError::InvalidArgument(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_invalid_windows_lookup_name_is_not_found() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+        let err = vfs.stat(Path::new("/slide-*.jpg")).await.unwrap_err();
+        assert!(matches!(err, VfsError::NotFound));
     }
 
     #[tokio::test]

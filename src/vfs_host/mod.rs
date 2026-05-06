@@ -432,21 +432,45 @@ impl FuseHost {
             } => Some((*mount_id, *nodeid, entries.clone())),
             _ => None,
         });
-        let Some(Some((mount_id, parent_nodeid, entries))) = snap else {
+        let Some(Some((mount_id, dir_nodeid, entries))) = snap else {
             return Res::Error(errno_for(&VfsError::InvalidArgument("bad fh".into())));
         };
-        let parent_path = match self.resolve_path(mount_id, parent_nodeid) {
+        let dir_path = match self.resolve_path(mount_id, dir_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
         };
+        let parent_nodeid = if dir_path == Path::new("/") {
+            1
+        } else {
+            let parent_path = dir_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+            let (nodeid, _) = self.id_table.intern_peek(mount_id, parent_path);
+            nodeid
+        };
+
         let off = offset as usize;
         let mut out = Vec::new();
-        for (i, (name, snap)) in entries.into_iter().enumerate().skip(off) {
-            let child = Self::child_path(&parent_path, &name);
+        if off == 0 {
+            out.push(WireDirEntry {
+                nodeid: dir_nodeid,
+                offset: 1,
+                kind: NodeKind::Dir,
+                name: ".".into(),
+            });
+        }
+        if off <= 1 {
+            out.push(WireDirEntry {
+                nodeid: parent_nodeid,
+                offset: 2,
+                kind: NodeKind::Dir,
+                name: "..".into(),
+            });
+        }
+        for (i, (name, snap)) in entries.into_iter().enumerate().skip(off.saturating_sub(2)) {
+            let child = Self::child_path(&dir_path, &name);
             let (nodeid, _) = self.id_table.intern_peek(mount_id, child);
             out.push(WireDirEntry {
                 nodeid,
-                offset: (i + 1) as u64,
+                offset: (i + 3) as u64,
                 kind: snap.kind,
                 name,
             });
@@ -965,7 +989,11 @@ mod tests {
             Res::DirEntries(v) => v,
             other => panic!("{:?}", other),
         };
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, ".");
+        assert_eq!(entries[0].offset, 1);
+        assert_eq!(entries[1].name, "..");
+        assert_eq!(entries[1].offset, 2);
         let names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains(&"d".to_string()));
         assert!(names.contains(&"a".to_string()));
