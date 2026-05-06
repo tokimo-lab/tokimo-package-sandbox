@@ -7,11 +7,11 @@ name: vm
 # split. The split existed to make rebuilding the init binary cheap by
 # reusing a cached debootstrap, but in practice debootstrap takes only
 # ~5 min per arch and the cross-workflow tag namespace
-# (`vm-base-v*` ↔ `vm-v*`) was a constant source of confusion. Build it
+# (`vm-base-v*` ↔ `vm-*`) was a constant source of confusion. Build it
 # all in one pipeline and pay the few extra minutes.
 #
 # Trigger:
-#   * push tag vm-v*               → publish GitHub Release at that tag
+#   * push tag vm-*               → publish GitHub Release at that tag
 #   * workflow_dispatch            → optional release_tag for manual cuts
 #
 # Output (per arch):
@@ -21,11 +21,11 @@ name: vm
 
 on:
   push:
-    tags: ['vm-v*']
+    tags: ['vm-*']
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag to publish (e.g. vm-v1.9.0). Leave empty for dry run."
+        description: "Tag to publish (e.g. vm-1.9.0). Leave empty for dry run."
         required: false
         default: ""
 
