@@ -17,7 +17,7 @@
 //! The slab approach gives O(1) allocate / lookup / release with
 //! amortized 0 alloc once steady-state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -63,9 +63,14 @@ pub struct StagingFile {
     pub dirty: bool,
 }
 
-#[derive(Debug, Default)]
+/// Default capacity for cold refcount=0 entry cache.
+/// Bounds memory usage for large directories while preserving recently listed entries.
+const DEFAULT_COLD_CAP: usize = 4096;
+
+#[derive(Debug)]
 pub struct IdTable {
     inner: Mutex<Inner>,
+    cold_cap: usize,
 }
 
 #[derive(Debug, Default)]
@@ -75,15 +80,23 @@ struct Inner {
     fhs: Slab<FhEntry>,
     /// Bumped per-process at startup; surfaces in [`crate::vfs_protocol::EntryOut::generation`].
     generation: u64,
+    /// Queue of refcount=0 entries in insertion order. May contain stale ids.
+    cold_queue: VecDeque<u64>,
 }
 
 impl IdTable {
     pub fn new(generation: u64) -> Self {
+        Self::with_cold_cap(generation, DEFAULT_COLD_CAP)
+    }
+
+    /// Create an IdTable with a custom cold entry cap (for testing).
+    pub fn with_cold_cap(generation: u64, cold_cap: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 generation,
                 ..Default::default()
             }),
+            cold_cap,
         }
     }
 
@@ -137,6 +150,7 @@ impl IdTable {
         if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
             return (nodeid, false);
         }
+
         let entry = NodeEntry {
             mount_id,
             path: path.clone(),
@@ -145,6 +159,30 @@ impl IdTable {
         let idx = inner.nodes.insert(entry);
         let nodeid = idx as u64 + 2;
         inner.by_path.insert((mount_id, path), nodeid);
+
+        // Remove any stale queue entries for this nodeid (from previous forget+reuse).
+        inner.cold_queue.retain(|&id| id != nodeid);
+
+        // Enqueue the new cold entry.
+        inner.cold_queue.push_back(nodeid);
+
+        // Lazy eviction: pop oldest entries until under cap.
+        while inner.cold_queue.len() > self.cold_cap {
+            let Some(old_id) = inner.cold_queue.pop_front() else {
+                break;
+            };
+            let old_idx = (old_id - 2) as usize;
+            // Skip if missing (stale) or refcount > 0 (upgraded).
+            if let Some(node) = inner.nodes.get(old_idx)
+                && node.refcount == 0
+            {
+                let path = node.path.clone();
+                let mid = node.mount_id;
+                inner.nodes.remove(old_idx);
+                inner.by_path.remove(&(mid, path));
+            }
+        }
+
         (nodeid, true)
     }
 
@@ -280,5 +318,85 @@ mod tests {
         // forget decrements to 0 → removes.
         t.forget(a, 1);
         assert!(t.lookup(a).is_none());
+    }
+
+    #[test]
+    fn cold_cap_evicts_oldest_when_full() {
+        let t = IdTable::with_cold_cap(1, 3);
+
+        // Allocate 3 cold entries (at cap)
+        let (a, _) = t.intern_peek(0, PathBuf::from("/cold1"));
+        let (b, _) = t.intern_peek(0, PathBuf::from("/cold2"));
+        let (c, _) = t.intern_peek(0, PathBuf::from("/cold3"));
+
+        // All should exist
+        assert!(t.lookup(a).is_some());
+        assert!(t.lookup(b).is_some());
+        assert!(t.lookup(c).is_some());
+
+        // Allocate one more entry, pushing past cap
+        let (d, _) = t.intern_peek(0, PathBuf::from("/cold4"));
+
+        // Oldest (a) should be evicted
+        assert!(t.lookup(a).is_none());
+        assert!(t.lookup(b).is_some());
+        assert!(t.lookup(c).is_some());
+        assert!(t.lookup(d).is_some());
+    }
+
+    #[test]
+    fn upgraded_entry_survives_eviction() {
+        let t = IdTable::with_cold_cap(1, 3);
+
+        // Allocate one cold entry
+        let (a, _) = t.intern_peek(0, PathBuf::from("/upgrade"));
+        assert_eq!(t.lookup(a).unwrap().refcount, 0);
+
+        // Upgrade it to refcount=1
+        let (a2, fresh) = t.intern(0, PathBuf::from("/upgrade"));
+        assert_eq!(a, a2);
+        assert!(!fresh);
+        assert_eq!(t.lookup(a).unwrap().refcount, 1);
+
+        // Fill the cap and go beyond
+        t.intern_peek(0, PathBuf::from("/cold1"));
+        t.intern_peek(0, PathBuf::from("/cold2"));
+        t.intern_peek(0, PathBuf::from("/cold3"));
+        t.intern_peek(0, PathBuf::from("/cold4"));
+        t.intern_peek(0, PathBuf::from("/cold5"));
+
+        // Upgraded entry should still exist with refcount=1
+        assert!(t.lookup(a).is_some());
+        assert_eq!(t.lookup(a).unwrap().refcount, 1);
+
+        // Verify path mapping still works
+        let (a3, fresh2) = t.intern(0, PathBuf::from("/upgrade"));
+        assert_eq!(a, a3);
+        assert!(!fresh2);
+        assert_eq!(t.lookup(a).unwrap().refcount, 2);
+    }
+
+    #[test]
+    fn forgotten_entry_eviction_safe() {
+        let t = IdTable::with_cold_cap(1, 3);
+
+        t.intern_peek(0, PathBuf::from("/old1"));
+        t.intern_peek(0, PathBuf::from("/old2"));
+        t.intern_peek(0, PathBuf::from("/old3"));
+
+        let (a, _) = t.intern_peek(0, PathBuf::from("/forgotten"));
+        t.forget(a, 1);
+
+        // Slab may reuse the freed slot for this new entry.
+        let (reused, _) = t.intern_peek(0, PathBuf::from("/reused"));
+
+        t.intern_peek(0, PathBuf::from("/new1"));
+        t.intern_peek(0, PathBuf::from("/new2"));
+
+        // Reused entry should survive eviction and path mapping should work.
+        assert!(t.lookup(reused).is_some());
+        let (reused2, fresh) = t.intern_peek(0, PathBuf::from("/reused"));
+        assert_eq!(reused, reused2);
+        assert!(!fresh);
     }
 }
