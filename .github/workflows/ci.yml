@@ -14,7 +14,7 @@ jobs:
   # ------------------------------------------------------------------
   # Linux: build + lib/bins tests. Integration tests are skipped in CI;
   # they require the packaged vm/rootfs (Node 24, Python 3, …) which is
-  # produced by .github/workflows/vm.yml under tag prefix vm-v* and is
+  # produced by .github/workflows/vm.yml under tag prefix vm-* and is
   # not bundled in the repo. Run them locally after fetch-vm.sh.
   # ------------------------------------------------------------------
   linux:

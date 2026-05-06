@@ -340,11 +340,11 @@ Linux/bwrap configuration is passed via argv (subcommand `tokimo-sandbox-init bw
 
 ## Windows VM artifacts
 
-Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm-image.yml` under tags with prefix `vm-v*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm.yml` under tags with prefix `vm-*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
 
 ```powershell
 pwsh scripts/windows/fetch-vm.ps1                 # latest
-pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # specific
+pwsh scripts/windows/fetch-vm.ps1 -Tag vm-1.9.0   # specific
 ```
 
 `src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**

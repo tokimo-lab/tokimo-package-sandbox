@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Download VM artifacts (kernel + initrd + rootfs/) from
-# tokimo-package-sandbox GitHub releases (tag prefix vm-v*) into <repo>/vm/.
+# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/vm/.
 #
 # Usage:
-#   scripts/linux/fetch-vm.sh                 # latest vm-v* release, host arch
-#   scripts/linux/fetch-vm.sh -t vm-v1.9.0    # specific tag
+#   scripts/linux/fetch-vm.sh                 # latest vm-* release, host arch
+#   scripts/linux/fetch-vm.sh -t vm-1.9.0    # specific tag
 #   scripts/linux/fetch-vm.sh -a arm64        # arm64
 #   scripts/linux/fetch-vm.sh -f              # force re-download
 #

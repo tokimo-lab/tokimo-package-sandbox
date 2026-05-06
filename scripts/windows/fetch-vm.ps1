@@ -1,10 +1,10 @@
 #!/usr/bin/env pwsh
 # Download VM artifacts (kernel + initrd + rootfs.vhdx) from
-# tokimo-package-sandbox GitHub releases (tag prefix vm-v*) into <repo>/vm/.
+# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/vm/.
 #
 # Usage:
-#   pwsh scripts/windows/fetch-vm.ps1                # latest vm-v* release, amd64
-#   pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0 # specific tag
+#   pwsh scripts/windows/fetch-vm.ps1                # latest vm-* release, amd64
+#   pwsh scripts/windows/fetch-vm.ps1 -Tag vm-1.9.0 # specific tag
 #   pwsh scripts/windows/fetch-vm.ps1 -Arch arm64    # arm64 (less tested)
 #
 # Layout produced (all read-only at runtime):
@@ -27,7 +27,7 @@ $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 $repo = "tokimo-lab/tokimo-package-sandbox"
 # Artifacts are named: tokimo-linux-<component>-<arch>.<ext>
 # arch in the artifact filename is x86_64 / arm64.
-# Tag prefix is "vm-v*" (produced by .github/workflows/vm-image.yml).
+# Tag prefix is "vm-*" (produced by .github/workflows/vm-image.yml).
 $archName = if ($Arch -eq "amd64") { "x86_64" } else { "arm64" }
 $kernelAsset = "tokimo-linux-kernel-$archName.tar.zst"
 $vhdxAsset   = "tokimo-linux-rootfs-$archName.vhdx.zip"

@@ -35,7 +35,7 @@ both halves.
                 │           with init+tun-pump baked in     │
                 │   ③ rebake-initrd.sh (adds fuse)          │
                 │   ④ pack vmlinuz / initrd / rootfs        │
-                │   → vm-v1.9.0 release                     │
+                │   → vm-1.9.0 release                     │
                 └──────────────────┬───────────────────────┘
                                    ▼
                          scripts/windows/fetch-vm.ps1
