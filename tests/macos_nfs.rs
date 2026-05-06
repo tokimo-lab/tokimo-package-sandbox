@@ -1,8 +1,11 @@
 mod common;
 
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use common::{SandboxGuard, config, drain_until, workspace_dir};
+#[cfg(target_os = "macos")]
 use tokimo_package_sandbox::{Mount, Sandbox};
 
 #[test]
