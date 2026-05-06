@@ -110,11 +110,13 @@ impl IdTable {
     /// nodeid and `true` if it was newly allocated. Bumps refcount.
     pub fn intern(&self, mount_id: u32, path: PathBuf) -> (u64, bool) {
         let mut inner = self.inner.lock().unwrap();
+        // get() borrows a temporary — path is NOT moved, usable afterward.
         if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
             let idx = (nodeid - 2) as usize;
             inner.nodes[idx].refcount += 1;
             return (nodeid, false);
         }
+        // Slow path: one clone for the NodeEntry, then move into HashMap.
         let entry = NodeEntry {
             mount_id,
             path: path.clone(),
@@ -126,7 +128,31 @@ impl IdTable {
         (nodeid, true)
     }
 
+    /// Like [`intern`](Self::intern) but does **not** bump refcount.
+    /// Used for readdir entries where the kernel won't send `Forget` —
+    /// the nodeid stays in the table until a real `Lookup` + `Forget`
+    /// cycle releases it.
+    pub fn intern_peek(&self, mount_id: u32, path: PathBuf) -> (u64, bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
+            return (nodeid, false);
+        }
+        let entry = NodeEntry {
+            mount_id,
+            path: path.clone(),
+            refcount: 0,
+        };
+        let idx = inner.nodes.insert(entry);
+        let nodeid = idx as u64 + 2;
+        inner.by_path.insert((mount_id, path), nodeid);
+        (nodeid, true)
+    }
+
     /// Decrement refcount; release the slot when it hits zero.
+    ///
+    /// Entries with `refcount == 0` (created by [`intern_peek`](Self::intern_peek)
+    /// for readdir) are removed immediately — the kernel is telling us it
+    /// no longer holds a reference, so the slab entry can be freed.
     pub fn forget(&self, nodeid: u64, n: u64) {
         if nodeid < 2 {
             return;
@@ -136,6 +162,14 @@ impl IdTable {
         let Some(node) = inner.nodes.get_mut(idx) else {
             return;
         };
+        if node.refcount == 0 {
+            // readdir-allocated entry — remove unconditionally.
+            let path = node.path.clone();
+            let mid = node.mount_id;
+            inner.nodes.remove(idx);
+            inner.by_path.remove(&(mid, path));
+            return;
+        }
         node.refcount = node.refcount.saturating_sub(n);
         if node.refcount == 0 {
             let path = node.path.clone();
@@ -211,5 +245,40 @@ mod tests {
         assert!(fh >= 1);
         assert!(t.take_fh(fh).is_some());
         assert!(t.take_fh(fh).is_none());
+    }
+
+    #[test]
+    fn intern_peek_reuses_existing() {
+        let t = IdTable::new(1);
+        // First peek allocates with refcount=0.
+        let (a, fresh) = t.intern_peek(0, PathBuf::from("/bar"));
+        assert!(fresh);
+        assert!(t.lookup(a).is_some());
+        // Second peek reuses the same nodeid without bumping refcount.
+        let (b, fresh2) = t.intern_peek(0, PathBuf::from("/bar"));
+        assert!(!fresh2);
+        assert_eq!(a, b);
+        // forget on refcount=0 entry removes it.
+        t.forget(a, 1);
+        assert!(t.lookup(a).is_none());
+        // Re-peek allocates a new entry.
+        let (c, fresh3) = t.intern_peek(0, PathBuf::from("/bar"));
+        assert!(fresh3);
+        assert!(c >= 2);
+    }
+
+    #[test]
+    fn intern_bumps_refcount_on_peek_entry() {
+        let t = IdTable::new(1);
+        let (a, _) = t.intern_peek(0, PathBuf::from("/baz"));
+        assert_eq!(t.lookup(a).unwrap().refcount, 0);
+        // intern bumps refcount from 0 → 1.
+        let (b, fresh) = t.intern(0, PathBuf::from("/baz"));
+        assert!(!fresh);
+        assert_eq!(a, b);
+        assert_eq!(t.lookup(a).unwrap().refcount, 1);
+        // forget decrements to 0 → removes.
+        t.forget(a, 1);
+        assert!(t.lookup(a).is_none());
     }
 }

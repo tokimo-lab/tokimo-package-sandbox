@@ -432,18 +432,20 @@ impl FuseHost {
             } => Some((*mount_id, *nodeid, entries.clone())),
             _ => None,
         });
-        let Some(Some((_mount_id, parent_nodeid, entries))) = snap else {
+        let Some(Some((mount_id, parent_nodeid, entries))) = snap else {
             return Res::Error(errno_for(&VfsError::InvalidArgument("bad fh".into())));
         };
-        // No nodeid allocation here — the guest will Lookup before using
-        // dir entries that need a nodeid. We surface 0 to indicate
-        // "lookup required".
-        let _ = parent_nodeid;
+        let parent_path = match self.resolve_path(mount_id, parent_nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
         let off = offset as usize;
         let mut out = Vec::new();
         for (i, (name, snap)) in entries.into_iter().enumerate().skip(off) {
+            let child = Self::child_path(&parent_path, &name);
+            let (nodeid, _) = self.id_table.intern_peek(mount_id, child);
             out.push(WireDirEntry {
-                nodeid: 0,
+                nodeid,
                 offset: (i + 1) as u64,
                 kind: snap.kind,
                 name,

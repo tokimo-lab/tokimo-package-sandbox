@@ -94,3 +94,46 @@ fn fuse_dynamic_add_remove() {
 
     sb.stop_vm().ok();
 }
+
+/// Verify that glob expansion (`ls slide-*.jpg`) inside a FUSE-mounted
+/// directory does not produce spurious I/O errors.  Regression test for
+/// a FUSE readdir issue that returned `nodeid: 0` for all entries,
+/// causing the Linux kernel to drop them from glob expansion.
+#[test]
+fn fuse_glob_no_io_error() {
+    const MARKER: &str = "GLOB_DONE_A1B2";
+
+    let label = "fuseglob";
+    let ws = workspace_dir(label);
+
+    // Seed files so the glob has something to match.
+    for name in &["slide-01.jpg", "slide-02.jpg", "slide-03.jpg"] {
+        std::fs::write(ws.join(name), b"fake-jpeg").expect("write seed file");
+    }
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(config(label)).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    sb.write_stdin(&shell, b"ls /work/slide-*.jpg 2>&1; echo GLOB_DONE_A1B2\n")
+        .unwrap();
+    let captured = drain_until(&rx, &shell, MARKER, Duration::from_secs(30));
+
+    sb.stop_vm().ok();
+
+    for name in &["slide-01.jpg", "slide-02.jpg", "slide-03.jpg"] {
+        let _ = std::fs::remove_file(ws.join(name));
+    }
+
+    assert!(
+        !captured.contains("Input/output error"),
+        "FUSE glob produced an I/O error. captured: {captured:?}"
+    );
+    assert!(
+        captured.contains("slide-01.jpg"),
+        "expected slide-01.jpg in ls output. captured: {captured:?}"
+    );
+}
