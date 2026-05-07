@@ -529,7 +529,9 @@ mod linux {
 
         fn opendir(&mut self, _r: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
             match self.dispatcher.call(Req::OpenDir { nodeid: ino }) {
-                Res::OpenOk { fh } => reply.opened(fh, 0),
+                // FOPEN_CACHE_DIR: kernel may cache directory contents
+                // across opens, eliding repeated readdir round-trips.
+                Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_CACHE_DIR),
                 Res::Error(we) => reply.error(errno_of(&we)),
                 _ => reply.error(libc::EIO),
             }
@@ -598,7 +600,13 @@ mod linux {
                 nodeid: ino,
                 flags: flags as u32,
             }) {
-                Res::OpenOk { fh } => reply.opened(fh, 0),
+                // FOPEN_KEEP_CACHE: kernel keeps page cache across opens
+                // — subsequent reads of the same file hit the cache
+                // without ever consulting FUSE userspace. Combined with
+                // FUSE_AUTO_INVAL_DATA and our 60s entry/attr TTL the
+                // cache is safe for sandbox-local FS where no external
+                // process mutates files behind our back.
+                Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_KEEP_CACHE),
                 Res::Error(we) => reply.error(errno_of(&we)),
                 _ => reply.error(libc::EIO),
             }
