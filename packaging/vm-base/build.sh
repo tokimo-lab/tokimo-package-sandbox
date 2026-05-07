@@ -78,6 +78,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   bash-completion \
   pandoc poppler-utils qpdf tesseract-ocr \
   libreoffice-writer libreoffice-impress libreoffice-calc \
+  openjdk-21-jre-headless \
   lua5.4 \
   busybox-static \
   gcc libc6-dev \
