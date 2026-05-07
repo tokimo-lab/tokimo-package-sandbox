@@ -548,12 +548,12 @@ impl Sandbox {
         // Refresh fontconfig cache in the guest so the newly mounted fonts
         // are discovered.  Run in background so we don't block the shell.
         // Non-fatal: the guest may not have fc-cache.
-        if !mounted.is_empty() {
-            if let Ok(shell) = self.shell_id() {
-                let paths: Vec<&str> = mounted.iter().filter_map(|p| p.to_str()).collect();
-                let cmd = format!("fc-cache -f {} >/dev/null 2>&1 &\n", paths.join(" "));
-                let _ = self.write_stdin(&shell, cmd.as_bytes());
-            }
+        if !mounted.is_empty()
+            && let Ok(shell) = self.shell_id()
+        {
+            let paths: Vec<&str> = mounted.iter().filter_map(|p| p.to_str()).collect();
+            let cmd = format!("fc-cache -f {} >/dev/null 2>&1 &\n", paths.join(" "));
+            let _ = self.write_stdin(&shell, cmd.as_bytes());
         }
 
         Ok(mounted)
