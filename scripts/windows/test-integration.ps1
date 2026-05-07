@@ -156,11 +156,11 @@ Write-Host "  ‣ pipe ready: $PipePath" -ForegroundColor Green
 # ---------------------------------------------------------------------------
 # 4. Run cargo test
 # ---------------------------------------------------------------------------
-Write-Section 'cargo test --test sandbox_integration'
+Write-Section 'cargo test'
 $testExit = 1
 Push-Location $Root
 try {
-    cargo test --test sandbox_integration -- --test-threads=1 --nocapture *>&1 |
+    cargo test -- --test-threads=1 --nocapture *>&1 |
         Tee-Object -FilePath $TestLog
     $testExit = $LASTEXITCODE
 } finally {

@@ -38,9 +38,10 @@ pub fn config(label: &str) -> ConfigureParams {
         base_rootfs
     };
 
-    let vm_dir = std::path::PathBuf::from(".vm/run");
-    std::fs::create_dir_all(&vm_dir).expect("create .vm/run directory");
-    let vm_dir = vm_dir.canonicalize().expect("canonicalize .vm/run directory");
+    let counter = N.load(Ordering::Relaxed);
+    let vm_dir = std::path::PathBuf::from(format!(".vm/run-{label}-{counter}"));
+    std::fs::create_dir_all(&vm_dir).expect("create vm_dir directory");
+    let vm_dir = vm_dir.canonicalize().expect("canonicalize vm_dir directory");
 
     ConfigureParams {
         user_data_name: "test".into(),

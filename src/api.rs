@@ -87,11 +87,13 @@ pub struct ConfigureParams {
     /// - Windows: must contain `vmlinuz`, `initrd.img`, and `rootfs.vhdx`.
     ///
     /// Errors immediately if the directory or required files are missing.
+    #[serde(default)]
     pub base_rootfs: PathBuf,
 
     /// VM working directory. A writable copy of the rootfs is stored here
     /// and persists across sessions. First boot initialises it from
     /// `base_rootfs`; subsequent boots reuse the existing copy.
+    #[serde(default)]
     pub vm_dir: PathBuf,
 
     /// VM memory budget (mebibytes). Default 4096.
