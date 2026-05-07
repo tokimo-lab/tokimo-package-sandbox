@@ -1084,7 +1084,7 @@ fn register_tcp_flow(
     // userspace gateway, BDP-saturating throughput requires the window
     // to grow well past the kernel default of 64 KiB. See
     // tests/netstack_perf.rs for the measurement that motivated this.
-    const TCP_BUF: usize = 1024 * 1024;
+    const TCP_BUF: usize = 4 * 1024 * 1024;
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);

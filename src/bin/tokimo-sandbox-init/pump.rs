@@ -11,12 +11,13 @@
 //!   - guest IP4: 192.168.127.2/24, gateway 192.168.127.1
 //!   - guest IP6: fd00:7f::2/64,    gateway fd00:7f::1
 //!   - guest MAC: 02:00:00:00:00:02
-//!   - MTU:       1400
+//!   - MTU:       see `tokimo_package_sandbox::net_constants::MTU`
+//!     (currently 65000 — jumbo, since the "wire" is a kernel pipe)
 
 #![cfg(target_os = "linux")]
 
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufReader, IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,7 +84,10 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
         .name("pump-host-to-tap".into())
         .spawn(move || {
             let mut tap = unsafe { std::fs::File::from_raw_fd(tap_b) };
-            let mut net = unsafe { std::fs::File::from_raw_fd(net_b) };
+            let net = unsafe { std::fs::File::from_raw_fd(net_b) };
+            // BufReader pulls multiple frames per read syscall when the
+            // host pumps a burst (steady-state under load).
+            let mut net = BufReader::with_capacity(256 * 1024, net);
             while !sd2.load(Ordering::Relaxed) {
                 match read_frame(&mut net) {
                     Ok(frame) => {
@@ -162,7 +166,10 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     if len == 0 || len > 65535 {
         return Err(std::io::Error::other(format!("bad frame len {len}")));
     }
-    let mut buf = vec![0u8; len];
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    // SAFETY: read_exact either fully populates `len` bytes or returns
+    // Err — in the Err case `buf` is dropped without ever being read.
+    unsafe { buf.set_len(len) };
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
@@ -172,8 +179,21 @@ fn write_frame<W: Write>(w: &mut W, frame: &[u8]) -> std::io::Result<()> {
         return Err(std::io::Error::other("frame too large"));
     }
     let hdr = (frame.len() as u16).to_be_bytes();
-    w.write_all(&hdr)?;
-    w.write_all(frame)?;
+    let total = hdr.len() + frame.len();
+    let bufs = [IoSlice::new(&hdr), IoSlice::new(frame)];
+    let n = w.write_vectored(&bufs)?;
+    if n == total {
+        return Ok(());
+    }
+    if n == 0 {
+        return Err(std::io::ErrorKind::WriteZero.into());
+    }
+    if n < hdr.len() {
+        w.write_all(&hdr[n..])?;
+        w.write_all(frame)?;
+    } else {
+        w.write_all(&frame[n - hdr.len()..])?;
+    }
     Ok(())
 }
 
