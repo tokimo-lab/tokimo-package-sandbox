@@ -1383,22 +1383,35 @@ fn handle_stop_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<
 fn teardown_session(st: &mut SessionState) {
     // Signal the dispatcher to stop.  We do not join here because the
     // caller holds the session mutex and the dispatcher also acquires it;
-    // setting `stop` (plus the init EOF below) makes the thread exit
-    // within one loop iteration without needing a join.
+    // setting `stop` (plus HCS shutdown or init EOF below) makes the thread
+    // exit without needing a join.
     if let Some(ref d) = st.dispatcher {
         d.stop.store(true, Ordering::Relaxed);
     }
-    if let Some(init) = st.init.take() {
-        let _ = init.shutdown();
-    }
+    let mut init = st.init.take();
     if let Some((api, cs, _vm_id)) = st.hcs.take() {
-        let _ = api.terminate_compute_system(cs);
+        // Keep PID 1 alive while HCS requests graceful ACPI shutdown so the
+        // guest can flush persistent VHDX writes before power-off.
+        let graceful_shutdown = api.shutdown_compute_system(cs).is_ok();
+        if !graceful_shutdown {
+            if let Some(init) = init.take() {
+                let _ = init.shutdown();
+            }
+            let _ = api.terminate_compute_system(cs);
+        }
+        // Close HCS before dropping the VHDX lease below.
         api.close_compute_system(cs);
+        // On graceful shutdown, drop the init transport after HCS close.
+        if graceful_shutdown {
+            drop(init.take());
+        }
+    } else if let Some(init) = init.take() {
+        let _ = init.shutdown();
     }
     st.shell_child_id = None;
     st.children.clear();
     // Detach the dispatcher JoinHandle; the thread exits promptly because
-    // we set `stop` above and the init is now dead.
+    // we set `stop` above, and any in-flight wait wakes by timeout or teardown.
     st.dispatcher = None;
     // Drop FuseHost first (causes in-flight serve tasks to see EOF),
     // then shut down the tokio runtime.

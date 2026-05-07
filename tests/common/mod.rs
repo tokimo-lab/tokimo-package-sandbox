@@ -31,10 +31,21 @@ pub fn workspace_dir(label: &str) -> std::path::PathBuf {
 }
 
 pub fn config(label: &str) -> ConfigureParams {
+    let base_rootfs = std::path::PathBuf::from(".vm/base");
+    let base_rootfs = if base_rootfs.exists() {
+        base_rootfs.canonicalize().expect("canonicalize .vm/base")
+    } else {
+        base_rootfs
+    };
+
+    let vm_dir = std::path::PathBuf::from(".vm/run");
+    std::fs::create_dir_all(&vm_dir).expect("create .vm/run directory");
+    let vm_dir = vm_dir.canonicalize().expect("canonicalize .vm/run directory");
+
     ConfigureParams {
         user_data_name: "test".into(),
-        base_rootfs: ".vm/base".into(),
-        vm_dir: ".vm/run".into(),
+        base_rootfs,
+        vm_dir,
         memory_mb: 1024,
         cpu_count: 2,
         mounts: vec![Mount {

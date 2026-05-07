@@ -1,9 +1,9 @@
-//! HCS (vmcompute.dll) FFI for the SYSTEM service.
+//! HCS (ComputeCore.dll / vmcompute.dll) FFI for the SYSTEM service.
 //!
-//! `vmcompute.dll` exports aren't yet covered by an official `windows`
-//! crate binding, so we still go through `LoadLibraryW` + `GetProcAddress`.
-//! We at least use the `windows` crate for those two calls so we're not
-//! hand-declaring extern blocks.
+//! HCS exports aren't yet covered by an official `windows` crate binding,
+//! so we still go through `LoadLibraryW` + `GetProcAddress`. We at least use
+//! the `windows` crate for those two calls so we're not hand-declaring extern
+//! blocks.
 
 #![cfg(target_os = "windows")]
 
@@ -24,15 +24,18 @@ type PfnCloseOp = unsafe extern "system" fn(Op);
 type PfnCreateCs = unsafe extern "system" fn(*const u16, *const u16, Op, *mut c_void, *mut CsHandle) -> Hres;
 type PfnStartCs = unsafe extern "system" fn(CsHandle, Op, *const u16) -> Hres;
 type PfnTerminateCs = unsafe extern "system" fn(CsHandle, Op, *const u16) -> Hres;
+type PfnShutdownCs = unsafe extern "system" fn(CsHandle, Op, *const u16) -> Hres;
 type PfnCloseCs = unsafe extern "system" fn(CsHandle);
 type PfnWaitOp = unsafe extern "system" fn(Op, u32, *mut *mut u16) -> Hres;
 pub struct HcsApi {
     module: HMODULE,
+    shutdown_module: HMODULE,
     create_op: PfnCreateOp,
     close_op: PfnCloseOp,
     create_cs: PfnCreateCs,
     start_cs: PfnStartCs,
     terminate_cs: PfnTerminateCs,
+    shutdown_cs: PfnShutdownCs,
     close_cs: PfnCloseCs,
     wait_op: PfnWaitOp,
 }
@@ -42,6 +45,11 @@ unsafe impl Sync for HcsApi {}
 
 impl Drop for HcsApi {
     fn drop(&mut self) {
+        if !self.shutdown_module.is_invalid() {
+            unsafe {
+                let _ = FreeLibrary(self.shutdown_module);
+            }
+        }
         if !self.module.is_invalid() {
             unsafe {
                 let _ = FreeLibrary(self.module);
@@ -50,39 +58,67 @@ impl Drop for HcsApi {
     }
 }
 
-static HCS: OnceLock<Option<Arc<HcsApi>>> = OnceLock::new();
+static HCS: OnceLock<Result<Arc<HcsApi>, String>> = OnceLock::new();
 
 impl HcsApi {
     pub fn init() -> Result<Arc<Self>, String> {
-        HCS.get_or_init(|| Self::load().ok().map(Arc::new))
-            .clone()
-            .ok_or_else(|| "vmcompute.dll not available — is the Hyper-V Host Compute Service installed?".to_string())
+        HCS.get_or_init(|| Self::load().map(Arc::new)).clone()
     }
 
     fn load() -> Result<Self, String> {
         let dll = HSTRING::from("ComputeCore.dll");
         let module = unsafe { LoadLibraryW(&dll) }.map_err(|e| format!("LoadLibrary ComputeCore.dll: {e}"))?;
+        let shutdown_dll = HSTRING::from("vmcompute.dll");
+        let shutdown_module = match unsafe { LoadLibraryW(&shutdown_dll) } {
+            Ok(module) => module,
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(module);
+                }
+                return Err(format!("LoadLibrary vmcompute.dll: {e}"));
+            }
+        };
 
         macro_rules! resolve {
-            ($name:literal, $ty:ty) => {{
-                let addr = unsafe { GetProcAddress(module, PCSTR(concat!($name, "\0").as_ptr())) };
+            ($module:expr, $dll:literal, $name:literal, $ty:ty) => {{
+                let addr = unsafe { GetProcAddress($module, PCSTR(concat!($name, "\0").as_ptr())) };
                 match addr {
-                    Some(a) => unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(a) },
-                    None => return Err(format!("missing export: {}", $name)),
+                    Some(a) => Ok(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(a) }),
+                    None => Err(format!("missing export in {}: {}", $dll, $name)),
                 }
             }};
         }
 
-        Ok(HcsApi {
-            module,
-            create_op: resolve!("HcsCreateOperation", PfnCreateOp),
-            close_op: resolve!("HcsCloseOperation", PfnCloseOp),
-            create_cs: resolve!("HcsCreateComputeSystem", PfnCreateCs),
-            start_cs: resolve!("HcsStartComputeSystem", PfnStartCs),
-            terminate_cs: resolve!("HcsTerminateComputeSystem", PfnTerminateCs),
-            close_cs: resolve!("HcsCloseComputeSystem", PfnCloseCs),
-            wait_op: resolve!("HcsWaitForOperationResult", PfnWaitOp),
-        })
+        let api = (|| -> Result<HcsApi, String> {
+            Ok(HcsApi {
+                module,
+                shutdown_module,
+                create_op: resolve!(module, "ComputeCore.dll", "HcsCreateOperation", PfnCreateOp)?,
+                close_op: resolve!(module, "ComputeCore.dll", "HcsCloseOperation", PfnCloseOp)?,
+                create_cs: resolve!(module, "ComputeCore.dll", "HcsCreateComputeSystem", PfnCreateCs)?,
+                start_cs: resolve!(module, "ComputeCore.dll", "HcsStartComputeSystem", PfnStartCs)?,
+                terminate_cs: resolve!(module, "ComputeCore.dll", "HcsTerminateComputeSystem", PfnTerminateCs)?,
+                shutdown_cs: resolve!(
+                    shutdown_module,
+                    "vmcompute.dll",
+                    "HcsShutdownComputeSystem",
+                    PfnShutdownCs
+                )?,
+                close_cs: resolve!(module, "ComputeCore.dll", "HcsCloseComputeSystem", PfnCloseCs)?,
+                wait_op: resolve!(module, "ComputeCore.dll", "HcsWaitForOperationResult", PfnWaitOp)?,
+            })
+        })();
+
+        match api {
+            Ok(api) => Ok(api),
+            Err(e) => {
+                unsafe {
+                    let _ = FreeLibrary(shutdown_module);
+                    let _ = FreeLibrary(module);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn create_compute_system(&self, id: &str, config_json: &str) -> Result<CsHandle, String> {
@@ -123,6 +159,24 @@ impl HcsApi {
         }
         self.wait_and_close(op, 10_000)
             .map_err(|e| format!("Terminate wait: {e}"))
+    }
+
+    /// Request a graceful ACPI shutdown and wait for the VM to power off.
+    ///
+    /// Sends the equivalent of pressing the power button on the guest. The
+    /// guest OS flushes dirty filesystem buffers and powers off cleanly,
+    /// ensuring any rootfs writes are committed to the VHDX before we
+    /// release the lease. Times out after 30 s; caller should fall back to
+    /// [`terminate_compute_system`] on error.
+    pub fn shutdown_compute_system(&self, handle: CsHandle) -> Result<(), String> {
+        let op = unsafe { (self.create_op)(ptr::null_mut(), ptr::null_mut()) };
+        let hr = unsafe { (self.shutdown_cs)(handle, op, ptr::null()) };
+        if hr < 0 {
+            unsafe { (self.close_op)(op) };
+            return Err(format!("HcsShutdownComputeSystem: 0x{:08X}", hr as u32));
+        }
+        self.wait_and_close(op, 30_000)
+            .map_err(|e| format!("Shutdown wait: {e}"))
     }
 
     pub fn close_compute_system(&self, handle: CsHandle) {
