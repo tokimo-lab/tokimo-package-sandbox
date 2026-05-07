@@ -17,8 +17,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     sb.configure(ConfigureParams {
         user_data_name: "pty-shell".into(),
-        memory_mb: 4096,
-        cpu_count: 4,
+        base_rootfs: ".vm/base".into(),
+        vm_dir: ".vm/run".into(),
         mounts: vec![Mount {
             name: "work".into(),
             host_path: cwd,

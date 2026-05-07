@@ -210,35 +210,35 @@ impl SandboxBackend for LinuxBackend {
         // 3. Build bwrap args.
         //
         // Binaries + libraries + user table come from the packaged rootfs
-        // (vm/rootfs/) so all three platforms (Linux/macOS/Windows) see the
-        // same tool versions inside the sandbox. Network/DNS/CA/runtime
-        // config still come from the host: those are environmental, not
+        // so all three platforms (Linux/macOS/Windows) see the same tool
+        // versions inside the sandbox. Network/DNS/CA/runtime config
+        // still come from the host: those are environmental, not
         // packaged content.
-        let vm_dir = crate::vm_dir::find_vm_dir()?;
-        let rootfs = vm_dir.join("rootfs");
+        crate::rootfs_init::ensure_rootfs(&config.base_rootfs, &config.vm_dir)?;
+        let rootfs = config.vm_dir.join("rootfs");
         let rootfs_str = |sub: &str| -> String { rootfs.join(sub).to_string_lossy().into_owned() };
         for sub in ["usr", "bin", "sbin", "lib", "lib64"] {
             if !rootfs.join(sub).is_dir() {
                 return Err(Error::other(format!(
-                    "packaged rootfs is missing /{sub}: {}",
+                    "rootfs is missing /{sub}: {}",
                     rootfs.join(sub).display()
                 )));
             }
         }
         let mut args: Vec<String> = vec![
-            "--ro-bind".to_string(),
+            "--bind".to_string(),
             rootfs_str("usr"),
             "/usr".to_string(),
-            "--ro-bind".to_string(),
+            "--bind".to_string(),
             rootfs_str("bin"),
             "/bin".to_string(),
-            "--ro-bind".to_string(),
+            "--bind".to_string(),
             rootfs_str("sbin"),
             "/sbin".to_string(),
-            "--ro-bind".to_string(),
+            "--bind".to_string(),
             rootfs_str("lib"),
             "/lib".to_string(),
-            "--ro-bind".to_string(),
+            "--bind".to_string(),
             rootfs_str("lib64"),
             "/lib64".to_string(),
         ];
@@ -257,7 +257,7 @@ impl SandboxBackend for LinuxBackend {
         // resolve against the packaged binary set. Falls back gracefully.
         if rootfs.join("etc/alternatives").is_dir() {
             args.extend([
-                "--ro-bind".to_string(),
+                "--bind".to_string(),
                 rootfs_str("etc/alternatives"),
                 "/etc/alternatives".to_string(),
             ]);
@@ -266,10 +266,10 @@ impl SandboxBackend for LinuxBackend {
         // user table is independent of the host.
         for f in ["etc/passwd", "etc/group"] {
             if rootfs.join(f).is_file() {
-                args.extend(["--ro-bind".to_string(), rootfs_str(f), format!("/{f}")]);
+                args.extend(["--bind".to_string(), rootfs_str(f), format!("/{f}")]);
             } else {
                 return Err(Error::other(format!(
-                    "packaged rootfs is missing /{f}: {}",
+                    "rootfs is missing /{f}: {}",
                     rootfs.join(f).display()
                 )));
             }

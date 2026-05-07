@@ -70,9 +70,9 @@ pub struct VmConfig {
     pub memory_mb: u64,
     pub cpu_count: u32,
     pub network: NetworkPolicy,
+    pub base_rootfs: std::path::PathBuf,
+    pub vm_dir: std::path::PathBuf,
 }
-
-pub use crate::vm_dir::find_vm_dir;
 
 /// Boot the VM and connect to the guest's vsock listener.
 pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
@@ -92,10 +92,10 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    let vm_dir = find_vm_dir()?;
-    let kernel = vm_dir.join("vmlinuz");
-    let initrd = vm_dir.join("initrd.img");
-    let rootfs = vm_dir.join("rootfs");
+    crate::rootfs_init::ensure_rootfs(&config.base_rootfs, &config.vm_dir)?;
+    let kernel = config.base_rootfs.join("vmlinuz");
+    let initrd = config.base_rootfs.join("initrd.img");
+    let rootfs = config.vm_dir.join("rootfs");
 
     let kernel_s = kernel.to_string_lossy().into_owned();
     let initrd_s = initrd.to_string_lossy().into_owned();

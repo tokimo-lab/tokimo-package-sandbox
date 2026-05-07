@@ -413,6 +413,8 @@ mod tests {
     fn cfg(session_id: &str) -> ConfigureParams {
         ConfigureParams {
             session_id: session_id.into(),
+            base_rootfs: ".vm/base".into(),
+            vm_dir: ".vm/run".into(),
             ..Default::default()
         }
     }

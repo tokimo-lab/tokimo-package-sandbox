@@ -74,14 +74,25 @@ pub struct Mount {
     pub create_host_dir: bool,
 }
 
-/// Configuration passed to [`Sandbox::configure`]. All non-Windows fields
-/// are honoured on every platform; the *Path* / disk fields are Windows-only
-/// and are silently ignored on Linux/macOS.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Configuration passed to [`Sandbox::configure`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureParams {
     /// Logical session name (used for VM id, log prefixes, persistent
     /// rootfs lookup).
     pub user_data_name: String,
+
+    /// Read-only rootfs template directory.
+    ///
+    /// - Linux/macOS: must contain `vmlinuz`, `initrd.img`, and `rootfs/`.
+    /// - Windows: must contain `vmlinuz`, `initrd.img`, and `rootfs.vhdx`.
+    ///
+    /// Errors immediately if the directory or required files are missing.
+    pub base_rootfs: PathBuf,
+
+    /// VM working directory. A writable copy of the rootfs is stored here
+    /// and persists across sessions. First boot initialises it from
+    /// `base_rootfs`; subsequent boots reuse the existing copy.
+    pub vm_dir: PathBuf,
 
     /// VM memory budget (mebibytes). Default 4096.
     /// Pass 0 for no limit (backend-specific: HCS omits the constraint,
@@ -103,22 +114,6 @@ pub struct ConfigureParams {
     /// `Blocked` engages the host-side gateway egress filter.
     #[serde(default)]
     pub network: NetworkPolicy,
-
-    // ---- Windows-only fields -------------------------------------------
-    //
-    // Linux/macOS backends ignore these.
-    /// Path to the persistent rootfs VHDX (Windows). If `None`, the
-    /// service auto-discovers from `<repo>/vm/rootfs.vhdx`.
-    #[serde(default)]
-    pub vhdx_path: Option<PathBuf>,
-
-    /// Path to the Linux kernel image (Windows). If `None`, auto-discovered.
-    #[serde(default)]
-    pub kernel_path: Option<PathBuf>,
-
-    /// Path to the Linux initrd image (Windows). If `None`, auto-discovered.
-    #[serde(default)]
-    pub initrd_path: Option<PathBuf>,
 
     /// Optional secondary scratch VHDX path (Windows).
     #[serde(default)]
@@ -144,6 +139,24 @@ pub struct ConfigureParams {
     /// one-shot — no reconnect possible).
     #[serde(default)]
     pub session_id: String,
+}
+
+impl Default for ConfigureParams {
+    fn default() -> Self {
+        Self {
+            user_data_name: String::new(),
+            base_rootfs: PathBuf::new(),
+            vm_dir: PathBuf::new(),
+            memory_mb: 4096,
+            cpu_count: 4,
+            mounts: Vec::new(),
+            network: NetworkPolicy::default(),
+            session_disk_path: None,
+            conda_disk_path: None,
+            api_probe_url: None,
+            session_id: String::new(),
+        }
+    }
 }
 
 fn default_memory_mb() -> u64 {
@@ -470,6 +483,82 @@ impl Sandbox {
         self.inner.remove_mount(name)
     }
 
+    // ---- Font mounting --------------------------------------------------
+
+    /// Mount host font directories into the guest and refresh the fontconfig
+    /// cache.
+    ///
+    /// Discovers platform-specific font directories on the host, mounts each
+    /// one via FUSE under `base_guest_path` (e.g. `"/usr/share/fonts/host"`),
+    /// and runs `fc-cache -f` in the guest so fontconfig picks them up
+    /// immediately.
+    ///
+    /// Returns the guest paths where fonts were mounted. If no host font
+    /// directories are found, returns an empty vec (not an error).
+    ///
+    /// Must be called after [`Sandbox::start_vm`]. Safe to call multiple
+    /// times — already-mounted font directories are skipped.
+    pub fn mount_host_fonts(&self, base_guest_path: &str) -> Result<Vec<std::path::PathBuf>> {
+        use crate::fonts::discover_host_font_dirs;
+
+        let font_dirs = discover_host_font_dirs();
+        if font_dirs.is_empty() {
+            tracing::info!("no host font directories found");
+            return Ok(Vec::new());
+        }
+
+        let base = std::path::Path::new(base_guest_path);
+        let mut mounted = Vec::new();
+
+        for fd in &font_dirs {
+            let guest_path = base.join(&fd.mount_name);
+            let mount = Mount {
+                name: fd.mount_name.clone(),
+                host_path: fd.host_path.clone(),
+                guest_path: guest_path.clone(),
+                read_only: true,
+                create_host_dir: false,
+            };
+            match self.add_mount(mount) {
+                Ok(()) => {
+                    tracing::info!(
+                        host = %fd.host_path.display(),
+                        guest = %guest_path.display(),
+                        "mounted host fonts"
+                    );
+                    mounted.push(guest_path);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Duplicate / already-mounted — skip silently, still
+                    // record the path so the caller knows it's available.
+                    if msg.contains("duplicate") || msg.contains("already") {
+                        tracing::debug!(name = %fd.mount_name, "font dir already mounted, skipping");
+                        mounted.push(guest_path);
+                    } else {
+                        return Err(Error::other(format!(
+                            "mount host fonts ({}): {e}",
+                            fd.host_path.display()
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Refresh fontconfig cache in the guest so the newly mounted fonts
+        // are discovered.  Run in background so we don't block the shell.
+        // Non-fatal: the guest may not have fc-cache.
+        if !mounted.is_empty() {
+            if let Ok(shell) = self.shell_id() {
+                let paths: Vec<&str> = mounted.iter().filter_map(|p| p.to_str()).collect();
+                let cmd = format!("fc-cache -f {} >/dev/null 2>&1 &\n", paths.join(" "));
+                let _ = self.write_stdin(&shell, cmd.as_bytes());
+            }
+        }
+
+        Ok(mounted)
+    }
+
     // ---- Management / introspection ------------------------------------
 
     /// Enumerate all sessions known to this `Sandbox`'s backend.
@@ -511,6 +600,12 @@ impl Sandbox {
 fn validate_configure(p: &ConfigureParams) -> Result<()> {
     if p.user_data_name.is_empty() {
         return Err(Error::validation("user_data_name must not be empty"));
+    }
+    if p.base_rootfs.as_os_str().is_empty() {
+        return Err(Error::validation("base_rootfs must not be empty"));
+    }
+    if p.vm_dir.as_os_str().is_empty() {
+        return Err(Error::validation("vm_dir must not be empty"));
     }
     if p.memory_mb != 0 && p.memory_mb < 256 {
         return Err(Error::validation("memory_mb must be 0 (no limit) or >= 256"));

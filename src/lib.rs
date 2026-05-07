@@ -8,6 +8,8 @@
 //! let sb = Sandbox::connect().unwrap();
 //! sb.configure(ConfigureParams {
 //!     user_data_name: "demo".into(),
+//!     base_rootfs: ".vm/base".into(),
+//!     vm_dir: ".vm/run".into(),
 //!     session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
 //!     memory_mb: 4096,
 //!     cpu_count: 4,
@@ -23,6 +25,7 @@
 mod api;
 mod backend;
 mod error;
+pub mod fonts;
 pub mod init_client;
 mod platform;
 pub mod session_registry;
@@ -31,6 +34,7 @@ pub(crate) mod shared_backend;
 
 pub mod net_constants;
 pub mod protocol;
+pub mod rootfs_init;
 pub mod svc_protocol;
 pub mod vm_dir;
 
@@ -64,6 +68,7 @@ pub use api::{
 };
 pub use backend::SandboxBackend;
 pub use error::{Error, Result};
+pub use fonts::FontDir;
 
 #[cfg(target_os = "windows")]
 pub use windows::canonicalize_safe;

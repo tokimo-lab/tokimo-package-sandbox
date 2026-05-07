@@ -25,3 +25,5 @@ Cargo.lock
 
 # Ephemeral rootfs VHDX clones left by crashed/killed service
 .tokimo-rootfs-*.vhdx
+# Local VM working directory (base rootfs template + writable run copy)
+/.vm/

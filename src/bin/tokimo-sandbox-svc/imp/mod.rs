@@ -1067,7 +1067,16 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // entries (e.g. NFS) regardless of policy.
     let netstack_port: Option<u32> = Some(vmconfig::alloc_session_init_port());
 
-    let (kernel, initrd, rootfs_template) = resolve_vm_artifacts(&cfg).map_err(|e| RpcError::new("bad_path", e))?;
+    let base = &cfg.base_rootfs;
+    tokimo_package_sandbox::vm_dir::validate_base_rootfs(base).map_err(|e| RpcError::new("bad_path", e.to_string()))?;
+    let kernel = base.join("vmlinuz");
+    let initrd = base.join("initrd.img");
+    let rootfs_template = base.join("rootfs.vhdx");
+
+    // Ensure vm_dir has a persistent rootfs copy.
+    tokimo_package_sandbox::rootfs_init::ensure_rootfs(base, &cfg.vm_dir)
+        .map_err(|e| RpcError::new("rootfs_init", e.to_string()))?;
+    let rootfs_target = cfg.vm_dir.join("rootfs.vhdx");
 
     if cfg.mounts.is_empty() {
         return Err(RpcError::new("validation", "at least one mount is required on Windows"));
@@ -1093,11 +1102,11 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
 
     let vm_id = format!("tokimo-sess-{}-{}", std::process::id(), rand_session_suffix());
 
-    let scratch_dir: PathBuf = canon_shares[0].0.clone();
-    let rootfs_spec = RootfsSpec::Ephemeral {
+    let rootfs_spec = RootfsSpec::Persistent {
         template: rootfs_template.to_string_lossy().into_owned(),
+        target: rootfs_target.to_string_lossy().into_owned(),
     };
-    let lease = vhdx_pool::acquire(&rootfs_spec, &scratch_dir, &vm_id).map_err(|e| match e {
+    let lease = vhdx_pool::acquire(&rootfs_spec, &cfg.vm_dir, &vm_id).map_err(|e| match e {
         vhdx_pool::PoolError::Busy(p) => {
             RpcError::new("persistent_busy", format!("rootfs target busy: {}", p.display()))
         }
@@ -1747,51 +1756,6 @@ fn require_init(
         .init
         .clone()
         .ok_or_else(|| RpcError::new("vm_not_running", "VM is not running"))
-}
-
-// ---------------------------------------------------------------------------
-// VM artifact discovery
-// ---------------------------------------------------------------------------
-
-fn resolve_vm_artifacts(cfg: &ConfigureParams) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let kernel = match &cfg.kernel_path {
-        Some(p) => canonicalize_safe(p).map_err(|e| format!("kernel: {e}"))?,
-        None => find_artifact("vmlinuz")?,
-    };
-    let initrd = match &cfg.initrd_path {
-        Some(p) => canonicalize_safe(p).map_err(|e| format!("initrd: {e}"))?,
-        None => find_artifact("initrd.img")?,
-    };
-    let rootfs = match &cfg.vhdx_path {
-        Some(p) => canonicalize_safe(p).map_err(|e| format!("rootfs: {e}"))?,
-        None => find_artifact("rootfs.vhdx")?,
-    };
-    Ok((kernel, initrd, rootfs))
-}
-
-fn find_artifact(name: &str) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let mut dir = exe.parent().map(Path::to_path_buf);
-    while let Some(d) = dir {
-        let candidate = d.join("vm").join(name);
-        if candidate.is_file() {
-            return canonicalize_safe(&candidate).map_err(|e| e.to_string());
-        }
-        dir = d.parent().map(Path::to_path_buf);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut d = Some(cwd);
-        while let Some(p) = d {
-            let candidate = p.join("vm").join(name);
-            if candidate.is_file() {
-                return canonicalize_safe(&candidate).map_err(|e| e.to_string());
-            }
-            d = p.parent().map(Path::to_path_buf);
-        }
-    }
-    Err(format!(
-        "could not locate vm/{name}. Place vmlinuz + initrd.img + rootfs.vhdx in <repo>/vm/. Run scripts/windows/fetch-vm.ps1 to download."
-    ))
 }
 
 // ---------------------------------------------------------------------------

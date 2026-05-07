@@ -33,6 +33,8 @@ pub fn workspace_dir(label: &str) -> std::path::PathBuf {
 pub fn config(label: &str) -> ConfigureParams {
     ConfigureParams {
         user_data_name: "test".into(),
+        base_rootfs: ".vm/base".into(),
+        vm_dir: ".vm/run".into(),
         memory_mb: 1024,
         cpu_count: 2,
         mounts: vec![Mount {

@@ -137,6 +137,8 @@ impl SandboxBackend for MacosBackend {
             memory_mb: params.memory_mb,
             cpu_count: params.cpu_count,
             network: params.network,
+            base_rootfs: params.base_rootfs.clone(),
+            vm_dir: params.vm_dir.clone(),
         };
 
         let BootedVm {
