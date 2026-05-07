@@ -1,4 +1,4 @@
-//! Linux CPU affinity helpers shared by the host netstack and the guest
+//! CPU affinity helpers shared by the host netstack and the guest
 //! pump. Both speak the same protocol over a kernel pipe (or vsock) and
 //! benefit from being pinned to fixed, distinct cores so the scheduler
 //! can't accidentally co-locate the two hot threads on the same core
@@ -6,17 +6,23 @@
 //!
 //! This module is intentionally tiny — no new deps, just `libc`.
 //!
-//! Failure modes (cgroup-restricted CPU set, seccomp denial of
+//! On non-Linux targets (macOS, Windows) all functions are stubs: the
+//! Linux `sched_setaffinity` API has no portable counterpart with the
+//! same semantics, so callers degrade gracefully to "let the scheduler
+//! decide" — same behavior as a Linux container with a restricted CPU
+//! set or a seccomp denial.
+//!
+//! Failure modes on Linux (cgroup-restricted CPU set, seccomp denial of
 //! `sched_setaffinity`, container with effective single-core set) are
 //! all *non-fatal*: helpers log to stderr and the caller proceeds.
 
-#![cfg(target_os = "linux")]
-
+#[cfg(target_os = "linux")]
 use std::mem;
 
 /// List the CPU ids currently allowed for this thread, by reading the
 /// effective affinity mask via `sched_getaffinity(0, ...)`. Returns an
 /// empty Vec on syscall failure.
+#[cfg(target_os = "linux")]
 pub fn online_cpus() -> Vec<usize> {
     unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
@@ -33,6 +39,13 @@ pub fn online_cpus() -> Vec<usize> {
         }
         out
     }
+}
+
+/// Stub for non-Linux targets: returns an empty vector so callers fall
+/// through to the "no pinning available" code path.
+#[cfg(not(target_os = "linux"))]
+pub fn online_cpus() -> Vec<usize> {
+    Vec::new()
 }
 
 /// Pick `n` distinct CPUs from `available`, preferring even-indexed ones
@@ -75,6 +88,7 @@ pub fn pick_cpus(available: &[usize], n: usize, skip: &[usize]) -> Vec<usize> {
 /// Pin the *current* thread to a single CPU. Logs and returns Err on
 /// failure but does not panic — affinity is an optimization, not a
 /// correctness requirement.
+#[cfg(target_os = "linux")]
 pub fn pin_current_thread(cpu: usize) -> Result<(), String> {
     unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
@@ -87,4 +101,14 @@ pub fn pin_current_thread(cpu: usize) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Stub for non-Linux targets: macOS exposes `thread_policy_set` with
+/// `THREAD_AFFINITY_POLICY` but it is only an *advisory hint*, and
+/// Windows uses `SetThreadAffinityMask` which would need its own
+/// platform-specific implementation. Both are out of scope here —
+/// callers degrade gracefully to "no pinning".
+#[cfg(not(target_os = "linux"))]
+pub fn pin_current_thread(_cpu: usize) -> Result<(), String> {
+    Err("affinity pinning not implemented on this platform".into())
 }
