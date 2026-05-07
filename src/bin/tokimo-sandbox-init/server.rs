@@ -908,7 +908,9 @@ fn handle_mount_fuse(
         {
             return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {target}: {e}")));
         }
-        let exe = if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
+        let exe = if std::path::Path::new("/run/tokimo/bin/tokimo-sandbox-fuse").exists() {
+            "/run/tokimo/bin/tokimo-sandbox-fuse".to_string()
+        } else if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
             "/bin/tokimo-sandbox-fuse".to_string()
         } else if std::path::Path::new("/usr/bin/tokimo-sandbox-fuse").exists() {
             "/usr/bin/tokimo-sandbox-fuse".to_string()

@@ -1,19 +1,25 @@
 #!/usr/bin/env pwsh
 # Download VM artifacts (kernel + initrd + rootfs.vhdx) from
-# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/.vm/base/.
+# tokimo-package-sandbox GitHub releases into <repo>/.vm/base/.
+#
+# Kernel and rootfs are published under independent tag namespaces:
+#   vm-kernel-*  → vmlinuz + initrd.img (tokimo guest bins baked in)
+#   vm-rootfs-*  → rootfs.vhdx.zip (Debian, no tokimo bins)
 #
 # Usage:
-#   pwsh scripts/windows/fetch-vm.ps1                # latest vm-* release, amd64
-#   pwsh scripts/windows/fetch-vm.ps1 -Tag vm-1.9.0 # specific tag
-#   pwsh scripts/windows/fetch-vm.ps1 -Arch arm64    # arm64 (less tested)
+#   pwsh scripts/windows/fetch-vm.ps1                         # latest of each
+#   pwsh scripts/windows/fetch-vm.ps1 -KernelTag vm-kernel-1.0.0
+#   pwsh scripts/windows/fetch-vm.ps1 -RootfsTag vm-rootfs-1.0.0
+#   pwsh scripts/windows/fetch-vm.ps1 -Arch arm64
 #
 # Layout produced (all read-only at runtime):
-#   .vm/base/vmlinuz        — Linux kernel
-#   .vm/base/initrd.img     — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
-#   .vm/base/rootfs.vhdx    — ext4 VHDX rootfs
+#   .vm/base/vmlinuz        — Linux kernel (from vm-kernel-*)
+#   .vm/base/initrd.img     — initramfs incl. tokimo-sandbox-init/fuse/tun-pump (from vm-kernel-*)
+#   .vm/base/rootfs.vhdx    — ext4 VHDX rootfs, pure Debian (from vm-rootfs-*)
 
 param(
-    [string]$Tag = "latest",
+    [string]$KernelTag = "latest",
+    [string]$RootfsTag = "latest",
     [ValidateSet("amd64", "arm64")]
     [string]$Arch = "amd64",
     [switch]$Force
@@ -25,18 +31,26 @@ $vmDir = Join-Path $repoRoot ".vm/base"
 $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 
 $repo = "tokimo-lab/tokimo-package-sandbox"
-# Artifacts are named: tokimo-linux-<component>-<arch>.<ext>
-# arch in the artifact filename is x86_64 / arm64.
-# Tag prefix is "vm-*" (produced by .github/workflows/vm-image.yml).
 $archName = if ($Arch -eq "amd64") { "x86_64" } else { "arm64" }
 $kernelAsset = "tokimo-linux-kernel-$archName.tar.zst"
 $vhdxAsset   = "tokimo-linux-rootfs-$archName.vhdx.zip"
 
-if ($Tag -eq "latest") {
-    $base = "https://github.com/$repo/releases/latest/download"
-} else {
-    $base = "https://github.com/$repo/releases/download/$Tag"
+function Resolve-Base($tag, $prefix) {
+    if ($tag -eq "latest") {
+        # GitHub /releases/latest only returns the single newest release across
+        # ALL tags; with two independent prefixes we have to query the API to
+        # find the most recent matching one.
+        $resp = Invoke-RestMethod -UseBasicParsing `
+            -Uri "https://api.github.com/repos/$repo/releases?per_page=30"
+        $hit = $resp | Where-Object { $_.tag_name -like "$prefix*" } | Select-Object -First 1
+        if (-not $hit) { throw "no release found for tag prefix $prefix*" }
+        return "https://github.com/$repo/releases/download/$($hit.tag_name)"
+    }
+    return "https://github.com/$repo/releases/download/$tag"
 }
+
+$kernelBase = Resolve-Base $KernelTag "vm-kernel-"
+$rootfsBase = Resolve-Base $RootfsTag "vm-rootfs-"
 
 New-Item -ItemType Directory -Force -Path $vmDir, $work | Out-Null
 
@@ -58,9 +72,8 @@ function Download($url, $out) {
 # 1) kernel bundle (vmlinuz + initrd.img, zstd-compressed tarball)
 $bootZst = Join-Path $work $kernelAsset
 $bootTar = $bootZst -replace '\.zst$', ''
-Download "$base/$kernelAsset" $bootZst
+Download "$kernelBase/$kernelAsset" $bootZst
 
-# Need zstd. Try ambient, then fall back to MSYS / scoop / chocolatey.
 $zstd = Get-Command zstd -ErrorAction SilentlyContinue
 if (-not $zstd) {
     throw "zstd.exe not found. Install with: winget install Facebook.Zstd  (or: choco install zstandard)"
@@ -68,7 +81,6 @@ if (-not $zstd) {
 & zstd -d -f $bootZst -o $bootTar
 if ($LASTEXITCODE -ne 0) { throw "zstd decompression failed" }
 
-# Extract vmlinuz + initrd.img from the tar.
 $tar = Get-Command tar -ErrorAction SilentlyContinue
 if (-not $tar) {
     throw "tar.exe not found. Windows 10+ ships bsdtar in System32; check your PATH."
@@ -78,7 +90,7 @@ if ($LASTEXITCODE -ne 0) { throw "tar extraction failed" }
 
 # 2) rootfs VHDX
 $vhdxZip = Join-Path $work $vhdxAsset
-Download "$base/$vhdxAsset" $vhdxZip
+Download "$rootfsBase/$vhdxAsset" $vhdxZip
 Expand-Archive -Path $vhdxZip -DestinationPath $work -Force
 Move-Item -Force (Join-Path $work "rootfs.vhdx") $rootfs
 
@@ -87,3 +99,4 @@ Remove-Item -Recurse -Force $work
 Write-Host ""
 Write-Host "Done. .vm/base contents:" -ForegroundColor Green
 Get-ChildItem $vmDir | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB, 2)}} | Format-Table -AutoSize
+

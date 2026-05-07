@@ -207,33 +207,34 @@ fn host_thread(rx_from_vm: chan::Receiver<Vec<u8>>, tx_to_vm: chan::Sender<Vec<u
 
         // ── TCP proxy ──
         let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if tcp_socket.is_active() && tcp_socket.can_recv() && upstream_tcp.is_none() {
-            if let Ok(bytes) = tcp_socket.recv(|b| (b.len(), b.to_vec())) {
-                if !bytes.is_empty() {
-                    request_buf.extend_from_slice(&bytes);
-                    if request_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        println!("[Host/TCP] Got request ({} bytes)", request_buf.len());
-                        if let Ok(mut stream) =
-                            TcpStream::connect_timeout(&"1.1.1.1:80".parse().unwrap(), Duration::from_secs(5))
-                        {
-                            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                            if stream.write_all(&request_buf).is_ok() {
-                                let mut resp = Vec::new();
-                                let _ = stream.read_to_end(&mut resp);
-                                println!("[Host/TCP] Got {} bytes from upstream", resp.len());
-                                upstream_tcp = Some(stream);
-                                let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-                                let mut off = 0;
-                                while off < resp.len() {
-                                    match tcp_socket.send_slice(&resp[off..]) {
-                                        Ok(n) => off += n,
-                                        Err(_) => break,
-                                    }
-                                }
-                                tcp_done = true;
-                                println!("[Host/TCP] Response sent back");
+        if tcp_socket.is_active()
+            && tcp_socket.can_recv()
+            && upstream_tcp.is_none()
+            && let Ok(bytes) = tcp_socket.recv(|b| (b.len(), b.to_vec()))
+            && !bytes.is_empty()
+        {
+            request_buf.extend_from_slice(&bytes);
+            if request_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                println!("[Host/TCP] Got request ({} bytes)", request_buf.len());
+                if let Ok(mut stream) =
+                    TcpStream::connect_timeout(&"1.1.1.1:80".parse().unwrap(), Duration::from_secs(5))
+                {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    if stream.write_all(&request_buf).is_ok() {
+                        let mut resp = Vec::new();
+                        let _ = stream.read_to_end(&mut resp);
+                        println!("[Host/TCP] Got {} bytes from upstream", resp.len());
+                        upstream_tcp = Some(stream);
+                        let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                        let mut off = 0;
+                        while off < resp.len() {
+                            match tcp_socket.send_slice(&resp[off..]) {
+                                Ok(n) => off += n,
+                                Err(_) => break,
                             }
                         }
+                        tcp_done = true;
+                        println!("[Host/TCP] Response sent back");
                     }
                 }
             }
@@ -247,25 +248,25 @@ fn host_thread(rx_from_vm: chan::Receiver<Vec<u8>>, tx_to_vm: chan::Sender<Vec<u
 
         // ── UDP DNS proxy ──
         let udp_socket = sockets.get_mut::<udp::Socket>(udp_handle);
-        if udp_socket.can_recv() {
-            if let Ok((data, remote_ep)) = udp_socket.recv() {
-                println!("[Host/UDP] DNS query from {} ({} bytes)", remote_ep, data.len());
-                // Forward to real DNS server 1.1.1.1:53
-                match UdpSocket::bind("0.0.0.0:0") {
-                    Ok(real_udp) => {
-                        real_udp.set_read_timeout(Some(Duration::from_secs(3))).ok();
-                        if real_udp.send_to(&data, "1.1.1.1:53").is_ok() {
-                            let mut buf = vec![0u8; 512];
-                            if let Ok((n, _src)) = real_udp.recv_from(&mut buf) {
-                                println!("[Host/UDP] DNS response from 1.1.1.1 ({} bytes)", n);
-                                let udp_socket = sockets.get_mut::<udp::Socket>(udp_handle);
-                                let _ = udp_socket.send_slice(&buf[..n], remote_ep);
-                                udp_done = true;
-                            }
+        if udp_socket.can_recv()
+            && let Ok((data, remote_ep)) = udp_socket.recv()
+        {
+            println!("[Host/UDP] DNS query from {} ({} bytes)", remote_ep, data.len());
+            // Forward to real DNS server 1.1.1.1:53
+            match UdpSocket::bind("0.0.0.0:0") {
+                Ok(real_udp) => {
+                    real_udp.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                    if real_udp.send_to(data, "1.1.1.1:53").is_ok() {
+                        let mut buf = vec![0u8; 512];
+                        if let Ok((n, _src)) = real_udp.recv_from(&mut buf) {
+                            println!("[Host/UDP] DNS response from 1.1.1.1 ({} bytes)", n);
+                            let udp_socket = sockets.get_mut::<udp::Socket>(udp_handle);
+                            let _ = udp_socket.send_slice(&buf[..n], remote_ep);
+                            udp_done = true;
                         }
                     }
-                    Err(e) => println!("[Host/UDP] bind failed: {e}"),
                 }
+                Err(e) => println!("[Host/UDP] bind failed: {e}"),
             }
         }
 
@@ -323,12 +324,11 @@ fn vm_thread(rx_from_host: chan::Receiver<Vec<u8>>, tx_to_host: chan::Sender<Vec
                 sent = true;
             }
 
-            if socket.can_recv() {
-                if let Ok(chunk) = socket.recv(|b| (b.len(), String::from_utf8_lossy(b).into_owned())) {
-                    if !chunk.is_empty() {
-                        tcp_response.push_str(&chunk);
-                    }
-                }
+            if socket.can_recv()
+                && let Ok(chunk) = socket.recv(|b| (b.len(), String::from_utf8_lossy(b).into_owned()))
+                && !chunk.is_empty()
+            {
+                tcp_response.push_str(&chunk);
             }
 
             if sent && !socket.is_active() && !tcp_response.is_empty() {

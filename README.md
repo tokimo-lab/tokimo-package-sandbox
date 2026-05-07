@@ -205,18 +205,18 @@ sb.stop_vm().unwrap();
 
 ### VM artifacts (all platforms)
 
-All three backends share the same Linux kernel + initrd + Debian 13 rootfs. Download via:
+All three backends share the same Linux kernel + initrd + Debian 13 rootfs. The kernel/initrd and the rootfs are released under independent tag namespaces (`vm-kernel-*` ships with each host crate version; `vm-rootfs-*` rebuilds rarely). Download via:
 
 ```sh
 # Linux / WSL
-scripts/linux/fetch-vm.sh                  # latest release
-scripts/linux/fetch-vm.sh -t vm-v1.9.0     # specific tag
+scripts/linux/fetch-vm.sh                                    # latest of each
+scripts/linux/fetch-vm.sh -k vm-kernel-1.0.0 -r vm-rootfs-1.0.0  # pinned
 ```
 
 ```powershell
 # Windows
-pwsh scripts/windows/fetch-vm.ps1                 # latest release
-pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # specific tag
+pwsh scripts/windows/fetch-vm.ps1                                          # latest of each
+pwsh scripts/windows/fetch-vm.ps1 -KernelTag vm-kernel-1.0.0 -RootfsTag vm-rootfs-1.0.0
 ```
 
 Or build locally for macOS:

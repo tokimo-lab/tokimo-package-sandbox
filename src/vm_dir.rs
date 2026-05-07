@@ -9,7 +9,8 @@ use crate::error::{Error, Result};
 
 /// Error prefix when the base rootfs directory is missing or incomplete.
 pub const ROOTFS_NOT_FOUND_MSG: &str = "base_rootfs not found or incomplete. \
-Run scripts/<platform>/fetch-vm.* to download the required artifacts.";
+Run scripts/<platform>/fetch-vm.* to download the required artifacts \
+(kernel from vm-kernel-* tag, rootfs from vm-rootfs-* tag).";
 
 /// Validate that `base` contains the platform-required artifacts.
 ///

@@ -337,11 +337,11 @@ Linux/bwrap configuration is passed via argv (subcommand `tokimo-sandbox-init bw
 
 ## Windows VM artifacts
 
-Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/.vm/base/`. Built and published in-repo by `.github/workflows/vm.yml` under tags with prefix `vm-*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/.vm/base/`. Built and published in-repo by `.github/workflows/vm.yml` under two independent tag namespaces: `vm-kernel-*` (vmlinuz + initrd, ships with each host crate version; the three guest binaries `tokimo-sandbox-init` / `tokimo-sandbox-fuse` / `tokimo-tun-pump` are baked into the initrd's `/bin/` and bind-mounted at runtime to `/run/tokimo/bin/` inside the rootfs) and `vm-rootfs-*` (pure Debian rootfs, no tokimo binaries, rarely rebuilt). See `packaging/vm-base/README.md` for the build pipeline. Download via:
 
 ```powershell
-pwsh scripts/windows/fetch-vm.ps1                 # latest
-pwsh scripts/windows/fetch-vm.ps1 -Tag vm-1.9.0   # specific
+pwsh scripts/windows/fetch-vm.ps1                                                   # latest of each
+pwsh scripts/windows/fetch-vm.ps1 -KernelTag vm-kernel-1.0.0 -RootfsTag vm-rootfs-1.0.0
 ```
 
 ## HvSocket concurrency — critical design note

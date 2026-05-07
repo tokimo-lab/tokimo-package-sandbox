@@ -11,21 +11,33 @@ name: vm
 # all in one pipeline and pay the few extra minutes.
 #
 # Trigger:
-#   * push tag vm-*               → publish GitHub Release at that tag
+#   * push tag vm-kernel-*         → publish kernel + initrd (tokimo guest
+#                                    binaries baked in) at that tag
+#   * push tag vm-rootfs-*         → publish Debian rootfs (tarball + vhdx,
+#                                    NO tokimo binaries inside) at that tag
 #   * workflow_dispatch            → optional release_tag for manual cuts
 #
-# Output (per arch):
-#   tokimo-linux-kernel-{x86_64,arm64}.tar.zst   (vmlinuz + initrd with init/fuse/tun-pump baked in)
-#   tokimo-linux-rootfs-{x86_64,arm64}.tar.zst   (Debian rootfs tarball)
-#   tokimo-linux-rootfs-x86_64.vhdx.zip          (Windows HCS, amd64 only)
+# The two tag namespaces decouple host-crate version churn (which only
+# touches the initrd, via vm-kernel-*) from rare Debian/kernel rebuilds
+# (vm-rootfs-*). Old `vm-*` tags are retired and not produced.
+#
+# Output (per arch), depending on tag prefix:
+#   vm-kernel-* publishes:
+#     tokimo-linux-kernel-{x86_64,arm64}.tar.zst
+#       vmlinuz + initrd.img (init/fuse/tun-pump baked into initrd /bin/)
+#   vm-rootfs-* publishes:
+#     tokimo-linux-rootfs-{x86_64,arm64}.tar.zst   (Debian, no tokimo bins)
+#     tokimo-linux-rootfs-x86_64.vhdx.zip          (Windows HCS, amd64 only)
 
 on:
   push:
-    tags: ['vm-*']
+    tags:
+      - 'vm-kernel-*'
+      - 'vm-rootfs-*'
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag to publish (e.g. vm-1.9.0). Leave empty for dry run."
+        description: "Tag to publish (vm-kernel-* or vm-rootfs-*). Leave empty for dry run."
         required: false
         default: ""
 
@@ -130,14 +142,38 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: vm-arm64,  path: dist }
 
-      - name: Resolve tag
+      - name: Resolve tag and select artifact set
         id: meta
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            TAG="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ inputs.release_tag }}"
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          case "$TAG" in
+            vm-kernel-*)
+              echo "kind=kernel" >> "$GITHUB_OUTPUT"
+              {
+                echo 'files<<EOF'
+                echo 'dist/tokimo-linux-kernel-*.tar.zst*'
+                echo EOF
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            vm-rootfs-*)
+              echo "kind=rootfs" >> "$GITHUB_OUTPUT"
+              {
+                echo 'files<<EOF'
+                echo 'dist/tokimo-linux-rootfs-*.tar.zst*'
+                echo 'dist/tokimo-linux-rootfs-*.vhdx.zip*'
+                echo EOF
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "tag '$TAG' does not match vm-kernel-* or vm-rootfs-*" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -146,17 +182,7 @@ jobs:
           name: ${{ steps.meta.outputs.tag }}
           make_latest: true
           body: |
-            VM image (kernel + initrd + rootfs) for tokimo-package-sandbox.
+            ${{ steps.meta.outputs.kind == 'kernel' && 'Kernel + initrd (tokimo guest binaries baked in) for tokimo-package-sandbox.' || 'Debian rootfs (tarball + vhdx, no tokimo binaries) for tokimo-package-sandbox.' }}
 
-            ## Artifacts
-
-            | File | Consumed by |
-            |------|-------------|
-            | `tokimo-linux-rootfs-x86_64.tar.zst`  | Linux x86_64 (bwrap) |
-            | `tokimo-linux-rootfs-arm64.tar.zst`   | macOS arm64 (VZ virtiofs) |
-            | `tokimo-linux-rootfs-x86_64.vhdx.zip` | Windows x86_64 (HCS) |
-            | `tokimo-linux-kernel-x86_64.tar.zst`  | Windows x86_64 (HCS) |
-            | `tokimo-linux-kernel-arm64.tar.zst`   | macOS arm64 (VZ) |
-
-            Pull via `pwsh scripts/windows/fetch-vm.ps1 -Tag ${{ steps.meta.outputs.tag }}`.
-          files: dist/*
+            See `scripts/windows/fetch-vm.ps1` / `scripts/linux/fetch-vm.sh` for download usage. The `vm-kernel-*` and `vm-rootfs-*` tags are independent — pull them as a pair (latest of each) into `.vm/base/`.
+          files: ${{ steps.meta.outputs.files }}

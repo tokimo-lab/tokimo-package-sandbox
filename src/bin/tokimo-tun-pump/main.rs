@@ -292,9 +292,29 @@ mod imp {
             return Err(std::io::Error::other("frame too large"));
         }
         let hdr = (frame.len() as u16).to_be_bytes();
-        // Combine header + payload into a single writev to reduce syscalls.
+        // Combine header + payload into a single writev to reduce syscalls;
+        // fall back to write_all on any short write.
         let bufs = [std::io::IoSlice::new(&hdr), std::io::IoSlice::new(frame)];
-        w.write_vectored(&bufs)?;
+        let n = w.write_vectored(&bufs)?;
+        let total = hdr.len() + frame.len();
+        if n < total {
+            // Short write: finish remaining bytes serially.
+            let mut remaining = total - n;
+            let mut off = n;
+            while remaining > 0 {
+                let buf = if off < hdr.len() {
+                    &hdr[off..]
+                } else {
+                    &frame[off - hdr.len()..]
+                };
+                let m = w.write(buf)?;
+                if m == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                }
+                off += m;
+                remaining -= m;
+            }
+        }
         Ok(())
     }
 }

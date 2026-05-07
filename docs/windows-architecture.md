@@ -114,13 +114,13 @@
 
 ## 3. VM 启动用什么文件，从哪里来？
 
-三个文件都从本仓库 `vm.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `.vm/base/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
+三个文件来自本仓库 `vm.yml` 工作流发布的两个独立 tag 系统：内核+initrd 走 `vm-kernel-*`（跟 host crate 版本同步发布），rootfs 走 `vm-rootfs-*`（很少重发）。统一放在本仓库的 `.vm/base/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
 
 ```powershell
 # 下载最新 release 到 .vm/base/
 pwsh scripts\windows\fetch-vm.ps1
 # 指定 tag
-pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
+pwsh scripts\windows\fetch-vm.ps1 -KernelTag vm-kernel-1.0.0 -RootfsTag vm-rootfs-1.0.0
 ```
 
 ### 3.1 内核（vmlinuz）

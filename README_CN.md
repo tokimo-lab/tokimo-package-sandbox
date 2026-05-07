@@ -205,18 +205,18 @@ sb.stop_vm().unwrap();
 
 ### 虚拟机产物（所有平台）
 
-三个后端共享同一套 Linux 内核 + initrd + Debian 13 rootfs。下载：
+三个后端共享同一套 Linux 内核 + initrd + Debian 13 rootfs。内核+initrd 与 rootfs 通过两个独立 tag 系统发布：`vm-kernel-*` 跟随 host crate 版本，`vm-rootfs-*` 很少重发。下载：
 
 ```sh
 # Linux / WSL
-scripts/linux/fetch-vm.sh                  # 最新发布
-scripts/linux/fetch-vm.sh -t vm-v1.9.0     # 指定标签
+scripts/linux/fetch-vm.sh                                              # 最新发布
+scripts/linux/fetch-vm.sh -k vm-kernel-1.0.0 -r vm-rootfs-1.0.0       # 指定标签
 ```
 
 ```powershell
 # Windows
-pwsh scripts/windows/fetch-vm.ps1                 # 最新发布
-pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # 指定标签
+pwsh scripts/windows/fetch-vm.ps1                                                       # 最新发布
+pwsh scripts/windows/fetch-vm.ps1 -KernelTag vm-kernel-1.0.0 -RootfsTag vm-rootfs-1.0.0
 ```
 
 macOS 本地构建：

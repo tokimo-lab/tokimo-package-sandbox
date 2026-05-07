@@ -278,23 +278,21 @@ if [ "$SESSION_MODE" = 1 ]; then
         echo "tokimo-init: NETSTACK_PORT unset — no network" >/dev/kmsg 2>/dev/null || true
     fi
 
-    # Always copy a fresh tokimo-sandbox-init from initramfs into the rootfs
-    # so a stale binary doesn't get reused across builds.
-    if [ -x /bin/tokimo-sandbox-init ]; then
-        /bin/busybox cp /bin/tokimo-sandbox-init /newroot/bin/tokimo-sandbox-init
-        /bin/busybox chmod +x /newroot/bin/tokimo-sandbox-init
-    elif [ ! -x /newroot/bin/tokimo-sandbox-init ]; then
-        echo "tokimo-init: tokimo-sandbox-init missing in initramfs and rootfs" >/dev/kmsg 2>/dev/null || true
+    # Expose tokimo binaries from the initrd at /run/tokimo/bin/ inside the
+    # rootfs via a read-only bind-mount. /newroot/run is already a tmpfs
+    # (mounted above), so this never touches the rootfs disk and the
+    # initrd /bin/ stays the single source of truth for these binaries.
+    # The initrd ships:
+    #   /bin/tokimo-sandbox-init
+    #   /bin/tokimo-sandbox-fuse
+    #   /bin/tokimo-tun-pump      (only invoked from the initrd side, before chroot)
+    if [ ! -x /bin/tokimo-sandbox-init ]; then
+        echo "tokimo-init: /bin/tokimo-sandbox-init missing in initramfs" >/dev/kmsg 2>/dev/null || true
         /bin/busybox poweroff -f
     fi
-
-    # Same for tokimo-sandbox-fuse: tokimo-sandbox-init spawns it as
-    # /bin/tokimo-sandbox-fuse from inside the chroot, so it must be
-    # present under /newroot/bin/.
-    if [ -x /bin/tokimo-sandbox-fuse ]; then
-        /bin/busybox cp /bin/tokimo-sandbox-fuse /newroot/bin/tokimo-sandbox-fuse
-        /bin/busybox chmod +x /newroot/bin/tokimo-sandbox-fuse
-    fi
+    /bin/busybox mkdir -p /newroot/run/tokimo/bin
+    /bin/busybox mount --bind /bin /newroot/run/tokimo/bin
+    /bin/busybox mount -o remount,bind,ro /newroot/run/tokimo/bin 2>/dev/null || true
 
     # The init binary listens on AF_VSOCK port $INIT_PORT for the
     # host-side service to connect via AF_HYPERV. Kernel console is on
@@ -310,7 +308,7 @@ if [ "$SESSION_MODE" = 1 ]; then
         # macOS VZ: guest listens for host connect on AF_VSOCK.
         export TOKIMO_SANDBOX_GUEST_LISTENS=1
     fi
-    exec /bin/busybox chroot /newroot /bin/tokimo-sandbox-init </dev/null >/dev/null 2>/dev/kmsg
+    exec /bin/busybox chroot /newroot /run/tokimo/bin/tokimo-sandbox-init </dev/null >/dev/null 2>/dev/kmsg
     # If exec returns, something went wrong.
     echo "tokimo-init: chroot exec failed" >/dev/kmsg 2>/dev/null || true
     /bin/busybox poweroff -f
