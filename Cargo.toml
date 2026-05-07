@@ -101,7 +101,16 @@ path = "src/bin/tokimo-tun-pump/main.rs"
 name = "tokimo-sandbox-fuse"
 path = "src/bin/tokimo-sandbox-fuse/main.rs"
 
+[[bench]]
+name = "vfs_wire"
+harness = false
+
+[[bench]]
+name = "vfs_e2e"
+harness = false
+
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",

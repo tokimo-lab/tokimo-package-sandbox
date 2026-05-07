@@ -106,7 +106,12 @@ impl VfsReader for LocalDirVfs {
 
     async fn stat(&self, path: &Path) -> VfsResult<VfsFileInfo> {
         let host = self.host_join(path)?;
-        let md = tokio::fs::metadata(&host).await.map_err(local_stat_error)?;
+        // stat() is a single µs-level syscall — running it inline on
+        // the reactor thread saves the ~50µs round-trip through
+        // spawn_blocking that tokio::fs::metadata does internally.
+        // For LocalDirVfs the FUSE getattr/lookup RTT is dominated by
+        // exactly this hop, so we shave a worker hop.
+        let md = std::fs::metadata(&host).map_err(local_stat_error)?;
         let name = host
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())

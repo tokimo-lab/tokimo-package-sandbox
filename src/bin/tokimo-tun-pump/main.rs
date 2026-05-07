@@ -114,10 +114,11 @@ mod imp {
             .spawn(move || {
                 let mut tap = unsafe { std::fs::File::from_raw_fd(tap_b) };
                 let mut vsock = unsafe { std::fs::File::from_raw_fd(vsock_b) };
+                let mut frame_buf = vec![0u8; 65536];
                 while !sd2.load(Ordering::Relaxed) {
-                    match read_frame(&mut vsock) {
-                        Ok(frame) => {
-                            if tap.write_all(&frame).is_err() {
+                    match read_frame(&mut vsock, &mut frame_buf) {
+                        Ok(_len) => {
+                            if tap.write_all(&frame_buf).is_err() {
                                 break;
                             }
                         }
@@ -273,16 +274,17 @@ mod imp {
         Ok(r)
     }
 
-    fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    fn read_frame<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
         let mut hdr = [0u8; 2];
         r.read_exact(&mut hdr)?;
         let len = u16::from_be_bytes(hdr) as usize;
         if len == 0 || len > 65535 {
             return Err(std::io::Error::other(format!("bad frame len {len}")));
         }
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        Ok(buf)
+        buf.clear();
+        buf.resize(len, 0);
+        r.read_exact(buf)?;
+        Ok(len)
     }
 
     fn write_frame<W: Write>(w: &mut W, frame: &[u8]) -> std::io::Result<()> {
@@ -290,8 +292,9 @@ mod imp {
             return Err(std::io::Error::other("frame too large"));
         }
         let hdr = (frame.len() as u16).to_be_bytes();
-        w.write_all(&hdr)?;
-        w.write_all(frame)?;
+        // Combine header + payload into a single writev to reduce syscalls.
+        let bufs = [std::io::IoSlice::new(&hdr), std::io::IoSlice::new(frame)];
+        w.write_vectored(&bufs)?;
         Ok(())
     }
 }

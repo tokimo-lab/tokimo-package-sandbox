@@ -38,16 +38,20 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::vfs_backend::{SharedVfsBackend, VfsError, VfsFileInfo, VfsResult};
 use crate::vfs_protocol::wire::{read_frame, write_frame};
 use crate::vfs_protocol::{
-    AttrOut, DirEntry as WireDirEntry, EntryOut, Frame, NodeKind, Req, Res, StatfsOut, errno_for,
+    AttrOut, DirEntry as WireDirEntry, DirEntryPlus as WireDirEntryPlus, EntryOut, Frame, NodeKind, Req, Res,
+    StatfsOut, errno_for,
 };
 use id_table::{FhEntry, IdTable, StagingFile};
 
 /// Lightweight clone of [`VfsFileInfo`] used inside `FhEntry::Dir`
-/// snapshots. Currently only the kind drives `ReadDir` output; the
-/// remaining attrs are re-fetched on `Lookup` when the guest needs them.
+/// snapshots. Carries enough metadata for both `ReadDir` (just kind)
+/// and `ReadDirPlus` (full attrs) without re-stat'ing.
 #[derive(Debug, Clone)]
 pub struct DirSnapshot {
     pub kind: NodeKind,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,15 +170,27 @@ impl FuseHost {
             let Some(frame) = frame else { return Ok(()) };
             match frame {
                 Frame::Request { req_id, mount_id, op } => {
-                    let host = self.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let result = host.dispatch(mount_id, op).await;
+                    // Cheap ops complete in tens of µs and benefit from
+                    // skipping the tokio::spawn task allocation + scheduler
+                    // hop. Heavy ops (real I/O, dir listing) get their own
+                    // task so they don't block reading the next frame.
+                    if op_is_cheap(&op) {
+                        let result = self.clone().dispatch(mount_id, op).await;
                         let mut tx_guard = tx.lock().await;
                         if let Err(e) = write_frame(&mut *tx_guard, &Frame::Response { req_id, result }).await {
                             tracing::warn!("vfs_host: write response failed: {e}");
                         }
-                    });
+                    } else {
+                        let host = self.clone();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let result = host.dispatch(mount_id, op).await;
+                            let mut tx_guard = tx.lock().await;
+                            if let Err(e) = write_frame(&mut *tx_guard, &Frame::Response { req_id, result }).await {
+                                tracing::warn!("vfs_host: write response failed: {e}");
+                            }
+                        });
+                    }
                 }
                 Frame::Hello { .. } | Frame::HelloAck { .. } => {
                     tracing::warn!("vfs_host: stray Hello in steady state, ignoring");
@@ -207,6 +223,7 @@ impl FuseHost {
             } => self.op_setattr(mount_id, nodeid, mode, size, atime, mtime).await,
             Req::OpenDir { nodeid } => self.op_opendir(mount_id, nodeid).await,
             Req::ReadDir { fh, offset } => self.op_readdir(fh, offset).await,
+            Req::ReadDirPlus { fh, offset } => self.op_readdirplus(fh, offset).await,
             Req::ReleaseDir { fh } => {
                 self.id_table.take_fh(fh);
                 Res::Ok
@@ -408,8 +425,12 @@ impl FuseHost {
         let snapshot: Vec<(String, DirSnapshot)> = entries
             .into_iter()
             .map(|info| {
+                let attr = attr_from(&info);
                 let snap = DirSnapshot {
-                    kind: if info.is_dir { NodeKind::Dir } else { NodeKind::File },
+                    kind: attr.kind,
+                    size: attr.size,
+                    mode: attr.mode,
+                    mtime: attr.mtime,
                 };
                 (info.name, snap)
             })
@@ -478,6 +499,112 @@ impl FuseHost {
         Res::DirEntries(out)
     }
 
+    /// FUSE READDIRPLUS: same iteration as [`op_readdir`](Self::op_readdir)
+    /// but each entry carries full attrs and bumps the lookup count
+    /// (kernel will [`Forget`](Req::Forget) when evicting from cache).
+    async fn op_readdirplus(&self, fh: u64, offset: u64) -> Res {
+        let snap = self.id_table.with_fh_mut(fh, |entry| match entry {
+            FhEntry::Dir {
+                mount_id,
+                nodeid,
+                entries,
+            } => Some((*mount_id, *nodeid, entries.clone())),
+            _ => None,
+        });
+        let Some(Some((mount_id, dir_nodeid, entries))) = snap else {
+            return Res::Error(errno_for(&VfsError::InvalidArgument("bad fh".into())));
+        };
+        let dir_path = match self.resolve_path(mount_id, dir_nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let parent_nodeid = if dir_path == Path::new("/") {
+            1
+        } else {
+            let parent_path = dir_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+            let (nodeid, _) = self.id_table.intern_peek(mount_id, parent_path);
+            nodeid
+        };
+
+        let off = offset as usize;
+        let mut out = Vec::new();
+        let generation = self.id_table.generation();
+
+        // "." and ".." get nodeid=0/0 attrs from a stat-on-demand cost we
+        // skip — the kernel only uses these for completeness, not for
+        // attr caching. We still must include them with valid attrs or
+        // some kernels reject the entry. Use a synthetic dir attr.
+        let synthetic_dir_attr = AttrOut {
+            size: 0,
+            blocks: 0,
+            mtime: 0,
+            mode: 0o755,
+            nlink: 2,
+            #[cfg(target_os = "linux")]
+            uid: unsafe { libc::getuid() },
+            #[cfg(target_os = "linux")]
+            gid: unsafe { libc::getgid() },
+            #[cfg(not(target_os = "linux"))]
+            uid: 0,
+            #[cfg(not(target_os = "linux"))]
+            gid: 0,
+            kind: NodeKind::Dir,
+        };
+        if off == 0 {
+            out.push(WireDirEntryPlus {
+                offset: 1,
+                name: ".".into(),
+                entry: EntryOut {
+                    nodeid: dir_nodeid,
+                    generation,
+                    attr: synthetic_dir_attr.clone(),
+                },
+            });
+        }
+        if off <= 1 {
+            out.push(WireDirEntryPlus {
+                offset: 2,
+                name: "..".into(),
+                entry: EntryOut {
+                    nodeid: parent_nodeid,
+                    generation,
+                    attr: synthetic_dir_attr,
+                },
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        #[cfg(not(target_os = "linux"))]
+        let (uid, gid) = (0u32, 0u32);
+
+        for (i, (name, snap)) in entries.into_iter().enumerate().skip(off.saturating_sub(2)) {
+            let child = Self::child_path(&dir_path, &name);
+            // intern() bumps lookup count — required for READDIRPLUS so
+            // the kernel's Forget pairs balance out.
+            let (nodeid, _) = self.id_table.intern(mount_id, child);
+            out.push(WireDirEntryPlus {
+                offset: (i + 3) as u64,
+                name,
+                entry: EntryOut {
+                    nodeid,
+                    generation,
+                    attr: AttrOut {
+                        size: snap.size,
+                        blocks: snap.size.div_ceil(512),
+                        mtime: snap.mtime,
+                        mode: snap.mode,
+                        nlink: 1,
+                        uid,
+                        gid,
+                        kind: snap.kind,
+                    },
+                },
+            });
+        }
+        Res::DirEntriesPlus(out)
+    }
+
     async fn op_open(self: Arc<Self>, mount_id: u32, nodeid: u64, flags: u32) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
@@ -490,6 +617,7 @@ impl FuseHost {
         const O_ACCMODE: u32 = 0o3;
         const O_WRONLY: u32 = 0o1;
         const O_RDWR: u32 = 0o2;
+        const O_TRUNC: u32 = 0o1000;
         let access = flags & O_ACCMODE;
         let needs_write = access == O_WRONLY || access == O_RDWR;
 
@@ -497,7 +625,10 @@ impl FuseHost {
             if mount.read_only {
                 return Res::Error(errno_for(&VfsError::PermissionDenied));
             }
-            if mount.backend.as_put().is_none() && mount.backend.as_put_stream().is_none() {
+            if mount.backend.as_put().is_none()
+                && mount.backend.as_put_stream().is_none()
+                && mount.backend.as_resolve_local().is_none()
+            {
                 return Res::Error(crate::vfs_protocol::WireError {
                     errno: crate::vfs_protocol::Errno::Erofs as i32,
                     message: "backend has no write capability".into(),
@@ -505,10 +636,35 @@ impl FuseHost {
             }
         }
 
-        // Verify the file exists (or open with create-on-write semantics).
-        // FUSE distinguishes `create` from `open`; we don't implement the
-        // create op explicitly — mkdir / put paths handle creation.
-        if !needs_write && let Err(e) = mount.backend.stat(&path).await {
+        // Fastpath: backend exposes a real local path → open the host
+        // file once and let op_read/op_write do direct pread/pwrite.
+        let host_file = if let Some(resolver) = mount.backend.as_resolve_local() {
+            if let Some(real) = resolver.resolve_real_path(&path) {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(true);
+                if needs_write {
+                    opts.write(true);
+                    if (flags & O_TRUNC) != 0 {
+                        opts.truncate(true);
+                    }
+                }
+                match tokio::task::spawn_blocking(move || opts.open(&real)).await {
+                    Ok(Ok(f)) => Some(Arc::new(f)),
+                    Ok(Err(e)) => return Res::Error(errno_for(&VfsError::from(e))),
+                    Err(e) => return Res::Error(errno_for(&VfsError::Io(e.to_string()))),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Slow path: just verify the file exists.
+        if host_file.is_none()
+            && !needs_write
+            && let Err(e) = mount.backend.stat(&path).await
+        {
             return Res::Error(errno_for(&e));
         }
 
@@ -517,18 +673,62 @@ impl FuseHost {
             nodeid,
             flags,
             staging: None,
+            host_file,
         });
         Res::OpenOk { fh }
     }
 
     async fn op_read(&self, fh: u64, offset: u64, size: u32) -> Res {
         let info = self.id_table.with_fh_mut(fh, |entry| match entry {
-            FhEntry::File { mount_id, nodeid, .. } => Some((*mount_id, *nodeid)),
+            FhEntry::File {
+                mount_id,
+                nodeid,
+                host_file,
+                ..
+            } => Some((*mount_id, *nodeid, host_file.clone())),
             _ => None,
         });
-        let Some(Some((mount_id, nodeid))) = info else {
+        let Some(Some((mount_id, nodeid, host_file))) = info else {
             return Res::Error(errno_for(&VfsError::InvalidArgument("bad fh".into())));
         };
+
+        // Fastpath: pread directly from the local host file.
+        if let Some(file) = host_file {
+            let want = size as usize;
+            let res = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; want];
+                    let mut filled = 0;
+                    while filled < want {
+                        match file.read_at(&mut buf[filled..], offset + filled as u64)? {
+                            0 => break,
+                            n => filled += n,
+                        }
+                    }
+                    buf.truncate(filled);
+                    Ok(buf)
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = (*file).try_clone()?;
+                    f.seek(SeekFrom::Start(offset))?;
+                    let mut buf = Vec::with_capacity(want);
+                    f.take(want as u64).read_to_end(&mut buf)?;
+                    Ok(buf)
+                }
+            })
+            .await;
+            return match res {
+                Ok(Ok(bytes)) => Res::Bytes(bytes),
+                Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
+                Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
+            };
+        }
+
+        // Slow path: backend does its own thing.
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -543,10 +743,49 @@ impl FuseHost {
     }
 
     async fn op_write(&self, fh: u64, offset: u64, data: Vec<u8>) -> Res {
-        use std::io::{Seek, SeekFrom, Write as _};
         let written = data.len() as u32;
 
-        // Take or create the staging file under the table lock.
+        // Fastpath: pwrite directly to the local host file.
+        let host_file = self.id_table.with_fh_mut(fh, |entry| match entry {
+            FhEntry::File { host_file, .. } => host_file.clone(),
+            _ => None,
+        });
+        if let Some(Some(file)) = host_file {
+            let res = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut written_off = 0;
+                    while written_off < data.len() {
+                        match file.write_at(&data[written_off..], offset + written_off as u64)? {
+                            0 => {
+                                return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite returned 0"));
+                            }
+                            n => written_off += n,
+                        }
+                    }
+                    Ok(())
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Seek, SeekFrom, Write as _};
+                    let mut f = (*file).try_clone()?;
+                    f.seek(SeekFrom::Start(offset))?;
+                    f.write_all(&data)?;
+                    Ok(())
+                }
+            })
+            .await;
+            return match res {
+                Ok(Ok(())) => Res::Written { size: written },
+                Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
+                Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
+            };
+        }
+
+        // Slow path: stage into a tempfile, drain on Flush/Release.
+        use std::io::{Seek, SeekFrom, Write as _};
+
         let staging_path: PathBuf = match self.id_table.with_fh_mut(fh, |entry| -> VfsResult<PathBuf> {
             let FhEntry::File { staging, .. } = entry else {
                 return Err(VfsError::InvalidArgument("bad fh".into()));
@@ -573,8 +812,6 @@ impl FuseHost {
             None => return Res::Error(errno_for(&VfsError::InvalidArgument("bad fh".into()))),
         };
 
-        // Open the staging path and pwrite. Doing this outside the
-        // IdTable lock so concurrent writes to other fhs aren't blocked.
         let res = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).open(&staging_path)?;
             f.seek(SeekFrom::Start(offset))?;
@@ -588,7 +825,6 @@ impl FuseHost {
             Err(e) => return Res::Error(errno_for(&VfsError::Io(e.to_string()))),
         }
 
-        // Update max_offset under the lock.
         self.id_table.with_fh_mut(fh, |entry| {
             if let FhEntry::File { staging: Some(s), .. } = entry {
                 s.max_offset = s.max_offset.max(offset + written as u64);
@@ -606,8 +842,14 @@ impl FuseHost {
                 mount_id,
                 nodeid,
                 staging,
+                host_file,
                 ..
             } => {
+                // Direct-IO fh: nothing to flush; the kernel already
+                // pushed bytes into the file via pwrite.
+                if host_file.is_some() {
+                    return Some((*mount_id, *nodeid, None));
+                }
                 let staging_info = staging
                     .as_ref()
                     .filter(|s| s.dirty)
@@ -653,11 +895,17 @@ impl FuseHost {
             mount_id,
             nodeid,
             staging,
+            host_file,
             ..
         } = entry
         else {
             return Res::Ok;
         };
+        // Direct-IO fh: just drop the file; bytes are already on disk.
+        if host_file.is_some() {
+            drop(host_file);
+            return Res::Ok;
+        }
         if let Some(s) = staging {
             if s.dirty {
                 let path = match self.resolve_path(mount_id, nodeid) {
@@ -831,6 +1079,26 @@ impl FuseHost {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Returns true for ops that complete in tens of µs without doing real
+/// I/O, so it's cheaper to await them inline than to allocate a new
+/// tokio task. Heavy ops (Read/Write/ReadDir/ReadDirPlus do bulk
+/// transfers or backend list/stat per entry) get spawned so they don't
+/// stall the read loop.
+fn op_is_cheap(op: &Req) -> bool {
+    matches!(
+        op,
+        Req::Forget { .. }
+            | Req::GetAttr { .. }
+            | Req::Lookup { .. }
+            | Req::Open { .. }
+            | Req::OpenDir { .. }
+            | Req::Release { .. }
+            | Req::ReleaseDir { .. }
+            | Req::Flush { .. }
+            | Req::Statfs { .. }
+    )
+}
 
 fn attr_from(info: &VfsFileInfo) -> AttrOut {
     let kind = if info.is_dir { NodeKind::Dir } else { NodeKind::File };

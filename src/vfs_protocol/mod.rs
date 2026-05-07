@@ -125,6 +125,16 @@ pub enum Req {
         offset: u64,
     },
 
+    /// Like [`ReadDir`](Self::ReadDir) but each entry carries its full
+    /// `EntryOut`, letting the guest kernel populate dentry + inode
+    /// caches in a single round-trip (FUSE READDIRPLUS). The host
+    /// increments lookup count once per entry returned (the kernel will
+    /// `Forget` them later).
+    ReadDirPlus {
+        fh: u64,
+        offset: u64,
+    },
+
     /// Release the directory handle.
     ReleaseDir {
         fh: u64,
@@ -213,6 +223,7 @@ pub enum Res {
     Attr(AttrOut),
     OpenOk { fh: u64 },
     DirEntries(Vec<DirEntry>),
+    DirEntriesPlus(Vec<DirEntryPlus>),
     Bytes(Vec<u8>),
     Written { size: u32 },
     Statfs(StatfsOut),
@@ -250,6 +261,15 @@ pub struct DirEntry {
     pub offset: u64,
     pub kind: NodeKind,
     pub name: String,
+}
+
+/// READDIRPLUS entry: same as [`DirEntry`] but with full attrs so the
+/// kernel can satisfy subsequent `getattr`/`lookup` from cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntryPlus {
+    pub offset: u64,
+    pub name: String,
+    pub entry: EntryOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

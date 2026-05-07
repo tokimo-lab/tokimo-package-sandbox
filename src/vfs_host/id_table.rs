@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use slab::Slab;
 
@@ -48,7 +48,18 @@ pub enum FhEntry {
         flags: u32,
         /// Set on first write. Path-on-host of the staging tempfile.
         /// `Release`/`Flush` drains this into the backend.
+        ///
+        /// Mutually exclusive with `host_file` — a fh either uses the
+        /// fast direct-IO path (LocalDirVfs) or the staging path
+        /// (everything else).
         staging: Option<StagingFile>,
+        /// Direct host-file fastpath: when the backend exposes
+        /// `as_resolve_local()`, [`super::FuseHost::op_open`] opens the
+        /// real on-disk file once and stashes it here. `op_read` /
+        /// `op_write` then do `pread` / `pwrite` directly, skipping the
+        /// staging-tempfile dance entirely. Reduces big writes from
+        /// O(N) tempfile bytes + read-back + put → O(N) pwrite.
+        host_file: Option<Arc<std::fs::File>>,
     },
 }
 

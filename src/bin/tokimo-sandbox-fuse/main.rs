@@ -60,8 +60,8 @@ mod linux {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fuser::{
-        FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-        ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+        FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
+        ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, consts,
     };
     use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
     use tokimo_package_sandbox::vfs_protocol::{AttrOut, EntryOut, Frame, NodeKind, Req, Res, StatfsOut, WireError};
@@ -284,8 +284,9 @@ mod linux {
                         return;
                     }
                 };
+                let mut read_buf = Vec::with_capacity(8192);
                 loop {
-                    let frame = match wire::read_frame(&mut read_file) {
+                    let frame = match wire::read_frame_into(&mut read_file, &mut read_buf) {
                         Ok(Some(f)) => f,
                         Ok(None) => {
                             eprintln!("[tokimo-fuse] host closed connection");
@@ -414,9 +415,43 @@ mod linux {
         if we.errno == 0 { libc::EIO } else { we.errno }
     }
 
-    const TTL: Duration = Duration::from_secs(1);
+    /// Inode/attr cache TTL handed back to the kernel on lookup/getattr
+    /// replies. The kernel will satisfy stat/access calls from its own
+    /// cache for this long without bothering us. 60 s is conservative —
+    /// agentic sandboxes are short-lived and the host filesystem isn't
+    /// concurrently mutated by anyone outside this process.
+    const TTL: Duration = Duration::from_secs(60);
 
     impl Filesystem for FuseBridge {
+        /// Negotiate kernel-side capabilities. Big wins:
+        ///   * `set_max_write(1MB)` — single FUSE write request can carry
+        ///     up to 1 MiB instead of the legacy 128 KiB. Cuts our write
+        ///     RTTs by 8× for streamed writes.
+        ///   * `set_max_readahead(1MB)` — kernel issues 1 MiB read-aheads
+        ///     so sequential `read()` is one RTT instead of many.
+        ///   * `FUSE_WRITEBACK_CACHE` — kernel buffers small writes in
+        ///     the page cache and flushes lazily, so memcpy-sized writes
+        ///     don't round-trip on every syscall.
+        ///   * `FUSE_AUTO_INVAL_DATA` — kernel can re-read data when our
+        ///     attr changes mtime, so it's safe to leave page cache hot.
+        ///   * `FUSE_DO_READDIRPLUS` — combines READDIR + LOOKUP per
+        ///     entry, halving syscalls when traversing big trees.
+        ///   * `set_max_background(64)` — let the kernel issue more
+        ///     concurrent requests instead of serialising at 16 inflight.
+        fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+            let _ = config.set_max_write(1024 * 1024);
+            let _ = config.set_max_readahead(1024 * 1024);
+            let _ = config.set_max_background(64);
+            let _ = config.add_capabilities(
+                consts::FUSE_WRITEBACK_CACHE
+                    | consts::FUSE_AUTO_INVAL_DATA
+                    | consts::FUSE_DO_READDIRPLUS
+                    | consts::FUSE_ASYNC_READ
+                    | consts::FUSE_BIG_WRITES,
+            );
+            Ok(())
+        }
+
         fn lookup(&mut self, _r: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
             let n = match name.to_str() {
                 Some(s) => s.to_string(),
@@ -527,6 +562,32 @@ mod linux {
         fn releasedir(&mut self, _r: &Request, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
             match self.dispatcher.call(Req::ReleaseDir { fh }) {
                 Res::Ok => reply.ok(),
+                Res::Error(we) => reply.error(errno_of(&we)),
+                _ => reply.error(libc::EIO),
+            }
+        }
+
+        fn readdirplus(&mut self, _r: &Request<'_>, _ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectoryPlus) {
+            match self.dispatcher.call(Req::ReadDirPlus {
+                fh,
+                offset: offset.max(0) as u64,
+            }) {
+                Res::DirEntriesPlus(entries) => {
+                    for e in entries {
+                        let attr = entry_to_attr(&e.entry);
+                        if reply.add(
+                            e.entry.nodeid,
+                            e.offset as i64,
+                            &e.name,
+                            &TTL,
+                            &attr,
+                            e.entry.generation,
+                        ) {
+                            break;
+                        }
+                    }
+                    reply.ok();
+                }
                 Res::Error(we) => reply.error(errno_of(&we)),
                 _ => reply.error(libc::EIO),
             }
