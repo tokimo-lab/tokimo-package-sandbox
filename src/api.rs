@@ -507,11 +507,14 @@ impl Sandbox {
             return Ok(Vec::new());
         }
 
-        let base = std::path::Path::new(base_guest_path);
+        // Guest paths are always Linux-style.  We can't use `Path::join`
+        // here because on Windows it would inject backslashes.  Strip a
+        // trailing `/` and append `/<mount_name>` manually.
+        let base = base_guest_path.trim_end_matches('/');
         let mut mounted = Vec::new();
 
         for fd in &font_dirs {
-            let guest_path = base.join(&fd.mount_name);
+            let guest_path = std::path::PathBuf::from(format!("{base}/{}", fd.mount_name));
             let mount = Mount {
                 name: fd.mount_name.clone(),
                 host_path: fd.host_path.clone(),
