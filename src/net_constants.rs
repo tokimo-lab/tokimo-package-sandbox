@@ -48,7 +48,17 @@ pub const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
 /// Maximum transmission unit advertised on both ends, in bytes (payload
 /// only; Ethernet header is +14).
-pub const MTU: usize = 1400;
+///
+/// The transport between the guest TAP and the host smoltcp gateway is a
+/// length-prefixed stream (socketpair / vsock / pipe) capped at 65 535
+/// bytes per frame — there is no real Ethernet wire in between. So we
+/// pick a jumbo MTU well above 1500 to amortize per-packet overhead and
+/// drop the per-frame syscall rate dramatically. Local benchmarks at
+/// 1 MiB TCP socket buffers (see `tests/netstack_perf.rs`) show this
+/// turning the guest↔host TCP throughput from ~30 MiB/s into the GB/s
+/// range while remaining safely under the 65 535-byte frame ceiling
+/// (65 000 + 14 Ethernet + 2 length prefix = 65 016).
+pub const MTU: usize = 65000;
 
 // ─── Vsock ───────────────────────────────────────────────────────────────────
 

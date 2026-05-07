@@ -477,6 +477,12 @@ fn run(
     let mut events = Events::with_capacity(64);
     let mut next_token: usize = 0;
 
+    // Reusable scratch read buffer for the upstream→guest pump. Hoisted
+    // out of the per-flow loop so we don't reallocate 256 KiB on every
+    // iteration of the main poll loop. 256 KiB is sized to absorb a full
+    // smoltcp tx ring (1 MiB) in ~4 syscalls under load.
+    let mut up_scratch = vec![0u8; 256 * 1024];
+
     while !shutdown.load(Ordering::Relaxed) {
         let mut io = IoCtx {
             registry: poll.registry(),
@@ -646,29 +652,39 @@ fn run(
             if !still_pending {
                 flow.pending_to_guest = None;
                 if matches!(flow.state, TcpUpstreamState::Connected) {
-                    let mut up_buf = vec![0u8; 32 * 1024];
+                    // Scratch read buffer is `up_scratch` hoisted above —
+                    // sized to amortize the syscall + smoltcp send_slice
+                    // cost over many bytes per loop iteration. Stalled
+                    // tail (when smoltcp's tx ring fills) is stashed in
+                    // `pending_to_guest` until the guest ACKs.
                     loop {
                         if !socket.can_send() {
                             break;
                         }
-                        match flow.upstream.read(&mut up_buf) {
+                        match flow.upstream.read(&mut up_scratch[..]) {
                             Ok(0) => {
                                 flow.state = TcpUpstreamState::UpstreamFinned;
                                 break;
                             }
                             Ok(n) => {
-                                let data = up_buf[..n].to_vec();
+                                // Fast path: smoltcp absorbs the whole read
+                                // in one shot — no allocation, no copy
+                                // beyond send_slice's own ring memcpy. This
+                                // is the steady-state behavior for a flow
+                                // whose guest is keeping up with ACKs.
                                 let mut off = 0;
-                                while off < data.len() {
-                                    match socket.send_slice(&data[off..]) {
+                                let mut stalled = false;
+                                while off < n {
+                                    match socket.send_slice(&up_scratch[off..n]) {
                                         Ok(0) | Err(_) => {
-                                            flow.pending_to_guest = Some((data, off));
+                                            stalled = true;
                                             break;
                                         }
                                         Ok(m) => off += m,
                                     }
                                 }
-                                if flow.pending_to_guest.is_some() {
+                                if stalled {
+                                    flow.pending_to_guest = Some((up_scratch[off..n].to_vec(), 0));
                                     break;
                                 }
                                 flow.last_activity = now;
@@ -1019,8 +1035,13 @@ fn register_tcp_flow(
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
     io: &mut IoCtx<'_>,
 ) {
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+    // 1 MiB rx/tx ring per flow. At ~300 µs effective RTT through the
+    // userspace gateway, BDP-saturating throughput requires the window
+    // to grow well past the kernel default of 64 KiB. See
+    // tests/netstack_perf.rs for the measurement that motivated this.
+    const TCP_BUF: usize = 1024 * 1024;
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
     let listen_ep = IpListenEndpoint {
         addr: None, // any_ip=true makes this match any dst IP; None is more reliable than Some(key.dst_ip)
