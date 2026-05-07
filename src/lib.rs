@@ -39,6 +39,8 @@ pub mod svc_protocol;
 pub mod vm_dir;
 
 #[cfg(target_os = "linux")]
+pub mod affinity;
+#[cfg(target_os = "linux")]
 pub mod ifreq;
 #[cfg(target_os = "linux")]
 pub mod vsock_util;

@@ -48,6 +48,24 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Pin the two pump threads to distinct CPUs so the kernel can't
+    // co-locate tap→host and host→tap on the same physical core, which
+    // collapses throughput by serializing them. We also try to avoid
+    // the top 2 even cores, which the host netstack uses (the guest
+    // sees the same CPU set inside bwrap, so picks consistent with
+    // `affinity::pick_cpus`'s "even from top" heuristic). Both threads
+    // log + continue on failure.
+    let cpus = tokimo_package_sandbox::affinity::online_cpus();
+    let host_picks = tokimo_package_sandbox::affinity::pick_cpus(&cpus, 2, &[]);
+    let pump_picks = tokimo_package_sandbox::affinity::pick_cpus(&cpus, 2, &host_picks);
+    let tap2host_cpu = pump_picks.first().copied();
+    let host2tap_cpu = pump_picks.get(1).copied();
+    eprintln!(
+        "[init/pump] affinity: tap2host={} host2tap={}",
+        tap2host_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
+        host2tap_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
+    );
+
     let tap_a = dup_fd(tap.as_raw_fd())?;
     let tap_b = dup_fd(tap.as_raw_fd())?;
     let net_a = dup_fd(net_fd)?;
@@ -60,6 +78,11 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
     thread::Builder::new()
         .name("pump-tap-to-host".into())
         .spawn(move || {
+            if let Some(c) = tap2host_cpu {
+                if let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c) {
+                    eprintln!("[init/pump] affinity pin (tap2host) failed: {e}");
+                }
+            }
             let mut tap = unsafe { std::fs::File::from_raw_fd(tap_a) };
             let mut net = unsafe { std::fs::File::from_raw_fd(net_a) };
             let mut buf = vec![0u8; 65536];
@@ -83,6 +106,11 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
     thread::Builder::new()
         .name("pump-host-to-tap".into())
         .spawn(move || {
+            if let Some(c) = host2tap_cpu {
+                if let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c) {
+                    eprintln!("[init/pump] affinity pin (host2tap) failed: {e}");
+                }
+            }
             let mut tap = unsafe { std::fs::File::from_raw_fd(tap_b) };
             let net = unsafe { std::fs::File::from_raw_fd(net_b) };
             // BufReader pulls multiple frames per read syscall when the

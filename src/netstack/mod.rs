@@ -442,6 +442,28 @@ fn run(
     let (rx_in_tx, rx_in_rx) = chan::bounded::<Vec<u8>>(256);
     let (tx_out_tx, tx_out_rx) = chan::bounded::<Vec<u8>>(256);
 
+    // Pick two distinct CPUs for (netstack-rx, main netstack). Pinning
+    // these prevents the kernel from co-locating them on the same
+    // physical core, which collapses TX throughput by ~3-5x because the
+    // two threads then fight for the same execution units. Even-indexed
+    // cores from the high end avoid the low cores typically used by
+    // system services and the test harness's main thread, and avoid SMT
+    // siblings on x86. Failures (cgroup, seccomp) are non-fatal.
+    let cpus = crate::affinity::online_cpus();
+    let picks = crate::affinity::pick_cpus(&cpus, 2, &[]);
+    let rx_cpu = picks.first().copied();
+    let main_cpu = picks.get(1).copied();
+    eprintln!(
+        "[netstack] affinity: rx={} main={}",
+        rx_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
+        main_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
+    );
+    if let Some(c) = main_cpu {
+        if let Err(e) = crate::affinity::pin_current_thread(c) {
+            eprintln!("[netstack] affinity pin (main) failed: {e}");
+        }
+    }
+
     // mio Poll multiplexes upstream UDP sockets + a Waker for "channel got
     // pushed" events (rx_in_rx, tcp upstream→guest channels, tcp ready
     // signals).  This replaces the prior fixed-cap sleep-on-recv_timeout
@@ -453,6 +475,11 @@ fn run(
     let shutdown_r = Arc::clone(&shutdown);
     let waker_r = Arc::clone(&waker);
     thread::Builder::new().name("netstack-rx".into()).spawn(move || {
+        if let Some(c) = rx_cpu {
+            if let Err(e) = crate::affinity::pin_current_thread(c) {
+                eprintln!("[netstack] affinity pin (rx) failed: {e}");
+            }
+        }
         // BufReader coalesces the 2-byte length prefix and the frame body
         // into a single backing read syscall when the kernel has the data
         // already buffered (steady-state under load). 256 KiB matches the
@@ -473,6 +500,8 @@ fn run(
                 }
             }
         }
+        // Final wake so main observes shutdown / drains the tail.
+        let _ = waker_r.wake();
     })?;
 
     // Writer thread: blocks on `recv()` until either a frame arrives or all
