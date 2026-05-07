@@ -52,7 +52,7 @@ use crossbeam_channel as chan;
 use mio::net::{TcpStream as MioTcpStream, UdpSocket as MioUdpSocket};
 use mio::{Events, Interest, Poll, Token, Waker};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
@@ -254,6 +254,19 @@ impl Device for StreamDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU + 14; // + Ethernet header
+        // The "wire" is a kernel pipe / vsock — no bit corruption is
+        // possible. Skip RX checksum verification on every protocol; still
+        // compute TX checksums because the guest kernel runs unmodified
+        // and would drop zero-checksum frames received off its TAP. This
+        // is a measurable win on guest->host throughput where every
+        // segment used to take a TCP/IP/Ethernet checksum walk.
+        let cs = phy::Checksum::Tx;
+        caps.checksum = phy::ChecksumCapabilities::default();
+        caps.checksum.ipv4 = cs;
+        caps.checksum.tcp = cs;
+        caps.checksum.udp = cs;
+        caps.checksum.icmpv4 = cs;
+        caps.checksum.icmpv6 = cs;
         caps
     }
 }
@@ -1084,6 +1097,18 @@ fn register_tcp_flow(
         return;
     }
     sock.set_nagle_enabled(false);
+    // The transport between guest and host is a memory pipe, not a real
+    // network: there is zero benefit to coalescing ACKs. The default
+    // 10 ms ack_delay was the dominant cause of bimodal guest->upstream
+    // throughput — unidirectional flows would stall up to 10 ms waiting
+    // for an ACK to piggyback. None disables the timer entirely so ACKs
+    // fire as soon as smoltcp processes the inbound segment.
+    sock.set_ack_delay(None);
+    // Same reasoning: there is no congestion on a memory pipe. Reno's
+    // slow start + cwnd cap was throttling guest->upstream during the
+    // ramp phase. Disabling congestion control lets smoltcp use the
+    // full advertised receive window from segment 1.
+    sock.set_congestion_control(tcp::CongestionControl::None);
     sock.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
     // Hold the SYN-ACK until the upstream connect completes.  This prevents
     // the guest from starting to send data before we know whether the

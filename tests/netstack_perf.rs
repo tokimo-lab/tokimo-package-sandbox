@@ -31,8 +31,10 @@ use common::{SandboxGuard, config, drain_until, workspace_dir};
 use tokimo_package_sandbox::{NetworkPolicy, Sandbox};
 
 const MB: usize = 1024 * 1024;
-const THROUGHPUT_BYTES: usize = 64 * MB;
+const THROUGHPUT_BYTES: usize = 256 * MB;
 const LATENCY_ITERS: usize = 2000;
+const TX_REPEATS: usize = 3;
+const RX_REPEATS: usize = 3;
 
 /// Discover the host's primary IPv4 by asking the kernel which source
 /// address it would use for an arbitrary public destination. No packets
@@ -247,11 +249,22 @@ lp_port = loop_sink_port()
 sb, dl = tx("127.0.0.1", lp_port)
 print(f"LOOPBACK_TX  bytes={{sb}} dt={{dl:.4f}}s mibps={{sb/dl/1048576:.1f}}")
 
-sb, dt = tx(HOST, SINK)
-print(f"SMOLTCP_TX   bytes={{sb}} dt={{dt:.4f}}s mibps={{sb/dt/1048576:.1f}}")
+def run_many(fn, n):
+    rates = []
+    for _ in range(n):
+        b, t = fn()
+        rates.append(b/t/1048576)
+    rates.sort()
+    return rates
 
-gb, dr = rx(HOST, SRC)
-print(f"SMOLTCP_RX   bytes={{gb}} dt={{dr:.4f}}s mibps={{gb/dr/1048576:.1f}}")
+# Warm up once (cold caches, page faults, jit), then measure.
+tx(HOST, SINK)
+rates = run_many(lambda: tx(HOST, SINK), {tx_repeats})
+print(f"SMOLTCP_TX   runs={{len(rates)}} mibps_min={{rates[0]:.1f}} mibps_median={{rates[len(rates)//2]:.1f}} mibps_max={{rates[-1]:.1f}}")
+
+rx(HOST, SRC)
+rates = run_many(lambda: rx(HOST, SRC), {rx_repeats})
+print(f"SMOLTCP_RX   runs={{len(rates)}} mibps_min={{rates[0]:.1f}} mibps_median={{rates[len(rates)//2]:.1f}} mibps_max={{rates[-1]:.1f}}")
 
 it, dl2 = lat(HOST, ECHO, ITERS)
 print(f"SMOLTCP_RTT  iters={{it}} dt={{dl2:.4f}}s mean_us={{dl2*1e6/it:.1f}}")
@@ -264,6 +277,8 @@ print("NETPERF_DONE")
         echo_port = echo_port,
         throughput = THROUGHPUT_BYTES,
         iters = LATENCY_ITERS,
+        tx_repeats = TX_REPEATS,
+        rx_repeats = RX_REPEATS,
     );
 
     let ws = workspace_dir(LABEL);
