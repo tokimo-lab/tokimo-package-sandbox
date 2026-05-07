@@ -78,10 +78,10 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
     thread::Builder::new()
         .name("pump-tap-to-host".into())
         .spawn(move || {
-            if let Some(c) = tap2host_cpu {
-                if let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c) {
-                    eprintln!("[init/pump] affinity pin (tap2host) failed: {e}");
-                }
+            if let Some(c) = tap2host_cpu
+                && let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c)
+            {
+                eprintln!("[init/pump] affinity pin (tap2host) failed: {e}");
             }
             let mut tap = unsafe { std::fs::File::from_raw_fd(tap_a) };
             let mut net = unsafe { std::fs::File::from_raw_fd(net_a) };
@@ -106,10 +106,10 @@ pub fn spawn_pump(net_fd: RawFd) -> Result<Arc<AtomicBool>, String> {
     thread::Builder::new()
         .name("pump-host-to-tap".into())
         .spawn(move || {
-            if let Some(c) = host2tap_cpu {
-                if let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c) {
-                    eprintln!("[init/pump] affinity pin (host2tap) failed: {e}");
-                }
+            if let Some(c) = host2tap_cpu
+                && let Err(e) = tokimo_package_sandbox::affinity::pin_current_thread(c)
+            {
+                eprintln!("[init/pump] affinity pin (host2tap) failed: {e}");
             }
             let mut tap = unsafe { std::fs::File::from_raw_fd(tap_b) };
             let net = unsafe { std::fs::File::from_raw_fd(net_b) };
@@ -187,6 +187,7 @@ fn dup_fd(fd: i32) -> Result<i32, String> {
     Ok(r)
 }
 
+#[allow(clippy::uninit_vec)]
 fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 2];
     r.read_exact(&mut hdr)?;

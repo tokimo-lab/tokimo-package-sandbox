@@ -220,6 +220,7 @@ impl RxToken for StreamRxToken {
 }
 
 impl TxToken for StreamTxToken {
+    #[allow(clippy::uninit_vec)]
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         // SAFETY: smoltcp's `TxToken::consume` contract guarantees that the
         // closure writes exactly `len` bytes before returning (the buffer is
@@ -227,6 +228,7 @@ impl TxToken for StreamTxToken {
         // pure waste — at MTU 65000 a memset is ~10 µs per frame on the hot
         // path. Skipping it shaves measurable cycles per packet.
         let mut buf: Vec<u8> = Vec::with_capacity(len);
+        // SAFETY: see above — `f` fully overwrites the `len` bytes.
         unsafe {
             buf.set_len(len);
         }
@@ -271,6 +273,7 @@ impl Device for StreamDevice {
     }
 }
 
+#[allow(clippy::uninit_vec)]
 fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 2];
     r.read_exact(&mut hdr)?;
@@ -458,10 +461,10 @@ fn run(
         rx_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
         main_cpu.map(|c| format!("cpu{c}")).unwrap_or_else(|| "off".into()),
     );
-    if let Some(c) = main_cpu {
-        if let Err(e) = crate::affinity::pin_current_thread(c) {
-            eprintln!("[netstack] affinity pin (main) failed: {e}");
-        }
+    if let Some(c) = main_cpu
+        && let Err(e) = crate::affinity::pin_current_thread(c)
+    {
+        eprintln!("[netstack] affinity pin (main) failed: {e}");
     }
 
     // mio Poll multiplexes upstream UDP sockets + a Waker for "channel got
@@ -475,10 +478,10 @@ fn run(
     let shutdown_r = Arc::clone(&shutdown);
     let waker_r = Arc::clone(&waker);
     thread::Builder::new().name("netstack-rx".into()).spawn(move || {
-        if let Some(c) = rx_cpu {
-            if let Err(e) = crate::affinity::pin_current_thread(c) {
-                eprintln!("[netstack] affinity pin (rx) failed: {e}");
-            }
+        if let Some(c) = rx_cpu
+            && let Err(e) = crate::affinity::pin_current_thread(c)
+        {
+            eprintln!("[netstack] affinity pin (rx) failed: {e}");
         }
         // BufReader coalesces the 2-byte length prefix and the frame body
         // into a single backing read syscall when the kernel has the data

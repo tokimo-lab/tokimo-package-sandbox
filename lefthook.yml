@@ -23,3 +23,13 @@ pre-commit:
         [ -z "$files" ] && exit 0
         pnpm exec biome format --write --no-errors-on-unmatched $files
       stage_fixed: true
+
+# Pre-push: catch what CI catches, before CI does. Clippy is too slow for
+# pre-commit but acceptable on push. Mirrors `.github/workflows/ci.yml`.
+pre-push:
+  parallel: false
+  commands:
+    clippy:
+      tags: rust lint
+      glob: "*.rs"
+      run: cargo clippy --lib --bins --tests -- -D warnings
