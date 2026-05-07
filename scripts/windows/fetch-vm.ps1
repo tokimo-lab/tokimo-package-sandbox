@@ -81,11 +81,14 @@ if (-not $zstd) {
 & zstd -d -f $bootZst -o $bootTar
 if ($LASTEXITCODE -ne 0) { throw "zstd decompression failed" }
 
-$tar = Get-Command tar -ErrorAction SilentlyContinue
-if (-not $tar) {
-    throw "tar.exe not found. Windows 10+ ships bsdtar in System32; check your PATH."
+# Use the built-in Windows bsdtar explicitly. If we rely on PATH, MSYS/Git
+# Bash's GNU tar takes precedence and misinterprets Windows paths as remote
+# URLs ("Cannot connect to C: resolve failed").
+$tar = Join-Path $env:SystemRoot "System32\tar.exe"
+if (-not (Test-Path $tar)) {
+    throw "tar.exe not found at $tar. Windows 10+ ships bsdtar in System32."
 }
-& tar -xf $bootTar -C $vmDir vmlinuz initrd.img
+& $tar -xf $bootTar -C $vmDir vmlinuz initrd.img
 if ($LASTEXITCODE -ne 0) { throw "tar extraction failed" }
 
 # 2) rootfs VHDX
