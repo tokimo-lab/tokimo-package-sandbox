@@ -59,8 +59,8 @@ Sandbox::start_vm()
   │
   └─ exec bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts
                  --unshare-net                ← always: fresh netns
-                 --ro-bind <vm/rootfs>/{usr,bin,sbin,lib,lib64}
-                 --ro-bind <vm/rootfs>/etc/{passwd,group}     ← packaged user table
+                 --ro-bind <.vm/base/rootfs>/{usr,bin,sbin,lib,lib64}
+                 --ro-bind <.vm/base/rootfs>/etc/{passwd,group}     ← packaged user table
                  --ro-bind /etc/{resolv.conf,hosts,ssl,...}   ← host network/CA only
                  --cap-add CAP_SYS_ADMIN      ← for fusermount3
                  --cap-add CAP_NET_ADMIN      ← for TAP + lo bringup
@@ -79,7 +79,7 @@ Sandbox::start_vm()
 ```
 
 - **No daemon, no service, no root.** Each `Sandbox` owns its own bwrap+init pair.
-- **Packaged rootfs.** `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` come from `vm/rootfs/` (the same artifact macOS and Windows boot from), so the in-sandbox tool versions are the same on every platform. Only network/DNS/CA config is bound from the host.
+- **Packaged rootfs.** `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` come from `.vm/base/rootfs/` (the same artifact macOS and Windows boot from), so the in-sandbox tool versions are the same on every platform. Only network/DNS/CA config is bound from the host.
 - **Networking:** Both `AllowAll` and `Blocked` use `--unshare-net` with a fresh netns. `AllowAll` layers a userspace smoltcp netstack on top via a TAP device (`tk0`) inside the sandbox, bridged to the host through a STREAM socketpair — the same architecture as macOS and Windows. `Blocked` gets only `lo`.
 - **File sharing:** All mounts use **FUSE-over-socketpair** — the same `FuseHost` + `tokimo-sandbox-fuse` infrastructure as macOS and Windows. Each mount gets a `AF_UNIX SOCK_STREAM` socketpair; the host end is served by `FuseHost`, the guest end is passed to `tokimo-sandbox-fuse` via `--transport unix-fd`. Boot-time and runtime mounts use the same mechanism.
 - **PTY:** Master fd transferred to host via `SCM_RIGHTS` for direct I/O.
@@ -199,9 +199,9 @@ sb.stop_vm().unwrap();
 
 | Platform | Requirement |
 |---|---|
-| **Linux** | `sudo apt install bubblewrap` — no root at runtime. VM artifacts under `<repo>/vm/` (rootfs is bind-mounted into bwrap). |
-| **macOS** | macOS 13+, Apple Silicon. VM artifacts under `<repo>/vm/` (see below). Code-sign with `com.apple.security.virtualization` entitlement. |
-| **Windows** | "Virtual Machine Platform" enabled (Win 10 1903+). One-time `sudo` to install service. VM artifacts under `<repo>/vm/`. |
+| **Linux** | `sudo apt install bubblewrap` — no root at runtime. VM artifacts under `<repo>/.vm/base/` (rootfs is bind-mounted into bwrap). |
+| **macOS** | macOS 13+, Apple Silicon. VM artifacts under `<repo>/.vm/base/` (see below). Code-sign with `com.apple.security.virtualization` entitlement. |
+| **Windows** | "Virtual Machine Platform" enabled (Win 10 1903+). One-time `sudo` to install service. VM artifacts under `<repo>/.vm/base/`. |
 
 ### VM artifacts (all platforms)
 
@@ -219,13 +219,10 @@ pwsh scripts/windows/fetch-vm.ps1                 # latest release
 pwsh scripts/windows/fetch-vm.ps1 -Tag vm-v1.9.0  # specific tag
 ```
 
-Or symlink prebuilt arm64 artifacts for local macOS development:
+Or build locally for macOS:
 
 ```sh
-mkdir -p vm
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
+scripts/macos/build-vm-local.sh              # arm64 (default)
 ```
 
 ### Local initrd rebake (after editing init.sh or guest binaries)

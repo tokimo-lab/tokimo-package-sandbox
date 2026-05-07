@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# rebake-initrd.ps1 — local dev convenience for rebuilding vm/initrd.img
+# rebake-initrd.ps1 — local dev convenience for rebuilding .vm/base/initrd.img
 # on Windows. Thin wrapper that delegates to scripts/linux/rebake-initrd.sh
 # inside WSL — that script in turn cross-compiles the three guest musl
 # binaries and calls packaging/vm/scripts/rebake-initrd.sh to swap them
@@ -10,7 +10,7 @@
 # Usage:
 #   pwsh scripts/windows/rebake-initrd.ps1                  # full rebake
 #   pwsh scripts/windows/rebake-initrd.ps1 -SkipBuild       # use existing build
-#   pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm     # overwrite vm/initrd.img
+#   pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm     # overwrite .vm/base/initrd.img
 #   pwsh scripts/windows/rebake-initrd.ps1 -Arch arm64      # cross-target
 #   pwsh scripts/windows/rebake-initrd.ps1 -BaseInitrd path # custom base
 #

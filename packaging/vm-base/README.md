@@ -39,7 +39,7 @@ both halves.
                 └──────────────────┬───────────────────────┘
                                    ▼
                          scripts/windows/fetch-vm.ps1
-                         vm/{vmlinuz,initrd.img,rootfs.vhdx}
+                         .vm/base/{vmlinuz,initrd.img,rootfs.vhdx}
 ```
 
 For local dev after editing `tokimo-sandbox-init` Rust sources, the loop is

@@ -91,7 +91,7 @@ them at once with `cargo test` (no `--test` flag needed).
 | **sudo** | HCS / HCN (Hyper-V Host Compute Service / Network) require SYSTEM-level access. The library connects to `\\.\pipe\tokimo-sandbox-svc` which is owned by the SYSTEM-level service. Use `sudo` to elevate. |
 | **Hyper-V feature enabled** | `Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All` must report `Enabled`. |
 | **PowerShell 7 (`pwsh.exe`)** | The wrapper script uses strict mode and fails on `cargo`'s stderr-on-success under Windows PowerShell 5.1 (`$ErrorActionPreference='Stop'` + `NativeCommandError`). PS 7 handles it correctly. Path: `C:\Program Files\PowerShell\7\pwsh.exe`. |
-| **VM artifacts in `vm/`** | `vm/vmlinuz`, `vm/initrd.img`, `vm/rootfs.vhdx` must exist. Pull via `pwsh scripts/windows/fetch-vm.ps1`. |
+| **VM artifacts in `.vm/base/`** | `.vm/base/vmlinuz`, `.vm/base/initrd.img`, `.vm/base/rootfs.vhdx` must exist. Pull via `pwsh scripts/windows/fetch-vm.ps1`. |
 | **`tokimo-sandbox-svc` running** | Either as an installed service (`tokimo-sandbox-svc.exe --install`) or in console mode (`tokimo-sandbox-svc.exe --console`). The runner script auto-launches console mode when needed. |
 | **WAN NIC `Forwarding=Enabled`** | Required for `network_allow_all_has_nic`. HCN's NAT network only enables IP forwarding on its own `vEthernet (tokimo-sandbox-nat)` adapter; the host's WAN-facing physical NIC defaults to `Forwarding=Disabled`, which causes reverse-NAT'd return packets to be misrouted out the WAN instead of into the NAT vSwitch. The guest then never sees a SYN-ACK and `bash exec 3<>/dev/tcp/...` hangs past 5 s with probe text `NET_PROBE_DONE`. Fix (sudo, one-shot, no reboot): `Set-NetIPInterface -InterfaceAlias '<WAN-alias>' -Forwarding Enabled`. See [docs/network-allow-all-failure-investigation.md](../docs/network-allow-all-failure-investigation.md) for the full pktmon trace. |
 
@@ -125,7 +125,7 @@ in order from a normal shell, then run with sudo:
 | Edited file path | Required rebuild step | Why |
 |---|---|---|
 | `src/lib.rs`, `src/api.rs`, `src/windows/**`, `src/svc_protocol.rs`, `src/shared_backend.rs`, `src/bin/tokimo-sandbox-svc/**`, `tests/**` | (none — `test-integration.ps1` rebuilds these) | The wrapper script invokes `cargo build` and `cargo test` which produce `target/debug/tokimo-sandbox-svc.exe` + the test binaries. |
-| `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`, `packaging/vm-base/init.sh` | **`pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm`** | The init binary runs **inside the guest VM**, not on Windows. It must be cross-compiled to `x86_64-unknown-linux-musl` and packed into `vm/initrd.img`. `cargo build` alone does not do this. |
+| `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`, `packaging/vm-base/init.sh` | **`pwsh scripts\windows\rebake-initrd.ps1 -InstallToVm`** | The init binary runs **inside the guest VM**, not on Windows. It must be cross-compiled to `x86_64-unknown-linux-musl` and packed into `.vm/base/initrd.img`. `cargo build` alone does not do this. |
 | Anything else in `src/` (lib code shared by both sides) | Both of the above | The lib is linked into both `tokimo-sandbox-svc.exe` (host) and `tokimo-sandbox-init` (guest). |
 
 #### Binary lock: `cargo build --tests` vs running service
@@ -167,7 +167,7 @@ the initrd is stale — re-run `rebake-initrd.ps1 -InstallToVm`.
 
 #### Pre-test cleanup (always)
 
-Leftover Hyper-V VMs from previous runs hold `vm/initrd.img` open and
+Leftover Hyper-V VMs from previous runs hold `.vm/base/initrd.img` open and
 will block both the rebake step and the next test run. Each test
 session leaks a VM if the service is killed without `stopVm`. After a
 few rounds you can have dozens of orphan VMs consuming gigabytes of RAM.
@@ -200,7 +200,7 @@ hcsdiag.exe list | Select-String 'tokimo-sess'
 1. **Edit source.**
 2. **If you touched `src/bin/tokimo-sandbox-init/**`, `src/protocol/**`,
    or `packaging/vm-base/init.sh`:** rebake (sudo required to release
-   `vm/initrd.img` lock from leftover VMs).
+   `.vm/base/initrd.img` lock from leftover VMs).
    ```powershell
    # Kill leftover VMs first if Copy-Item fails with "cannot access".
    hcsdiag.exe list | Select-String 'tokimo-sess' | ForEach-Object {
@@ -357,17 +357,15 @@ knowing when porting tests or debugging:
 | **Apple Silicon (arm64) host** | The bundled prebuilt rootfs / kernel under `packaging/vm-base/tokimo-os-arm64/` is arm64-only. |
 | **macOS 13+** | Apple Virtualization.framework's modern `VZVirtioFileSystemDevice` + virtio-vsock support. |
 | **Code-signed binary with `packaging/macos/vz.entitlements`** | Without `com.apple.security.virtualization`, `start_vm()` fails with: *"The process doesn't have the com.apple.security.virtualization entitlement."* |
-| **VM artifacts at `<repo>/vm/`** | The backend walks up from cwd looking for `vm/{vmlinuz,initrd.img,rootfs}` (override with `TOKIMO_VM_DIR`). |
+| **VM artifacts at `<repo>/.vm/base/`** | Build or download via `scripts/macos/build-vm-local.sh` or `scripts/linux/fetch-vm.sh`. |
 | **No service / no admin** | Like Linux, the macOS backend is library-only — `Sandbox::connect()` is a no-op. The host process directly drives `arcbox-vz` → Virtualization.framework. |
 
 ### One-time setup
 
 ```sh
-# 1. Symlink prebuilt artifacts into vm/
-mkdir -p vm
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
+# 1. Build or download VM artifacts into .vm/base/
+scripts/macos/build-vm-local.sh        # arm64 (default, needs Docker)
+# or: scripts/linux/fetch-vm.sh        # download from CI releases
 
 # 2. Wire up the codesign cargo runner in your local .cargo/config.toml
 #    (gitignored). It ad-hoc-signs every test/example binary with

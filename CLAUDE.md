@@ -2,7 +2,7 @@
 
 Cross-platform native sandbox for running arbitrary commands in isolated environments.
 
-- **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer; uses the packaged `vm/rootfs/` for `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` (same artifact as macOS/Windows)
+- **Linux**: bubblewrap (`bwrap`) + seccomp-bpf with optional eBPF L4 observer; uses the packaged `.vm/base/rootfs/` for `/usr /bin /sbin /lib /lib64 /etc/passwd /etc/group` (same artifact as macOS/Windows)
 - **macOS**: Apple Virtualization.framework (via `arcbox-vz`) → Linux micro-VM, in-process FUSE-over-vsock host (`vfs_host::FuseHost`) for boot/runtime mounts, virtio-vsock control plane
 - **Windows**: Hyper-V Host Compute Service (HCS) via a client-service architecture
 
@@ -306,10 +306,8 @@ PATH="$PWD/target/debug:$PATH" cargo test -- --test-threads=1
 ```bash
 # --- macOS (Apple Silicon) ---
 
-# 1. Provide VM artifacts under <repo>/vm/ (symlinks are fine):
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
+# 1. Provide VM artifacts under <repo>/.vm/base/:
+#    Use scripts/macos/build-vm-local.sh or scripts/linux/fetch-vm.sh
 
 # 2. Register the codesign cargo runner once (in your gitignored
 #    .cargo/config.toml; the runner ad-hoc-signs each test binary with
@@ -334,20 +332,17 @@ See `docs/macos-testing.md` for the full setup walkthrough.
 | `SAFEBOX_DISABLE=1` | Bypass sandbox entirely, run natively (debug escape hatch) |
 | `TOKIMO_VERIFY_CALLER=1` | Enforce Authenticode verification of pipe clients (Windows service) |
 | `TOKIMO_SANDBOX_PRE_CHROOTED=1` | VM modes: skip init's mount/chroot setup because `init.sh` already did it |
-| `TOKIMO_VM_DIR=<path>` | macOS / Windows: override VM artifact discovery (default walks up from cwd looking for `vm/`) |
 
 Linux/bwrap configuration is passed via argv (subcommand `tokimo-sandbox-init bwrap --control-fd=<n> [--bringup-lo] [--mount-sysfs]`) rather than env vars, so nothing leaks into spawned children.
 
 ## Windows VM artifacts
 
-Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/vm/`. Built and published in-repo by `.github/workflows/vm.yml` under tags with prefix `vm-*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
+Windows requires three files (`vmlinuz`, `initrd.img`, `rootfs.vhdx`) in `<repo>/.vm/base/`. Built and published in-repo by `.github/workflows/vm.yml` under tags with prefix `vm-*` (see `packaging/vm-base/README.md` for the build pipeline). Download via:
 
 ```powershell
 pwsh scripts/windows/fetch-vm.ps1                 # latest
 pwsh scripts/windows/fetch-vm.ps1 -Tag vm-1.9.0   # specific
 ```
-
-`src/windows/mod.rs::find_vm_dir()` walks up from the service exe / cwd looking for a `vm/` directory containing all three files. **No environment variables are consulted.**
 
 ## HvSocket concurrency — critical design note
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # Download VM artifacts (kernel + initrd + rootfs.vhdx) from
-# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/vm/.
+# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/.vm/base/.
 #
 # Usage:
 #   pwsh scripts/windows/fetch-vm.ps1                # latest vm-* release, amd64
@@ -8,9 +8,9 @@
 #   pwsh scripts/windows/fetch-vm.ps1 -Arch arm64    # arm64 (less tested)
 #
 # Layout produced (all read-only at runtime):
-#   vm/vmlinuz        — Linux kernel
-#   vm/initrd.img     — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
-#   vm/rootfs.vhdx    — ext4 VHDX rootfs
+#   .vm/base/vmlinuz        — Linux kernel
+#   .vm/base/initrd.img     — initramfs (busybox + Hyper-V modules + tokimo-sandbox-init)
+#   .vm/base/rootfs.vhdx    — ext4 VHDX rootfs
 
 param(
     [string]$Tag = "latest",
@@ -21,7 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$vmDir = Join-Path $repoRoot "vm"
+$vmDir = Join-Path $repoRoot ".vm/base"
 $work  = Join-Path $env:TEMP "tokimo-fetch-vm"
 
 $repo = "tokimo-lab/tokimo-package-sandbox"
@@ -45,7 +45,7 @@ $initrd = Join-Path $vmDir "initrd.img"
 $rootfs = Join-Path $vmDir "rootfs.vhdx"
 
 if (-not $Force -and (Test-Path $kernel) -and (Test-Path $initrd) -and (Test-Path $rootfs)) {
-    Write-Host "vm/ already populated. Use -Force to re-download." -ForegroundColor Yellow
+    Write-Host ".vm/base already populated. Use -Force to re-download." -ForegroundColor Yellow
     Get-ChildItem $vmDir | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB, 2)}}
     return
 }
@@ -85,5 +85,5 @@ Move-Item -Force (Join-Path $work "rootfs.vhdx") $rootfs
 Remove-Item -Recurse -Force $work
 
 Write-Host ""
-Write-Host "Done. vm/ contents:" -ForegroundColor Green
+Write-Host "Done. .vm/base contents:" -ForegroundColor Green
 Get-ChildItem $vmDir | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB, 2)}} | Format-Table -AutoSize

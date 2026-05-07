@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download VM artifacts (kernel + initrd + rootfs/) from
-# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/vm/.
+# tokimo-package-sandbox GitHub releases (tag prefix vm-*) into <repo>/.vm/base/.
 #
 # Usage:
 #   scripts/linux/fetch-vm.sh                 # latest vm-* release, host arch
@@ -9,9 +9,9 @@
 #   scripts/linux/fetch-vm.sh -f              # force re-download
 #
 # Layout produced:
-#   vm/vmlinuz        — Linux kernel
-#   vm/initrd.img     — initramfs (busybox + tokimo-sandbox-init/fuse/tun-pump)
-#   vm/rootfs/        — extracted Debian rootfs directory
+#   .vm/base/vmlinuz        — Linux kernel
+#   .vm/base/initrd.img     — initramfs (busybox + tokimo-sandbox-init/fuse/tun-pump)
+#   .vm/base/rootfs/        — extracted Debian rootfs directory
 #
 # Dependencies: curl, jq, tar, zstd.
 
@@ -56,7 +56,7 @@ for cmd in curl jq tar zstd; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-VM_DIR="$REPO_ROOT/vm"
+VM_DIR="$REPO_ROOT/.vm/base"
 WORK="$(mktemp -d -p "$REPO_ROOT" .fetch-vm.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -75,7 +75,7 @@ if [[ $FORCE -eq 0 \
       && -f "$VM_DIR/vmlinuz" \
       && -f "$VM_DIR/initrd.img" \
       && -d "$VM_DIR/rootfs" ]]; then
-    echo "vm/ already populated. Use -f/--force to re-download." >&2
+    echo ".vm/base already populated. Use -f/--force to re-download." >&2
     ls -lh "$VM_DIR"
     exit 0
 fi
@@ -102,5 +102,5 @@ mkdir -p "$VM_DIR/rootfs"
 tar -xpf "$WORK/rootfs.tar" -C "$VM_DIR/rootfs"
 
 echo
-echo "Done. vm/ contents:"
+echo "Done. .vm/base contents:"
 ls -lh "$VM_DIR"

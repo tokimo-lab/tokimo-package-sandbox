@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rebake-initrd.sh — local dev convenience for rebuilding vm/initrd.img
+# rebake-initrd.sh — local dev convenience for rebuilding .vm/base/initrd.img
 # on macOS. Identical to scripts/linux/rebake-initrd.sh.
 #
 # Note: guest binaries are always Linux musl, never aarch64-apple-darwin.

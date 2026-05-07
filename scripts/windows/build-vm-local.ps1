@@ -1,14 +1,14 @@
 #!/usr/bin/env pwsh
-# Build Tokimo VM artifacts on Windows using Docker, then install to vm/.
+# Build Tokimo VM artifacts on Windows using Docker, then install to .vm/base/.
 # Reuses CI's packaging/vm-base/build.sh for the full rootfs pipeline.
 #
 # Steps:
 #   1) docker run rust:1.95-slim-bookworm  → builds guest binaries (musl static)
 #   2) packaging/vm-base/build.sh          → builds vmlinuz + initrd + rootfs
 #   3) Convert rootfs to vhdx (Windows-specific)
-#   4) Copy artifacts to vm/
+#   4) Copy artifacts to .vm/base/
 #
-# Output: <repo>/vm/{vmlinuz, initrd.img, rootfs.vhdx}
+# Output: <repo>/.vm/base/{vmlinuz, initrd.img, rootfs.vhdx}
 
 param(
     [ValidateSet("amd64", "arm64")]
@@ -19,7 +19,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$vmDir = Join-Path $repoRoot "vm"
+$vmDir = Join-Path $repoRoot ".vm/base"
 $pkgDir = Join-Path $repoRoot "packaging/vm-local"
 $vmBaseDir = Join-Path $repoRoot "packaging/vm-base"
 
@@ -65,7 +65,7 @@ $env:TOKIMO_FUSE_BIN = Join-Path $pkgDir "tokimo-sandbox-fuse"
 if ($LASTEXITCODE -ne 0) { throw "VM build failed" }
 
 # ---------------------------------------------------------------------------
-# 3) Convert rootfs to vhdx + copy to vm/
+# 3) Convert rootfs to vhdx + copy to .vm/base/
 # ---------------------------------------------------------------------------
 $outputDir = Join-Path $vmBaseDir "tokimo-os-$Arch"
 Write-Host "==> [3/3] Converting rootfs to vhdx + copying to $vmDir" -ForegroundColor Cyan

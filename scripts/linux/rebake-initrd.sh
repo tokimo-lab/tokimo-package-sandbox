@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rebake-initrd.sh — local dev convenience for rebuilding vm/initrd.img
+# rebake-initrd.sh — local dev convenience for rebuilding .vm/base/initrd.img
 # after editing init.sh or the three guest-side musl binaries (init,
 # tun-pump, fuse).
 #
@@ -9,17 +9,17 @@
 #         --bin tokimo-tun-pump
 #         --bin tokimo-sandbox-fuse
 #   2. packaging/vm/scripts/rebake-initrd.sh \
-#         --base   <BaseInitrd>     (default: vm/initrd.img — must already exist)
+#         --base   <BaseInitrd>     (default: .vm/base/initrd.img — must already exist)
 #         --init-bin / --tun-pump-bin / --fuse-bin / --init-sh
 #         --out    target/vm-rebake/initrd.img
-#   3. Optional: --install-to-vm copies the rebaked initrd over vm/initrd.img
-#      and writes vm/.rebaked so the user knows this isn't a clean release.
+#   3. Optional: --install-to-vm copies the rebaked initrd over .vm/base/initrd.img
+#      and writes .vm/base/.rebaked so the user knows this isn't a clean release.
 #
 # Flags:
 #   --skip-build           skip cargo build (use existing target/<triple>/release/*)
-#   --install-to-vm        copy result over vm/initrd.img
+#   --install-to-vm        copy result over .vm/base/initrd.img
 #   --arch amd64|arm64     target arch (default: host arch)
-#   --base <path>          base initrd to rebake (default: <repo>/vm/initrd.img)
+#   --base <path>          base initrd to rebake (default: <repo>/.vm/base/initrd.img)
 #
 # Note: guest binaries are always Linux musl, never the host's native
 # triple (so on macOS this still cross-compiles to *-unknown-linux-musl
@@ -60,7 +60,7 @@ case "$ARCH" in
     *) echo "rebake-initrd: unsupported --arch $ARCH (amd64 | arm64)" >&2; exit 2 ;;
 esac
 
-[ -n "$BASE" ] || BASE="$REPO_ROOT/vm/initrd.img"
+[ -n "$BASE" ] || BASE="$REPO_ROOT/.vm/base/initrd.img"
 [ -f "$BASE" ] || { echo "rebake-initrd: base initrd not found: $BASE (run scripts/linux/fetch-vm.sh first)" >&2; exit 1; }
 
 INIT_BIN="$REPO_ROOT/target/$RUST_TARGET/release/tokimo-sandbox-init"
@@ -94,8 +94,8 @@ bash "$REPO_ROOT/packaging/vm/scripts/rebake-initrd.sh" \
 echo "==> rebaked initrd: $OUT_IMG ($(stat -c%s "$OUT_IMG" 2>/dev/null || stat -f%z "$OUT_IMG") bytes)"
 
 if [ "$INSTALL_TO_VM" -eq 1 ]; then
-    target="$REPO_ROOT/vm/initrd.img"
+    target="$REPO_ROOT/.vm/base/initrd.img"
     cp -f "$OUT_IMG" "$target"
-    echo "rebaked from $BASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$REPO_ROOT/vm/.rebaked"
-    echo "==> installed to $target (vm/.rebaked marker written)"
+    echo "rebaked from $BASE at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$REPO_ROOT/.vm/base/.rebaked"
+    echo "==> installed to $target (.vm/base/.rebaked marker written)"
 fi

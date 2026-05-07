@@ -114,10 +114,10 @@
 
 ## 3. VM 启动用什么文件，从哪里来？
 
-三个文件都从本仓库 `vm.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `vm/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
+三个文件都从本仓库 `vm.yml` 工作流发布的 GitHub Release（tag 前缀 `vm-v*`）下载，统一放在本仓库的 `.vm/base/` 目录。构建过程见 [`packaging/vm-base/README.md`](../packaging/vm-base/README.md)。
 
 ```powershell
-# 下载最新 release 到 vm/
+# 下载最新 release 到 .vm/base/
 pwsh scripts\windows\fetch-vm.ps1
 # 指定 tag
 pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
@@ -127,13 +127,13 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 - **来源**：`vm.yml` 在 `debian:13` 容器中复制 `linux-image-{amd64,arm64}`（含 hv_vmbus / hv_sock 等可加载模块）
 - **大小**：约 15 MB（含模块）
-- **位置**：`vm/vmlinuz`
+- **位置**：`.vm/base/vmlinuz`
 
 ### 3.2 Initrd（initrd.img）
 
 - **来源**：`vm.yml` 单一工作流：`build.sh` 用 debootstrap 打基础 rootfs + busybox initrd（含 Hyper-V 必要模块：hv_vmbus, hv_sock, hv_storvsc, ext4, fuse, tun 等共 ~30 个 .ko，外加 `init.sh` 挂载/chroot 流程），并把当次构建的 `tokimo-sandbox-init` / `tokimo-tun-pump` / `tokimo-sandbox-fuse` 在同一步直接 bake 进 initrd（参见 §3.6）
 - **session 模式流程**：init.sh 加载模块 → mount `/dev/sda` → chroot → exec `tokimo-sandbox-init`
-- **位置**：`vm/initrd.img`
+- **位置**：`.vm/base/initrd.img`
 
 > ⚠️ v1.7.0 发布的 initrd 的 `modules/` 目录为空（build.sh 的 `find -delete` 在模块依赖解析之前运行）——会导致 `hv_vmbus: missing` 错误、hvsock accept 超时。v1.7.1 已修复，请务必使用 v1.7.1+。
 
@@ -141,11 +141,7 @@ pwsh scripts\windows\fetch-vm.ps1 -Tag vm-v1.9.0
 
 - **来源**：`vm.yml` 从 Debian 13 rootfs → `mkfs.ext4 -d` → `qemu-img convert -O vhdx`
 - **包含**：Debian 13 瘦身版、Node.js 24、Python 3.13、LibreOffice headless、ffmpeg 等
-- **位置**：`vm/rootfs.vhdx`（被服务按 session 克隆为独立副本，互不影响）
-
-### 3.4 路径发现
-
-[`src/windows/mod.rs`](src/windows/mod.rs) `find_vm_dir()`：从 service exe 路径向上走父目录，找同时包含 `vmlinuz` + `initrd.img` + `rootfs.vhdx` 三个文件的 `vm/` 目录。**不读任何环境变量。**
+- **位置**：`.vm/base/rootfs.vhdx`（被服务按 session 克隆为独立副本，互不影响）
 
 ### 3.5 内核命令行（[vmconfig.rs](src/bin/tokimo-sandbox-svc/imp/vmconfig.rs)）
 
@@ -184,7 +180,7 @@ vm-v* tag (push)    │  ├─ initrd: busybox + init.sh + 三个 musl 业务�
                   fetch-vm.sh            (symlink to         fetch-vm.ps1
                                          arm64 dir)
                           │                   │                   │
-                          └─────────► <repo>/vm/ ◄────────────────┘
+                          └─────────► <repo>/.vm/base/ ◄────────────────┘
                                   vmlinuz / initrd.img /
                                   {rootfs/, rootfs.vhdx}
 ```
@@ -211,7 +207,7 @@ scripts/macos/rebake-initrd.sh --install-to-vm
 pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
 ```
 
-三个入口接受同一组 flag：`--skip-build`（跳过 cargo 构建）、`--install-to-vm`（覆盖 `vm/initrd.img`）、`--arch amd64|arm64`（默认宿主架构）、`--base <path>`（默认 `<repo>/vm/initrd.img`）。
+三个入口接受同一组 flag：`--skip-build`（跳过 cargo 构建）、`--install-to-vm`（覆盖 `.vm/base/initrd.img`）、`--arch amd64|arm64`（默认宿主架构）、`--base <path>`（默认 `<repo>/.vm/base/initrd.img`）。
 
 > 改了 `/modules/` 里的内核模块？请重发 `vm-v*` tag 让 CI 重建 initrd —— 本地无法保证 vermagic 一致。
 
@@ -223,9 +219,9 @@ pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
 
 | 路径 | 作用 |
 |---|---|
-| `<repo>/vm/vmlinuz` | Linux kernel |
-| `<repo>/vm/initrd.img` | Initrd |
-| `<repo>/vm/rootfs.vhdx` | rootfs（只读源；每 session 克隆一份）|
+| `<repo>/.vm/base/vmlinuz` | Linux kernel |
+| `<repo>/.vm/base/initrd.img` | Initrd |
+| `<repo>/.vm/base/rootfs.vhdx` | rootfs（只读源；每 session 克隆一份）|
 | `target\debug\tokimo-sandbox-svc.exe` | 服务二进制（dev） |
 | `target\release\tokimo-sandbox-svc.exe` | 服务二进制（release） |
 | `target\msix\Tokimo.SandboxSvc.msix` | 打包好的 MSIX |
@@ -239,7 +235,7 @@ pwsh scripts/windows/rebake-initrd.ps1 -InstallToVm
 
 | 路径 | 作用 |
 |---|---|
-| [scripts/windows/fetch-vm.ps1](scripts/windows/fetch-vm.ps1) | 从 sister project release 下载 VM 产物到 `vm/` |
+| [scripts/windows/fetch-vm.ps1](scripts/windows/fetch-vm.ps1) | 从 sister project release 下载 VM 产物到 `.vm/base/` |
 | [scripts/windows/build-msix.ps1](scripts/windows/build-msix.ps1) | 打包 MSIX |
 | [scripts/check-env.ps1](scripts/check-env.ps1) | 接手者第一步：核实 Hyper-V / HCS / 文件齐不齐 |
 

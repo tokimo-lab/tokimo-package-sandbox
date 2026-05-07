@@ -11,19 +11,17 @@ Invalid virtual machine configuration. The process doesn't have the
 
 ## One-time setup
 
-### 1. Provide VM artifacts at `<repo>/vm/`
+### 1. Provide VM artifacts at `<repo>/.vm/base/`
 
-The backend auto-discovers `vmlinuz`, `initrd.img`, and `rootfs/` under
-`<repo>/vm/` (or any ancestor). For local development point those at the
-prebuilt arm64 artifacts:
+Build or download VM artifacts into `.vm/base/`:
 
 ```sh
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/vmlinuz"    vm/vmlinuz
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/initrd.img" vm/initrd.img
-ln -sf "$PWD/packaging/vm-base/tokimo-os-arm64/rootfs"     vm/rootfs
-```
+# Option A: download from CI releases
+scripts/linux/fetch-vm.sh
 
-Override with `TOKIMO_VM_DIR=/path/to/dir` if needed.
+# Option B: build locally using Docker
+scripts/macos/build-vm-local.sh
+```
 
 ### 2. Register the codesign cargo runner
 

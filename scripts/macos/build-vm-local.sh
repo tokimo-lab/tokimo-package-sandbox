@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build Tokimo VM artifacts on macOS using Docker, then install to vm/.
+# Build Tokimo VM artifacts on macOS using Docker, then install to .vm/base/.
 # Reuses CI's packaging/vm-base/build.sh for the full rootfs pipeline.
 #
 # Steps:
 #   1) docker run rust:1.95-slim-bookworm  → builds guest binaries (musl static)
 #   2) packaging/vm-base/build.sh          → builds vmlinuz + initrd + rootfs
-#   3) Copy artifacts to vm/
+#   3) Copy artifacts to .vm/base/
 #
-# Output: <repo>/vm/{vmlinuz, initrd.img, rootfs/}
+# Output: <repo>/.vm/base/{vmlinuz, initrd.img, rootfs/}
 #
 # Usage: build-vm-local.sh [--arch amd64|arm64] [--force] [--skip-init-build]
 #   --arch            Target architecture (default: arm64)
-#   --force           Remove existing vm/ artifacts before building
+#   --force           Remove existing .vm/base/ artifacts before building
 #   --skip-init-build Skip guest binary build (reuse existing)
 
 set -euo pipefail
@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-VM_DIR="$REPO_ROOT/vm"
+VM_DIR="$REPO_ROOT/.vm/base"
 PKG_DIR="$REPO_ROOT/packaging/vm-local"
 VM_BASE_DIR="$REPO_ROOT/packaging/vm-base"
 
@@ -73,7 +73,7 @@ TOKIMO_FUSE_BIN="$PKG_DIR/tokimo-sandbox-fuse" \
 bash "$VM_BASE_DIR/build.sh" "$ARCH"
 
 # ---------------------------------------------------------------------------
-# 3) Copy to vm/
+# 3) Copy to .vm/base/
 # ---------------------------------------------------------------------------
 OUTPUT_DIR="$VM_BASE_DIR/tokimo-os-$ARCH"
 echo "==> Copying to $VM_DIR"
