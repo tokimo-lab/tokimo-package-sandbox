@@ -12,6 +12,24 @@ use std::time::Duration;
 use common::{SandboxGuard, config, drain_until};
 use tokimo_package_sandbox::{HostExecAction, HostExecCtx, Sandbox};
 
+/// Platform-appropriate argv that prints "BRIDGED:<arg>" to stdout.
+fn bridged_print_argv(arg: &str) -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec!["cmd".into(), "/c".into(), format!("echo BRIDGED:{arg}")]
+    } else {
+        vec!["printf".into(), "BRIDGED:%s".into(), arg.to_string()]
+    }
+}
+
+/// Platform-appropriate no-op command (returns 0).
+fn true_argv() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec!["cmd".into(), "/c".into(), "exit 0".into()]
+    } else {
+        vec!["true".into()]
+    }
+}
+
 #[test]
 fn host_exec_register_and_callback_invoked() {
     let sb = Sandbox::connect().expect("connect");
@@ -23,7 +41,7 @@ fn host_exec_register_and_callback_invoked() {
     let cb = Arc::new(move |ctx: HostExecCtx| {
         received_cl.lock().unwrap().push(ctx.clone());
         HostExecAction::RunOnHost {
-            argv: vec!["printf".into(), "BRIDGED:%s".into(), ctx.command.clone()],
+            argv: bridged_print_argv(&ctx.command),
             env: ctx.env,
             cwd: ctx.cwd,
         }
@@ -43,8 +61,10 @@ fn host_exec_register_and_callback_invoked() {
 
     const END: &str = "END_HOSTEXEC_1";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"mycmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    // Combine on one line so the shell doesn't pipe the echo sentinel
+    // into tokimo-host-exec's stdin.
+    sb.write_stdin(&shell, format!("mycmd 2>&1; echo {END}\n").as_bytes())
+        .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -114,9 +134,8 @@ fn host_exec_reject_returns_nonzero_exit() {
 
     const END: &str = "END_REJECT";
     let shell = sb.shell_id().expect("shell_id");
-    // Run command; capture its exit code into $RC, then echo sentinel.
-    sb.write_stdin(&shell, b"rejectcmd; echo RC=$?\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(&shell, format!("rejectcmd; echo RC=$?; echo {END}\n").as_bytes())
+        .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -137,7 +156,7 @@ fn host_exec_callback_receives_env() {
     let cb = Arc::new(move |ctx: HostExecCtx| {
         *env_clone.lock().unwrap() = ctx.env.clone();
         HostExecAction::RunOnHost {
-            argv: vec!["true".into()],
+            argv: true_argv(),
             env: ctx.env,
             cwd: ctx.cwd,
         }
@@ -152,8 +171,8 @@ fn host_exec_callback_receives_env() {
 
     const END: &str = "END_ENV";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"MY_SENTINEL=hello envcmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(&shell, format!("MY_SENTINEL=hello envcmd; echo {END}\n").as_bytes())
+        .unwrap();
 
     drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -176,7 +195,7 @@ fn host_exec_callback_receives_cwd() {
     let cb = Arc::new(move |ctx: HostExecCtx| {
         *cwd_clone.lock().unwrap() = ctx.cwd.clone();
         HostExecAction::RunOnHost {
-            argv: vec!["true".into()],
+            argv: true_argv(),
             env: ctx.env,
             cwd: ctx.cwd,
         }
@@ -191,8 +210,8 @@ fn host_exec_callback_receives_cwd() {
 
     const END: &str = "END_CWD";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"cd /tmp && cwdcmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(&shell, format!("cd /tmp && cwdcmd; echo {END}\n").as_bytes())
+        .unwrap();
 
     drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -209,7 +228,6 @@ fn host_exec_unregistered_command_not_found_in_bridge_dir() {
     sb.configure(config("hostexec6")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
 
-    // We need the bridge to exist so the PATH is set up, but we don't register "ghostcmd".
     let cb = Arc::new(|_: HostExecCtx| HostExecAction::Reject {
         exit_code: 0,
         message: None,
@@ -221,15 +239,15 @@ fn host_exec_unregistered_command_not_found_in_bridge_dir() {
     sb.start_vm().expect("start_vm");
     let _guard = SandboxGuard(sb.clone());
 
-    // Register one unrelated command so the bridge dir is initialised.
     sb.add_host_command("other").unwrap();
 
     const END: &str = "END_NOTFOUND";
     let shell = sb.shell_id().expect("shell_id");
-    // ghostcmd should NOT be found (it's not in PATH via bridge dir).
-    sb.write_stdin(&shell, b"type ghostcmd 2>/dev/null && echo FOUND || echo NOTFOUND\n")
-        .unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(
+        &shell,
+        format!("type ghostcmd 2>/dev/null && echo FOUND || echo NOTFOUND; echo {END}\n").as_bytes(),
+    )
+    .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -296,7 +314,6 @@ fn host_exec_callback_updated_after_start_vm() {
     sb.configure(config("hostexec9")).expect("configure");
     let rx = sb.subscribe().expect("subscribe");
 
-    // Register a first callback that rejects everything.
     let cb_initial = Arc::new(|_: HostExecCtx| HostExecAction::Reject {
         exit_code: 99,
         message: None,
@@ -309,9 +326,12 @@ fn host_exec_callback_updated_after_start_vm() {
     let _guard = SandboxGuard(sb.clone());
     sb.add_host_command("updatecmd").unwrap();
 
-    // Replace with a callback that prints a known string.
     let cb_new = Arc::new(|ctx: HostExecCtx| HostExecAction::RunOnHost {
-        argv: vec!["printf".into(), "UPDATED\n".into()],
+        argv: if cfg!(target_os = "windows") {
+            vec!["cmd".into(), "/c".into(), "echo UPDATED".into()]
+        } else {
+            vec!["printf".into(), "UPDATED\n".into()]
+        },
         env: ctx.env,
         cwd: ctx.cwd,
     });
@@ -319,8 +339,8 @@ fn host_exec_callback_updated_after_start_vm() {
 
     const END: &str = "END_UPDATE";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"updatecmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(&shell, format!("updatecmd; echo {END}\n").as_bytes())
+        .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -365,7 +385,11 @@ fn host_exec_stdout_piped_back_to_guest() {
     let rx = sb.subscribe().expect("subscribe");
 
     let cb = Arc::new(|ctx: HostExecCtx| HostExecAction::RunOnHost {
-        argv: vec!["printf".into(), "STDOUT_TOKEN\n".into()],
+        argv: if cfg!(target_os = "windows") {
+            vec!["cmd".into(), "/c".into(), "echo STDOUT_TOKEN".into()]
+        } else {
+            vec!["printf".into(), "STDOUT_TOKEN\n".into()]
+        },
         env: ctx.env,
         cwd: ctx.cwd,
     });
@@ -379,8 +403,8 @@ fn host_exec_stdout_piped_back_to_guest() {
 
     const END: &str = "END_STDOUT";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"printcmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(&shell, format!("printcmd; echo {END}\n").as_bytes())
+        .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();
@@ -404,7 +428,11 @@ fn host_exec_multiple_invocations_of_same_command() {
     let cb = Arc::new(move |ctx: HostExecCtx| {
         let n = count_cl.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         HostExecAction::RunOnHost {
-            argv: vec!["printf".into(), format!("CALL{n}\n")],
+            argv: if cfg!(target_os = "windows") {
+                vec!["cmd".into(), "/c".into(), format!("echo CALL{n}")]
+            } else {
+                vec!["printf".into(), format!("CALL{n}\n")]
+            },
             env: ctx.env,
             cwd: ctx.cwd,
         }
@@ -419,8 +447,11 @@ fn host_exec_multiple_invocations_of_same_command() {
 
     const END: &str = "END_MULTI";
     let shell = sb.shell_id().expect("shell_id");
-    sb.write_stdin(&shell, b"multicmd && multicmd && multicmd\n").unwrap();
-    sb.write_stdin(&shell, format!("echo {END}\n").as_bytes()).unwrap();
+    sb.write_stdin(
+        &shell,
+        format!("multicmd && multicmd && multicmd; echo {END}\n").as_bytes(),
+    )
+    .unwrap();
 
     let captured = drain_until(&rx, &shell, END, Duration::from_secs(30));
     sb.stop_vm().ok();

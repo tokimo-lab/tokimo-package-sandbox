@@ -91,6 +91,15 @@ impl SandboxBackend for WindowsBackend {
         let bridge = Arc::new(HostExecBridge::new(cb));
         *self.host_exec_bridge.lock().unwrap() = Some(Arc::clone(&bridge));
 
+        // Ensure Winsock is initialized in this process so the
+        // duplicated SOCKET handles can be used as TcpStreams.
+        {
+            use windows::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+            let mut data = WSADATA::default();
+            // Safe to call multiple times; only the first call matters.
+            let _ = unsafe { WSAStartup(0x0202, &mut data) };
+        }
+
         // Spawn the subscriber thread. It watches for
         // EV_HOST_EXEC_ACCEPTED events emitted by the service,
         // converts the duplicated handle to a TcpStream, and

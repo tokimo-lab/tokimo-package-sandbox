@@ -137,7 +137,9 @@ fn run() -> u8 {
 
     let writer = Arc::new(Mutex::new(writer));
 
-    // Pump stdin → Frame::Stdin.
+    // Pump stdin → Frame::Stdin. We keep the thread handle so we can
+    // close stdin fd before exiting, which causes the blocking read to
+    // return and the thread to exit cleanly.
     let writer_in = Arc::clone(&writer);
     let stdin_thread = thread::spawn(move || {
         let mut stdin = std::io::stdin();
@@ -173,12 +175,19 @@ fn run() -> u8 {
                 exit_code = code;
                 break;
             }
-            Ok(_other) => {
-                // Ignore unexpected frames.
-            }
-            Err(_) => {
-                break;
-            }
+            Ok(_other) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Close stdin fd so the stdin_thread's blocking read returns EOF.
+    // Without this, the thread keeps reading and the process hangs on
+    // join, which also stalls the parent shell's stdin pipe.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::close(std::io::stdin().as_raw_fd());
         }
     }
     drop(reader);
