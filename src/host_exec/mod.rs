@@ -84,12 +84,16 @@ impl HostExecBridge {
         linux_relay::start(self.clone(), relay_fd);
     }
 
-    /// macOS: start the vsock listener on the given port (CID = host
-    /// CID, accepts guest connections). Spawns one worker thread per
-    /// accepted connection.
+    /// macOS: start the vsock listener using the pre-allocated
+    /// `VirtioSocketListener` from the booted VM. Spawns one worker
+    /// thread per accepted connection via `handle_one`.
     #[cfg(target_os = "macos")]
-    pub fn start_vsock_listener(self: &Arc<Self>, port: u32) -> std::io::Result<()> {
-        macos_listener::start(self.clone(), port)
+    pub fn start_vsock_listener(
+        self: &Arc<Self>,
+        listener: arcbox_vz::VirtioSocketListener,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> std::io::Result<()> {
+        macos_listener::start(self.clone(), listener, runtime)
     }
 
     /// Drive a single client connection to completion. Reads the
@@ -298,11 +302,7 @@ fn run_on_host(rw: std::os::unix::net::UnixStream, argv: Vec<String>, env: Vec<(
     let reader = std::thread::Builder::new()
         .name("host-exec-reader".into())
         .spawn(move || {
-            loop {
-                let frame = match read_frame(&mut read_half_owned) {
-                    Ok(f) => f,
-                    Err(_) => break,
-                };
+            while let Ok(frame) = read_frame(&mut read_half_owned) {
                 match frame {
                     Frame::Stdin(data) => {
                         if data.is_empty() {

@@ -28,7 +28,7 @@ use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts}
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
-use super::vm::{BootedVm, FUSE_VSOCK_PORT, VmConfig, boot_vm};
+use super::vm::{BootedVm, FUSE_VSOCK_PORT, HOST_EXEC_VSOCK_PORT, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
 
 use crate::vfs_host::FuseHost;
@@ -42,6 +42,9 @@ pub struct MacosBackend {
     state: Mutex<State>,
     event_senders: Arc<Mutex<Vec<Sender<Event>>>>,
     debug_logging: Mutex<bool>,
+    /// Callback registered via `on_host_exec` before `start_vm`. Consumed
+    /// by `start_vm` to create the `HostExecBridge`.
+    pending_host_exec_cb: Mutex<Option<crate::api::HostExecCallback>>,
 }
 
 #[allow(clippy::large_enum_variant)] // RunningState already boxed; ConfigureParams is the next biggest variant and is short-lived
@@ -75,6 +78,12 @@ struct RunningState {
     /// Shutdown flag for the netstack thread. Setting true causes the
     /// reader/writer threads to exit at their next iteration.
     netstack_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Host-Exec Bridge: forwards bridged commands from the guest to a
+    /// host-side callback via vsock. `None` if `on_host_exec` was never
+    /// called before or after `start_vm`.
+    host_exec_bridge: Option<Arc<crate::host_exec::HostExecBridge>>,
+    /// Currently-registered host-bridged command names.
+    host_exec_commands: HashSet<String>,
     /// Snapshot of [`ConfigureParams`] that drove this boot — preserved
     /// here so management RPCs (`list_sessions` / `session_info`) can
     /// report the original `user_data_name`, `memory_mb`, etc., without
@@ -92,6 +101,7 @@ impl MacosBackend {
             state: Mutex::new(State::Empty),
             event_senders: Arc::new(Mutex::new(Vec::new())),
             debug_logging: Mutex::new(false),
+            pending_host_exec_cb: Mutex::new(None),
         })
     }
 
@@ -146,6 +156,7 @@ impl SandboxBackend for MacosBackend {
             vsock,
             netstack_listener: mut listener,
             fuse_listener,
+            host_exec_listener,
             runtime,
         } = boot_vm(&vm_config)?;
 
@@ -165,6 +176,27 @@ impl SandboxBackend for MacosBackend {
         // `Hello.mount_name`.
         let fuse_host: Arc<FuseHost> = Arc::new(FuseHost::new());
         spawn_fuse_accept_loop(fuse_listener, fuse_host.clone(), runtime.clone());
+
+        // ---- Host-Exec Bridge ----------------------------------------
+        // Always create the bridge (like Linux backend): use the pre-registered
+        // callback or a default passthrough. The user can call `on_host_exec`
+        // after `start_vm` to replace the callback.
+        let host_exec_cb: crate::api::HostExecCallback = self
+            .pending_host_exec_cb
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .unwrap_or_else(|| {
+                Arc::new(|ctx: crate::api::HostExecCtx| crate::api::HostExecAction::RunOnHost {
+                    argv: ctx.argv,
+                    env: ctx.env,
+                    cwd: ctx.cwd,
+                })
+            });
+        let host_exec_bridge = Arc::new(crate::host_exec::HostExecBridge::new(host_exec_cb));
+        if let Err(e) = host_exec_bridge.start_vsock_listener(host_exec_listener, runtime.clone()) {
+            tracing::warn!("host-exec vsock listener start failed: {e}");
+        }
 
         // ---- Network: always-on userspace netstack -------------------
         // FUSE no longer requires a `LocalService` (it talks vsock
@@ -264,6 +296,8 @@ impl SandboxBackend for MacosBackend {
             boot_share_names,
             fuse_mount_names,
             netstack_shutdown,
+            host_exec_bridge: Some(host_exec_bridge),
+            host_exec_commands: HashSet::new(),
             params: params.clone(),
             started_at_unix_ms: macos_now_unix_ms(),
         }));
@@ -282,9 +316,13 @@ impl SandboxBackend for MacosBackend {
                     runtime,
                     fuse_host,
                     netstack_shutdown,
+                    host_exec_bridge,
                     ..
                 } = *rs;
                 netstack_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(b) = host_exec_bridge {
+                    b.shutdown();
+                }
                 let _ = init.shutdown();
                 drop(init);
                 drop(fuse_host); // tear down FuseHost; in-flight serve tasks see EOF
@@ -446,6 +484,79 @@ impl SandboxBackend for MacosBackend {
 
     fn passthrough(&self, _method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
         Err(Error::not_implemented("passthrough on macOS"))
+    }
+
+    fn on_host_exec(&self, cb: crate::api::HostExecCallback) -> Result<()> {
+        let state = self.state.lock().unwrap();
+        match &*state {
+            State::Running(rs) => {
+                if let Some(bridge) = &rs.host_exec_bridge {
+                    bridge.set_callback(cb);
+                    Ok(())
+                } else {
+                    Err(Error::other("host-exec bridge not initialised"))
+                }
+            }
+            _ => {
+                drop(state);
+                *self.pending_host_exec_cb.lock().unwrap() = Some(cb);
+                Ok(())
+            }
+        }
+    }
+
+    fn add_host_command(&self, name: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let rs = match &mut *state {
+            State::Running(rs) => rs,
+            _ => return Err(Error::VmNotRunning),
+        };
+        if rs.host_exec_commands.contains(name) {
+            return Ok(());
+        }
+        rs.init
+            .add_host_command(name)
+            .map_err(|e| Error::other(format!("add_host_command: {e}")))?;
+        rs.host_exec_commands.insert(name.to_string());
+        Ok(())
+    }
+
+    fn remove_host_command(&self, name: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let rs = match &mut *state {
+            State::Running(rs) => rs,
+            _ => return Err(Error::VmNotRunning),
+        };
+        if !rs.host_exec_commands.remove(name) {
+            return Ok(());
+        }
+        rs.init
+            .remove_host_command(name)
+            .map_err(|e| Error::other(format!("remove_host_command: {e}")))
+    }
+
+    fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let rs = match &mut *state {
+            State::Running(rs) => rs,
+            _ => return Err(Error::VmNotRunning),
+        };
+        rs.init
+            .set_host_commands(names)
+            .map_err(|e| Error::other(format!("set_host_commands: {e}")))?;
+        rs.host_exec_commands = names.iter().cloned().collect();
+        Ok(())
+    }
+
+    fn list_host_commands(&self) -> Result<Vec<String>> {
+        let state = self.state.lock().unwrap();
+        let rs = match &*state {
+            State::Running(rs) => rs,
+            _ => return Err(Error::VmNotRunning),
+        };
+        let mut v: Vec<String> = rs.host_exec_commands.iter().cloned().collect();
+        v.sort();
+        Ok(v)
     }
 
     fn add_mount(&self, share: Mount) -> Result<()> {

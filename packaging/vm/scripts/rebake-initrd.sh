@@ -2,13 +2,13 @@
 # rebake-initrd.sh — fast initrd rebuild for the dev/CI loop.
 #
 # Takes a "base" initrd.img (cpio.gz produced by packaging/vm-base/build.sh
-# in CI) and three musl-static guest binaries, and produces a new initrd
+# in CI) and four musl-static guest binaries, and produces a new initrd
 # with /init + /bin/tokimo-sandbox-init + /bin/tokimo-tun-pump +
-# /bin/tokimo-sandbox-fuse swapped in.
+# /bin/tokimo-sandbox-fuse + /bin/tokimo-host-exec swapped in.
 #
 # Scope (intentionally narrow):
 #   * REPLACE /init (shell script)
-#   * REPLACE the three guest binaries under /bin/
+#   * REPLACE the four guest binaries under /bin/
 #   * NEVER touch /modules/ — kernel modules including tun.ko are baked
 #     into the base initrd by build.sh against the actual shipped kernel
 #     and must keep their vermagic. Local dev never has the matching
@@ -24,12 +24,13 @@
 #
 # Usage:
 #   rebake-initrd.sh \
-#       --base         <base-initrd.img> \
-#       --init-bin     <path/tokimo-sandbox-init> \
-#       --tun-pump-bin <path/tokimo-tun-pump> \
-#       --fuse-bin     <path/tokimo-sandbox-fuse> \
-#       --init-sh      <path/init.sh> \
-#       --out          <out.img>
+#       --base           <base-initrd.img> \
+#       --init-bin       <path/tokimo-sandbox-init> \
+#       --tun-pump-bin   <path/tokimo-tun-pump> \
+#       --fuse-bin       <path/tokimo-sandbox-fuse> \
+#       --host-exec-bin  <path/tokimo-host-exec> \
+#       --init-sh        <path/init.sh> \
+#       --out            <out.img>
 
 set -euo pipefail
 
@@ -38,18 +39,20 @@ INIT_BIN=""
 INIT_SH=""
 TUN_PUMP_BIN=""
 FUSE_BIN=""
+HOST_EXEC_BIN=""
 OUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --base)         BASE="$2";         shift 2 ;;
-        --init-bin)     INIT_BIN="$2";     shift 2 ;;
-        --init-sh)      INIT_SH="$2";      shift 2 ;;
-        --tun-pump-bin) TUN_PUMP_BIN="$2"; shift 2 ;;
-        --fuse-bin)     FUSE_BIN="$2";     shift 2 ;;
-        --out)          OUT="$2";          shift 2 ;;
+        --base)            BASE="$2";            shift 2 ;;
+        --init-bin)        INIT_BIN="$2";        shift 2 ;;
+        --init-sh)         INIT_SH="$2";         shift 2 ;;
+        --tun-pump-bin)    TUN_PUMP_BIN="$2";    shift 2 ;;
+        --fuse-bin)        FUSE_BIN="$2";         shift 2 ;;
+        --host-exec-bin)   HOST_EXEC_BIN="$2";   shift 2 ;;
+        --out)             OUT="$2";              shift 2 ;;
         -h|--help)
-            sed -n '2,32p' "$0"
+            sed -n '2,35p' "$0"
             exit 0
             ;;
         *)
@@ -64,18 +67,20 @@ require_arg() {
     [ -n "$val" ] || { echo "rebake-initrd: $name required" >&2; exit 2; }
 }
 
-require_arg "$BASE"         "--base"
-require_arg "$INIT_BIN"     "--init-bin"
-require_arg "$TUN_PUMP_BIN" "--tun-pump-bin"
-require_arg "$FUSE_BIN"     "--fuse-bin"
-require_arg "$INIT_SH"      "--init-sh"
-require_arg "$OUT"          "--out"
+require_arg "$BASE"          "--base"
+require_arg "$INIT_BIN"      "--init-bin"
+require_arg "$TUN_PUMP_BIN"  "--tun-pump-bin"
+require_arg "$FUSE_BIN"      "--fuse-bin"
+require_arg "$HOST_EXEC_BIN" "--host-exec-bin"
+require_arg "$INIT_SH"       "--init-sh"
+require_arg "$OUT"           "--out"
 
-[ -f "$BASE" ]          || { echo "rebake-initrd: base not found: $BASE"           >&2; exit 1; }
-[ -x "$INIT_BIN" ]      || { echo "rebake-initrd: init bin not executable: $INIT_BIN" >&2; exit 1; }
-[ -x "$TUN_PUMP_BIN" ]  || { echo "rebake-initrd: tun-pump bin not executable: $TUN_PUMP_BIN" >&2; exit 1; }
-[ -x "$FUSE_BIN" ]      || { echo "rebake-initrd: fuse bin not executable: $FUSE_BIN"        >&2; exit 1; }
-[ -f "$INIT_SH" ]       || { echo "rebake-initrd: init.sh not found: $INIT_SH"     >&2; exit 1; }
+[ -f "$BASE" ]             || { echo "rebake-initrd: base not found: $BASE"                >&2; exit 1; }
+[ -x "$INIT_BIN" ]         || { echo "rebake-initrd: init bin not executable: $INIT_BIN"   >&2; exit 1; }
+[ -x "$TUN_PUMP_BIN" ]     || { echo "rebake-initrd: tun-pump bin not executable: $TUN_PUMP_BIN" >&2; exit 1; }
+[ -x "$FUSE_BIN" ]         || { echo "rebake-initrd: fuse bin not executable: $FUSE_BIN"   >&2; exit 1; }
+[ -x "$HOST_EXEC_BIN" ]    || { echo "rebake-initrd: host-exec bin not executable: $HOST_EXEC_BIN" >&2; exit 1; }
+[ -f "$INIT_SH" ]          || { echo "rebake-initrd: init.sh not found: $INIT_SH"          >&2; exit 1; }
 
 for tool in cpio gzip gunzip find install; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -105,6 +110,9 @@ install -m 0755 "$TUN_PUMP_BIN" "$TMP/bin/tokimo-tun-pump"
 
 echo "==> rebake: installing /bin/tokimo-sandbox-fuse ($(stat -c%s "$FUSE_BIN") bytes)"
 install -m 0755 "$FUSE_BIN" "$TMP/bin/tokimo-sandbox-fuse"
+
+echo "==> rebake: installing /bin/tokimo-host-exec ($(stat -c%s "$HOST_EXEC_BIN") bytes)"
+install -m 0755 "$HOST_EXEC_BIN" "$TMP/bin/tokimo-host-exec"
 
 OUT_DIR="$(dirname "$OUT")"
 mkdir -p "$OUT_DIR"

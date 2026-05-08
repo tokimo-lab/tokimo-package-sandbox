@@ -6,10 +6,11 @@
 //! prepended with the bridge directory), `argv[0]` is the basename of
 //! the link — i.e. the bridged command name.
 //!
-//! This binary connects to `/run/tokimo/host-exec.sock` (a Unix listener
-//! served by init), which forwards the connection to the host bridge
-//! via SCM_RIGHTS. We then send a `Spawn{argv, env, cwd}` frame and pump
-//! stdio until we get an `Exit{code}` frame.
+//! **Transport selection** (Linux guest only):
+//! - If `TOKIMO_HOST_EXEC_VSOCK_PORT` is set (macOS/Windows VM mode):
+//!   connect via AF_VSOCK to the host CID on that port.
+//! - Otherwise (Linux bwrap mode): connect to `/run/tokimo/host-exec.sock`
+//!   (a Unix listener served by init via SCM_RIGHTS relay).
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -48,13 +49,34 @@ fn run() -> u8 {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
 
-    let stream = match UnixStream::connect(SOCK) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tokimo-host-exec: connect {SOCK}: {e}");
-            return 127;
+    // Connect: vsock if running inside a macOS/Windows VM, otherwise Unix socket.
+    let stream: UnixStream = if let Ok(port_str) = std::env::var("TOKIMO_HOST_EXEC_VSOCK_PORT") {
+        match port_str.parse::<u32>() {
+            Ok(port) => {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                match tokimo_package_sandbox::vsock_util::connect_host(port) {
+                    Ok(fd) => unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) },
+                    Err(e) => {
+                        eprintln!("tokimo-host-exec: vsock connect port {port}: {e}");
+                        return 127;
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("tokimo-host-exec: invalid TOKIMO_HOST_EXEC_VSOCK_PORT={port_str:?}");
+                return 127;
+            }
+        }
+    } else {
+        match UnixStream::connect(SOCK) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("tokimo-host-exec: connect {SOCK}: {e}");
+                return 127;
+            }
         }
     };
+
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = stream;
 

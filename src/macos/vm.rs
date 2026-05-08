@@ -44,6 +44,10 @@ pub(crate) const NETSTACK_VSOCK_PORT: u32 = 4444;
 /// binds to it via `Frame::Hello { mount_name }`.
 pub(crate) const FUSE_VSOCK_PORT: u32 = 5555;
 
+/// Vsock port the host listens on for Host-Exec Bridge connections from
+/// `tokimo-host-exec` running inside the guest.
+pub(crate) const HOST_EXEC_VSOCK_PORT: u32 = 5556;
+
 /// Tag used for the rootfs virtiofs share. Must match the hard-coded value
 /// in `tokimo-sandbox-init/main.rs` which mounts `work` at `/mnt/work`.
 const ROOTFS_TAG: &str = "work";
@@ -61,6 +65,9 @@ pub struct BootedVm {
     /// mount). Allocated regardless of mount count so dynamic
     /// `add_mount` calls work without re-listening.
     pub fuse_listener: VirtioSocketListener,
+    /// Listener for Host-Exec Bridge connections from `tokimo-host-exec`
+    /// inside the guest.
+    pub host_exec_listener: VirtioSocketListener,
     pub runtime: Arc<Runtime>,
 }
 
@@ -130,6 +137,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
          tokimo.session=1 tokimo.init_port=2222 tokimo.guest_listens=1 \
          tokimo.net=netstack tokimo.netstack_port={NETSTACK_VSOCK_PORT} {dns_flag} \
          net.ifnames=0 biosdevname=0 \
+         TOKIMO_HOST_EXEC_VSOCK_PORT={HOST_EXEC_VSOCK_PORT} \
          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
          HOME=/root TERM=xterm-256color LANG=C.UTF-8"
     );
@@ -144,7 +152,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
     );
 
     let rt_for_block = runtime.clone();
-    let (vm, vsock_fd, netstack_listener, fuse_listener) = rt_for_block.block_on(async move {
+    let (vm, vsock_fd, netstack_listener, fuse_listener, host_exec_listener) = rt_for_block.block_on(async move {
         // ---- Boot loader -----------------------------------------------
         let mut boot_loader = LinuxBootLoader::new(&kernel_s)
             .map_err(|e| Error::other(format!("LinuxBootLoader: {e}")))?;
@@ -227,6 +235,9 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         let fuse_listener = socket_dev
             .listen(FUSE_VSOCK_PORT)
             .map_err(|e| Error::other(format!("fuse listen: {e}")))?;
+        let host_exec_listener = socket_dev
+            .listen(HOST_EXEC_VSOCK_PORT)
+            .map_err(|e| Error::other(format!("host_exec listen: {e}")))?;
         let _ = network; // used only to derive cmdline above
 
         let connect_timeout = Duration::from_secs(30);
@@ -268,7 +279,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         }
 
         let vsock_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(conn.into_raw_fd()) };
-        Ok::<_, Error>((vm, vsock_fd, netstack_listener, fuse_listener))
+        Ok::<_, Error>((vm, vsock_fd, netstack_listener, fuse_listener, host_exec_listener))
     })?;
 
     Ok(BootedVm {
@@ -276,6 +287,7 @@ pub fn boot_vm(config: &VmConfig) -> Result<BootedVm> {
         vsock: vsock_fd,
         netstack_listener,
         fuse_listener,
+        host_exec_listener,
         runtime,
     })
 }

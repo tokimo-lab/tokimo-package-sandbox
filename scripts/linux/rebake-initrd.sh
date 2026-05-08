@@ -66,16 +66,18 @@ esac
 INIT_BIN="$REPO_ROOT/target/$RUST_TARGET/release/tokimo-sandbox-init"
 PUMP_BIN="$REPO_ROOT/target/$RUST_TARGET/release/tokimo-tun-pump"
 FUSE_BIN="$REPO_ROOT/target/$RUST_TARGET/release/tokimo-sandbox-fuse"
+HOST_EXEC_BIN="$REPO_ROOT/target/$RUST_TARGET/release/tokimo-host-exec"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
-    echo "==> cargo build --release --target $RUST_TARGET (init + tun-pump + fuse)"
+    echo "==> cargo build --release --target $RUST_TARGET (init + tun-pump + fuse + host-exec)"
     ( cd "$REPO_ROOT" && cargo build --release --target "$RUST_TARGET" \
         --bin tokimo-sandbox-init \
         --bin tokimo-tun-pump \
-        --bin tokimo-sandbox-fuse )
+        --bin tokimo-sandbox-fuse \
+        --bin tokimo-host-exec )
 fi
 
-for f in "$INIT_BIN" "$PUMP_BIN" "$FUSE_BIN"; do
+for f in "$INIT_BIN" "$PUMP_BIN" "$FUSE_BIN" "$HOST_EXEC_BIN"; do
     [ -x "$f" ] || { echo "rebake-initrd: missing binary $f (drop --skip-build?)" >&2; exit 1; }
 done
 
@@ -84,12 +86,13 @@ mkdir -p "$OUT_DIR"
 OUT_IMG="$OUT_DIR/initrd.img"
 
 bash "$REPO_ROOT/packaging/vm/scripts/rebake-initrd.sh" \
-    --base         "$BASE" \
-    --init-bin     "$INIT_BIN" \
-    --tun-pump-bin "$PUMP_BIN" \
-    --fuse-bin     "$FUSE_BIN" \
-    --init-sh      "$REPO_ROOT/packaging/vm-base/init.sh" \
-    --out          "$OUT_IMG"
+    --base           "$BASE" \
+    --init-bin       "$INIT_BIN" \
+    --tun-pump-bin   "$PUMP_BIN" \
+    --fuse-bin       "$FUSE_BIN" \
+    --host-exec-bin  "$HOST_EXEC_BIN" \
+    --init-sh        "$REPO_ROOT/packaging/vm-base/init.sh" \
+    --out            "$OUT_IMG"
 
 echo "==> rebaked initrd: $OUT_IMG ($(stat -c%s "$OUT_IMG" 2>/dev/null || stat -f%z "$OUT_IMG") bytes)"
 
