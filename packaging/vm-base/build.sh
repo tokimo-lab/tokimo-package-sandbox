@@ -569,15 +569,29 @@ echo "    rootfs.tar: $(du -sh "$ROOTFS_TAR" | cut -f1)"
 mkdir -p "$ROOTFS_DIR"
 # IMPORTANT: --numeric-owner so we keep the docker container's uid space
 # (notably tokimo=1000), NOT --no-same-owner which would re-stamp every
-# file to the invoking host user's uid. Run this script as root (or via
-# sudo) when you want exact ownership; under unprivileged extraction the
-# kernel silently squashes ownership to the caller anyway.
-tar -xpf "$ROOTFS_TAR" \
-  -C "$ROOTFS_DIR" \
-  --numeric-owner \
-  --exclude='./dev/*' \
-  --exclude='./proc/*' \
-  --exclude='./sys/*'
+# file to the invoking host user's uid.
+#
+# Crucially this MUST run as root on the host: even with --numeric-owner,
+# an unprivileged tar silently drops uid/gid down to the invoking user
+# (the kernel rejects chown). On GitHub-hosted runners the default
+# `runner` user is uid=1001, which collides with our requirement that
+# /home/tokimo files stay uid=1000. The downstream packaging steps
+# (vm.yml: tar -cpf the rootfs, mount+cp -a into rootfs.vhdx) preserve
+# whatever ownership ROOTFS_DIR has, so the wrong uid here propagates
+# all the way into the published Windows VHDX. Run this script as root,
+# or via sudo, so extraction preserves the docker uids exactly.
+TAR_CMD=(tar --numeric-owner -xpf "$ROOTFS_TAR" -C "$ROOTFS_DIR"
+  --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*')
+if [[ "$(id -u)" -eq 0 ]]; then
+    "${TAR_CMD[@]}"
+elif command -v sudo >/dev/null 2>&1; then
+    echo "    extracting as root (preserves uid=1000 for tokimo); sudo may prompt"
+    sudo "${TAR_CMD[@]}"
+else
+    echo "ERROR: rootfs extraction requires root to preserve uid=1000;" >&2
+    echo "       no sudo available. Re-run as root." >&2
+    exit 1
+fi
 
 # Remove kernel files from rootfs (already extracted above)
 rm -f "$ROOTFS_DIR"/boot/vmlinuz-* "$ROOTFS_DIR"/boot/initrd.img-* "$ROOTFS_DIR"/boot/System.map-* "$ROOTFS_DIR"/boot/config-* 2>/dev/null || true

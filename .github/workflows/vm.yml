@@ -95,7 +95,12 @@ jobs:
       - name: Package rootfs tarball
         run: |
           SFX=${{ matrix.suffix }}
-          tar -cpf "tokimo-linux-rootfs-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs" .
+          # build.sh extracted the rootfs as root (so tokimo=1000 is
+          # preserved); read it back as root and write the tar with
+          # --numeric-owner so the published archive ships with the
+          # exact uid/gid set, independent of the consumer's passwd db.
+          sudo tar --numeric-owner -cpf "tokimo-linux-rootfs-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}/rootfs" .
+          sudo chown "$USER:$USER" "tokimo-linux-rootfs-${SFX}.tar"
           zstd -10 -T0 "tokimo-linux-rootfs-${SFX}.tar" -o "tokimo-linux-rootfs-${SFX}.tar.zst"
           sha256sum "tokimo-linux-rootfs-${SFX}.tar.zst" > "tokimo-linux-rootfs-${SFX}.tar.zst.sha256"
           rm "tokimo-linux-rootfs-${SFX}.tar"
