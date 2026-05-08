@@ -178,6 +178,26 @@ fi
 # /run/tk-sandbox/control.sock if it falls back to that path.
 /bin/busybox mkdir -p /newroot/run/tk-sandbox 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Populate /etc/hosts + /etc/hostname inside the rootfs.
+#
+# These files are 0-byte stubs in the exported tarball because docker
+# bind-mounts both during `docker run`, so any writes from build.sh
+# never reach the underlying ext4. We instead materialise them here,
+# at boot, just before chroot. Without /etc/hosts containing "(none)"
+# (the kernel's default hostname when nothing has called sethostname()),
+# `sudo` aborts with `unable to resolve host (none)`. We also set the
+# kernel hostname so /proc/sys/kernel/hostname returns something sane.
+# ---------------------------------------------------------------------------
+echo "TokimoOS" > /newroot/etc/hostname 2>/dev/null || true
+/bin/busybox chmod 0644 /newroot/etc/hostname 2>/dev/null || true
+cat > /newroot/etc/hosts <<'HOSTSEOF' 2>/dev/null || true
+127.0.0.1   localhost TokimoOS (none)
+::1         localhost ip6-localhost ip6-loopback
+HOSTSEOF
+/bin/busybox chmod 0644 /newroot/etc/hosts 2>/dev/null || true
+/bin/busybox hostname TokimoOS 2>/dev/null || true
+
 if [ "$SESSION_MODE" = 1 ]; then
     echo "tokimo-init: SESSION mode — exec'ing tokimo-sandbox-init under chroot" >/dev/kmsg 2>/dev/null || true
 

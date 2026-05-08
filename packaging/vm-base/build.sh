@@ -93,6 +93,15 @@ corepack enable
 
 groupadd -g 1000 tokimo
 useradd -m -u 1000 -g 1000 -s /bin/bash -d /home/tokimo tokimo
+# Debian's `useradd` writes `!` into /etc/shadow, which marks the account
+# as *locked*. PAM's `pam_unix.so account` step then refuses authorisation
+# even when sudoers says NOPASSWD, producing:
+#     sudo: account validation failure, is your account locked?
+#     sudo: a password is required
+# `passwd -d` clears the password field entirely, leaving the account
+# unlocked but un-loginnable with a password — exactly what we want for a
+# sandboxed workspace.
+passwd -d tokimo
 
 # Passwordless sudo for the `tokimo` user.
 #  - macOS VZ / Windows HCS modes: real Linux root inside the VM, sudo
@@ -151,13 +160,14 @@ npm config set --global registry https://registry.npmmirror.com
 
 echo "TokimoOS" > /etc/hostname
 
-# /etc/hosts must resolve the kernel's default hostname "(none)" too,
-# because nothing in our boot path calls sethostname() before sudo runs;
-# without it sudo aborts with "unable to resolve host (none)".
-cat > /etc/hosts << 'HOSTSEOF'
-127.0.0.1   localhost TokimoOS (none)
-::1         localhost ip6-localhost ip6-loopback
-HOSTSEOF
+# NOTE: `/etc/hostname` and `/etc/hosts` writes inside docker do NOT
+# persist into the exported tarball — docker bind-mounts both files
+# from its own state for the duration of the container, so what we
+# write here lands on the bind, not on the underlying ext4. The real
+# /etc/hosts and /etc/hostname inside the rootfs therefore stay 0-byte
+# stubs created by debootstrap. Both files are populated at boot by
+# packaging/vm-base/init.sh just before chroot — see the
+# `populate /etc/hosts + /etc/hostname` block there.
 
 cat > /etc/os-release << 'OSEOF'
 PRETTY_NAME="TokimoOS 1.0"
