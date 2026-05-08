@@ -44,7 +44,6 @@ impl TransportRecv for PipeRecv {
 // ---------------------------------------------------------------------------
 
 // Re-export shared types so existing call sites compile unchanged.
-pub use crate::init_client::{DrainedEvent, SpawnInfo};
 
 impl crate::init_client::InitClient<PipeSend> {
     /// Build a client from the bidirectional `OvPipe`. The pipe is split via

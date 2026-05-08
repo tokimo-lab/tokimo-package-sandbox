@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "windows")]
 
-pub use crate::init_client::{ChildEvents, DrainedEvent, SpawnInfo};
+// Re-exports for backward compatibility — used by downstream code.
 pub use crate::windows::init_transport::{InitReader, InitStdin, InitStream};
 
 /// Windows init client — `InitClient<PipeSend>` behind the original name.

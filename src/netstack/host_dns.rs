@@ -34,6 +34,7 @@ fn detect_platform() -> Option<SocketAddr> {
     windows_get_network_params()
 }
 
+#[cfg(unix)]
 fn parse_resolv_conf(path: &str) -> Option<SocketAddr> {
     let body = std::fs::read_to_string(path).ok()?;
     for line in body.lines() {
@@ -78,7 +79,7 @@ fn windows_get_network_params() -> Option<SocketAddr> {
         }
         let mut node: *const IP_ADDR_STRING = &(*info).DnsServerList;
         while !node.is_null() {
-            let s = (*node).IpAddress.String.as_ptr() as *const i8;
+            let s = (*node).IpAddress.String.as_ptr();
             let cstr = CStr::from_ptr(s);
             if let Ok(text) = cstr.to_str()
                 && let Ok(ip) = text.parse::<IpAddr>()
