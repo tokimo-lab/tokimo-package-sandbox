@@ -1828,10 +1828,10 @@ fn dispatcher_loop(
         for cid in to_close {
             let _ = init.close_child(&cid);
             // Use try_lock so we never block the dispatcher on teardown.
-            if let Ok(st) = shared.state.try_lock() {
-                if let Some(entry) = st.children.get(&cid) {
-                    entry.finished.store(true, Ordering::Relaxed);
-                }
+            if let Ok(st) = shared.state.try_lock()
+                && let Some(entry) = st.children.get(&cid)
+            {
+                entry.finished.store(true, Ordering::Relaxed);
             }
         }
     }

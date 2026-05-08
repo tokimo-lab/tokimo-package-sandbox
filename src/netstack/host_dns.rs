@@ -96,11 +96,11 @@ fn windows_get_network_params() -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[cfg(unix)]
     #[test]
     fn parses_nameserver() {
+        use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(tmp, "# comment").unwrap();
         writeln!(tmp, "nameserver 8.8.8.8").unwrap();
