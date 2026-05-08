@@ -28,6 +28,40 @@ use crate::error::{Error, Result};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Context passed to the host-exec callback when a guest command
+/// invokes a registered host bridge.
+#[derive(Debug, Clone)]
+pub struct HostExecCtx {
+    /// Basename used to invoke the bridge (e.g. `"docker"`).
+    pub command: String,
+    /// Full argv as supplied by the guest child (`argv[0]` is the
+    /// command basename — same as [`HostExecCtx::command`]).
+    pub argv: Vec<String>,
+    /// The guest child's environment at exec time (snapshot).
+    pub env: Vec<(String, String)>,
+    /// The guest child's cwd at exec time, if known.
+    pub cwd: Option<String>,
+}
+
+/// Action returned by the user callback to direct what the host-exec
+/// bridge should do for an invocation.
+#[derive(Debug, Clone)]
+pub enum HostExecAction {
+    /// Run a host-side process, pumping stdio to/from the guest child.
+    RunOnHost {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+    },
+    /// Reject the invocation with a fixed exit code; optional message
+    /// is written to the guest child's stderr.
+    Reject { exit_code: i32, message: Option<String> },
+}
+
+/// User callback registered via [`Sandbox::on_host_exec`]. Cheap to
+/// clone (`Arc`).
+pub type HostExecCallback = Arc<dyn Fn(HostExecCtx) -> HostExecAction + Send + Sync>;
+
 /// Network policy.
 ///
 /// Egress filtering is enforced at the host-side network gateway:
@@ -141,6 +175,14 @@ pub struct ConfigureParams {
     /// one-shot — no reconnect possible).
     #[serde(default)]
     pub session_id: String,
+
+    /// Initial set of host-bridged command names to register at boot
+    /// time (see [`Sandbox::add_host_command`] for the runtime variant).
+    /// Each name becomes a hardlink at
+    /// `/run/tokimo/host-bridge/<name>` inside the guest, prepended to
+    /// `PATH` for newly-spawned children.
+    #[serde(default, skip)]
+    pub host_commands: Vec<String>,
 }
 
 impl Default for ConfigureParams {
@@ -157,6 +199,7 @@ impl Default for ConfigureParams {
             conda_disk_path: None,
             api_probe_url: None,
             session_id: String::new(),
+            host_commands: Vec::new(),
         }
     }
 }
@@ -595,6 +638,57 @@ impl Sandbox {
             return Err(Error::validation("session name must not be empty"));
         }
         self.inner.stop_session(name)
+    }
+
+    // ---- Host-Exec Bridge -----------------------------------------------
+
+    /// Register a single host-bridged command. Creates a hardlink at
+    /// `/run/tokimo/host-bridge/<name>` in the guest pointing at
+    /// `tokimo-host-exec`, and prepends `/run/tokimo/host-bridge` to
+    /// `PATH` for newly-spawned guest children.
+    ///
+    /// Must be called after [`Sandbox::start_vm`].
+    pub fn add_host_command(&self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::validation("host command name must not be empty"));
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(Error::validation("host command name must not contain '/' or NUL"));
+        }
+        self.inner.add_host_command(name)
+    }
+
+    /// Remove a previously-registered host-bridged command.
+    pub fn remove_host_command(&self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::validation("host command name must not be empty"));
+        }
+        self.inner.remove_host_command(name)
+    }
+
+    /// Replace the full set of host-bridged commands atomically.
+    pub fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        for n in names {
+            if n.is_empty() {
+                return Err(Error::validation("host command name must not be empty"));
+            }
+            if n.contains('/') || n.contains('\0') {
+                return Err(Error::validation("host command name must not contain '/' or NUL"));
+            }
+        }
+        self.inner.set_host_commands(names)
+    }
+
+    /// Enumerate currently-registered host-bridged command names.
+    pub fn list_host_commands(&self) -> Result<Vec<String>> {
+        self.inner.list_host_commands()
+    }
+
+    /// Register the callback invoked when a guest child runs a
+    /// bridged command. Replaces any prior callback. Safe to call
+    /// before or after [`Sandbox::start_vm`].
+    pub fn on_host_exec(&self, cb: HostExecCallback) -> Result<()> {
+        self.inner.on_host_exec(cb)
     }
 }
 

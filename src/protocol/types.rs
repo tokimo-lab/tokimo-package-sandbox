@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// shape. Init's `Hello` reply MUST match the host's `Hello.protocol` exactly.
 ///
 /// History:
+///   * v5 — added host-exec bridge ops (`AddHostCommand`,
+///     `RemoveHostCommand`, `SetHostCommands`) for the PATH-shim host
+///     command bridge.
 ///   * v4 — replaced `MountNfs`/`UnmountNfs` with `MountFuse`/`UnmountFuse`.
 ///     macOS backend now serves dynamic mounts via FUSE-over-vsock instead
 ///     of in-process NFSv3 over smoltcp.
@@ -20,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///     dynamic and boot-time bidirectional mounts (replaced the old
 ///     virtio-fs `tokimo_dyn` pool + APFS-clone hack).
 ///   * v2 — initial public revision.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Maximum payload size (in bytes) of a single SEQPACKET message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -167,6 +170,15 @@ pub enum Op {
     /// Counterpart for `MountFuse`: `umount2(target, MNT_DETACH)` and
     /// signal/reap the child fuse process. Looks up by `name`.
     UnmountFuse { id: String, name: String },
+    /// Register a single host-bridged command. Init creates a hardlink
+    /// at `/run/tokimo/host-bridge/<name>` that points at the
+    /// `tokimo-host-exec` binary, and on first invocation prepends
+    /// `/run/tokimo/host-bridge` to `PATH` for newly-spawned children.
+    AddHostCommand { id: String, name: String },
+    /// Remove a single host-bridged command (unlink the hardlink).
+    RemoveHostCommand { id: String, name: String },
+    /// Replace the full set of host-bridged commands atomically.
+    SetHostCommands { id: String, names: Vec<String> },
 }
 
 fn default_true() -> bool {
@@ -285,5 +297,6 @@ pub fn default_features() -> Vec<String> {
         "unmount".into(),
         "dynamic_mount".into(),
         "fuse_mount".into(),
+        "host_exec".into(),
     ]
 }

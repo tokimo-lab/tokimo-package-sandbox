@@ -26,6 +26,8 @@ mod api;
 mod backend;
 mod error;
 pub mod fonts;
+pub mod host_exec;
+pub mod host_exec_protocol;
 pub mod init_client;
 mod platform;
 pub mod session_registry;
@@ -65,7 +67,8 @@ pub(crate) mod macos;
 pub(crate) mod windows;
 
 pub use api::{
-    ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox, SessionDetails, SessionSummary, ShellOpts,
+    ConfigureParams, Event, HostExecAction, HostExecCallback, HostExecCtx, JobId, Mount, NetworkPolicy, Sandbox,
+    SessionDetails, SessionSummary, ShellOpts,
 };
 pub use backend::SandboxBackend;
 pub use error::{Error, Result};

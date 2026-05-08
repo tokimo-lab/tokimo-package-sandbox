@@ -130,6 +130,10 @@ struct BwrapCli {
     /// userspace netstack. When present, init creates `tk0` inside the
     /// new netns and pumps Ethernet frames between `tk0` and this fd.
     net_fd: Option<i32>,
+    /// SEQPACKET socketpair end (host kept the other half) used to
+    /// relay accepted host-exec client fds back to the host via
+    /// SCM_RIGHTS.
+    host_exec_fd: Option<i32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -144,6 +148,8 @@ fn parse_bwrap_cli() -> Option<BwrapCli> {
             cli.control_fd = Some(v.parse().ok()?);
         } else if let Some(v) = a.strip_prefix("--net-fd=") {
             cli.net_fd = Some(v.parse().ok()?);
+        } else if let Some(v) = a.strip_prefix("--host-exec-fd=") {
+            cli.host_exec_fd = Some(v.parse().ok()?);
         } else if a == "--bringup-lo" {
             cli.bringup_lo = true;
         } else if a == "--mount-sysfs" {
@@ -337,6 +343,22 @@ fn run() -> Result<(), String> {
         let base_env = server::snapshot_base_env();
         let sigfd_owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(sigfd.as_raw_fd()) };
         std::mem::forget(sigfd);
+
+        // Optional: host-exec bridge listener. If the host passed
+        // `--host-exec-fd=N`, spawn a thread that accepts on
+        // `/run/tokimo/host-exec.sock` and forwards each accepted client
+        // fd back to the host via SCM_RIGHTS on the relay socket.
+        if let Some(relay_fd_raw) = cli.host_exec_fd {
+            // Clear CLOEXEC so the fd survives the bwrap pre_exec
+            // (we're already past exec but keep the invariant).
+            unsafe {
+                libc::fcntl(relay_fd_raw, libc::F_SETFD, 0);
+            }
+            if let Err(e) = spawn_host_exec_listener(relay_fd_raw) {
+                eprintln!("[tokimo-sandbox-init] WARN host-exec listener: {e}");
+            }
+        }
+
         eprintln!("[tokimo-sandbox-init] READY (bwrap, inherited fd {raw})");
         return server::run_loop_preconnected(client, sigfd_owned, base_env).map_err(|e| format!("event loop: {e}"));
     }
@@ -679,4 +701,67 @@ fn connect_vsock(port: u32) -> Result<OwnedFd, String> {
 #[cfg(target_os = "linux")]
 fn bringup_lo() -> Result<(), String> {
     tokimo_package_sandbox::ifreq::bringup_lo().map_err(|e| format!("bringup_lo: {e}"))
+}
+
+/// Spawn a listener thread that accepts connections from in-guest
+/// `tokimo-host-exec` clients on `/run/tokimo/host-exec.sock` and
+/// forwards each accepted client fd to the host (which keeps the
+/// other end of `relay_fd_raw`) via SCM_RIGHTS.
+///
+/// The relay fd is a SEQPACKET socketpair — one tiny zero-byte
+/// payload per fd is enough for the host to recvmsg cmsg.
+#[cfg(target_os = "linux")]
+fn spawn_host_exec_listener(relay_fd_raw: i32) -> Result<(), String> {
+    use nix::sys::socket::{ControlMessage, MsgFlags, accept, sendmsg};
+    use std::io::IoSlice;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+
+    const SOCK_PATH: &str = "/run/tokimo/host-exec.sock";
+    if let Some(parent) = std::path::Path::new(SOCK_PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(SOCK_PATH);
+
+    let listener = socket(AddressFamily::Unix, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
+        .map_err(|e| format!("socket(host-exec): {e}"))?;
+    let addr = UnixAddr::new(SOCK_PATH).map_err(|e| format!("UnixAddr {SOCK_PATH}: {e}"))?;
+    bind(listener.as_raw_fd(), &addr).map_err(|e| format!("bind {SOCK_PATH}: {e}"))?;
+    listen(&listener, Backlog::new(32).unwrap()).map_err(|e| format!("listen: {e}"))?;
+    // Make the socket world-accessible — the bridged commands run as whatever
+    // uid the user selected, not necessarily root.
+    let cpath = std::ffi::CString::new(SOCK_PATH).unwrap();
+    unsafe {
+        libc::chmod(cpath.as_ptr(), 0o666);
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("host-exec-accept".into())
+        .spawn(move || {
+            let _ = relay_fd_raw; // kept alive by closure capture
+            loop {
+                let cfd = match accept(listener.as_raw_fd()) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        eprintln!("[tokimo-sandbox-init] host-exec accept: {e}");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                };
+                // Send the new fd via SCM_RIGHTS over relay_fd_raw.
+                let payload = [0u8; 1];
+                let iov = [IoSlice::new(&payload)];
+                let fds = [cfd];
+                let cmsg = [ControlMessage::ScmRights(&fds)];
+                let relay = unsafe { BorrowedFd::borrow_raw(relay_fd_raw) };
+                if let Err(e) = sendmsg::<()>(relay.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None) {
+                    eprintln!("[tokimo-sandbox-init] host-exec sendmsg: {e}");
+                }
+                // Close our copy of the accepted fd; the host owns the other.
+                unsafe {
+                    libc::close(cfd);
+                }
+            }
+        })
+        .map_err(|e| format!("spawn host-exec thread: {e}"))?;
+    Ok(())
 }

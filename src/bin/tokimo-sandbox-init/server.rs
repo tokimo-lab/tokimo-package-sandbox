@@ -95,6 +95,12 @@ pub struct State {
     /// `umount2(target, MNT_DETACH)` and signal+reap the child.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fuse_mounts: HashMap<String, FuseMount>,
+    /// Currently-registered host-bridged command names (set by
+    /// AddHostCommand / RemoveHostCommand / SetHostCommands).
+    pub host_bridge_commands: HashSet<String>,
+    /// True once the bridge dir has been created and the path-prepend
+    /// has been applied to `effective_base_env`.
+    pub host_bridge_initialized: bool,
 }
 
 /// Per-mount state for a `tokimo-sandbox-fuse` child process.
@@ -188,6 +194,8 @@ fn run_loop_inner(
         client_slots: Vec::new(),
         transport,
         fuse_mounts: HashMap::new(),
+        host_bridge_commands: HashSet::new(),
+        host_bridge_initialized: false,
     };
 
     let mut shutdown = false;
@@ -854,6 +862,18 @@ fn handle_op(op: Op, client_fd: RawFd, state: &mut State, registry: &mio::Regist
         Op::UnmountFuse { id, name } => {
             handle_unmount_fuse(state, client_fd, id, name);
         }
+        Op::AddHostCommand { id, name } => {
+            let res = handle_add_host_command(state, &name);
+            ack(state, client_fd, id, res);
+        }
+        Op::RemoveHostCommand { id, name } => {
+            let res = handle_remove_host_command(state, &name);
+            ack(state, client_fd, id, res);
+        }
+        Op::SetHostCommands { id, names } => {
+            let res = handle_set_host_commands(state, &names);
+            ack(state, client_fd, id, res);
+        }
     }
 }
 
@@ -1054,6 +1074,113 @@ fn handle_unmount_fuse(state: &mut State, client_fd: RawFd, id: String, _name: S
 
 // 9p mount_one/mount_fs removed — Linux uses FUSE-over-socketpair now.
 
+// ---------------------------------------------------------------------------
+// Host-Exec Bridge: hardlink farm under /run/tokimo/host-bridge/
+// ---------------------------------------------------------------------------
+
+const HOST_BRIDGE_DIR: &str = "/run/tokimo/host-bridge";
+
+fn find_host_exec_binary() -> Option<String> {
+    for p in [
+        "/run/tokimo/bin/tokimo-host-exec",
+        "/bin/tokimo-host-exec",
+        "/usr/bin/tokimo-host-exec",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    // Also try the directory containing this init binary — that dir is
+    // bind-mounted into the bwrap container as a unit (see
+    // `linux/sandbox.rs --ro-bind {init_dir} {init_dir}`), so siblings
+    // of tokimo-sandbox-init are reachable at the same path.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let cand = parent.join("tokimo-host-exec");
+        if cand.exists() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn ensure_host_bridge_dir(state: &mut State) -> Result<(), ErrorReply> {
+    if !state.host_bridge_initialized {
+        if let Err(e) = std::fs::create_dir_all(HOST_BRIDGE_DIR)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("create {HOST_BRIDGE_DIR}: {e}"),
+            ));
+        }
+        state.host_bridge_initialized = true;
+    }
+    Ok(())
+}
+
+fn host_bridge_link_path(name: &str) -> String {
+    format!("{HOST_BRIDGE_DIR}/{name}")
+}
+
+fn handle_add_host_command(state: &mut State, name: &str) -> Result<(), ErrorReply> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(ErrorReply::new(ErrorCode::BadRequest, "invalid host command name"));
+    }
+    ensure_host_bridge_dir(state)?;
+    let target = find_host_exec_binary().ok_or_else(|| {
+        ErrorReply::new(
+            ErrorCode::Internal,
+            "tokimo-host-exec binary not found in /run/tokimo/bin, /bin, or /usr/bin",
+        )
+    })?;
+    let link = host_bridge_link_path(name);
+    // Best-effort idempotent: remove any pre-existing link.
+    let _ = std::fs::remove_file(&link);
+    if let Err(e) = std::fs::hard_link(&target, &link) {
+        // Hardlink may fail across mount boundaries; fall back to symlink.
+        if let Err(e2) = std::os::unix::fs::symlink(&target, &link) {
+            return Err(ErrorReply::new(
+                ErrorCode::Internal,
+                format!("hardlink {target} -> {link}: {e}; symlink also failed: {e2}"),
+            ));
+        }
+    }
+    state.host_bridge_commands.insert(name.to_string());
+    Ok(())
+}
+
+fn handle_remove_host_command(state: &mut State, name: &str) -> Result<(), ErrorReply> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(ErrorReply::new(ErrorCode::BadRequest, "invalid host command name"));
+    }
+    let link = host_bridge_link_path(name);
+    let _ = std::fs::remove_file(&link);
+    state.host_bridge_commands.remove(name);
+    Ok(())
+}
+
+fn handle_set_host_commands(state: &mut State, names: &[String]) -> Result<(), ErrorReply> {
+    for n in names {
+        if n.is_empty() || n.contains('/') || n.contains('\0') {
+            return Err(ErrorReply::new(ErrorCode::BadRequest, "invalid host command name"));
+        }
+    }
+    ensure_host_bridge_dir(state)?;
+    let new: HashSet<String> = names.iter().cloned().collect();
+    let to_remove: Vec<String> = state.host_bridge_commands.difference(&new).cloned().collect();
+    for n in to_remove {
+        let _ = std::fs::remove_file(host_bridge_link_path(&n));
+        state.host_bridge_commands.remove(&n);
+    }
+    let to_add: Vec<String> = new.difference(&state.host_bridge_commands).cloned().collect();
+    for n in to_add {
+        handle_add_host_command(state, &n)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_child(
     client_fd: RawFd,
@@ -1066,8 +1193,33 @@ fn spawn_child(
     stdio: StdioMode,
     kind: ChildKind,
 ) {
-    let env = merge_env(&state.base_env, &env_overlay);
+    let base = effective_base_env(state);
+    let env = merge_env(&base, &env_overlay);
     spawn_child_inner(client_fd, state, registry, id, argv, env, cwd, stdio, kind);
+}
+
+/// Always prepend `/run/tokimo/host-bridge` to `PATH`. Bash skips
+/// non-existent PATH entries silently, and prepending unconditionally
+/// means shells spawned before the first `add_host_command` (e.g. the
+/// default login shell at `start_vm`) will still find newly registered
+/// host commands without needing PATH to be reloaded.
+fn effective_base_env(state: &State) -> Vec<(String, String)> {
+    let _ = state.host_bridge_initialized; // kept for future use
+    let mut out = state.base_env.clone();
+    let mut found = false;
+    for (k, v) in out.iter_mut() {
+        if k == "PATH" {
+            if !v.split(':').any(|seg| seg == HOST_BRIDGE_DIR) {
+                *v = format!("{HOST_BRIDGE_DIR}:{v}");
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        out.push(("PATH".into(), format!("{HOST_BRIDGE_DIR}:/usr/bin:/bin")));
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1319,5 +1471,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::RemoveMountByName { .. } => "RemoveMountByName",
         Op::MountFuse { .. } => "MountFuse",
         Op::UnmountFuse { .. } => "UnmountFuse",
+        Op::AddHostCommand { .. } => "AddHostCommand",
+        Op::RemoveHostCommand { .. } => "RemoveHostCommand",
+        Op::SetHostCommands { .. } => "SetHostCommands",
     }
 }

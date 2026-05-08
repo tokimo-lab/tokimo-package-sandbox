@@ -288,6 +288,28 @@ impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
         }
         Ok(())
     }
+
+    // -- Host-Exec Bridge: forward to the resolved inner backend -----------
+
+    fn add_host_command(&self, name: &str) -> Result<()> {
+        self.get()?.add_host_command(name)
+    }
+
+    fn remove_host_command(&self, name: &str) -> Result<()> {
+        self.get()?.remove_host_command(name)
+    }
+
+    fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        self.get()?.set_host_commands(names)
+    }
+
+    fn list_host_commands(&self) -> Result<Vec<String>> {
+        self.get()?.list_host_commands()
+    }
+
+    fn on_host_exec(&self, cb: crate::api::HostExecCallback) -> Result<()> {
+        self.get()?.on_host_exec(cb)
+    }
 }
 
 #[cfg(test)]

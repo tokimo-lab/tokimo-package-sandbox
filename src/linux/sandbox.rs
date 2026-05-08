@@ -71,6 +71,16 @@ struct BackendState {
     /// Unix-millisecond timestamp captured when `start_vm` flips
     /// `running` to `true`. `None` until first successful start.
     started_at_unix_ms: Option<u64>,
+    /// Host-Exec Bridge state (Linux only).
+    host_exec_bridge: Option<Arc<crate::host_exec::HostExecBridge>>,
+    /// Set of host commands currently registered with the guest (mirror
+    /// of init's `host_bridge_commands`).
+    host_exec_commands: HashSet<String>,
+    /// Callback set via `on_host_exec`. Stored here so the user can set
+    /// it before `start_vm`; it's transferred into the bridge at
+    /// `start_vm` time. After start_vm, replacement goes through the
+    /// bridge directly.
+    host_exec_pending_callback: Option<crate::api::HostExecCallback>,
 }
 
 struct JobSpawnInfo {
@@ -99,6 +109,9 @@ impl Default for BackendState {
             debug_logging: false,
             netstack_shutdown: None,
             started_at_unix_ms: None,
+            host_exec_bridge: None,
+            host_exec_commands: HashSet::new(),
+            host_exec_pending_callback: None,
         }
     }
 }
@@ -202,6 +215,19 @@ impl SandboxBackend for LinuxBackend {
             (Some(h), Some(c))
         };
         let net_child_fd_raw = net_child_end.as_ref().map(|f| f.as_raw_fd());
+
+        // 1c. Third socketpair (SEQPACKET) for the Host-Exec Bridge. The
+        //     guest end is handed to init via `--host-exec-fd=N`; init
+        //     forwards each accepted `tokimo-host-exec` client fd back
+        //     to the host through this channel via SCM_RIGHTS.
+        let (he_host_end, he_child_end) = socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .map_err(|e| Error::other(format!("socketpair(SEQPACKET,host-exec): {e}")))?;
+        let he_child_fd_raw = he_child_end.as_raw_fd();
 
         // 2. Find the init binary.
         let init_path = find_init_binary()?;
@@ -371,6 +397,8 @@ impl SandboxBackend for LinuxBackend {
                 "/dev/stderr",
                 "--tmpfs",
                 "/tmp",
+                "--tmpfs",
+                "/run",
                 "--unshare-pid",
                 "--unshare-ipc",
                 "--unshare-uts",
@@ -456,6 +484,7 @@ impl SandboxBackend for LinuxBackend {
         if let Some(fd) = net_child_fd_raw {
             args.push(format!("--net-fd={fd}"));
         }
+        args.push(format!("--host-exec-fd={he_child_fd_raw}"));
         if bringup_lo {
             args.push("--bringup-lo".to_string());
         }
@@ -473,6 +502,7 @@ impl SandboxBackend for LinuxBackend {
         // in --ro-bind without disturbing it.
         let tail_len = 1 /* init_path */ + 1 /* "bwrap" */ + 1 /* --control-fd */
             + net_child_fd_raw.is_some() as usize
+            + 1 /* --host-exec-fd */
             + bringup_lo as usize + mount_sysfs as usize;
         // The `--` separator sits before the tail; insert --ro-bind in
         // front of it.
@@ -489,6 +519,7 @@ impl SandboxBackend for LinuxBackend {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let net_child_fd_for_pre_exec = net_child_fd_raw;
+        let he_child_fd_for_pre_exec = he_child_fd_raw;
         unsafe {
             cmd.pre_exec(move || {
                 let r = libc::fcntl(child_fd_raw, libc::F_SETFD, 0);
@@ -501,6 +532,10 @@ impl SandboxBackend for LinuxBackend {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
+                let r = libc::fcntl(he_child_fd_for_pre_exec, libc::F_SETFD, 0);
+                if r == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -510,6 +545,7 @@ impl SandboxBackend for LinuxBackend {
         //    control fd; net_host_end (if any) feeds the netstack thread.
         drop(child_end);
         drop(net_child_end);
+        drop(he_child_end);
 
         let bwrap_pid = child.id();
         g.bwrap_child = Some(child);
@@ -559,6 +595,35 @@ impl SandboxBackend for LinuxBackend {
         init_client
             .hello()
             .map_err(|e| Error::other(format!("init hello failed: {e}")))?;
+
+        // 6a. Host-Exec Bridge — start SCM_RIGHTS relay loop on the
+        //     host end of the host-exec socketpair. Init forwards
+        //     each accepted `tokimo-host-exec` client fd back to us
+        //     here, which we then dispatch to the `HostExecCallback`.
+        let host_exec_callback: crate::api::HostExecCallback = {
+            let saved = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|mut g| g.host_exec_pending_callback.take());
+            saved.unwrap_or_else(|| {
+                Arc::new(|ctx: crate::api::HostExecCtx| crate::api::HostExecAction::RunOnHost {
+                    argv: ctx.argv,
+                    env: ctx.env,
+                    cwd: ctx.cwd,
+                })
+            })
+        };
+        let bridge = crate::host_exec::HostExecBridge::new(host_exec_callback);
+        let bridge = Arc::new(bridge);
+        bridge.start_linux_relay(he_host_end);
+
+        // If the user pre-declared host_commands, register them now.
+        if !config.host_commands.is_empty() {
+            init_client
+                .set_host_commands(&config.host_commands)
+                .map_err(|e| Error::other(format!("set_host_commands: {e}")))?;
+        }
 
         // 6b. FUSE host — register backends and send MountFuse for each
         //     boot-time share. Each mount gets its own socketpair:
@@ -681,6 +746,8 @@ impl SandboxBackend for LinuxBackend {
         );
         g.child_to_job.insert(shell_info.child_id.clone(), shell_job_id.clone());
         g.shell_job_id = Some(shell_job_id);
+        g.host_exec_bridge = Some(Arc::clone(&bridge));
+        g.host_exec_commands = config.host_commands.iter().cloned().collect();
         drop(g);
 
         // 8. Start event pump.
@@ -1185,6 +1252,71 @@ impl SandboxBackend for LinuxBackend {
             return Ok(());
         }
         self.stop_vm()
+    }
+
+    // -- Host-Exec Bridge -------------------------------------------------
+
+    fn add_host_command(&self, name: &str) -> Result<()> {
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            g.init_client
+                .clone()
+                .ok_or_else(|| Error::other("sandbox not started"))?
+        };
+        client
+            .add_host_command(name)
+            .map_err(|e| Error::other(format!("add_host_command: {e}")))?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.host_exec_commands.insert(name.to_string());
+        Ok(())
+    }
+
+    fn remove_host_command(&self, name: &str) -> Result<()> {
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            g.init_client
+                .clone()
+                .ok_or_else(|| Error::other("sandbox not started"))?
+        };
+        client
+            .remove_host_command(name)
+            .map_err(|e| Error::other(format!("remove_host_command: {e}")))?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.host_exec_commands.remove(name);
+        Ok(())
+    }
+
+    fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        let client = {
+            let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+            g.init_client
+                .clone()
+                .ok_or_else(|| Error::other("sandbox not started"))?
+        };
+        client
+            .set_host_commands(names)
+            .map_err(|e| Error::other(format!("set_host_commands: {e}")))?;
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        g.host_exec_commands = names.iter().cloned().collect();
+        Ok(())
+    }
+
+    fn list_host_commands(&self) -> Result<Vec<String>> {
+        let g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        let mut v: Vec<String> = g.host_exec_commands.iter().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    fn on_host_exec(&self, cb: crate::api::HostExecCallback) -> Result<()> {
+        let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
+        if let Some(b) = g.host_exec_bridge.as_ref() {
+            b.set_callback(cb);
+        } else {
+            // Sandbox not started yet; stash for later.
+            g.host_exec_pending_callback = Some(cb);
+        }
+        Ok(())
     }
 }
 

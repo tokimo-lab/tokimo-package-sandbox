@@ -430,6 +430,35 @@ impl<S: TransportSend> InitClient<S> {
         self.ack_op(&id, op)
     }
 
+    // -- Host-Exec Bridge ---------------------------------------------------
+
+    pub fn add_host_command(&self, name: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::AddHostCommand {
+            id: id.clone(),
+            name: name.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    pub fn remove_host_command(&self, name: &str) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::RemoveHostCommand {
+            id: id.clone(),
+            name: name.into(),
+        };
+        self.ack_op(&id, op)
+    }
+
+    pub fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        let id = next_id(&self.inner.counter);
+        let op = Op::SetHostCommands {
+            id: id.clone(),
+            names: names.to_vec(),
+        };
+        self.ack_op(&id, op)
+    }
+
     // -- Event drain --------------------------------------------------------
 
     pub fn drain_stdout(&self, child_id: &str) -> Vec<Vec<u8>> {

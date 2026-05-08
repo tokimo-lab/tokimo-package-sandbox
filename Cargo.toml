@@ -101,6 +101,10 @@ path = "src/bin/tokimo-tun-pump/main.rs"
 name = "tokimo-sandbox-fuse"
 path = "src/bin/tokimo-sandbox-fuse/main.rs"
 
+[[bin]]
+name = "tokimo-host-exec"
+path = "src/bin/tokimo-host-exec/main.rs"
+
 [[bench]]
 name = "vfs_wire"
 harness = false

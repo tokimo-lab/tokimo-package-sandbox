@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
-use crate::error::Result;
+use crate::api::{ConfigureParams, Event, HostExecCallback, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
+use crate::error::{Error, Result};
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
 ///
@@ -62,4 +62,22 @@ pub trait SandboxBackend: Send + Sync + 'static {
     fn session_info(&self, name: &str) -> Result<Option<SessionDetails>>;
     /// Force-stop a session by name, idempotent.
     fn stop_session(&self, name: &str) -> Result<()>;
+
+    // -- Host-Exec Bridge ---------------------------------------------
+
+    fn add_host_command(&self, _name: &str) -> Result<()> {
+        Err(Error::other("host-exec bridge not implemented on this backend"))
+    }
+    fn remove_host_command(&self, _name: &str) -> Result<()> {
+        Err(Error::other("host-exec bridge not implemented on this backend"))
+    }
+    fn set_host_commands(&self, _names: &[String]) -> Result<()> {
+        Err(Error::other("host-exec bridge not implemented on this backend"))
+    }
+    fn list_host_commands(&self) -> Result<Vec<String>> {
+        Err(Error::other("host-exec bridge not implemented on this backend"))
+    }
+    fn on_host_exec(&self, _cb: HostExecCallback) -> Result<()> {
+        Err(Error::other("host-exec bridge not implemented on this backend"))
+    }
 }
