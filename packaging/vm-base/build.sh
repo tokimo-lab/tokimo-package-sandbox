@@ -131,6 +131,30 @@ grep -q '^@includedir /etc/sudoers.d' /etc/sudoers || \
 chown root:root /usr/bin/sudo
 chmod 4755 /usr/bin/sudo
 
+# /etc/pam.d/sudo: short-circuit the entire PAM stack.
+#
+# Debian's default chain pulls in common-{auth,account,session-noninteractive}
+# which run pam_unix.so against /etc/shadow. pam_unix's account step
+# reads the password field and treats *anything* starting with '!' or
+# '*' (including the bare "*" we set with `usermod -p '*'`) as a
+# disabled / locked account, producing:
+#     sudo: account validation failure, is your account locked?
+#     sudo: a password is required
+# In a sandbox there's no real authentication boundary — the shell
+# already runs as the only intended user — so collapse all three
+# stacks to pam_permit.so. Sudoers' rule (NOPASSWD: ALL) remains the
+# real authorisation policy.
+cat > /etc/pam.d/sudo <<'PAMEOF'
+#%PAM-1.0
+# tokimo sandbox: bypass PAM entirely; sudoers is the policy of record.
+auth     sufficient pam_permit.so
+account  sufficient pam_permit.so
+session  sufficient pam_permit.so
+PAMEOF
+chmod 0644 /etc/pam.d/sudo
+# sudo-i wraps with -i flag; same policy applies.
+cp /etc/pam.d/sudo /etc/pam.d/sudo-i 2>/dev/null || true
+
 # Use upstream npm registry for the install itself (fast on overseas CI).
 npm config set --global prefix /home/tokimo
 npm install -g pnpm docx pptxgenjs
