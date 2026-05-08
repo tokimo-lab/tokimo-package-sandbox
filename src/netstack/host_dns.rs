@@ -98,6 +98,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[cfg(unix)]
     #[test]
     fn parses_nameserver() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
