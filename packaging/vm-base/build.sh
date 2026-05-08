@@ -151,6 +151,14 @@ npm config set --global registry https://registry.npmmirror.com
 
 echo "TokimoOS" > /etc/hostname
 
+# /etc/hosts must resolve the kernel's default hostname "(none)" too,
+# because nothing in our boot path calls sethostname() before sudo runs;
+# without it sudo aborts with "unable to resolve host (none)".
+cat > /etc/hosts << 'HOSTSEOF'
+127.0.0.1   localhost TokimoOS (none)
+::1         localhost ip6-localhost ip6-loopback
+HOSTSEOF
+
 cat > /etc/os-release << 'OSEOF'
 PRETTY_NAME="TokimoOS 1.0"
 NAME="TokimoOS"
@@ -264,7 +272,9 @@ rm -rf /usr/share/debianutils /usr/share/base-files /usr/share/base-passwd
 rm -rf /usr/share/gdb /usr/share/gitweb /usr/share/tabset
 rm -rf /usr/share/python-wheels
 
-rm -rf /etc/pam.d /etc/pam.conf /etc/security /usr/share/pam*
+# NOTE: do NOT remove /etc/pam.d, /etc/security or /usr/share/pam — sudo
+# is PAM-aware and aborts with "unable to initialize PAM" without them.
+# /var/lib/pam is just runtime state and safe to drop.
 rm -rf /var/lib/pam
 rm -rf /etc/cron* /etc/logrotate.d /etc/logcheck /etc/default /etc/skel
 rm -rf /usr/lib/lsb /usr/lib/valgrind /usr/lib/mime
