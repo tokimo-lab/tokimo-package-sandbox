@@ -84,6 +84,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   busybox-static \
   gcc libc6-dev \
   kmod \
+  sudo \
   $KERNEL_PKG
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
@@ -92,6 +93,28 @@ corepack enable
 
 groupadd -g 1000 tokimo
 useradd -m -u 1000 -g 1000 -s /bin/bash -d /home/tokimo tokimo
+
+# Passwordless sudo for the `tokimo` user.
+#  - macOS VZ / Windows HCS modes: real Linux root inside the VM, sudo
+#    elevates from uid=1000 → uid=0 via SUID as usual.
+#  - Linux bwrap mode: by default the host uid is mapped to root inside
+#    the user_ns, so `sudo whoami` already returns root without elevation;
+#    sudo simply re-execs the command preserving env. The binary must
+#    still be present so `sudo apt-get …` style scripts don't ENOENT.
+mkdir -p /etc/sudoers.d
+cat > /etc/sudoers.d/tokimo <<'SUDOERS'
+tokimo ALL=(ALL:ALL) NOPASSWD: ALL
+Defaults:tokimo !requiretty
+SUDOERS
+chmod 0440 /etc/sudoers.d/tokimo
+# Make sure /etc/sudoers itself includes the drop-in dir (Debian default
+# already does, but be explicit so a stripped-down build keeps working).
+grep -q '^@includedir /etc/sudoers.d' /etc/sudoers || \
+    echo '@includedir /etc/sudoers.d' >> /etc/sudoers
+# `sudo` must remain SUID root (apt may have stripped it under
+# unprivileged builds). Re-assert the bits explicitly.
+chown root:root /usr/bin/sudo
+chmod 4755 /usr/bin/sudo
 
 # Use upstream npm registry for the install itself (fast on overseas CI).
 npm config set --global prefix /home/tokimo
@@ -544,10 +567,14 @@ docker export "$CONTAINER_NAME" -o "$ROOTFS_TAR"
 echo "    rootfs.tar: $(du -sh "$ROOTFS_TAR" | cut -f1)"
 
 mkdir -p "$ROOTFS_DIR"
+# IMPORTANT: --numeric-owner so we keep the docker container's uid space
+# (notably tokimo=1000), NOT --no-same-owner which would re-stamp every
+# file to the invoking host user's uid. Run this script as root (or via
+# sudo) when you want exact ownership; under unprivileged extraction the
+# kernel silently squashes ownership to the caller anyway.
 tar -xpf "$ROOTFS_TAR" \
   -C "$ROOTFS_DIR" \
   --numeric-owner \
-  --no-same-owner \
   --exclude='./dev/*' \
   --exclude='./proc/*' \
   --exclude='./sys/*'

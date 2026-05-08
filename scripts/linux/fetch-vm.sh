@@ -113,12 +113,40 @@ tar -xf "$WORK/kernel.tar" -C "$VM_DIR" vmlinuz initrd.img
 dl "$ROOTFS_BASE/$ROOTFS_ASSET" "$WORK/$ROOTFS_ASSET"
 zstd -d -f "$WORK/$ROOTFS_ASSET" -o "$WORK/rootfs.tar"
 
-rm -rf "$VM_DIR/rootfs"
+if [[ -e "$VM_DIR/rootfs" ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
+        rm -rf "$VM_DIR/rootfs"
+    elif ! rm -rf "$VM_DIR/rootfs" 2>/dev/null; then
+        # Previous extraction may have created root-owned files.
+        sudo rm -rf "$VM_DIR/rootfs"
+    fi
+fi
 mkdir -p "$VM_DIR/rootfs"
-# rootfs tar uses absolute device files (etc/ already preserves perms);
-# extract as the current user — the sandbox doesn't care about ownership
-# at runtime since bwrap binds it read-only.
-tar -xpf "$WORK/rootfs.tar" -C "$VM_DIR/rootfs"
+# rootfs.tar carries numeric uid/gid (notably tokimo=1000 / root=0).
+# Preserving them matters because:
+#   - the rootfs ships /etc/passwd with `tokimo:x:1000:1000:…`; if the
+#     extraction renumbers files to the host user's uid (e.g. 1001) then
+#     the tokimo account owns nothing in /home/tokimo, sudo's group
+#     membership lookups break, and macOS/Windows VM modes (which boot
+#     this rootfs as a real Linux root) end up with mismatched owners.
+#   - `tar -xpf` as a non-root user silently *drops* ownership and writes
+#     everything as the invoking uid, which is exactly the regression
+#     we're guarding against here.
+# So extract as root with --numeric-owner. Fall back to sudo if available.
+if [[ "$(id -u)" -eq 0 ]]; then
+    tar --numeric-owner -xpf "$WORK/rootfs.tar" -C "$VM_DIR/rootfs"
+elif command -v sudo >/dev/null 2>&1; then
+    echo "==> extracting rootfs as root (preserves uid=1000 for tokimo); sudo may prompt"
+    sudo tar --numeric-owner -xpf "$WORK/rootfs.tar" -C "$VM_DIR/rootfs"
+    # Make the tree at least readable to the invoking user so subsequent
+    # tooling (e.g. `cargo test`, fetch-vm.sh -f) can rm -rf it without
+    # another sudo prompt.
+    sudo chmod -R u+rwX,go+rX "$VM_DIR/rootfs" || true
+else
+    echo "ERROR: extracting rootfs requires root to preserve uid=1000 ownership," >&2
+    echo "       and 'sudo' was not found. Re-run as root or install sudo." >&2
+    exit 1
+fi
 
 echo
 echo "Done. .vm/base contents:"
