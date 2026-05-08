@@ -55,13 +55,13 @@ mod linux {
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fuser::{
-        FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-        ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, consts,
+        FileAttr, FileType, Filesystem, KernelConfig, MountOption, Notifier, ReplyAttr, ReplyData, ReplyDirectory,
+        ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, Session, consts,
     };
     use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
     use tokimo_package_sandbox::vfs_protocol::{AttrOut, EntryOut, Frame, NodeKind, Req, Res, StatfsOut, WireError};
@@ -179,8 +179,45 @@ mod linux {
         let dispatch_handle = dispatcher.clone().spawn_reader();
 
         // Build FUSE filesystem and mount.
+        //
+        // Background invalidator thread: rename() (and any other op that
+        // needs FUSE_NOTIFY_INVAL_ENTRY) cannot send the notification
+        // inline — the calling fuse worker thread is holding state that
+        // the kernel needs in order to process the notification, which
+        // deadlocks. We spawn a dedicated thread that drains a channel
+        // and forwards each entry to `Notifier::inval_entry`. The
+        // notifier is plumbed in via Arc<OnceLock<_>> after Session::new.
+        let (inval_tx, inval_rx) = mpsc::channel::<InvalEntry>();
+        let notifier_cell: Arc<OnceLock<Notifier>> = Arc::new(OnceLock::new());
+        let inval_notifier = notifier_cell.clone();
+        let inval_handle = std::thread::Builder::new()
+            .name("tokimo-fuse-inval".into())
+            .spawn(move || {
+                // Wait for the notifier to be installed by the main
+                // thread — fuser only exposes Session::notifier() AFTER
+                // Session::new returns. A short spin is fine; in
+                // practice it's filled within microseconds.
+                let n = loop {
+                    if let Some(n) = inval_notifier.get() {
+                        break n.clone();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                while let Ok(InvalEntry { parent, name }) = inval_rx.recv() {
+                    // ENOENT here just means the kernel had no cached
+                    // entry to drop — that's the harmless common case.
+                    if let Err(e) = n.inval_entry(parent, &name)
+                        && e.raw_os_error() != Some(libc::ENOENT)
+                    {
+                        eprintln!("[tokimo-fuse] inval_entry(parent={parent}, name={name:?}) failed: {e}");
+                    }
+                }
+            })
+            .expect("spawn invalidator thread");
+
         let fs = FuseBridge {
             dispatcher: dispatcher.clone(),
+            inval_tx: inval_tx.clone(),
         };
         let mut opts = vec![
             MountOption::FSName(format!("tokimo-{}", args.mount_name)),
@@ -202,14 +239,32 @@ mod linux {
             return ExitCode::from(5);
         }
 
-        match fuser::mount2(fs, &args.target, &opts) {
+        // We use Session::new (instead of fuser::mount2) so we can grab a
+        // Notifier handle and push FUSE_NOTIFY_INVAL_ENTRY messages after
+        // ops that the kernel does not auto-invalidate.
+        let mut session = match Session::new(fs, &args.target, &opts) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[tokimo-fuse] Session::new: {e}");
+                return ExitCode::from(6);
+            }
+        };
+        let _ = notifier_cell.set(session.notifier());
+
+        let run_res = session.run();
+        // Drop our send side so the invalidator thread observes channel
+        // close and exits.
+        drop(inval_tx);
+        let _ = inval_handle.join();
+
+        match run_res {
             Ok(()) => {
                 eprintln!("[tokimo-fuse] unmounted cleanly");
                 let _ = dispatch_handle.join();
                 ExitCode::from(0)
             }
             Err(e) => {
-                eprintln!("[tokimo-fuse] mount2: {e}");
+                eprintln!("[tokimo-fuse] session.run: {e}");
                 ExitCode::from(6)
             }
         }
@@ -359,8 +414,21 @@ mod linux {
 
     // ---------- FUSE → wire bridge ----------
 
+    /// One unit of work for the background dentry-invalidator thread.
+    /// We push these from inside FUSE callbacks instead of calling
+    /// `Notifier::inval_entry` directly: the kernel holds the parent
+    /// directory's i_rwsem while a request such as FUSE_RENAME is in
+    /// flight, and `inval_entry` would re-enter the same rwsem on the
+    /// same fuse worker thread → D-state deadlock.
+    struct InvalEntry {
+        parent: u64,
+        name: std::ffi::OsString,
+    }
+
     struct FuseBridge {
         dispatcher: Arc<Dispatcher>,
+        /// Send-side of the background invalidator queue.
+        inval_tx: mpsc::Sender<InvalEntry>,
     }
 
     fn now_systime_to_secs() -> i64 {
@@ -753,11 +821,45 @@ mod linux {
             };
             match self.dispatcher.call(Req::Rename {
                 old_parent: parent,
-                old_name: on,
+                old_name: on.clone(),
                 new_parent: newparent,
-                new_name: nn,
+                new_name: nn.clone(),
             }) {
-                Res::Ok => reply.ok(),
+                Res::Ok => {
+                    // The kernel auto-handles the source dentry on a
+                    // successful FUSE_RENAME, but it does NOT invalidate
+                    // a previously cached *negative* dentry for the
+                    // destination name. Sequences like
+                    //
+                    //     stat("config")        // negative dentry cached
+                    //     write("config.lock")
+                    //     rename("config.lock","config")
+                    //     open("config")        // ENOENT — boom
+                    //
+                    // (which is exactly what `git init` and
+                    // `git_config_set` do) then fail with ENOENT or
+                    // produce stale data. We push an explicit
+                    // FUSE_NOTIFY_INVAL_ENTRY for the destination so
+                    // the kernel re-looks it up on the next access.
+                    //
+                    // CRITICAL: this MUST be sent off-thread. The
+                    // kernel holds the parent dir's i_rwsem while a
+                    // FUSE_RENAME is in flight, and inval_entry needs
+                    // the same lock — calling it from this worker
+                    // thread deadlocks both kernel-side (rwsem) and
+                    // userspace-side (Notifier blocks on the channel).
+                    let _ = self.inval_tx.send(InvalEntry {
+                        parent: newparent,
+                        name: newname.to_owned(),
+                    });
+                    if !(parent == newparent && name == newname) {
+                        let _ = self.inval_tx.send(InvalEntry {
+                            parent,
+                            name: name.to_owned(),
+                        });
+                    }
+                    reply.ok()
+                }
                 Res::Error(we) => reply.error(errno_of(&we)),
                 _ => reply.error(libc::EIO),
             }
