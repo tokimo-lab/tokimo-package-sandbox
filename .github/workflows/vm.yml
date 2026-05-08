@@ -75,19 +75,21 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools zstd cpio gzip qemu-utils zip
 
-      - name: Build guest binaries (init + tun-pump + fuse) musl static
+      - name: Build guest binaries (init + tun-pump + fuse + host-exec) musl static
         run: |
           cargo build --release --target ${{ matrix.rust_target }} \
             --bin tokimo-sandbox-init \
             --bin tokimo-tun-pump \
-            --bin tokimo-sandbox-fuse
+            --bin tokimo-sandbox-fuse \
+            --bin tokimo-host-exec
 
-      - name: Build base VM image (debootstrap + kernel + initrd) with init/tun-pump/fuse baked in
+      - name: Build base VM image (debootstrap + kernel + initrd) with init/tun-pump/fuse/host-exec baked in
         working-directory: packaging/vm-base
         env:
           TOKIMO_INIT_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-sandbox-init
           TOKIMO_TUN_PUMP_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-tun-pump
           TOKIMO_FUSE_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-sandbox-fuse
+          TOKIMO_HOST_EXEC_BIN: ${{ github.workspace }}/target/${{ matrix.rust_target }}/release/tokimo-host-exec
         run: bash build.sh ${{ matrix.arch }}
 
       - name: Package rootfs tarball

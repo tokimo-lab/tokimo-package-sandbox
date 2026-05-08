@@ -39,6 +39,7 @@ BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 i
 TOKIMO_INIT_BIN="${TOKIMO_INIT_BIN:-}"
 TOKIMO_TUN_PUMP_BIN="${TOKIMO_TUN_PUMP_BIN:-}"
 TOKIMO_FUSE_BIN="${TOKIMO_FUSE_BIN:-}"
+TOKIMO_HOST_EXEC_BIN="${TOKIMO_HOST_EXEC_BIN:-}"
 
 echo "==> [1/6] Cleaning old build..."
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
@@ -471,6 +472,22 @@ elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-sandbox-fuse" ]; then
     chmod +x "$INITRD_DIR/bin/tokimo-sandbox-fuse"
 else
     echo "    NOTE: tokimo-sandbox-fuse not provided; FUSE-over-vsock dynamic mounts disabled."
+fi
+
+# --- bake tokimo-host-exec (Linux-only static musl) into initrd ---
+# PATH-shim guest binary that bridges command invocations back to the
+# host over vsock (macOS/Windows) or socketpair (Linux). init.sh sets
+# up shims under /run/tokimo/host-bridge/ pointing at this binary.
+if [ -n "$TOKIMO_HOST_EXEC_BIN" ] && [ -f "$TOKIMO_HOST_EXEC_BIN" ]; then
+    echo "    embedding tokimo-host-exec: $TOKIMO_HOST_EXEC_BIN ($(du -sh "$TOKIMO_HOST_EXEC_BIN" | cut -f1))"
+    cp "$TOKIMO_HOST_EXEC_BIN" "$INITRD_DIR/bin/tokimo-host-exec"
+    chmod +x "$INITRD_DIR/bin/tokimo-host-exec"
+elif [ -f "$PROJECT_DIR/initrd-prep/tokimo-host-exec" ]; then
+    echo "    embedding tokimo-host-exec from initrd-prep/"
+    cp "$PROJECT_DIR/initrd-prep/tokimo-host-exec" "$INITRD_DIR/bin/tokimo-host-exec"
+    chmod +x "$INITRD_DIR/bin/tokimo-host-exec"
+else
+    echo "    NOTE: tokimo-host-exec not provided; Host-Exec Bridge disabled."
 fi
 
 # --- write /etc/tokimo-vm-info -------------------------------------------

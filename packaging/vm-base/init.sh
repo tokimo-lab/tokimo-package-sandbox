@@ -288,6 +288,7 @@ if [ "$SESSION_MODE" = 1 ]; then
     #   /bin/tokimo-sandbox-init
     #   /bin/tokimo-sandbox-fuse
     #   /bin/tokimo-tun-pump      (only invoked from the initrd side, before chroot)
+    #   /bin/tokimo-host-exec     (PATH-shim target for Host-Exec Bridge)
     if [ ! -x /bin/tokimo-sandbox-init ]; then
         echo "tokimo-init: /bin/tokimo-sandbox-init missing in initramfs" >/dev/kmsg 2>/dev/null || true
         /bin/busybox poweroff -f
