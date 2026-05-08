@@ -6,19 +6,20 @@
 #![cfg(target_os = "windows")]
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
+use crate::api::{ConfigureParams, Event, HostExecCallback, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
+use crate::host_exec::HostExecBridge;
 use crate::svc_protocol::{
-    AddMountParams, BoolValue, CreateDiskImageParams, IdParams, JobIdListResult, JobIdResult, ListSessionsResult,
-    RemoveMountParams, ResizeShellParams, SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams,
-    WriteStdinParams, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, HostCommandParams, IdParams, JobIdListResult, JobIdResult,
+    ListHostCommandsResult, ListSessionsResult, RemoveMountParams, ResizeShellParams, SessionInfoResult,
+    SessionNameParams, SetHostCommandsParams, SignalShellParams, SpawnShellParams, WriteStdinParams, method,
 };
 
 use super::client::PipeClient;
@@ -34,6 +35,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WindowsBackend {
     client: Arc<PipeClient>,
+    /// Active host-exec bridge (created in `start_vm`).
+    host_exec_bridge: Mutex<Option<Arc<HostExecBridge>>>,
+    /// Callback registered before `start_vm`; installed into the bridge
+    /// once it is created.
+    pending_host_exec_cb: Mutex<Option<HostExecCallback>>,
 }
 
 impl WindowsBackend {
@@ -41,6 +47,8 @@ impl WindowsBackend {
         let client = PipeClient::connect(CONNECT_TIMEOUT)?;
         Ok(Self {
             client: Arc::new(client),
+            host_exec_bridge: Mutex::new(None),
+            pending_host_exec_cb: Mutex::new(None),
         })
     }
 
@@ -63,11 +71,52 @@ impl SandboxBackend for WindowsBackend {
 
     fn start_vm(&self) -> Result<()> {
         self.call(method::START_VM, json!({}), BOOT_TIMEOUT)?;
+
+        // Build the bridge with either the pre-registered callback or a
+        // default no-op (which can be replaced later via `on_host_exec`).
+        let cb: HostExecCallback = {
+            let mut g = self.pending_host_exec_cb.lock().unwrap();
+            g.take().unwrap_or_else(|| {
+                Arc::new(|_ctx| crate::api::HostExecAction::Reject {
+                    exit_code: 127,
+                    message: Some("no host-exec callback registered".to_string()),
+                })
+            })
+        };
+        let bridge = Arc::new(HostExecBridge::new(cb));
+        *self.host_exec_bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        // Spawn internal subscriber thread: watches for EV_HOST_EXEC_ACCEPTED
+        // events emitted by the service, converts the duplicated handle to a
+        // TcpStream, and dispatches it to the bridge.
+        let bridge_for_thread = Arc::clone(&bridge);
+        let client_for_thread = Arc::clone(&self.client);
+        std::thread::spawn(move || {
+            let (tx, rx): (Sender<Event>, Receiver<Event>) = channel();
+            client_for_thread.subscribe(tx);
+            while let Ok(ev) = rx.recv() {
+                if let Event::Raw { method: m, params } = ev {
+                    if m == method::EV_HOST_EXEC_ACCEPTED {
+                        let handle = params.get("duplicated_handle").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if handle != 0 {
+                            use std::os::windows::io::FromRawSocket;
+                            let stream = unsafe { std::net::TcpStream::from_raw_socket(handle) };
+                            let b = Arc::clone(&bridge_for_thread);
+                            std::thread::spawn(move || b.handle_one_tcp(stream));
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 
     fn stop_vm(&self) -> Result<()> {
         self.call(method::STOP_VM, json!({}), LONG_CALL_TIMEOUT)?;
+        // Tear down the bridge so subsequent calls to on_host_exec store
+        // the callback in pending again.
+        *self.host_exec_bridge.lock().unwrap() = None;
         Ok(())
     }
 
@@ -184,9 +233,7 @@ impl SandboxBackend for WindowsBackend {
     }
 
     fn send_guest_response(&self, raw: Value) -> Result<()> {
-        // TODO: implement guest-side RPC response forwarding. For now the
-        // service rejects this; surface the rejection rather than silently
-        // succeeding so callers can adapt.
+        // TODO: implement guest-side RPC response forwarding.
         let _ = raw;
         Err(Error::not_implemented(
             "send_guest_response is not yet implemented on Windows",
@@ -225,6 +272,48 @@ impl SandboxBackend for WindowsBackend {
     fn stop_session(&self, name: &str) -> Result<()> {
         let p = SessionNameParams { name: name.to_string() };
         self.call(method::STOP_SESSION, serde_json::to_value(&p)?, LONG_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-exec bridge
+    // -----------------------------------------------------------------------
+
+    fn add_host_command(&self, name: &str) -> Result<()> {
+        let p = HostCommandParams { name: name.to_string() };
+        self.call(method::ADD_HOST_COMMAND, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn remove_host_command(&self, name: &str) -> Result<()> {
+        let p = HostCommandParams { name: name.to_string() };
+        self.call(
+            method::REMOVE_HOST_COMMAND,
+            serde_json::to_value(&p)?,
+            SHORT_CALL_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    fn set_host_commands(&self, names: &[String]) -> Result<()> {
+        let p = SetHostCommandsParams { names: names.to_vec() };
+        self.call(method::SET_HOST_COMMANDS, serde_json::to_value(&p)?, SHORT_CALL_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn list_host_commands(&self) -> Result<Vec<String>> {
+        let v = self.call(method::LIST_HOST_COMMANDS, json!({}), SHORT_CALL_TIMEOUT)?;
+        let r: ListHostCommandsResult = serde_json::from_value(v)?;
+        Ok(r.names)
+    }
+
+    fn on_host_exec(&self, cb: HostExecCallback) -> Result<()> {
+        // If the bridge is already live, update its callback directly.
+        if let Some(bridge) = self.host_exec_bridge.lock().unwrap().as_ref() {
+            bridge.set_callback(cb);
+        } else {
+            *self.pending_host_exec_cb.lock().unwrap() = Some(cb);
+        }
         Ok(())
     }
 }

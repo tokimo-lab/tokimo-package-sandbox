@@ -54,6 +54,17 @@ pub fn alloc_fuse_port() -> u32 {
     0x5000_0000 | (n & 0x00FF_FFFF)
 }
 
+/// Allocate a unique vsock port for the per-session host-exec bridge
+/// listener. The service binds on this port, and the guest's
+/// `tokimo-host-exec` binary dials in when a bridged command is invoked.
+pub fn alloc_host_exec_port() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 0x60000000 .. 0x60FFFFFF — distinct from init (0x40xxxxxx) and fuse (0x50xxxxxx).
+    0x6000_0000 | (n & 0x00FF_FFFF)
+}
+
 /// Build the HvSocket service GUID for a given vsock port.
 /// Hyper-V's mapping: GUID = `XXXXXXXX-FACB-11E6-BD58-64006A7986D3`,
 /// where `XXXXXXXX` is the vsock port in big-endian hex.
@@ -89,6 +100,7 @@ pub fn build_session_v2_ex(
     init_port: u32,
     fuse_port: u32,
     netstack_port: Option<u32>,
+    host_exec_port: Option<u32>,
 ) -> String {
     let kernel_s = strip_extended_prefix(kernel);
     let initrd_s = strip_extended_prefix(initrd);
@@ -128,6 +140,14 @@ pub fn build_session_v2_ex(
         });
         svc_table.insert(hvsock_service_id(p), net_entry);
     }
+    if let Some(p) = host_exec_port {
+        let he_entry = serde_json::json!({
+            "BindSecurityDescriptor":    "D:(A;;GA;;;WD)",
+            "ConnectSecurityDescriptor": "D:(A;;GA;;;WD)",
+            "AllowWildcardBinds": true
+        });
+        svc_table.insert(hvsock_service_id(p), he_entry);
+    }
     devices.insert(
         "HvSocket".into(),
         serde_json::json!({
@@ -156,12 +176,18 @@ pub fn build_session_v2_ex(
             "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
              tokimo.session=1 tokimo.init_port={init_port} \
              tokimo.fuse_port={fuse_port} \
-             tokimo.net=netstack tokimo.netstack_port={p}"
+             tokimo.net=netstack tokimo.netstack_port={p}{he}",
+            he = host_exec_port
+                .map(|hp| format!(" tokimo.host_exec_port={hp}"))
+                .unwrap_or_default()
         ),
         None => format!(
             "console=ttyS1 loglevel=7 root=/dev/sda rootfstype=ext4 rw \
              tokimo.session=1 tokimo.init_port={init_port} \
-             tokimo.fuse_port={fuse_port}"
+             tokimo.fuse_port={fuse_port}{he}",
+            he = host_exec_port
+                .map(|hp| format!(" tokimo.host_exec_port={hp}"))
+                .unwrap_or_default()
         ),
     };
 
@@ -224,7 +250,7 @@ mod tests {
     #[test]
     fn v2_schema_and_cmdline() {
         let (k, i, rootfs) = dummy_paths();
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, 1024, 2, 0x4000_0001, 0x5000_0001, None);
+        let s = build_session_v2_ex("id", &k, &i, &rootfs, 1024, 2, 0x4000_0001, 0x5000_0001, None, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // SCSI carries the persistent rootfs path.
@@ -259,7 +285,7 @@ mod tests {
     #[test]
     fn v2_topology_and_comports() {
         let (k, i, rootfs) = dummy_paths();
-        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, 4096, 8, 0x4000_00AB, 0x5000_00AB, None);
+        let s = build_session_v2_ex("vm-foo", &k, &i, &rootfs, 4096, 8, 0x4000_00AB, 0x5000_00AB, None, None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         assert_eq!(v["VirtualMachine"]["ComputeTopology"]["Memory"]["SizeInMB"], 4096);
@@ -283,7 +309,18 @@ mod tests {
     fn v2_with_netstack_port() {
         let (k, i, rootfs) = dummy_paths();
         let port: u32 = 0x4000_00CD;
-        let s = build_session_v2_ex("id", &k, &i, &rootfs, 1024, 2, 0x4000_0002, 0x5000_0002, Some(port));
+        let s = build_session_v2_ex(
+            "id",
+            &k,
+            &i,
+            &rootfs,
+            1024,
+            2,
+            0x4000_0002,
+            0x5000_0002,
+            Some(port),
+            None,
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
         // Cmdline must select netstack mode and carry the port.
@@ -333,5 +370,52 @@ mod tests {
         assert_ne!(init, fuse);
         assert_eq!(init & 0xFF00_0000, 0x4000_0000);
         assert_eq!(fuse & 0xFF00_0000, 0x5000_0000);
+    }
+
+    #[test]
+    fn alloc_host_exec_port_is_in_range_and_unique() {
+        let a = alloc_host_exec_port();
+        let b = alloc_host_exec_port();
+        assert_ne!(a, b);
+        for p in [a, b] {
+            assert_eq!(p & 0xFF00_0000, 0x6000_0000, "host_exec port {p:#x} out of range");
+        }
+    }
+
+    #[test]
+    fn v2_with_host_exec_port() {
+        let (k, i, rootfs) = dummy_paths();
+        let he_port: u32 = 0x6000_0001;
+        let s = build_session_v2_ex(
+            "id",
+            &k,
+            &i,
+            &rootfs,
+            1024,
+            2,
+            0x4000_0003,
+            0x5000_0003,
+            None,
+            Some(he_port),
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        // Cmdline must carry the host_exec_port.
+        let cmdline = v["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelCmdLine"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmdline.contains(&format!("tokimo.host_exec_port={he_port}")),
+            "cmdline missing host_exec_port: {cmdline}"
+        );
+
+        // ServiceTable must register the host_exec service id.
+        let table = v["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
+            .as_object()
+            .unwrap();
+        assert!(
+            table.contains_key(&hvsock_service_id(he_port)),
+            "ServiceTable missing host_exec guid"
+        );
     }
 }

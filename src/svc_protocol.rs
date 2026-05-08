@@ -113,6 +113,12 @@ pub mod method {
     pub const SESSION_INFO: &str = "sessionInfo";
     pub const STOP_SESSION: &str = "stopSession";
 
+    // Host-Exec Bridge ops
+    pub const ADD_HOST_COMMAND: &str = "addHostCommand";
+    pub const REMOVE_HOST_COMMAND: &str = "removeHostCommand";
+    pub const SET_HOST_COMMANDS: &str = "setHostCommands";
+    pub const LIST_HOST_COMMANDS: &str = "listHostCommands";
+
     // Event names (service → client)
     pub const EV_STDOUT: &str = "stdout";
     pub const EV_STDERR: &str = "stderr";
@@ -122,6 +128,11 @@ pub mod method {
     pub const EV_GUEST_CONNECTED: &str = "guestConnected";
     pub const EV_NETWORK_STATUS: &str = "networkStatus";
     pub const EV_API_REACHABILITY: &str = "apiReachability";
+    /// Service → client: a guest host-exec client connected and the socket
+    /// handle has been `DuplicateHandle`d into the library process. The
+    /// library should convert the handle to a `TcpStream` and call
+    /// `HostExecBridge::handle_one_tcp`.
+    pub const EV_HOST_EXEC_ACCEPTED: &str = "hostExecAccepted";
 }
 
 // ---------------------------------------------------------------------------
@@ -311,4 +322,34 @@ pub struct EventError {
     pub message: String,
     #[serde(default)]
     pub fatal: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Host-Exec Bridge wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCommandParams {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetHostCommandsParams {
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListHostCommandsResult {
+    pub names: Vec<String>,
+}
+
+/// Params for the `EV_HOST_EXEC_ACCEPTED` service → client event.
+///
+/// `duplicated_handle` is the numeric value of a `SOCKET` handle that the
+/// service duplicated into the library process via `DuplicateHandle`. The
+/// library must convert it to a `std::net::TcpStream` (using
+/// `FromRawSocket`) and pass it to `HostExecBridge::handle_one_tcp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostExecAcceptedParams {
+    pub duplicated_handle: u64,
 }

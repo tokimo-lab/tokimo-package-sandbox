@@ -7,7 +7,7 @@
 
 #![cfg(target_os = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,14 +50,13 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use std::collections::HashSet;
-
 use tokimo_package_sandbox::canonicalize_safe;
 use tokimo_package_sandbox::session_registry::{SessionRegistry, SharedSession};
 use tokimo_package_sandbox::svc_protocol::{
-    AddMountParams, BoolValue, CreateDiskImageParams, Frame, IdParams, JobIdListResult, JobIdResult,
-    ListSessionsResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams, ResizeShellParams, RootfsSpec, RpcError,
-    SessionInfoResult, SessionNameParams, SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
+    AddMountParams, BoolValue, CreateDiskImageParams, Frame, HostCommandParams, IdParams, JobIdListResult, JobIdResult,
+    ListHostCommandsResult, ListSessionsResult, MAX_FRAME_BYTES, PROTOCOL_VERSION, RemoveMountParams,
+    ResizeShellParams, RootfsSpec, RpcError, SessionInfoResult, SessionNameParams, SetHostCommandsParams,
+    SignalShellParams, SpawnShellParams, WriteStdinParams, encode_frame, method,
 };
 use tokimo_package_sandbox::vfs_host::FuseHost;
 use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
@@ -512,6 +511,14 @@ struct SessionState {
     /// AtomicBool is the shutdown flag; setting it makes the netstack
     /// thread stop within ~50ms. The thread itself is detached.
     netstack_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Vsock port the host-exec bridge listener accepts on. Registered in
+    /// HvSocket ServiceTable so guest `tokimo-host-exec` can dial in.
+    host_exec_port: u32,
+    /// Shutdown flag for the host-exec accept-loop thread.
+    host_exec_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// In-memory set of command names registered via addHostCommand /
+    /// setHostCommands. Mirrored to guest init via WinInitClient methods.
+    host_exec_commands: HashSet<String>,
     running: bool,
     guest_connected: bool,
     /// Unix-millisecond timestamp captured when `running` flips to true.
@@ -543,6 +550,9 @@ impl Default for SessionState {
             guest_connected: false,
             started_at_unix_ms: None,
             owner_pid: None,
+            host_exec_port: 0,
+            host_exec_shutdown: None,
+            host_exec_commands: HashSet::new(),
         }
     }
 }
@@ -910,6 +920,23 @@ fn dispatch(
             handle_stop_session(conn, sessions, p)
         }
 
+        method::ADD_HOST_COMMAND => {
+            let p: HostCommandParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_add_host_command(conn, p, sessions)
+        }
+        method::REMOVE_HOST_COMMAND => {
+            let p: HostCommandParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_remove_host_command(conn, p, sessions)
+        }
+        method::SET_HOST_COMMANDS => {
+            let p: SetHostCommandsParams =
+                serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
+            handle_set_host_commands(conn, p, sessions)
+        }
+        method::LIST_HOST_COMMANDS => handle_list_host_commands(conn, sessions),
+
         other => Err(RpcError::new("unknown_method", format!("unknown method: {other}"))),
     }
 }
@@ -1134,6 +1161,11 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     };
 
     let fuse_port = vmconfig::alloc_fuse_port();
+    let host_exec_port = vmconfig::alloc_host_exec_port();
+    let host_exec_svc_id = vmconfig::hvsock_service_id(host_exec_port);
+    let host_exec_svc_guid = parse_guid(&host_exec_svc_id).map_err(|e| RpcError::new("guid", e))?;
+    let host_exec_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, host_exec_svc_guid)
+        .map_err(|e| RpcError::new("hvsock_listen_he", e.to_string()))?;
 
     let cfg_json = vmconfig::build_session_v2_ex(
         &vm_id,
@@ -1145,6 +1177,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         init_port,
         fuse_port,
         netstack_port,
+        Some(host_exec_port),
     );
 
     let t0 = std::time::Instant::now();
@@ -1295,6 +1328,80 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         });
     }
 
+    // Spawn the host-exec accept loop. Each accepted hvsock connection is
+    // duplicated into the library process (owner_pid) and the handle value
+    // is sent as an EV_HOST_EXEC_ACCEPTED event.
+    let host_exec_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let owner_pid = conn.owner_pid.unwrap_or(0);
+        let conn_he = Arc::clone(conn);
+        let shutdown_he = Arc::clone(&host_exec_shutdown);
+        thread::spawn(move || {
+            loop {
+                if shutdown_he.load(Ordering::Relaxed) {
+                    break;
+                }
+                match hvsock::listen_and_accept_on_port(host_exec_port) {
+                    Ok(hv_sock) => {
+                        if owner_pid == 0 {
+                            continue;
+                        }
+                        // Duplicate the socket into the library process so it
+                        // can wrap it in a TcpStream (both are Winsock SOCKETs).
+                        let raw = hv_sock.raw_socket();
+                        let dup_result = unsafe {
+                            use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+                            use windows::Win32::System::Threading::{
+                                GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+                            };
+                            let target = OpenProcess(PROCESS_DUP_HANDLE, false, owner_pid);
+                            match target {
+                                Ok(tp) => {
+                                    let mut dup_handle = windows::Win32::Foundation::HANDLE::default();
+                                    let ok = DuplicateHandle(
+                                        GetCurrentProcess(),
+                                        windows::Win32::Foundation::HANDLE(raw as isize),
+                                        tp,
+                                        &mut dup_handle,
+                                        0,
+                                        false,
+                                        DUPLICATE_SAME_ACCESS,
+                                    );
+                                    let _ = CloseHandle(tp);
+                                    if ok.is_ok() {
+                                        Ok(dup_handle.0 as u64)
+                                    } else {
+                                        Err(format!("DuplicateHandle: {:?}", GetLastError()))
+                                    }
+                                }
+                                Err(e) => Err(format!("OpenProcess(pid={owner_pid}): {e}")),
+                            }
+                        };
+                        match dup_result {
+                            Ok(h) => {
+                                let _ = send_event(
+                                    &conn_he,
+                                    svc_protocol::method::EV_HOST_EXEC_ACCEPTED,
+                                    serde_json::json!({ "duplicated_handle": h }),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[host_exec] dup failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if !shutdown_he.load(Ordering::Relaxed) {
+                            eprintln!("[host_exec] accept error: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    drop(host_exec_listener);
+
     // Register boot-time mounts with FuseHost and tell the guest to
     // mount them via FUSE.
     let mut fuse_mount_names = HashMap::new();
@@ -1345,6 +1452,8 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         st.fuse_mount_names = fuse_mount_names;
         st.boot_mount_names = boot_mount_names;
         st.fuse_rt = Some(fuse_rt);
+        st.host_exec_port = host_exec_port;
+        st.host_exec_shutdown = Some(host_exec_shutdown);
     }
 
     // Spawn the single per-session dispatcher thread AFTER releasing the
@@ -1427,6 +1536,11 @@ fn teardown_session(st: &mut SessionState) {
     if let Some(s) = st.netstack_shutdown.take() {
         s.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // Signal the host-exec accept loop to exit.
+    if let Some(s) = st.host_exec_shutdown.take() {
+        s.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    st.host_exec_commands.clear();
     st.running = false;
     st.guest_connected = false;
     st.started_at_unix_ms = None;
@@ -1438,6 +1552,57 @@ fn svc_now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Host-exec bridge handlers
+// ---------------------------------------------------------------------------
+
+fn handle_add_host_command(
+    conn: &Arc<Connection>,
+    p: HostCommandParams,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    init.add_host_command(&p.name)
+        .map_err(|e| RpcError::new("init_add_host_command", e.to_string()))?;
+    let shared = get_session(conn, sessions)?;
+    shared.state.lock().unwrap().host_exec_commands.insert(p.name);
+    Ok(json!({}))
+}
+
+fn handle_remove_host_command(
+    conn: &Arc<Connection>,
+    p: HostCommandParams,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    init.remove_host_command(&p.name)
+        .map_err(|e| RpcError::new("init_remove_host_command", e.to_string()))?;
+    let shared = get_session(conn, sessions)?;
+    shared.state.lock().unwrap().host_exec_commands.remove(&p.name);
+    Ok(json!({}))
+}
+
+fn handle_set_host_commands(
+    conn: &Arc<Connection>,
+    p: SetHostCommandsParams,
+    sessions: &WindowsRegistry,
+) -> Result<Value, RpcError> {
+    let init = require_init(conn, sessions)?;
+    init.set_host_commands(&p.names)
+        .map_err(|e| RpcError::new("init_set_host_commands", e.to_string()))?;
+    let shared = get_session(conn, sessions)?;
+    let mut st = shared.state.lock().unwrap();
+    st.host_exec_commands = p.names.into_iter().collect();
+    Ok(json!({}))
+}
+
+fn handle_list_host_commands(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
+    let shared = get_session(conn, sessions)?;
+    let st = shared.state.lock().unwrap();
+    let names: Vec<String> = st.host_exec_commands.iter().cloned().collect();
+    serde_json::to_value(ListHostCommandsResult { names }).map_err(|e| RpcError::new("encode", e.to_string()))
 }
 
 fn summarize_session(name: &str, st: &SessionState) -> tokimo_package_sandbox::SessionSummary {

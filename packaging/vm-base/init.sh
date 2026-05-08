@@ -28,6 +28,7 @@ INIT_PORT=50003
 NETSTACK_PORT=""
 GUEST_LISTENS=0
 NETDNS=on
+HOST_EXEC_PORT=""
 for arg in $CMDLINE; do
     case "$arg" in
         run=*)                       CMD_B64="${arg#run=}" ;;
@@ -36,6 +37,7 @@ for arg in $CMDLINE; do
         tokimo.netstack_port=*)      NETSTACK_PORT="${arg#tokimo.netstack_port=}" ;;
         tokimo.guest_listens=1)      GUEST_LISTENS=1 ;;
         tokimo.netdns=*)             NETDNS="${arg#tokimo.netdns=}" ;;
+        tokimo.host_exec_port=*)     HOST_EXEC_PORT="${arg#tokimo.host_exec_port=}" ;;
     esac
 done
 
@@ -307,6 +309,11 @@ if [ "$SESSION_MODE" = 1 ]; then
     if [ "$GUEST_LISTENS" = 1 ]; then
         # macOS VZ: guest listens for host connect on AF_VSOCK.
         export TOKIMO_SANDBOX_GUEST_LISTENS=1
+    fi
+    if [ -n "$HOST_EXEC_PORT" ]; then
+        # Propagate host-exec vsock port to guest children so
+        # tokimo-host-exec can connect back to the host bridge.
+        export TOKIMO_HOST_EXEC_VSOCK_PORT="$HOST_EXEC_PORT"
     fi
     exec /bin/busybox chroot /newroot /run/tokimo/bin/tokimo-sandbox-init </dev/null >/dev/null 2>/dev/kmsg
     # If exec returns, something went wrong.
