@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     // Usage: tokimo-sandbox-init --load-modules <module-path> [<module-path>...]
     //
     // Each module-path is the absolute path to a .ko file inside the
-    // rootfs. The shim uses this to bring up vsock + 9p before mounting
+    // rootfs. The shim uses this to bring up vsock + FUSE before mounting
     // the workspace, since a minimal Ubuntu base has no `modprobe`.
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--load-modules") {

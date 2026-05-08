@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Repack initrd.img: take the existing busybox + new init + new vsock9p
+# Repack initrd.img: take the existing busybox + new init
 # and produce a fresh gzipped cpio ready to feed into HCS.
 #
 # Usage (inside WSL):
@@ -16,11 +16,8 @@ FINAL="$ROOTFS_PROJ/tokimo-os-amd64/initrd.img"
 OUT=/tmp/tokimo-initrd.img
 GENKERN="${GENKERN:-/tmp/tokimo-genkern}"
 
-echo "==> compiling vsock9p"
-mkdir -p "$PREP/bin"
-gcc -static -O2 -o "$PREP/bin/vsock9p" "$ROOTFS_PROJ/vsock9p.c"
-
 echo "==> ensuring busybox is present"
+mkdir -p "$PREP/bin"
 if [ ! -x "$PREP/bin/busybox" ]; then
     cp "$ROOTFS_PROJ/tokimo-os-amd64/busybox" "$PREP/bin/busybox"
     chmod +x "$PREP/bin/busybox"

@@ -47,9 +47,9 @@ mkdir -p "$OUT"
 BUSYBOX_APPLETS="sh mount umount cat echo poweroff sync chroot mkdir ls base64 insmod cp chmod udhcpc ip"
 
 # ---------------------------------------------------------------------------
-# [1/6] Install packages (mirrors CI: kernel + busybox + runtimes)
+# [1/5] Install packages (mirrors CI: kernel + busybox + runtimes)
 # ---------------------------------------------------------------------------
-echo "==> [1/6] install packages (arch=$ARCH, format=$FORMAT)"
+echo "==> [1/5] install packages (arch=$ARCH, format=$FORMAT)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends ca-certificates curl >/dev/null
@@ -131,24 +131,17 @@ node --version
 python3 --version
 
 # ---------------------------------------------------------------------------
-# [2/6] compile vsock9p
+# [2/5] extract kernel
 # ---------------------------------------------------------------------------
-echo "==> [2/6] compile vsock9p"
-gcc -static -O2 -o /tmp/vsock9p /vm-base/vsock9p.c
-ls -lh /tmp/vsock9p
-
-# ---------------------------------------------------------------------------
-# [3/6] extract kernel
-# ---------------------------------------------------------------------------
-echo "==> [3/6] extract kernel"
+echo "==> [2/5] extract kernel"
 KERNEL_PATH=$(ls /boot/vmlinuz-* | head -1)
 cp "$KERNEL_PATH" "$OUT/vmlinuz"
 ls -lh "$OUT/vmlinuz"
 
 # ---------------------------------------------------------------------------
-# [4/6] build initrd
+# [3/5] build initrd
 # ---------------------------------------------------------------------------
-echo "==> [4/6] build initrd"
+echo "==> [3/5] build initrd"
 INITRD=/tmp/initrd
 rm -rf "$INITRD"
 mkdir -p "$INITRD"/{bin,sbin,proc,sys,dev,mnt/work,tmp,modules,newroot}
@@ -164,16 +157,13 @@ ln -sf /bin/busybox "$INITRD/sbin/init"
 cp /vm-base/init.sh "$INITRD/init"
 chmod +x "$INITRD/init"
 
-cp /tmp/vsock9p "$INITRD/bin/vsock9p"
-chmod +x "$INITRD/bin/vsock9p"
-
 for bin in tokimo-sandbox-init tokimo-tun-pump tokimo-sandbox-fuse; do
     cp "$WORK/$bin" "$INITRD/bin/$bin"
     chmod +x "$INITRD/bin/$bin"
 done
 
 KVER=$(ls /lib/modules | head -1)
-KMOD_LIST="hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun"
+KMOD_LIST="hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod hv_storvsc sd_mod netfs crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun"
 if [ "$ARCH" = "arm64" ]; then
     KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
 fi
@@ -216,9 +206,9 @@ echo "    modules: $(ls "$INITRD/modules" | wc -l) files"
 ls -lh "$OUT/initrd.img"
 
 # ---------------------------------------------------------------------------
-# [5/6] Slim down the container filesystem (mirrors CI)
+# [4/5] Slim down the container filesystem (mirrors CI)
 # ---------------------------------------------------------------------------
-echo "==> [5/6] slim down rootfs"
+echo "==> [4/5] slim down rootfs"
 
 # Remove build-only / dev packages
 rm -rf /usr/include
@@ -267,7 +257,7 @@ find / -name '*.pyc' -delete 2>/dev/null || true
 du -sh /
 
 # ---------------------------------------------------------------------------
-# [6/6] Export rootfs
+# [5/5] Export rootfs
 # ---------------------------------------------------------------------------
 # Stage the rootfs by copying real directories only (skip /proc, /sys, /dev, /tmp
 # which are virtual mounts inside the container).
@@ -286,14 +276,14 @@ PYLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))' 2>/de
 ROOTFS_SIZE_M=$(du -sm "$ROOTFS" | cut -f1)
 
 if [ "$FORMAT" = "vhdx" ]; then
-    echo "==> [6/6] mkfs.ext4 + qemu-img convert -> vhdx (rootfs ~${ROOTFS_SIZE_M}M)"
+    echo "==> [5/5] mkfs.ext4 + qemu-img convert -> vhdx (rootfs ~${ROOTFS_SIZE_M}M)"
     IMG_SIZE_M=$((ROOTFS_SIZE_M + 256))
     qemu-img create -f raw /tmp/rootfs.img "${IMG_SIZE_M}M" >/dev/null
     mkfs.ext4 -F -L tokimo-rootfs -d "$ROOTFS" /tmp/rootfs.img >/dev/null
     qemu-img convert -f raw -O vhdx -o subformat=dynamic /tmp/rootfs.img "$OUT/rootfs.vhdx"
     ls -lh "$OUT/rootfs.vhdx"
 else
-    echo "==> [6/6] copy rootfs directory (rootfs ~${ROOTFS_SIZE_M}M)"
+    echo "==> [5/5] copy rootfs directory (rootfs ~${ROOTFS_SIZE_M}M)"
     cp -a "$ROOTFS" "$OUT/rootfs"
     ls -lh "$OUT/rootfs"
 fi

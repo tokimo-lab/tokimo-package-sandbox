@@ -18,7 +18,6 @@ both halves.
 | `build.sh`           | Full build (debootstrap + busybox + kernel + initrd + vhdx). ~20 min on amd64, ~25 min on arm64 with QEMU. Used by `.github/workflows/vm.yml`. |
 | `init.sh`            | PID 1 inside the initrd (busybox shell). Loads kernel modules, mounts shares, chroots into rootfs, exec's `tokimo-sandbox-init`. |
 | `docker-modify.sh`   | One-shot tweaks applied inside the build container (mirrors, slim-down). |
-| `vsock9p.c`          | Static helper that connects to a vsock port and mounts Plan9 from the resulting fd. |
 | `../vm/scripts/fetch-generic-kernel.sh` | Pulls Debian's `linux-image-amd64` `.deb`, extracts vmlinuz + relevant modules. Used by alternative kernel-only flows; not part of vm-base. |
 | `../vm/scripts/repack-initrd.sh` | Local WSL-side repack of the prep dir → initrd.img. Used in dev. |
 | `../vm/scripts/rebake-initrd.sh` | Takes an existing base initrd + a freshly-built `tokimo-sandbox-init` / `tokimo-sandbox-fuse` and produces a final initrd. Used by `vm.yml` (to add the fuse binary on top of `build.sh`'s output) and by the local dev wrapper. |

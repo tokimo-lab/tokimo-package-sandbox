@@ -163,7 +163,7 @@ tokimo.session=1 tokimo.work_port=50002 tokimo.init_port=<per-session-port>
                     │ debian:13 容器 → apt install linux-image-${ARCH}        │
                     │  ├─ /boot/vmlinuz-*           → vmlinuz                │
                     │  ├─ resolve_deps + modinfo 收集 ~30 个 .ko             │
-                    │  │   (hv_vmbus / hv_storvsc / vsock / 9p / ext4 /      │
+                    │  │   (hv_vmbus / hv_storvsc / vsock / ext4 /             │
                     │  │    tun / nfs / ...) → /var/cache/tokimo-kmods       │
 vm-v* tag (push)    │  ├─ initrd: busybox + init.sh + 三个 musl 业务二进制   │
 ─────────────────►  │  │   (TOKIMO_INIT_BIN / TOKIMO_TUN_PUMP_BIN /          │

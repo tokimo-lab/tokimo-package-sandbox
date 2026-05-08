@@ -259,7 +259,7 @@ find /usr/share/zoneinfo -type d -empty -delete 2>/dev/null || true
 # Stage kernel modules (initrd needs them) BEFORE removing them from rootfs.
 # The module-bundle step on the host does `docker cp /var/cache/tokimo-kmods/.` out.
 KVER_INNER=$(ls /lib/modules | head -1)
-KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs 9pnet 9pnet_fd 9p crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun'
+KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun'
 # macOS VZ uses virtio-vsock + virtio-net (not Hyper-V). Add the virtio
 # transport modules for arm64 so the init binary can load them in the
 # guest VM. virtio_net requires net_failover (already listed) for SR-IOV
@@ -419,20 +419,12 @@ cp "$PROJECT_DIR/init.sh" "$INITRD_DIR/init"
 chmod +x "$INITRD_DIR/init"
 
 # --- vsock support for Windows HCS ---
-# HCS exposes Plan9 shares via vsock (Hyper-V sockets), not virtio devices.
 # The Debian *generic* (linux-image-amd64) kernel ships hv_vmbus / vsock /
 # hv_sock as loadable modules — init.sh insmods them at boot. The cloud
 # kernel is too stripped down (no vsock at all). We bundle the modules
-# along with vsock9p into the initrd.
+# into the initrd.
 
-echo "    compiling vsock9p static helper..."
-docker cp "$PROJECT_DIR/vsock9p.c" "$CONTAINER_NAME:/tmp/vsock9p.c"
-docker exec "$CONTAINER_NAME" gcc -static -O2 -o /tmp/vsock9p /tmp/vsock9p.c
-docker cp "$CONTAINER_NAME:/tmp/vsock9p" "$INITRD_DIR/bin/vsock9p"
-chmod +x "$INITRD_DIR/bin/vsock9p"
-echo "    vsock9p: $(du -sh "$INITRD_DIR/bin/vsock9p" | cut -f1)"
-
-echo "    bundling kernel modules (Hyper-V vsock + SCSI + 9p + ext4 + deps)..."
+echo "    bundling kernel modules (Hyper-V vsock + SCSI + ext4 + deps)..."
 KMODS_HOST="$INITRD_DIR/modules"
 mkdir -p "$KMODS_HOST"
 docker cp "$CONTAINER_NAME:/var/cache/tokimo-kmods/." "$KMODS_HOST/"

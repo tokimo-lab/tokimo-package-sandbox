@@ -57,7 +57,7 @@ impl Default for NetworkPolicy {
 /// virtiofs on macOS, bind mount on Linux).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mount {
-    /// Logical mount name (used as the 9p tag / virtiofs tag).
+    /// Logical mount name (used as the FUSE mount name / virtiofs tag).
     pub name: String,
     /// Host-side directory.
     pub host_path: PathBuf,
