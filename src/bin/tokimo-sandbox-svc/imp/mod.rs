@@ -1331,17 +1331,24 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // Spawn the host-exec accept loop. Each accepted hvsock connection is
     // duplicated into the library process (owner_pid) and the handle value
     // is sent as an EV_HOST_EXEC_ACCEPTED event.
+    //
+    // The listener bound earlier (`host_exec_listener`) is moved into the
+    // accept thread so it stays alive for the lifetime of the session;
+    // re-binding per-iteration would leave a window where guest connection
+    // attempts fail.
     let host_exec_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let owner_pid = conn.owner_pid.unwrap_or(0);
         let conn_he = Arc::clone(conn);
         let shutdown_he = Arc::clone(&host_exec_shutdown);
+        let listener = host_exec_listener;
         thread::spawn(move || {
             loop {
                 if shutdown_he.load(Ordering::Relaxed) {
                     break;
                 }
-                match hvsock::listen_and_accept_on_port(host_exec_port) {
+                // Short timeout so we re-check the shutdown flag.
+                match hvsock::accept_guest(&listener, std::time::Duration::from_secs(60)) {
                     Ok(hv_sock) => {
                         if owner_pid == 0 {
                             continue;
@@ -1391,6 +1398,13 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                         }
                     }
                     Err(e) => {
+                        // accept_guest returns an error on timeout *and* on
+                        // real failures; distinguish by message so we don't
+                        // tear down the listener every minute.
+                        let s = e.to_string();
+                        if s.contains("timed out") {
+                            continue;
+                        }
                         if !shutdown_he.load(Ordering::Relaxed) {
                             eprintln!("[host_exec] accept error: {e}");
                         }
@@ -1400,7 +1414,6 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             }
         });
     }
-    drop(host_exec_listener);
 
     // Register boot-time mounts with FuseHost and tell the guest to
     // mount them via FUSE.

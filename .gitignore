@@ -25,3 +25,4 @@ Cargo.lock
 .tokimo-rootfs-*.vhdx
 # Local VM working directory (base rootfs template + writable run copy)
 /.vm/
+initrd-extract/

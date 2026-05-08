@@ -40,6 +40,10 @@ pub struct WindowsBackend {
     /// Callback registered before `start_vm`; installed into the bridge
     /// once it is created.
     pending_host_exec_cb: Mutex<Option<HostExecCallback>>,
+    /// Join handle for the EV_HOST_EXEC_ACCEPTED subscriber thread; we
+    /// hold it so `stop_vm` can join cleanly and so the thread does
+    /// not pile up across start/stop cycles.
+    host_exec_subscriber: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl WindowsBackend {
@@ -49,6 +53,7 @@ impl WindowsBackend {
             client: Arc::new(client),
             host_exec_bridge: Mutex::new(None),
             pending_host_exec_cb: Mutex::new(None),
+            host_exec_subscriber: Mutex::new(None),
         })
     }
 
@@ -86,37 +91,66 @@ impl SandboxBackend for WindowsBackend {
         let bridge = Arc::new(HostExecBridge::new(cb));
         *self.host_exec_bridge.lock().unwrap() = Some(Arc::clone(&bridge));
 
-        // Spawn internal subscriber thread: watches for EV_HOST_EXEC_ACCEPTED
-        // events emitted by the service, converts the duplicated handle to a
-        // TcpStream, and dispatches it to the bridge.
+        // Spawn the subscriber thread. It watches for
+        // EV_HOST_EXEC_ACCEPTED events emitted by the service,
+        // converts the duplicated handle to a TcpStream, and
+        // dispatches each one to the bridge. The thread polls
+        // `bridge.shutdown_flag()` via `recv_timeout` so `stop_vm`
+        // can break it out cleanly.
         let bridge_for_thread = Arc::clone(&bridge);
         let client_for_thread = Arc::clone(&self.client);
-        std::thread::spawn(move || {
-            let (tx, rx): (Sender<Event>, Receiver<Event>) = channel();
-            client_for_thread.subscribe(tx);
-            while let Ok(ev) = rx.recv() {
-                if let Event::Raw { method: m, params } = ev {
-                    if m == method::EV_HOST_EXEC_ACCEPTED {
-                        let handle = params.get("duplicated_handle").and_then(|v| v.as_u64()).unwrap_or(0);
-                        if handle != 0 {
-                            use std::os::windows::io::FromRawSocket;
-                            let stream = unsafe { std::net::TcpStream::from_raw_socket(handle) };
-                            let b = Arc::clone(&bridge_for_thread);
-                            std::thread::spawn(move || b.handle_one_tcp(stream));
+        let shutdown = bridge.shutdown_flag();
+        let handle = std::thread::Builder::new()
+            .name("host-exec-subscriber".into())
+            .spawn(move || {
+                let (tx, rx): (Sender<Event>, Receiver<Event>) = channel();
+                client_for_thread.subscribe(tx);
+                loop {
+                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    match rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(Event::Raw { method: m, params }) if m == method::EV_HOST_EXEC_ACCEPTED => {
+                            let handle = params.get("duplicated_handle").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if handle != 0 {
+                                use std::os::windows::io::FromRawSocket;
+                                // SAFETY: the service `DuplicateHandle`'d
+                                // a Winsock SOCKET into our process; we
+                                // own it from this point on.
+                                let stream = unsafe { std::net::TcpStream::from_raw_socket(handle) };
+                                let b = Arc::clone(&bridge_for_thread);
+                                std::thread::Builder::new()
+                                    .name("host-exec-conn".into())
+                                    .spawn(move || b.handle_one(stream))
+                                    .ok();
+                            }
                         }
+                        Ok(_) => {} // unrelated event
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            }
-        });
+                // Drop tx implicitly by leaving scope; the client's
+                // broadcaster will GC the dead sender on next event.
+            })
+            .expect("spawn host-exec-subscriber");
+        *self.host_exec_subscriber.lock().unwrap() = Some(handle);
 
         Ok(())
     }
 
     fn stop_vm(&self) -> Result<()> {
+        // Signal the subscriber thread to exit, then tear down the
+        // bridge so subsequent calls to `on_host_exec` store the
+        // callback in `pending_host_exec_cb` again.
+        if let Some(bridge) = self.host_exec_bridge.lock().unwrap().take() {
+            bridge.shutdown();
+        }
+        if let Some(h) = self.host_exec_subscriber.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
         self.call(method::STOP_VM, json!({}), LONG_CALL_TIMEOUT)?;
-        // Tear down the bridge so subsequent calls to on_host_exec store
-        // the callback in pending again.
-        *self.host_exec_bridge.lock().unwrap() = None;
         Ok(())
     }
 
