@@ -584,9 +584,11 @@ TAR_CMD=(tar --numeric-owner -xpf "$ROOTFS_TAR" -C "$ROOTFS_DIR"
   --exclude='./dev/*' --exclude='./proc/*' --exclude='./sys/*')
 if [[ "$(id -u)" -eq 0 ]]; then
     "${TAR_CMD[@]}"
+    SUDO=""
 elif command -v sudo >/dev/null 2>&1; then
     echo "    extracting as root (preserves uid=1000 for tokimo); sudo may prompt"
     sudo "${TAR_CMD[@]}"
+    SUDO="sudo"
 else
     echo "ERROR: rootfs extraction requires root to preserve uid=1000;" >&2
     echo "       no sudo available. Re-run as root." >&2
@@ -594,14 +596,16 @@ else
 fi
 
 # Remove kernel files from rootfs (already extracted above)
-rm -f "$ROOTFS_DIR"/boot/vmlinuz-* "$ROOTFS_DIR"/boot/initrd.img-* "$ROOTFS_DIR"/boot/System.map-* "$ROOTFS_DIR"/boot/config-* 2>/dev/null || true
+$SUDO rm -f "$ROOTFS_DIR"/boot/vmlinuz-* "$ROOTFS_DIR"/boot/initrd.img-* "$ROOTFS_DIR"/boot/System.map-* "$ROOTFS_DIR"/boot/config-* 2>/dev/null || true
 # Remove root-level symlinks created by kernel package post-install
-rm -f "$ROOTFS_DIR"/vmlinuz "$ROOTFS_DIR"/vmlinuz.old "$ROOTFS_DIR"/initrd.img "$ROOTFS_DIR"/initrd.img.old 2>/dev/null || true
+$SUDO rm -f "$ROOTFS_DIR"/vmlinuz "$ROOTFS_DIR"/vmlinuz.old "$ROOTFS_DIR"/initrd.img "$ROOTFS_DIR"/initrd.img.old 2>/dev/null || true
 
 # Copy busybox into rootfs for sandbox use
-cp "$OUTPUT_DIR/busybox" "$ROOTFS_DIR/bin/busybox"
+$SUDO cp "$OUTPUT_DIR/busybox" "$ROOTFS_DIR/bin/busybox"
+$SUDO chown 0:0 "$ROOTFS_DIR/bin/busybox"
+$SUDO chmod 0755 "$ROOTFS_DIR/bin/busybox"
 for applet in $BUSYBOX_APPLETS; do
-    [ ! -e "$ROOTFS_DIR/bin/$applet" ] && ln -sf busybox "$ROOTFS_DIR/bin/$applet" || true
+    [ ! -e "$ROOTFS_DIR/bin/$applet" ] && $SUDO ln -sf busybox "$ROOTFS_DIR/bin/$applet" || true
 done
 
 echo "--- final ---"
