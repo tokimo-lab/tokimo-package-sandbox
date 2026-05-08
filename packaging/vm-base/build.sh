@@ -268,7 +268,8 @@ chown -R tokimo:tokimo /home/tokimo
 # =============================================
 
 rm -rf /usr/include/node
-rm -rf /usr/share/perl /usr/share/perl5 /etc/perl
+# NOTE: do NOT remove /usr/share/perl or /usr/share/perl5 — dpkg-preconfigure
+# (part of debconf) is a Perl script and apt invokes it during installs.
 
 echo "/usr/lib/${DEB_MULTIARCH}/pulseaudio" > /etc/ld.so.conf.d/pulseaudio.conf
 echo "/usr/lib/libreoffice/program" > /etc/ld.so.conf.d/libreoffice.conf
@@ -304,10 +305,11 @@ rm -rf /usr/share/icons /usr/share/pixmaps /usr/share/applications
 rm -rf /usr/share/menu /usr/share/polkit-1
 rm -rf /usr/share/fish /usr/share/zsh
 
-rm -rf /usr/share/keyrings /usr/share/gcc /usr/share/libgcrypt20
+rm -rf /usr/share/gcc /usr/share/libgcrypt20
 rm -rf /usr/share/cmake /usr/share/pkgconfig /usr/share/binfmts
 rm -rf /usr/share/libc-bin /usr/share/readline /usr/share/misc
-rm -rf /usr/share/bug /usr/share/doc-base /usr/share/debconf
+rm -rf /usr/share/bug /usr/share/doc-base
+# NOTE: do NOT remove /usr/share/debconf — dpkg-preconfigure needs it.
 rm -rf /usr/share/debianutils /usr/share/base-files /usr/share/base-passwd
 rm -rf /usr/share/gdb /usr/share/gitweb /usr/share/tabset
 rm -rf /usr/share/python-wheels
@@ -316,11 +318,9 @@ rm -rf /usr/share/python-wheels
 # is PAM-aware and aborts with "unable to initialize PAM" without them.
 # /var/lib/pam is just runtime state and safe to drop.
 rm -rf /var/lib/pam
-rm -rf /etc/cron* /etc/logrotate.d /etc/logcheck /etc/default /etc/skel
+rm -rf /etc/logrotate.d /etc/logcheck /etc/skel
 rm -rf /usr/lib/lsb /usr/lib/valgrind /usr/lib/mime
 
-find /usr/sbin -type f ! -name 'ldconfig' ! -name 'update-ca-certificates' \
-  ! -name 'zic' ! -name 'sysctl' ! -name 'iconvconfig' -delete 2>/dev/null || true
 
 find /usr/share/terminfo -type f ! -path '*/xterm*' -delete 2>/dev/null || true
 find /usr/share/terminfo -type d -empty -delete 2>/dev/null || true
