@@ -93,15 +93,21 @@ corepack enable
 
 groupadd -g 1000 tokimo
 useradd -m -u 1000 -g 1000 -s /bin/bash -d /home/tokimo tokimo
-# Debian's `useradd` writes `!` into /etc/shadow, which marks the account
-# as *locked*. PAM's `pam_unix.so account` step then refuses authorisation
-# even when sudoers says NOPASSWD, producing:
+# 'useradd' writes "!" into /etc/shadow which marks the tokimo account
+# as locked. PAM's account stack honours that even with NOPASSWD in
+# sudoers, producing:
 #     sudo: account validation failure, is your account locked?
 #     sudo: a password is required
-# `passwd -d` clears the password field entirely, leaving the account
-# unlocked but un-loginnable with a password — exactly what we want for a
-# sandboxed workspace.
-passwd -d tokimo
+# 'passwd -d' was tried first but Debian's PAM configuration also
+# rejects an empty password field on the account stack ("authentication
+# token is no longer valid"). The robust pattern — used by Debian for
+# all system accounts (daemon, www-data, …) — is to set the password
+# hash to literal "*", which means "valid but unusable", and is NOT
+# treated as locked by pam_unix's account check.
+usermod -p '*' tokimo
+# Belt and braces: clear any password-aging fields that 'useradd'
+# may have populated with restrictive defaults on this distro.
+chage -E -1 -I -1 -m 0 -M 99999 tokimo
 
 # Passwordless sudo for the `tokimo` user.
 #  - macOS VZ / Windows HCS modes: real Linux root inside the VM, sudo
