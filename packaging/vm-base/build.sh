@@ -297,9 +297,13 @@ find /usr/share/vim/vim*/syntax -type f \
   ! -name 'lua.vim' \
   -delete 2>/dev/null || true
 
-rm -rf /usr/lib/systemd /usr/lib/init /etc/systemd /etc/init.d
-rm -rf /var/lib/systemd /usr/lib/tmpfiles.d /usr/lib/sysctl.d
-rm -rf /usr/lib/udev /etc/udev 2>/dev/null || true
+# Do NOT rm -rf /usr/lib/systemd, /usr/lib/udev, /etc/systemd, or /etc/udev.
+# Many packages (openssh-server, initramfs-tools-core, libpam-systemd, …)
+# depend on systemd/udev via dpkg. Deleting the files while keeping the
+# packages "installed" breaks `apt install` for anything in that dependency
+# chain. The sandbox uses its own init (init.sh + tokimo-sandbox-init), so
+# systemd never starts — keeping the files is harmless.
+rm -rf /var/lib/systemd
 
 rm -rf /usr/share/icons /usr/share/pixmaps /usr/share/applications
 rm -rf /usr/share/menu /usr/share/polkit-1
@@ -314,10 +318,9 @@ rm -rf /usr/share/debianutils /usr/share/base-files /usr/share/base-passwd
 rm -rf /usr/share/gdb /usr/share/gitweb /usr/share/tabset
 rm -rf /usr/share/python-wheels
 
-# NOTE: do NOT remove /etc/pam.d, /etc/security or /usr/share/pam — sudo
-# is PAM-aware and aborts with "unable to initialize PAM" without them.
-# /var/lib/pam is just runtime state and safe to drop.
-rm -rf /var/lib/pam
+# NOTE: do NOT remove /etc/pam.d, /etc/security, /usr/share/pam, or
+# /var/lib/pam — sudo is PAM-aware and libpam-systemd's post-install
+# script writes to /var/lib/pam/seen.
 rm -rf /etc/logrotate.d /etc/logcheck /etc/skel
 rm -rf /usr/lib/lsb /usr/lib/valgrind /usr/lib/mime
 
