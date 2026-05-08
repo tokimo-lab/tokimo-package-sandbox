@@ -264,6 +264,12 @@ impl FuseHost {
                 namelen: 255,
                 frsize: 4096,
             }),
+            Req::Symlink {
+                parent_nodeid,
+                name,
+                target,
+            } => self.op_symlink(mount_id, parent_nodeid, &name, &target).await,
+            Req::Readlink { nodeid } => self.op_readlink(mount_id, nodeid).await,
         }
     }
 
@@ -1074,6 +1080,54 @@ impl FuseHost {
         }
         Res::Error(errno_for(&VfsError::NotImplemented("rename".into())))
     }
+
+    async fn op_symlink(&self, mount_id: u32, parent_nodeid: u64, name: &str, target: &str) -> Res {
+        let parent = match self.resolve_path(mount_id, parent_nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        if mount.read_only {
+            return Res::Error(errno_for(&VfsError::PermissionDenied));
+        }
+        let Some(s) = mount.backend.as_symlink() else {
+            return Res::Error(errno_for(&VfsError::NotImplemented("symlink".into())));
+        };
+        let path = Self::child_path(&parent, name);
+        if let Err(e) = s.symlink(target, &path).await {
+            return Res::Error(errno_for(&e));
+        }
+        match mount.backend.stat(&path).await {
+            Ok(info) => {
+                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                Res::Entry(EntryOut {
+                    nodeid,
+                    generation: self.id_table.generation(),
+                    attr: attr_from(&info),
+                })
+            }
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
+
+    async fn op_readlink(&self, mount_id: u32, nodeid: u64) -> Res {
+        let path = match self.resolve_path(mount_id, nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        let Some(r) = mount.backend.as_readlink() else {
+            return Res::Error(errno_for(&VfsError::NotImplemented("readlink".into())));
+        };
+        match r.readlink(&path).await {
+            Ok(target) => Res::Linkname(target),
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,8 +1155,18 @@ fn op_is_cheap(op: &Req) -> bool {
 }
 
 fn attr_from(info: &VfsFileInfo) -> AttrOut {
-    let kind = if info.is_dir { NodeKind::Dir } else { NodeKind::File };
-    let mode = info.mode.unwrap_or(if info.is_dir { 0o755 } else { 0o644 });
+    let kind = if info.is_symlink {
+        NodeKind::Symlink
+    } else if info.is_dir {
+        NodeKind::Dir
+    } else {
+        NodeKind::File
+    };
+    let mode = info.mode.unwrap_or(match kind {
+        NodeKind::Dir => 0o755,
+        NodeKind::Symlink => 0o777,
+        NodeKind::File => 0o644,
+    });
     let mtime = info
         .modified
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

@@ -209,6 +209,23 @@ pub enum Req {
     Statfs {
         nodeid: u64,
     },
+
+    /// Create a symbolic link `name` under `parent_nodeid` whose
+    /// contents are `target` (raw, unresolved — POSIX semantics).
+    /// Response: [`Res::Entry`] for the new link.
+    Symlink {
+        parent_nodeid: u64,
+        name: String,
+        target: String,
+    },
+
+    /// Read the raw target of an existing symlink. Response:
+    /// [`Res::Linkname`]. Returns ENOSYS when the backend doesn't
+    /// implement readlink (the kernel will then surface EINVAL to
+    /// userspace, matching the behaviour of a regular file's readlink).
+    Readlink {
+        nodeid: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -221,12 +238,18 @@ pub enum Res {
     Error(WireError),
     Entry(EntryOut),
     Attr(AttrOut),
-    OpenOk { fh: u64 },
+    OpenOk {
+        fh: u64,
+    },
     DirEntries(Vec<DirEntry>),
     DirEntriesPlus(Vec<DirEntryPlus>),
     Bytes(Vec<u8>),
-    Written { size: u32 },
+    Written {
+        size: u32,
+    },
     Statfs(StatfsOut),
+    /// Symlink target string (response to [`Req::Readlink`]).
+    Linkname(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

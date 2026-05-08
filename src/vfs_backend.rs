@@ -94,11 +94,21 @@ pub type VfsResult<T> = Result<T, VfsError>;
 ///
 /// `name` is the leaf name (no path separators). For the export root the
 /// FUSE bridge synthesises `name = ""`.
+///
+/// `is_dir` and `is_symlink` are mutually exclusive (a symlink to a dir
+/// is reported as `is_symlink: true, is_dir: false` — i.e. lstat semantics).
+/// The bridge picks `NodeKind::Symlink` over `Dir`/`File` when
+/// `is_symlink == true`.
 #[derive(Debug, Clone)]
 pub struct VfsFileInfo {
     pub name: String,
     pub size: u64,
     pub is_dir: bool,
+    /// `true` if this entry IS a symlink itself (lstat semantics, the
+    /// link is NOT followed). Backends that don't support symlinks
+    /// can ignore this and leave it `false`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub is_symlink: bool,
     pub modified: Option<SystemTime>,
     /// POSIX mode bits (lower 12). `None` → bridge picks 0o755 (dir) or
     /// 0o644 (file).
@@ -145,6 +155,30 @@ pub trait VfsDeleteDir: Send + Sync + 'static {
 #[async_trait]
 pub trait VfsRename: Send + Sync + 'static {
     async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()>;
+}
+
+/// Create a symbolic link `link_path` whose contents (raw target string)
+/// are exactly `target`. POSIX semantics: `target` is stored verbatim
+/// — no path resolution, no existence check. Dangling links are valid.
+///
+/// On Windows hosts the implementation has to pick "file" vs "directory"
+/// symlink type at creation time (NTFS quirk; POSIX does not have this
+/// concept). The recommended strategy is documented on the impl: probe
+/// the resolved target relative to `link_path`'s parent and pick
+/// `symlink_dir` only when that probe lands on an existing directory;
+/// fall back to `symlink_file` otherwise (this matches how `tar -x`,
+/// `git clone`, and Cygwin/WSL all behave on Windows).
+#[async_trait]
+pub trait VfsSymlink: Send + Sync + 'static {
+    async fn symlink(&self, target: &str, link_path: &Path) -> VfsResult<()>;
+}
+
+/// Read the raw target string of an existing symlink. Returns the
+/// target verbatim (NOT resolved against the link's parent); callers
+/// that want a resolved path must do that themselves.
+#[async_trait]
+pub trait VfsReadlink: Send + Sync + 'static {
+    async fn readlink(&self, link_path: &Path) -> VfsResult<String>;
 }
 
 #[async_trait]
@@ -195,6 +229,12 @@ pub trait VfsBackend: VfsReader {
         None
     }
     fn as_rename(&self) -> Option<&dyn VfsRename> {
+        None
+    }
+    fn as_symlink(&self) -> Option<&dyn VfsSymlink> {
+        None
+    }
+    fn as_readlink(&self) -> Option<&dyn VfsReadlink> {
         None
     }
     fn as_move(&self) -> Option<&dyn VfsMove> {

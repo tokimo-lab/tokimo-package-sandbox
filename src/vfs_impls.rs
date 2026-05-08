@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::vfs_backend::{
     VfsBackend, VfsCopy, VfsDeleteDir, VfsDeleteFile, VfsError, VfsFileInfo, VfsMkdir, VfsMove, VfsPut, VfsReader,
-    VfsRename, VfsResolveLocal, VfsResult,
+    VfsReadlink, VfsRename, VfsResolveLocal, VfsResult, VfsSymlink,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,11 @@ impl VfsReader for LocalDirVfs {
         let mut rd = tokio::fs::read_dir(&host).await?;
         let mut out = Vec::new();
         while let Some(entry) = rd.next_entry().await? {
-            let md = match entry.metadata().await {
+            // symlink_metadata: don't follow links, so symlink-typed
+            // entries surface as symlinks rather than their target.
+            // tokio::fs::DirEntry::metadata follows links, hence the
+            // explicit symlink_metadata call here.
+            let md = match tokio::fs::symlink_metadata(entry.path()).await {
                 Ok(m) => m,
                 Err(_) => continue, // skip racing-deleted entries
             };
@@ -106,12 +110,13 @@ impl VfsReader for LocalDirVfs {
 
     async fn stat(&self, path: &Path) -> VfsResult<VfsFileInfo> {
         let host = self.host_join(path)?;
-        // stat() is a single µs-level syscall — running it inline on
-        // the reactor thread saves the ~50µs round-trip through
-        // spawn_blocking that tokio::fs::metadata does internally.
-        // For LocalDirVfs the FUSE getattr/lookup RTT is dominated by
-        // exactly this hop, so we shave a worker hop.
-        let md = std::fs::metadata(&host).map_err(local_stat_error)?;
+        // symlink_metadata gives lstat semantics — a symlink at `path`
+        // is reported as a symlink, not its target. FUSE getattr/lookup
+        // expect lstat (the kernel handles symlink traversal itself
+        // by reading the link target via FUSE_READLINK).
+        // Inline syscall for the same reason as before: avoids the
+        // ~50µs spawn_blocking hop on the hot lookup path.
+        let md = std::fs::symlink_metadata(&host).map_err(local_stat_error)?;
         let name = host
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -181,6 +186,65 @@ impl VfsRename for LocalDirVfs {
 }
 
 #[async_trait]
+impl VfsSymlink for LocalDirVfs {
+    async fn symlink(&self, target: &str, link_path: &Path) -> VfsResult<()> {
+        let host_link = self.host_join(link_path)?;
+        // POSIX semantics: store `target` verbatim. No path resolution
+        // — dangling links are valid, relative targets are resolved at
+        // *read* time relative to the link's parent directory.
+        #[cfg(unix)]
+        {
+            let target = target.to_string();
+            let res = tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(&target, &host_link))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?;
+            res?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let parent_host = host_link
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let probe = parent_host.join(target);
+            let target_owned = target.to_string();
+            let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let is_dir = std::fs::metadata(&probe).map(|m| m.is_dir()).unwrap_or(false);
+                if is_dir {
+                    std::os::windows::fs::symlink_dir(&target_owned, &host_link)
+                } else {
+                    std::os::windows::fs::symlink_file(&target_owned, &host_link)
+                }
+            })
+            .await
+            .map_err(|e| VfsError::Io(e.to_string()))?;
+            res?;
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, host_link);
+            Err(VfsError::NotImplemented("symlink".into()))
+        }
+    }
+}
+
+#[async_trait]
+impl VfsReadlink for LocalDirVfs {
+    async fn readlink(&self, link_path: &Path) -> VfsResult<String> {
+        let host = self.host_join(link_path)?;
+        let target = tokio::fs::read_link(&host).await?;
+        // POSIX symlink contents are an opaque byte string. Our wire
+        // protocol carries them as String; on Unix paths are typically
+        // UTF-8, on Windows always so. lossy conversion is acceptable
+        // — non-UTF8 link targets are exceedingly rare and the FUSE
+        // bridge already round-trips names through String elsewhere.
+        Ok(target.to_string_lossy().into_owned())
+    }
+}
+
+#[async_trait]
 impl VfsMove for LocalDirVfs {
     async fn move_file(&self, from: &Path, to_dir: &Path) -> VfsResult<()> {
         let f = self.host_join(from)?;
@@ -232,6 +296,12 @@ impl VfsBackend for LocalDirVfs {
     fn as_rename(&self) -> Option<&dyn VfsRename> {
         Some(self)
     }
+    fn as_symlink(&self) -> Option<&dyn VfsSymlink> {
+        Some(self)
+    }
+    fn as_readlink(&self) -> Option<&dyn VfsReadlink> {
+        Some(self)
+    }
     fn as_move(&self) -> Option<&dyn VfsMove> {
         Some(self)
     }
@@ -258,10 +328,16 @@ fn meta_to_info(name: String, md: std::fs::Metadata) -> VfsFileInfo {
             None
         }
     };
+    let ft = md.file_type();
+    let is_symlink = ft.is_symlink();
     VfsFileInfo {
         name,
         size: md.len(),
-        is_dir: md.is_dir(),
+        // lstat semantics: a symlink is reported as a symlink, NOT as
+        // its target's type. The bridge maps `is_symlink` →
+        // `NodeKind::Symlink` ahead of `Dir`/`File`.
+        is_dir: !is_symlink && md.is_dir(),
+        is_symlink,
         modified: md.modified().ok(),
         mode,
     }
@@ -507,6 +583,7 @@ fn entry_to_info(name: String, entry: &MemEntry) -> VfsFileInfo {
             name,
             size: 0,
             is_dir: true,
+            is_symlink: false,
             modified: Some(*modified),
             mode: Some(0o755),
         },
@@ -514,6 +591,7 @@ fn entry_to_info(name: String, entry: &MemEntry) -> VfsFileInfo {
             name,
             size: data.len() as u64,
             is_dir: false,
+            is_symlink: false,
             modified: Some(*modified),
             mode: Some(0o644),
         },

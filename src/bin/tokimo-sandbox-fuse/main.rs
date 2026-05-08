@@ -52,7 +52,7 @@ mod linux {
     use std::fs::File;
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -860,6 +860,39 @@ mod linux {
                     }
                     reply.ok()
                 }
+                Res::Error(we) => reply.error(errno_of(&we)),
+                _ => reply.error(libc::EIO),
+            }
+        }
+
+        fn symlink(&mut self, _r: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+            let n = match name.to_str() {
+                Some(s) => s.to_string(),
+                None => return reply.error(libc::EINVAL),
+            };
+            // POSIX symlink targets are an opaque byte string. Our
+            // wire protocol carries them as String; on Linux paths
+            // are virtually always UTF-8, and lossy conversion only
+            // affects exotic locale encodings nobody uses today.
+            let target = link.to_string_lossy().into_owned();
+            match self.dispatcher.call(Req::Symlink {
+                parent_nodeid: parent,
+                name: n,
+                target,
+            }) {
+                Res::Entry(e) => {
+                    let attr = entry_to_attr(&e);
+                    reply.entry(&TTL, &attr, e.generation);
+                }
+                Res::Error(we) => reply.error(errno_of(&we)),
+                _ => reply.error(libc::EIO),
+            }
+        }
+
+        fn readlink(&mut self, _r: &Request, ino: u64, reply: ReplyData) {
+            match self.dispatcher.call(Req::Readlink { nodeid: ino }) {
+                Res::Linkname(s) => reply.data(s.as_bytes()),
+                Res::Bytes(b) => reply.data(&b),
                 Res::Error(we) => reply.error(errno_of(&we)),
                 _ => reply.error(libc::EIO),
             }
