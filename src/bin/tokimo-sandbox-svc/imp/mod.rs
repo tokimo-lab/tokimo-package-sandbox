@@ -1287,11 +1287,19 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // background thread. Each accepted connection gets its own
     // dedicated tokio runtime (single-threaded) so that
     // TcpStream::from_std has a reactor available.
+    //
+    // Bind the listener up front and move it into the thread so the
+    // port stays bound for the entire session; re-binding per-accept
+    // would leave a race window where guest connections fail.
     {
         let fuse_host = fuse_host.clone();
+        let fuse_svc_id = vmconfig::hvsock_service_id(fuse_port);
+        let fuse_svc_guid = parse_guid(&fuse_svc_id).map_err(|e| RpcError::new("guid", e))?;
+        let fuse_listener = hvsock::listen_for_guest(hvsock::HV_GUID_WILDCARD, fuse_svc_guid)
+            .map_err(|e| RpcError::new("hvsock_listen_fuse", e.to_string()))?;
         thread::spawn(move || {
             loop {
-                match hvsock::listen_and_accept_on_port(fuse_port) {
+                match hvsock::accept_guest(&fuse_listener, std::time::Duration::from_secs(60)) {
                     Ok(hv) => {
                         let host = fuse_host.clone();
                         thread::spawn(move || {
@@ -1320,6 +1328,11 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                         });
                     }
                     Err(e) => {
+                        // accept_guest returns Err on timeout *and* on real
+                        // failures; only treat real errors as fatal.
+                        if e.to_string().contains("timed out") {
+                            continue;
+                        }
                         eprintln!("[fuse] accept error: {e}");
                         break;
                     }
