@@ -28,7 +28,7 @@ use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts}
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
 
-use super::vm::{BootedVm, FUSE_VSOCK_PORT, HOST_EXEC_VSOCK_PORT, VmConfig, boot_vm};
+use super::vm::{BootedVm, FUSE_VSOCK_PORT, VmConfig, boot_vm};
 use super::vsock_init_client::VsockInitClient;
 
 use crate::vfs_host::FuseHost;
@@ -194,7 +194,7 @@ impl SandboxBackend for MacosBackend {
                 })
             });
         let host_exec_bridge = Arc::new(crate::host_exec::HostExecBridge::new(host_exec_cb));
-        if let Err(e) = host_exec_bridge.start_vsock_listener(host_exec_listener, runtime.clone()) {
+        if let Err(e) = host_exec_bridge.start_macos_listener(host_exec_listener, runtime.clone()) {
             tracing::warn!("host-exec vsock listener start failed: {e}");
         }
 

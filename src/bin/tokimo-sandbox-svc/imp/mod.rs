@@ -1380,7 +1380,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                                     let mut dup_handle = windows::Win32::Foundation::HANDLE::default();
                                     let ok = DuplicateHandle(
                                         GetCurrentProcess(),
-                                        windows::Win32::Foundation::HANDLE(raw as isize),
+                                        windows::Win32::Foundation::HANDLE(raw as *mut _),
                                         tp,
                                         &mut dup_handle,
                                         0,
@@ -1389,7 +1389,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                                     );
                                     let _ = CloseHandle(tp);
                                     if ok.is_ok() {
-                                        Ok(dup_handle.0 as u64)
+                                        Ok(dup_handle.0 as usize as u64)
                                     } else {
                                         Err(format!("DuplicateHandle: {:?}", GetLastError()))
                                     }
@@ -1401,7 +1401,7 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
                             Ok(h) => {
                                 let _ = send_event(
                                     &conn_he,
-                                    svc_protocol::method::EV_HOST_EXEC_ACCEPTED,
+                                    method::EV_HOST_EXEC_ACCEPTED,
                                     serde_json::json!({ "duplicated_handle": h }),
                                 );
                             }

@@ -29,7 +29,7 @@ pub(super) fn start(
             }
             match listener.accept().await {
                 Ok(conn) => {
-                    use std::os::fd::{FromRawFd, IntoRawFd};
+                    use std::os::fd::FromRawFd;
                     let raw = conn.into_raw_fd();
                     let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw) };
                     let b = bridge.clone();
