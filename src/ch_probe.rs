@@ -71,8 +71,9 @@ impl ChProbeResult {
 /// Search for the `cloud-hypervisor` binary.
 ///
 /// Priority order:
-/// 1. `bin/cloud-hypervisor/current/linux-x86_64/cloud-hypervisor` (project
-///    deps convention, matching how ffmpeg / lightpanda are installed).
+/// 1. `bin/cloud-hypervisor/current/bin/cloud-hypervisor` (project deps
+///    convention: bin/<name>/current/bin/<binary_name>, matching yt-dlp /
+///    lightpanda install layout produced by fetch.ts `kind = "binary"`).
 /// 2. Each directory in `PATH`.
 fn find_ch_binary() -> Option<PathBuf> {
     // 1. Project-local install (deps convention: bin/<name>/current/<host>/<bin>)
@@ -106,7 +107,7 @@ fn locate_project_ch_binary() -> Option<PathBuf> {
             .join("bin")
             .join("cloud-hypervisor")
             .join("current")
-            .join("linux-x86_64")
+            .join("bin")
             .join("cloud-hypervisor");
         if candidate.exists() {
             return Some(candidate);
