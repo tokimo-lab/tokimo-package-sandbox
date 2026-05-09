@@ -18,7 +18,8 @@
 //! # Static build (required for initrd packaging)
 //!
 //! ```bash
-//! cargo build --release --bin tokimo-guest-agent --target x86_64-unknown-linux-musl
+//! PATH="$HOME/zig-x86_64-linux-0.14.1:$PATH" cargo-zigbuild zigbuild \
+//!     --release --bin tokimo-guest-agent --target x86_64-unknown-linux-musl
 //! ```
 //!
 //! This target requires the `musl` toolchain; see `docs/platform/linux-sandbox-roadmap.md`.
@@ -36,6 +37,12 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // When compiled as a static musl binary running as initrd PID 1, mount
+    // essential pseudo-filesystems before starting the vsock listener.
+    // Gated on target_env="musl" so unit tests (gnu target) are never affected.
+    #[cfg(target_env = "musl")]
+    mount_guest_fs();
+
     let port: u32 = std::env::var("TOKIMO_GUEST_VSOCK_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -49,5 +56,38 @@ fn main() {
     if let Err(e) = rt.block_on(server::run(port)) {
         eprintln!("tokimo-guest-agent: fatal: {e:#}");
         std::process::exit(1);
+    }
+}
+
+/// Mount /proc, /sys, and /dev inside the microVM guest.
+///
+/// Called only when compiled as a musl static binary (initrd PID 1 scenario).
+/// Failures are logged as warnings but never panic — the vsock listener is
+/// started regardless so the host can still reach the agent.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn mount_guest_fs() {
+    let entries: &[(&[u8], &[u8], &[u8])] = &[
+        (b"proc\0", b"/proc\0", b"proc\0"),
+        (b"sysfs\0", b"/sys\0", b"sysfs\0"),
+        (b"devtmpfs\0", b"/dev\0", b"devtmpfs\0"),
+    ];
+    for (src, target, fstype) in entries {
+        let ret = unsafe {
+            libc::mount(
+                src.as_ptr() as *const libc::c_char,
+                target.as_ptr() as *const libc::c_char,
+                fstype.as_ptr() as *const libc::c_char,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            // EBUSY means already mounted — not an error in our context.
+            if err.raw_os_error() != Some(libc::EBUSY) {
+                let path = std::str::from_utf8(target).unwrap_or("?").trim_end_matches('\0');
+                eprintln!("tokimo-guest-agent: warning: mount {path}: {err}");
+            }
+        }
     }
 }
