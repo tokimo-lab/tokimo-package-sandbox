@@ -22,6 +22,9 @@
 //! sb.stop_vm().unwrap();
 //! ```
 
+pub mod backend_kind;
+pub mod ch_probe;
+
 mod api;
 mod backend;
 mod error;
@@ -71,6 +74,8 @@ pub use api::{
     SessionDetails, SessionSummary, ShellOpts,
 };
 pub use backend::SandboxBackend;
+pub use backend_kind::{SandboxBackendKind, detect_backend};
+pub use ch_probe::{ChProbeResult, probe_ch};
 pub use error::{Error, Result};
 pub use fonts::FontDir;
 
