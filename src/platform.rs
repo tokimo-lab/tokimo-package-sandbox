@@ -25,16 +25,29 @@ pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
+    use crate::backend_kind::{SandboxBackendKind, detect_backend};
     use crate::linux::sandbox::LinuxBackend;
     use crate::shared_backend::{Registry, SharedBackend};
 
-    static REG: OnceLock<Registry<LinuxBackend>> = OnceLock::new();
-    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    match detect_backend() {
+        SandboxBackendKind::Ch => {
+            let probe = crate::ch_probe::probe_ch();
+            let backend = crate::ch::backend::ChBackend::new(probe)?;
+            Ok(Arc::new(backend))
+        }
+        // Disabled falls through to Bwrap path for now — the caller that set
+        // SANDBOX_BACKEND=disabled should not reach here (Sandbox::connect
+        // checks SAFEBOX_DISABLE separately). Treat as bwrap for safety.
+        SandboxBackendKind::Disabled | SandboxBackendKind::Bwrap => {
+            static REG: OnceLock<Registry<LinuxBackend>> = OnceLock::new();
+            let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
 
-    fn factory() -> Result<Arc<LinuxBackend>> {
-        Ok(Arc::new(LinuxBackend::new()?))
+            fn factory() -> Result<Arc<LinuxBackend>> {
+                Ok(Arc::new(LinuxBackend::new()?))
+            }
+            Ok(Arc::new(SharedBackend::new(reg, factory)))
+        }
     }
-    Ok(Arc::new(SharedBackend::new(reg, factory)))
 }
 
 #[cfg(target_os = "macos")]

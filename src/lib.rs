@@ -63,6 +63,8 @@ pub mod vfs_protocol;
 pub mod netstack;
 
 #[cfg(target_os = "linux")]
+pub mod ch;
+#[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
