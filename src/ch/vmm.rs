@@ -103,7 +103,7 @@ impl ChVm {
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::other(format!("failed to spawn cloud-hypervisor: {e}")))?;
@@ -122,10 +122,25 @@ impl ChVm {
 
         if appeared.is_err() {
             warn!(cid, "API socket did not appear within 3s — killing child");
+            // Try to read stderr for a diagnostic message.
+            let stderr_snippet = if let Some(mut stderr) = child.stderr.take() {
+                let mut buf = Vec::new();
+                use tokio::io::AsyncReadExt;
+                let _ = tokio::time::timeout(Duration::from_millis(200), stderr.read_to_end(&mut buf)).await;
+                let txt = String::from_utf8_lossy(&buf);
+                let last_line = txt.lines().last().unwrap_or("").trim().to_owned();
+                if last_line.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {last_line}")
+                }
+            } else {
+                String::new()
+            };
             let _ = child.kill().await;
-            return Err(Error::other(
-                "cloud-hypervisor failed to start: API socket did not appear within 3s",
-            ));
+            return Err(Error::other(format!(
+                "cloud-hypervisor failed to start: API socket did not appear within 3s{stderr_snippet}"
+            )));
         }
 
         info!(cid, api_socket = %api_socket.display(), "VM is ready");

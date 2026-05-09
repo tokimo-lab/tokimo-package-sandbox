@@ -1,8 +1,9 @@
 //! `ChBackend` — Cloud Hypervisor implementation of [`SandboxBackend`].
 //!
-//! Implements the VM lifecycle methods (`configure`, `create_vm`, `start_vm`,
-//! `stop_vm`, `is_running`). All vsock IO / RPC methods retain their
-//! `unimplemented!` stubs marked `TODO(v30-vsock)`.
+//! V3.0-spawn: VM lifecycle (create / start / stop / is_running).
+//! V3.0-vsock: guest-agent RPC over hybrid vsock — ping + spawn_command.
+//!             Implements `shell_id`, `spawn_shell`, `subscribe`, `is_guest_connected`.
+//!             `write_stdin` is a TODO (one-shot model; interactive stdin needs v3.x).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -10,12 +11,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Runtime;
+use tracing::warn;
 
 use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
+use crate::ch::rpc::{GuestRpc, Response};
 use crate::ch::vmm::{ChVm, ChVmConfig, ch_initrd_path, ch_vmlinux_path, next_cid};
 use crate::ch_probe::ChProbeResult;
 use crate::error::{Error, Result};
+
+/// vsock port the guest-agent listens on (matches TOKIMO_GUEST_VSOCK_PORT default).
+const GUEST_AGENT_PORT: u32 = 1024;
+
+/// Timeout for guest-agent to come up after VM spawn.
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_PING_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Cloud Hypervisor backend.
 ///
@@ -37,6 +47,12 @@ pub struct ChBackend {
 
     /// The live VM process handle (present between create_vm and stop_vm).
     vm: Mutex<Option<ChVm>>,
+
+    /// Event subscribers registered via `subscribe()`.
+    ///
+    /// Each `SyncSender` is a bounded channel; dead receivers are pruned on
+    /// each publish. Shared with spawned tokio tasks via `Arc`.
+    subscribers: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Event>>>>,
 }
 
 impl ChBackend {
@@ -65,6 +81,7 @@ impl ChBackend {
             runtime: Arc::new(runtime),
             config: Mutex::new(None),
             vm: Mutex::new(None),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -114,8 +131,31 @@ impl SandboxBackend for ChBackend {
         };
 
         let vm = self.runtime.block_on(ChVm::spawn(vm_config))?;
+        let vsock_socket = vm.vsock_socket.clone();
         *self.vm.lock().unwrap() = Some(vm);
-        Ok(())
+
+        // Poll guest-agent ping until it responds or 30 s elapses.
+        self.runtime.block_on(async move {
+            let rpc = GuestRpc::new(vsock_socket, GUEST_AGENT_PORT);
+            let start = std::time::Instant::now();
+            loop {
+                match rpc.ping().await {
+                    Ok(()) => {
+                        tracing::info!("guest-agent responded to ping — VM ready");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if start.elapsed() >= GUEST_READY_TIMEOUT {
+                            return Err(Error::other(format!(
+                                "guest-agent did not respond within {:.0}s: {e}",
+                                GUEST_READY_TIMEOUT.as_secs_f32()
+                            )));
+                        }
+                        tokio::time::sleep(GUEST_PING_INTERVAL).await;
+                    }
+                }
+            }
+        })
     }
 
     fn start_vm(&self) -> Result<()> {
@@ -145,116 +185,194 @@ impl SandboxBackend for ChBackend {
     }
 
     fn is_guest_connected(&self) -> Result<bool> {
-        // TODO(v30-vsock): ping the guest-agent over the vsock control socket.
-        unimplemented!("V3.0-vsock: is_guest_connected() — ping guest-agent over vsock")
+        let vsock_socket = {
+            let guard = self.vm.lock().unwrap();
+            guard.as_ref().map(|vm| vm.vsock_socket.clone())
+        };
+        let Some(sock) = vsock_socket else {
+            return Ok(false);
+        };
+        let rpc = GuestRpc::new(sock, GUEST_AGENT_PORT);
+        Ok(self.runtime.block_on(rpc.ping()).is_ok())
     }
 
     fn is_process_running(&self, _id: &JobId) -> Result<bool> {
-        // TODO(v30-vsock): send {"method":"proc_status","id": <id>} RPC.
-        unimplemented!("V3.0-vsock: is_process_running() — query proc status via RPC")
+        // TODO(v3x-interactive-shell): track running jobs by JobId.
+        Err(Error::not_implemented("is_process_running — track jobs by id (v3.x)"))
     }
 
     // -- Shell management -----------------------------------------------------
 
     fn shell_id(&self) -> Result<JobId> {
-        // TODO(v30-vsock): return the boot shell JobId from control state.
-        unimplemented!("V3.0-vsock: shell_id() — return boot-shell JobId from control state")
+        // The guest-agent uses a one-shot-per-connection model; there is no
+        // persistent "boot shell" session. Return a fixed sentinel ID so
+        // callers that just need *a* shell JobId can proceed. Actual command
+        // execution goes through spawn_shell().
+        // TODO(v3x-interactive-shell): implement a persistent PTY shell channel.
+        if self.vm.lock().unwrap().is_none() {
+            return Err(Error::VmNotRunning);
+        }
+        Ok(JobId("boot".into()))
     }
 
-    fn spawn_shell(&self, _opts: ShellOpts) -> Result<JobId> {
-        // TODO(v30-vsock): send open_shell RPC to guest-agent.
-        unimplemented!("V3.0-vsock: spawn_shell() — open_shell RPC to guest-agent")
+    fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
+        let vsock_socket = {
+            let guard = self.vm.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|vm| vm.vsock_socket.clone())
+                .ok_or(Error::VmNotRunning)?
+        };
+
+        let argv = opts.argv.unwrap_or_else(|| vec!["/bin/sh".into()]);
+        let shell_id = JobId(uuid::Uuid::new_v4().to_string());
+        let id = shell_id.clone();
+        let subs = Arc::clone(&self.subscribers);
+
+        self.runtime.spawn(async move {
+            let rpc = GuestRpc::new(vsock_socket, GUEST_AGENT_PORT);
+            let frames = match rpc.spawn_command(&argv).await {
+                Ok(f) => f,
+                Err(e) => {
+                    publish_event(
+                        &subs,
+                        Event::Error {
+                            id: Some(id.clone()),
+                            message: e.to_string(),
+                            fatal: false,
+                        },
+                    );
+                    return;
+                }
+            };
+            for frame in frames {
+                let ev = match frame {
+                    Response::Stdout { data } => Event::Stdout {
+                        id: id.clone(),
+                        data: data.into_bytes(),
+                    },
+                    Response::Stderr { data } => Event::Stderr {
+                        id: id.clone(),
+                        data: data.into_bytes(),
+                    },
+                    Response::Exit { code } => Event::Exit {
+                        id: id.clone(),
+                        exit_code: code,
+                        signal: None,
+                    },
+                    Response::Error { msg } => Event::Error {
+                        id: Some(id.clone()),
+                        message: msg,
+                        fatal: false,
+                    },
+                    Response::Pong => continue,
+                };
+                publish_event(&subs, ev);
+            }
+        });
+
+        Ok(shell_id)
     }
 
     fn resize_shell(&self, _id: &JobId, _rows: u16, _cols: u16) -> Result<()> {
-        // TODO(v30-vsock): send resize_pty RPC to guest-agent.
-        unimplemented!("V3.0-vsock: resize_shell() — resize_pty RPC to guest-agent")
+        // TODO(v3x-interactive-shell): resize_pty RPC when PTY shells are supported.
+        Err(Error::not_implemented("resize_shell (v3.x PTY channel)"))
     }
 
     fn close_shell(&self, _id: &JobId) -> Result<()> {
-        // TODO(v30-vsock): send close_shell RPC to guest-agent.
-        unimplemented!("V3.0-vsock: close_shell() — close_shell RPC to guest-agent")
+        // TODO(v3x-interactive-shell): close_shell RPC.
+        Err(Error::not_implemented("close_shell (v3.x PTY channel)"))
     }
 
     fn list_shells(&self) -> Result<Vec<JobId>> {
-        // TODO(v30-vsock): return shell registry snapshot from control state.
-        unimplemented!("V3.0-vsock: list_shells() — snapshot shell registry")
+        // TODO(v3x-interactive-shell): shell registry.
+        Err(Error::not_implemented("list_shells (v3.x shell registry)"))
     }
 
     fn write_stdin(&self, _id: &JobId, _data: &[u8]) -> Result<()> {
-        // TODO(v30-vsock): write framed stdin bytes over vsock data channel.
-        unimplemented!("V3.0-vsock: write_stdin() — framed stdin write to vsock data channel")
+        // The guest-agent one-shot model does not support interactive stdin.
+        // TODO(v3x-interactive-shell): route data over a persistent PTY channel.
+        Err(Error::not_implemented(
+            "write_stdin — interactive stdin not supported in one-shot model (v3.x)",
+        ))
     }
 
     fn signal_shell(&self, _id: &JobId, _sig: i32) -> Result<()> {
-        // TODO(v30-vsock): send signal RPC to guest-agent.
-        unimplemented!("V3.0-vsock: signal_shell() — signal RPC to guest-agent")
+        // TODO(v3x-interactive-shell): signal RPC.
+        Err(Error::not_implemented("signal_shell (v3.x)"))
     }
 
     // -- Event subscription ---------------------------------------------------
 
     fn subscribe(&self) -> Result<Receiver<Event>> {
-        // TODO(v30-vsock): register mpsc Sender in event fan-out.
-        unimplemented!("V3.0-vsock: subscribe() — register mpsc Sender in event fan-out")
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        self.subscribers.lock().unwrap().push(tx);
+        Ok(rx)
     }
 
     // -- Disk / debug ---------------------------------------------------------
 
     fn create_disk_image(&self, _path: &Path, _gib: u64) -> Result<()> {
-        // TODO(v30-spawn): fallocate + optional mkfs.
-        unimplemented!("V3.0-spawn: create_disk_image() — fallocate + optional mkfs")
+        Err(Error::not_implemented("create_disk_image (v3.x)"))
     }
 
     fn set_debug_logging(&self, _enabled: bool) -> Result<()> {
-        // TODO(v30-spawn): toggle CH log verbosity.
-        unimplemented!("V3.0-spawn: set_debug_logging() — toggle CH log verbosity")
+        Err(Error::not_implemented("set_debug_logging (v3.x)"))
     }
 
     fn is_debug_logging_enabled(&self) -> Result<bool> {
-        // TODO(v30-spawn): return debug logging flag.
-        unimplemented!("V3.0-spawn: is_debug_logging_enabled() — return debug log flag")
+        Err(Error::not_implemented("is_debug_logging_enabled (v3.x)"))
     }
 
     fn send_guest_response(&self, _raw: serde_json::Value) -> Result<()> {
-        // TODO(v30-vsock): send JSON reply over vsock.
-        unimplemented!("V3.0-vsock: send_guest_response() — send JSON reply over vsock")
+        Err(Error::not_implemented("send_guest_response (v3.x)"))
     }
 
     fn passthrough(&self, _method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
-        // TODO(v30-vsock): forward arbitrary RPC to CH REST API socket.
-        unimplemented!("V3.0-vsock: passthrough() — forward RPC to CH REST API socket")
+        Err(Error::not_implemented("passthrough (v3.x)"))
     }
 
-    // -- Dynamic mounts -------------------------------------------------------
-
     fn add_mount(&self, _mount: Mount) -> Result<()> {
-        // TODO(v30-spawn): CH hotplug virtio-fs add-device.
-        unimplemented!("V3.0-spawn: add_mount() — CH hotplug virtio-fs add-device")
+        // TODO(v3x-mounts): CH hotplug virtio-fs.
+        Err(Error::not_implemented("add_mount (v3.x)"))
     }
 
     fn remove_mount(&self, _name: &str) -> Result<()> {
-        // TODO(v30-spawn): CH hotplug virtio-fs remove-device.
-        unimplemented!("V3.0-spawn: remove_mount() — CH hotplug virtio-fs remove-device")
+        // TODO(v3x-mounts): CH hotplug virtio-fs remove.
+        Err(Error::not_implemented("remove_mount (v3.x)"))
     }
 
-    // -- Session management ---------------------------------------------------
-
     fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        // TODO(v30-vsock): query session registry in control state.
-        unimplemented!("V3.0-vsock: list_sessions() — query session registry")
+        // TODO(v3x-sessions): session registry.
+        Err(Error::not_implemented("list_sessions (v3.x)"))
     }
 
     fn session_info(&self, _name: &str) -> Result<Option<SessionDetails>> {
-        // TODO(v30-vsock): look up session by name in control state registry.
-        unimplemented!("V3.0-vsock: session_info() — lookup session in control registry")
+        // TODO(v3x-sessions): session lookup.
+        Err(Error::not_implemented("session_info (v3.x)"))
     }
 
     fn stop_session(&self, _name: &str) -> Result<()> {
-        // TODO(v30-vsock): close all shells for session.
-        unimplemented!("V3.0-vsock: stop_session() — close all shells for session")
+        // TODO(v3x-sessions): stop session.
+        Err(Error::not_implemented("stop_session (v3.x)"))
     }
 
     // -- Host-Exec bridge -----------------------------------------------------
     // Default impls from the trait return Error::other("not implemented").
-    // TODO(v30-vsock): override with vsock relay.
+    // TODO(v3x-host-exec): override with vsock relay.
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Publish `ev` to all live subscribers, pruning disconnected ones.
+fn publish_event(subs: &Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Event>>>>, ev: Event) {
+    let mut guard = subs.lock().unwrap();
+    guard.retain(|tx| match tx.try_send(ev.clone()) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            warn!("subscriber channel full — dropping event");
+            true
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    });
 }
