@@ -274,6 +274,7 @@ fn ch_net_passt_smoke() {
         network: Some(NetworkConfig {
             passt_binary,
             mac_addr: None,
+            port_forwards: vec![],
         }),
     };
 

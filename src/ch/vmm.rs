@@ -35,9 +35,24 @@ pub fn next_cid() -> u32 {
 
 // ── ChVmConfig ───────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortProto {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortForward {
+    pub proto: PortProto,
+    pub host_port: u16,
+    pub guest_port: u16,
+    pub host_addr: Option<String>,
+}
+
 pub struct NetworkConfig {
     pub passt_binary: PathBuf,
     pub mac_addr: Option<String>,
+    pub port_forwards: Vec<PortForward>,
 }
 
 pub struct ChVmConfig {
@@ -186,10 +201,63 @@ impl ChVm {
                 )));
             }
 
+            let mut tcp_ports = std::collections::HashSet::new();
+            let mut udp_ports = std::collections::HashSet::new();
+            for pf in &network.port_forwards {
+                let ports = match &pf.proto {
+                    PortProto::Tcp => &mut tcp_ports,
+                    PortProto::Udp => &mut udp_ports,
+                };
+                if !ports.insert(pf.host_port) {
+                    if let Some(mut vfsd) = virtiofsd_child_opt.take() {
+                        let _ = vfsd.kill().await;
+                    }
+                    return Err(Error::validation(format!(
+                        "duplicate host_port {} for {:?} in port_forwards",
+                        pf.host_port, pf.proto
+                    )));
+                }
+            }
+
+            let mut passt_pf_args: Vec<String> = Vec::new();
+            let make_spec = |fwds: &[&PortForward]| {
+                fwds.iter()
+                    .map(|pf| {
+                        if let Some(addr) = &pf.host_addr {
+                            format!("{}/{}:{}", addr, pf.host_port, pf.guest_port)
+                        } else {
+                            format!("{}:{}", pf.host_port, pf.guest_port)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+
+            let tcp_fwds: Vec<&PortForward> = network
+                .port_forwards
+                .iter()
+                .filter(|pf| pf.proto == PortProto::Tcp)
+                .collect();
+            let udp_fwds: Vec<&PortForward> = network
+                .port_forwards
+                .iter()
+                .filter(|pf| pf.proto == PortProto::Udp)
+                .collect();
+
+            if !tcp_fwds.is_empty() {
+                passt_pf_args.push("-t".to_string());
+                passt_pf_args.push(make_spec(&tcp_fwds));
+            }
+            if !udp_fwds.is_empty() {
+                passt_pf_args.push("-u".to_string());
+                passt_pf_args.push(make_spec(&udp_fwds));
+            }
+
             info!(cid, "spawning passt for vhost-user networking");
             let passt_socket_arg = passt_socket.to_string_lossy().into_owned();
             let mut passt_child = match std::process::Command::new(&network.passt_binary)
                 .args(["--vhost-user", "--socket", &passt_socket_arg, "-f", "--no-map-gw"])
+                .args(&passt_pf_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
