@@ -6,7 +6,7 @@
 #   /proc /sys /dev     empty directories (guest-agent mounts them at startup)
 #   /tmp                empty directory
 #   /bin/busybox        static busybox binary (optional, if <busybox-binary> supplied)
-#   /bin/{sh,echo,cat,ls}  symlinks -> busybox
+#   /bin/{sh,echo,cat,ls,ip,udhcpc,wget,cut,ipcalc} symlinks -> busybox
 #
 # Usage:
 #   ./scripts/linux/build-ch-initrd.sh <out.cpio.gz> <agent-binary> [busybox-binary]
@@ -122,8 +122,8 @@ ino = 1
 entries.append(newc_entry(ino, ".", mode=0o040755, nlink=2))
 ino += 1
 
-# Empty directories that guest-agent mounts into.
-for d in ("dev", "proc", "sys", "tmp"):
+# Empty directories that guest-agent mounts into, plus minimal config dirs.
+for d in ("dev", "proc", "sys", "tmp", "etc", "etc/udhcpc"):
     entries.append(newc_entry(ino, d, mode=0o040755, nlink=2))
     ino += 1
 
@@ -131,24 +131,66 @@ for d in ("dev", "proc", "sys", "tmp"):
 entries.append(newc_entry(ino, "init", data=agent_data, mode=0o0100755))
 ino += 1
 
-listing = [".", "dev", "proc", "sys", "tmp", "init"]
+listing = [".", "dev", "proc", "sys", "tmp", "etc", "etc/udhcpc", "init"]
 
 if busybox_data:
-    # /bin directory
+    # /bin and /sbin directories
     entries.append(newc_entry(ino, "bin", mode=0o040755, nlink=2))
     ino += 1
     listing.append("bin")
+    entries.append(newc_entry(ino, "sbin", mode=0o040755, nlink=2))
+    ino += 1
+    listing.append("sbin")
 
     # /bin/busybox — the static binary
     entries.append(newc_entry(ino, "bin/busybox", data=busybox_data, mode=0o0100755))
     ino += 1
     listing.append("bin/busybox")
 
-    # Symlinks: /bin/{sh,echo,cat,ls} -> busybox
-    for applet in ("sh", "echo", "cat", "ls"):
+    # Symlinks: /bin/{sh,echo,cat,ls,ip,udhcpc,wget,cut,ipcalc} -> busybox
+    for applet in ("sh", "echo", "cat", "ls", "ip", "udhcpc", "wget", "cut", "ipcalc"):
         entries.append(newc_symlink(ino, f"bin/{applet}", "busybox"))
         ino += 1
         listing.append(f"bin/{applet}")
+
+    entries.append(newc_symlink(ino, "sbin/udhcpc", "/bin/busybox"))
+    ino += 1
+    listing.append("sbin/udhcpc")
+
+    udhcpc_script = b'''#!/bin/busybox sh
+RESOLV_CONF=/etc/resolv.conf
+[ -n "$1" ] || { echo "Error: should be called from udhcpc" >&2; exit 1; }
+case "$1" in
+    deconfig)
+        /bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        /bin/busybox ip link set "$interface" up
+        ;;
+    bound|renew)
+        /bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        if [ -n "$subnet" ]; then
+            mask=$(/bin/busybox ipcalc -p 0.0.0.0 "$subnet" 2>/dev/null | /bin/busybox cut -d= -f2)
+            [ -z "$mask" ] && mask=24
+            /bin/busybox ip addr add "$ip/$mask" dev "$interface"
+        else
+            /bin/busybox ip addr add "$ip/24" dev "$interface"
+        fi
+        if [ -n "$router" ]; then
+            for r in $router; do
+                /bin/busybox ip route add default via "$r" dev "$interface" 2>/dev/null
+            done
+        fi
+        : > "$RESOLV_CONF"
+        [ -n "$domain" ] && echo "search $domain" >> "$RESOLV_CONF"
+        for dns in $dns; do
+            echo "nameserver $dns" >> "$RESOLV_CONF"
+        done
+        ;;
+esac
+exit 0
+'''
+    entries.append(newc_entry(ino, "etc/udhcpc/default.script", data=udhcpc_script, mode=0o0100755))
+    ino += 1
+    listing.append("etc/udhcpc/default.script")
 
 # TRAILER (end of archive sentinel).
 entries.append(newc_entry(0, "TRAILER!!!", mode=0, nlink=1))

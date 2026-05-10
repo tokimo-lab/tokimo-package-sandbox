@@ -162,4 +162,88 @@ fn mount_guest_fs() {
             eprintln!("tokimo-guest-agent: warning: mount /mnt (virtiofs): {err}");
         }
     }
+
+    bring_up_guest_network();
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn bring_up_guest_network() {
+    if !std::path::Path::new("/sys/class/net/eth0").exists() {
+        return;
+    }
+
+    log_guest_command_result(
+        "ip link set lo up",
+        guest_applet_command("ip", &["link", "set", "lo", "up"]).output(),
+    );
+    log_guest_command_result(
+        "ip link set eth0 up",
+        guest_applet_command("ip", &["link", "set", "eth0", "up"]).output(),
+    );
+    let udhcpc_script = "/etc/udhcpc/default.script";
+    let mut udhcpc_args = vec!["-i", "eth0", "-q", "-n", "-t", "5"];
+    let udhcpc_command = if std::path::Path::new(udhcpc_script).exists() {
+        udhcpc_args.extend_from_slice(&["-s", udhcpc_script]);
+        "udhcpc -i eth0 -q -n -t 5 -s /etc/udhcpc/default.script"
+    } else {
+        "udhcpc -i eth0 -q -n -t 5"
+    };
+    log_guest_command_result(udhcpc_command, guest_applet_command("udhcpc", &udhcpc_args).output());
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn guest_applet_command(applet: &str, args: &[&str]) -> std::process::Command {
+    let path = match applet {
+        "ip" => first_existing_path(&["/bin/ip", "/sbin/ip", "/usr/bin/ip", "/usr/sbin/ip"]),
+        "udhcpc" => first_existing_path(&["/sbin/udhcpc", "/bin/udhcpc", "/usr/sbin/udhcpc", "/usr/bin/udhcpc"]),
+        _ => None,
+    };
+
+    let mut command = if let Some(path) = path {
+        std::process::Command::new(path)
+    } else if std::path::Path::new("/bin/busybox").exists() {
+        let mut command = std::process::Command::new("/bin/busybox");
+        command.arg(applet);
+        command
+    } else {
+        std::process::Command::new(applet)
+    };
+    command.args(args).env("PATH", "/sbin:/bin:/usr/sbin:/usr/bin");
+    command
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn first_existing_path(paths: &[&'static str]) -> Option<&'static str> {
+    paths.iter().copied().find(|path| std::path::Path::new(path).exists())
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn log_guest_command_result(command: &str, output: std::io::Result<std::process::Output>) {
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                eprintln!("tokimo-guest-agent: network: {command}: success ({})", output.status);
+            } else {
+                eprintln!(
+                    "tokimo-guest-agent: warning: network: {command}: failed ({})",
+                    output.status
+                );
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = stdout.trim();
+            if !stdout.is_empty() {
+                eprintln!("tokimo-guest-agent: network: {command}: stdout: {stdout}");
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                eprintln!("tokimo-guest-agent: network: {command}: stderr: {stderr}");
+            }
+        }
+        Err(e) => {
+            eprintln!("tokimo-guest-agent: warning: network: {command}: spawn failed: {e}");
+        }
+    }
 }
