@@ -17,6 +17,8 @@
 //! The test is `#[ignore]` by default because it requires KVM hardware
 //! access and built initrd artefacts that are not present in CI.
 
+#![cfg(target_os = "linux")]
+
 use std::time::Duration;
 
 use tokimo_package_sandbox::ch::vmm::{ChVm, ChVmConfig, ch_initrd_path, ch_vmlinux_path, next_cid};

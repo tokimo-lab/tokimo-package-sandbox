@@ -3,6 +3,9 @@
 //! Spawns a real cloud-hypervisor microVM, waits for the guest-agent to come
 //! up, then executes `/bin/echo hi` inside the VM and verifies that:
 //!  - stdout is `"hi\n"`
+
+#![cfg(target_os = "linux")]
+
 //!  - exit code is `0`
 //!
 //! # Prerequisites
