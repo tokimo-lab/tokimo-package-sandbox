@@ -120,6 +120,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+reqwest = { version = "0.12", features = ["blocking"] }
 tracing-subscriber = "0.3"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
