@@ -66,6 +66,7 @@ async fn ch_spawn_and_shutdown() {
         initrd,
         memory_mb: 256,
         cpu_count: 1,
+        shared_dir: None,
     };
 
     let api_socket = std::path::PathBuf::from(format!("/tmp/tokimo-ch-api-{cid}.sock"));

@@ -128,6 +128,7 @@ impl SandboxBackend for ChBackend {
             initrd: ch_initrd_path()?,
             memory_mb: memory_mb.max(256),
             cpu_count: cpu_count.max(1),
+            shared_dir: None,
         };
 
         let vm = self.runtime.block_on(ChVm::spawn(vm_config))?;
@@ -265,7 +266,7 @@ impl SandboxBackend for ChBackend {
                         message: msg,
                         fatal: false,
                     },
-                    Response::Pong => continue,
+                    Response::Pong | Response::MountStatus { .. } => continue,
                 };
                 publish_event(&subs, ev);
             }

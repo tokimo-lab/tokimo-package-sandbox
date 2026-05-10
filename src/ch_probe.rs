@@ -17,6 +17,8 @@ pub struct ChProbeResult {
     pub kvm_module_loaded: bool,
     /// Current process' supplementary groups include the `kvm` group.
     pub user_in_kvm_group: bool,
+    /// `virtiofsd` binary is available.
+    pub virtiofsd_available: bool,
 }
 
 /// Run all availability checks and return a [`ChProbeResult`].
@@ -27,6 +29,7 @@ pub fn probe_ch() -> ChProbeResult {
         ch_binary: find_ch_binary(),
         kvm_module_loaded: std::fs::metadata("/sys/module/kvm").is_ok(),
         user_in_kvm_group: current_user_in_kvm_group(),
+        virtiofsd_available: find_virtiofsd_binary().is_some(),
     }
 }
 
@@ -54,6 +57,7 @@ impl ChProbeResult {
              {} cloud-hypervisor binary: {}\n\
              {} /sys/module/kvm loaded\n\
              {} current user in kvm group\n\
+             {} virtiofsd available\n\
              {} overall ready",
             check(self.kvm_dev),
             check(self.vhost_vsock_dev),
@@ -61,12 +65,31 @@ impl ChProbeResult {
             binary_str,
             check(self.kvm_module_loaded),
             check(self.user_in_kvm_group),
+            check(self.virtiofsd_available),
             check(self.is_ready()),
         )
     }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Check if a path points to an executable file.
+///
+/// On Unix, verifies the file has executable permissions (mode & 0o111 != 0).
+/// On non-Unix, falls back to checking if it's a file.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
+}
 
 /// Search for the `cloud-hypervisor` binary.
 ///
@@ -81,7 +104,7 @@ fn find_ch_binary() -> Option<PathBuf> {
     //    we use the executable's location as a heuristic.
     let project_path = locate_project_ch_binary();
     if let Some(ref p) = project_path
-        && p.exists()
+        && is_executable_file(p)
     {
         return project_path;
     }
@@ -90,7 +113,7 @@ fn find_ch_binary() -> Option<PathBuf> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join("cloud-hypervisor");
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -109,6 +132,46 @@ fn locate_project_ch_binary() -> Option<PathBuf> {
             .join("current")
             .join("bin")
             .join("cloud-hypervisor");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Search for the `virtiofsd` binary.
+///
+/// Priority order:
+/// 1. `bin/virtiofsd/current/virtiofsd` (project deps convention)
+/// 2. Each directory in `PATH`.
+fn find_virtiofsd_binary() -> Option<PathBuf> {
+    // 1. Project-local install
+    let project_path = locate_project_virtiofsd_binary();
+    if let Some(ref p) = project_path
+        && is_executable_file(p)
+    {
+        return project_path;
+    }
+
+    // 2. PATH search
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("virtiofsd");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn locate_project_virtiofsd_binary() -> Option<PathBuf> {
+    // Walk up from the current exe to find the repo root (contains `bin/`).
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    for _ in 0..8 {
+        let candidate = dir.join("bin").join("virtiofsd").join("current").join("virtiofsd");
         if candidate.exists() {
             return Some(candidate);
         }
