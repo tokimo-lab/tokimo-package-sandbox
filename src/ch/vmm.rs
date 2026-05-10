@@ -93,6 +93,7 @@ impl ChVm {
             }
 
             info!(cid, "spawning virtiofsd for shared_dir {:?}", shared_dir);
+            // Use chroot sandbox; virtiofsd's default namespace sandbox relies on pivot_root which Docker seccomp blocks
             let mut vfsd_child = Command::new(&virtiofsd_bin)
                 .args([
                     "--socket-path",
@@ -100,6 +101,7 @@ impl ChVm {
                     "--shared-dir",
                     &shared_dir.to_string_lossy(),
                     "--cache=auto",
+                    "--sandbox=chroot",
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
