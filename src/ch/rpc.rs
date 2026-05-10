@@ -28,6 +28,29 @@
 //! - `{"type":"stderr","data":"..."}`
 //! - `{"type":"exit","code":0}`
 //! - `{"type":"error","msg":"..."}`
+//!
+//! # PTY Protocol
+//!
+//! PTY sessions run on a separate vsock port (default: one-shot port + 1).
+//! Port allocation convention:
+//! - Port N (default 1024): one-shot RPC (spawn_command, ping, etc.)
+//! - Port N+1 (default 1025): long-lived PTY sessions
+//!
+//! PTY handshake:
+//! 1. Host connects to PTY port, sends open request with argv/cols/rows
+//! 2. Guest forks with forkpty(), returns success
+//! 3. Bidirectional streaming begins (Stdin/Resize/Close -> Stdout/Exit/Error)
+//!
+//! PTY frames (tagged `"type"`, snake_case):
+//! Host -> Guest:
+//! - `{"type":"stdin","data":"text"}`
+//! - `{"type":"resize","cols":80,"rows":24}`
+//! - `{"type":"close"}`
+//!
+//! Guest -> Host:
+//! - `{"type":"stdout","data":"text"}`
+//! - `{"type":"exit","code":0}`
+//! - `{"type":"error","msg":"..."}`
 
 use std::path::Path;
 
@@ -58,6 +81,26 @@ pub enum Response {
     Exit { code: i32 },
     Error { msg: String },
     MountStatus { path: String, mounted: bool },
+}
+
+// ── PTY protocol types ────────────────────────────────────────────────────────
+
+/// Outgoing PTY control frame (host -> guest).
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PtyRequest<'a> {
+    Stdin { data: &'a str },
+    Resize { cols: u16, rows: u16 },
+    Close,
+}
+
+/// Incoming PTY event frame (guest -> host).
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PtyFrame {
+    Stdout { data: String },
+    Exit { code: i32 },
+    Error { msg: String },
 }
 
 // ── Hybrid vsock connector ────────────────────────────────────────────────────
@@ -187,6 +230,127 @@ impl GuestRpc {
             other => Err(Error::protocol(format!(
                 "query_mount: expected MountStatus, got {other:?}"
             ))),
+        }
+    }
+
+    /// Open a PTY session on the guest.
+    ///
+    /// Connects to the PTY port (one-shot port + 1), sends an open request,
+    /// and returns a `PtySession` for bidirectional streaming.
+    ///
+    /// The PTY port convention is: if the one-shot RPC port is N (default 1024),
+    /// the PTY port is N+1 (default 1025). This separation allows the guest to
+    /// run distinct vsock listeners with different protocol semantics.
+    pub async fn open_pty(&self, argv: Vec<String>, cols: u16, rows: u16) -> Result<PtySession> {
+        // PTY port is one-shot port + 1 by convention
+        let pty_port = self.port + 1;
+
+        let mut br = connect_guest_inner(&self.vsock_socket, pty_port).await?;
+
+        // Send PTY open request
+        #[derive(Serialize)]
+        struct PtyOpenRequest<'a> {
+            argv: &'a [String],
+            cols: u16,
+            rows: u16,
+        }
+
+        let open_req = PtyOpenRequest {
+            argv: &argv,
+            cols,
+            rows,
+        };
+        let json = serde_json::to_string(&open_req)?;
+        br.get_mut().write_all(json.as_bytes()).await?;
+        br.get_mut().write_all(b"\n").await?;
+        br.get_mut().flush().await?;
+
+        Ok(PtySession { br })
+    }
+}
+
+// ── PtySession ───────────────────────────────────────────────────────────────
+
+/// A long-lived PTY session to a guest process.
+///
+/// Provides async methods for reading output frames, writing stdin data,
+/// resizing the terminal window, and closing the session.
+pub struct PtySession {
+    br: BufReader<UnixStream>,
+}
+
+impl PtySession {
+    /// Read the next frame from the PTY session.
+    ///
+    /// Returns `Ok(None)` if the connection was closed (guest exited).
+    /// Returns `Ok(Some(frame))` with `Stdout`, `Exit`, or `Error` frames.
+    pub async fn read_frame(&mut self) -> Result<Option<PtyFrame>> {
+        let mut line = String::new();
+        let n = self.br.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let frame: PtyFrame = serde_json::from_str(trimmed)
+            .map_err(|e| Error::protocol(format!("PTY: deserialize frame: {e} (raw: {trimmed:?})")))?;
+
+        Ok(Some(frame))
+    }
+
+    /// Write stdin data to the PTY.
+    pub async fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
+        let data_str = std::str::from_utf8(data).map_err(|e| Error::other(format!("PTY stdin must be UTF-8: {e}")))?;
+
+        let req = serde_json::to_string(&PtyRequest::Stdin { data: data_str })?;
+        self.br.get_mut().write_all(req.as_bytes()).await?;
+        self.br.get_mut().write_all(b"\n").await?;
+        self.br.get_mut().flush().await?;
+
+        Ok(())
+    }
+
+    /// Resize the PTY window.
+    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        let req = serde_json::to_string(&PtyRequest::Resize { cols, rows })?;
+        self.br.get_mut().write_all(req.as_bytes()).await?;
+        self.br.get_mut().write_all(b"\n").await?;
+        self.br.get_mut().flush().await?;
+
+        Ok(())
+    }
+
+    /// Close the PTY session and wait for the guest to report child exit.
+    pub async fn close(mut self) -> Result<()> {
+        let req = serde_json::to_string(&PtyRequest::Close)?;
+        self.br.get_mut().write_all(req.as_bytes()).await?;
+        self.br.get_mut().write_all(b"\n").await?;
+        self.br.get_mut().flush().await?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.br.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let frame: PtyFrame = serde_json::from_str(trimmed)
+                .map_err(|e| Error::protocol(format!("PTY close: deserialize frame: {e} (raw: {trimmed:?})")))?;
+            match frame {
+                PtyFrame::Stdout { .. } => {}
+                PtyFrame::Exit { .. } => return Ok(()),
+                PtyFrame::Error { msg } => return Err(Error::Guest(format!("PTY close: {msg}"))),
+            }
         }
     }
 }
