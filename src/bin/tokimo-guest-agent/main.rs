@@ -59,7 +59,7 @@ fn main() {
     }
 }
 
-/// Mount /proc, /sys, and /dev inside the microVM guest.
+/// Mount /proc, /sys, /dev, and /mnt (for virtiofs) inside the microVM guest.
 ///
 /// Called only when compiled as a musl static binary (initrd PID 1 scenario).
 /// Failures are logged as warnings but never panic — the vsock listener is
@@ -88,6 +88,28 @@ fn mount_guest_fs() {
                 let path = std::str::from_utf8(target).unwrap_or("?").trim_end_matches('\0');
                 eprintln!("tokimo-guest-agent: warning: mount {path}: {err}");
             }
+        }
+    }
+
+    // Create and mount virtiofs share at /mnt
+    if let Err(e) = std::fs::create_dir_all("/mnt") {
+        eprintln!("tokimo-guest-agent: warning: create /mnt: {e}");
+    }
+
+    let ret = unsafe {
+        libc::mount(
+            b"tokimoshare\0".as_ptr() as *const libc::c_char,
+            b"/mnt\0".as_ptr() as *const libc::c_char,
+            b"virtiofs\0".as_ptr() as *const libc::c_char,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // EBUSY means already mounted; ENODEV means virtiofs not available (no --fs flag)
+        if err.raw_os_error() != Some(libc::EBUSY) && err.raw_os_error() != Some(libc::ENODEV) {
+            eprintln!("tokimo-guest-agent: warning: mount /mnt (virtiofs): {err}");
         }
     }
 }

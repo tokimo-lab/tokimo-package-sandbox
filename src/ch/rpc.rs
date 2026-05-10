@@ -45,6 +45,7 @@ use crate::error::{Error, Result};
 enum Request<'a> {
     Ping,
     Spawn { argv: &'a [String] },
+    QueryMount { path: &'a str },
 }
 
 /// Incoming RPC response (mirrors `tokimo-guest-agent::exec::Response`).
@@ -56,6 +57,7 @@ pub enum Response {
     Stderr { data: String },
     Exit { code: i32 },
     Error { msg: String },
+    MountStatus { path: String, mounted: bool },
 }
 
 // ── Hybrid vsock connector ────────────────────────────────────────────────────
@@ -160,5 +162,31 @@ impl GuestRpc {
         }
 
         Ok(responses)
+    }
+
+    /// Query whether a path is mounted on the guest.
+    ///
+    /// Returns `Ok(true)` if the path appears in /proc/self/mountinfo,
+    /// `Ok(false)` otherwise.
+    pub async fn query_mount(&self, path: &str) -> Result<bool> {
+        let mut br = connect_guest_inner(&self.vsock_socket, self.port).await?;
+
+        let req = serde_json::to_string(&Request::QueryMount { path })?;
+        br.get_mut().write_all(req.as_bytes()).await?;
+        br.get_mut().write_all(b"\n").await?;
+        br.get_mut().flush().await?;
+
+        let mut line = String::new();
+        br.read_line(&mut line).await?;
+        let resp: Response = serde_json::from_str(line.trim())
+            .map_err(|e| Error::protocol(format!("query_mount: deserialize response: {e} (raw: {line:?})")))?;
+
+        match resp {
+            Response::MountStatus { mounted, .. } => Ok(mounted),
+            Response::Error { msg } => Err(Error::protocol(format!("query_mount: guest error: {msg}"))),
+            other => Err(Error::protocol(format!(
+                "query_mount: expected MountStatus, got {other:?}"
+            ))),
+        }
     }
 }
