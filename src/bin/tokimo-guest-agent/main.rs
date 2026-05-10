@@ -27,6 +27,8 @@
 #[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
+mod pty;
+#[cfg(target_os = "linux")]
 mod server;
 
 #[cfg(not(target_os = "linux"))]
@@ -48,15 +50,41 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
 
+    // PTY port is offset +1 from the one-shot RPC port by convention.
+    // One-shot default 1024 => PTY default 1025.
+    // This allows separate vsock listeners for different protocol semantics:
+    // - port: one request/response per connection (spawn_command)
+    // - port+1: long-lived bidirectional PTY sessions
+    let pty_port = port + 1;
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
-    if let Err(e) = rt.block_on(server::run(port)) {
-        eprintln!("tokimo-guest-agent: fatal: {e:#}");
-        std::process::exit(1);
-    }
+    // Spawn one-shot RPC server
+    let rpc_handle = rt.spawn(async move {
+        if let Err(e) = server::run(port).await {
+            eprintln!("tokimo-guest-agent RPC: fatal: {e:#}");
+            std::process::exit(1);
+        }
+    });
+
+    // Spawn PTY server
+    let pty_handle = rt.spawn(async move {
+        if let Err(e) = server::run_pty(pty_port).await {
+            eprintln!("tokimo-guest-agent PTY: fatal: {e:#}");
+            std::process::exit(1);
+        }
+    });
+
+    // Wait for both servers
+    rt.block_on(async {
+        tokio::select! {
+            _ = rpc_handle => {}
+            _ = pty_handle => {}
+        }
+    });
 }
 
 /// Mount /proc, /sys, /dev, and /mnt (for virtiofs) inside the microVM guest.
@@ -88,6 +116,28 @@ fn mount_guest_fs() {
                 let path = std::str::from_utf8(target).unwrap_or("?").trim_end_matches('\0');
                 eprintln!("tokimo-guest-agent: warning: mount {path}: {err}");
             }
+        }
+    }
+
+    // Create and mount devpts so forkpty/openpty can allocate PTYs.
+    if let Err(e) = std::fs::create_dir_all("/dev/pts") {
+        eprintln!("tokimo-guest-agent: warning: create /dev/pts: {e}");
+    }
+
+    let ret = unsafe {
+        libc::mount(
+            b"devpts\0".as_ptr() as *const libc::c_char,
+            b"/dev/pts\0".as_ptr() as *const libc::c_char,
+            b"devpts\0".as_ptr() as *const libc::c_char,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        // EBUSY means already mounted — not an error in our context.
+        if err.raw_os_error() != Some(libc::EBUSY) {
+            eprintln!("tokimo-guest-agent: warning: mount /dev/pts (devpts): {err}");
         }
     }
 
