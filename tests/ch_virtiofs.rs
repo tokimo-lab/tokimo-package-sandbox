@@ -115,6 +115,7 @@ fn ch_virtiofs_round_trip() {
         memory_mb: 256,
         cpu_count: 1,
         shared_dir: Some(test_dir.clone()),
+        network: None,
     };
 
     // ── Boot VM ──────────────────────────────────────────────────────────────

@@ -3,11 +3,13 @@
 //! Provides [`ChVmConfig`], [`ChVm`] (the running VM handle), and helpers
 //! for finding kernel / initrd / project-root paths.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
@@ -17,6 +19,9 @@ use crate::error::{Error, Result};
 
 /// virtiofs tag name for the shared directory visible to the guest.
 pub const SHARED_TAG: &str = "tokimoshare";
+
+/// Default guest MAC address used when networking is enabled without an override.
+pub const DEFAULT_MAC_ADDR: &str = "9a:55:9a:55:9a:55";
 
 // ── CID allocator ────────────────────────────────────────────────────────────
 
@@ -30,6 +35,11 @@ pub fn next_cid() -> u32 {
 
 // ── ChVmConfig ───────────────────────────────────────────────────────────────
 
+pub struct NetworkConfig {
+    pub passt_binary: PathBuf,
+    pub mac_addr: Option<String>,
+}
+
 pub struct ChVmConfig {
     pub cid: u32,
     pub ch_binary: PathBuf,
@@ -38,6 +48,7 @@ pub struct ChVmConfig {
     pub memory_mb: u64,
     pub cpu_count: u32,
     pub shared_dir: Option<PathBuf>,
+    pub network: Option<NetworkConfig>,
 }
 
 // ── ChVm ─────────────────────────────────────────────────────────────────────
@@ -50,6 +61,8 @@ pub struct ChVm {
     pub vsock_socket: PathBuf,
     pub virtiofsd_child: Option<tokio::process::Child>,
     pub virtiofsd_socket: Option<PathBuf>,
+    pub passt_child: Option<std::process::Child>,
+    pub passt_socket: Option<PathBuf>,
 }
 
 impl ChVm {
@@ -77,6 +90,8 @@ impl ChVm {
         let _ = std::fs::remove_file(&api_socket);
         let _ = std::fs::remove_file(&vsock_socket);
 
+        let memory_shared = config.shared_dir.is_some() || config.network.is_some();
+
         // ── Optional virtiofsd setup ─────────────────────────────────────────
         let mut virtiofsd_child_opt = None;
         let mut virtiofsd_socket_opt = None;
@@ -94,7 +109,7 @@ impl ChVm {
 
             info!(cid, "spawning virtiofsd for shared_dir {:?}", shared_dir);
             // Use chroot sandbox; virtiofsd's default namespace sandbox relies on pivot_root which Docker seccomp blocks
-            let mut vfsd_child = Command::new(&virtiofsd_bin)
+            let mut vfsd_child = TokioCommand::new(&virtiofsd_bin)
                 .args([
                     "--socket-path",
                     &virtiofsd_socket.to_string_lossy(),
@@ -153,8 +168,99 @@ impl ChVm {
             Vec::new()
         };
 
+        // ── Optional passt setup ─────────────────────────────────────────────
+        let mut passt_child_opt: Option<std::process::Child> = None;
+        let mut passt_socket_opt = None;
+        let mut passt_stderr_opt: Option<Arc<Mutex<VecDeque<String>>>> = None;
+        let net_args = if let Some(ref network) = config.network {
+            let passt_socket = PathBuf::from(format!("/tmp/tokimo-ch-passt-{cid}.sock"));
+            let _ = std::fs::remove_file(&passt_socket);
+
+            if !network.passt_binary.exists() {
+                if let Some(mut vfsd) = virtiofsd_child_opt {
+                    let _ = vfsd.kill().await;
+                }
+                return Err(Error::other(format!(
+                    "passt not found at '{}'",
+                    network.passt_binary.display()
+                )));
+            }
+
+            info!(cid, "spawning passt for vhost-user networking");
+            let passt_socket_arg = passt_socket.to_string_lossy().into_owned();
+            let mut passt_child = match std::process::Command::new(&network.passt_binary)
+                .args(["--vhost-user", "--socket", &passt_socket_arg, "-f", "--no-map-gw"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    if let Some(mut vfsd) = virtiofsd_child_opt
+                        && let Err(err) = vfsd.kill().await
+                    {
+                        warn!(cid, error = %err, "failed to kill virtiofsd after passt spawn failure");
+                    }
+                    let _ = std::fs::remove_file(&passt_socket);
+                    return Err(Error::other(format!("failed to spawn passt: {e}")));
+                }
+            };
+
+            if let Some(stdout) = passt_child.stdout.take() {
+                spawn_passt_log_thread("stdout", stdout, None);
+            }
+
+            let passt_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
+            if let Some(stderr) = passt_child.stderr.take() {
+                spawn_passt_log_thread("stderr", stderr, Some(Arc::clone(&passt_stderr)));
+            }
+
+            let sock_poll = passt_socket.clone();
+            let appeared = timeout(Duration::from_secs(5), async move {
+                loop {
+                    if sock_poll.exists() {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+
+            if appeared.is_err() {
+                let passt_stderr_snippet = captured_stderr_snippet(&passt_stderr);
+                warn!(cid, "passt socket did not appear within 5s — killing child");
+                if let Err(e) = passt_child.kill() {
+                    warn!(cid, error = %e, "failed to kill passt after socket timeout");
+                }
+                if let Err(e) = passt_child.wait() {
+                    warn!(cid, error = %e, "failed to wait for passt after socket timeout");
+                }
+                let _ = std::fs::remove_file(&passt_socket);
+                if let Some(mut vfsd) = virtiofsd_child_opt {
+                    let _ = vfsd.kill().await;
+                }
+                return Err(Error::other(format!(
+                    "passt failed to start: socket did not appear within 5s{passt_stderr_snippet}"
+                )));
+            }
+
+            let mac_addr = network.mac_addr.as_deref().unwrap_or(DEFAULT_MAC_ADDR);
+            let net_arg = format!(
+                "mac={},vhost_user=true,socket={},vhost_mode=client",
+                mac_addr,
+                passt_socket.display()
+            );
+            passt_child_opt = Some(passt_child);
+            passt_socket_opt = Some(passt_socket);
+            passt_stderr_opt = Some(passt_stderr);
+            vec!["--net".to_string(), net_arg]
+        } else {
+            Vec::new()
+        };
+
         // ── Build cloud-hypervisor arguments ─────────────────────────────────
-        let memory_arg = if config.shared_dir.is_some() {
+        let memory_arg = if memory_shared {
             format!("size={}M,shared=on", config.memory_mb.max(256))
         } else {
             format!("size={}M", config.memory_mb.max(256))
@@ -190,8 +296,9 @@ impl ChVm {
             api_socket.to_string_lossy().into_owned(),
         ];
         ch_args.extend(fs_args);
+        ch_args.extend(net_args);
 
-        let mut child = match Command::new(&config.ch_binary)
+        let mut child = match TokioCommand::new(&config.ch_binary)
             .args(&ch_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -201,11 +308,30 @@ impl ChVm {
         {
             Ok(c) => c,
             Err(e) => {
-                // Clean up virtiofsd if CH spawn fails
-                if let Some(mut vfsd) = virtiofsd_child_opt {
-                    let _ = vfsd.start_kill();
+                let passt_stderr_snippet = if let Some(ref passt_stderr) = passt_stderr_opt {
+                    captured_stderr_snippet(passt_stderr)
+                } else {
+                    String::new()
+                };
+                if let Some(mut vfsd) = virtiofsd_child_opt
+                    && let Err(err) = vfsd.kill().await
+                {
+                    warn!(cid, error = %err, "failed to kill virtiofsd after CH spawn failure");
                 }
-                return Err(Error::other(format!("failed to spawn cloud-hypervisor: {e}")));
+                if let Some(mut passt) = passt_child_opt {
+                    if let Err(err) = passt.kill() {
+                        warn!(cid, error = %err, "failed to kill passt after CH spawn failure");
+                    }
+                    if let Err(err) = passt.wait() {
+                        warn!(cid, error = %err, "failed to wait for passt after CH spawn failure");
+                    }
+                }
+                if let Some(ref sock) = passt_socket_opt {
+                    let _ = std::fs::remove_file(sock);
+                }
+                return Err(Error::other(format!(
+                    "failed to spawn cloud-hypervisor: {e}{passt_stderr_snippet}"
+                )));
             }
         };
 
@@ -238,13 +364,28 @@ impl ChVm {
             } else {
                 String::new()
             };
+            let passt_stderr_snippet = if let Some(ref passt_stderr) = passt_stderr_opt {
+                captured_stderr_snippet(passt_stderr)
+            } else {
+                String::new()
+            };
             let _ = child.kill().await;
-            // Clean up virtiofsd too
             if let Some(mut vfsd) = virtiofsd_child_opt {
                 let _ = vfsd.kill().await;
             }
+            if let Some(mut passt) = passt_child_opt {
+                if let Err(e) = passt.kill() {
+                    warn!(cid, error = %e, "failed to kill passt after CH API timeout");
+                }
+                if let Err(e) = passt.wait() {
+                    warn!(cid, error = %e, "failed to wait for passt after CH API timeout");
+                }
+            }
+            if let Some(ref sock) = passt_socket_opt {
+                let _ = std::fs::remove_file(sock);
+            }
             return Err(Error::other(format!(
-                "cloud-hypervisor failed to start: API socket did not appear within 3s{stderr_snippet}"
+                "cloud-hypervisor failed to start: API socket did not appear within 3s{stderr_snippet}{passt_stderr_snippet}"
             )));
         }
 
@@ -256,6 +397,8 @@ impl ChVm {
             vsock_socket,
             virtiofsd_child: virtiofsd_child_opt,
             virtiofsd_socket: virtiofsd_socket_opt,
+            passt_child: passt_child_opt,
+            passt_socket: passt_socket_opt,
         })
     }
 
@@ -301,10 +444,48 @@ impl ChVm {
             }
         }
 
+        // Shutdown passt if it was spawned
+        if let Some(mut passt) = self.passt_child.take() {
+            match passt.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        use nix::sys::signal::{Signal, kill};
+                        use nix::unistd::Pid;
+                        let pid = passt.id();
+                        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                        info!(cid, pid, "sent SIGTERM to passt");
+                    }
+                    let grace_start = std::time::Instant::now();
+                    loop {
+                        match passt.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if grace_start.elapsed() >= grace => {
+                                warn!(cid, "passt did not exit within grace period — sending SIGKILL");
+                                let _ = passt.kill();
+                                let _ = passt.wait();
+                                break;
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                            Err(e) => {
+                                warn!(cid, error = %e, "error waiting for passt during shutdown");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(cid, error = %e, "error checking passt status during shutdown"),
+            }
+        }
+
         // Clean up socket files.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_socket);
         if let Some(ref sock) = self.virtiofsd_socket {
+            let _ = std::fs::remove_file(sock);
+        }
+        if let Some(ref sock) = self.passt_socket {
             let _ = std::fs::remove_file(sock);
         }
         info!(cid, "VM shutdown complete");
@@ -314,6 +495,77 @@ impl ChVm {
     /// Returns `true` if the child process has not yet exited.
     pub fn is_alive(&mut self) -> bool {
         self.child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+    }
+}
+
+impl Drop for ChVm {
+    fn drop(&mut self) {
+        kill_wait_passt_child(self.cid, &mut self.passt_child);
+        if let Some(ref sock) = self.passt_socket {
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+}
+
+fn captured_stderr_snippet(lines: &Arc<Mutex<VecDeque<String>>>) -> String {
+    let lines = lines.lock().unwrap();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; passt stderr: {}",
+        lines.iter().cloned().collect::<Vec<_>>().join(" | ")
+    )
+}
+
+/// Spawn a background std thread to read a passt stdout/stderr pipe line by
+/// line, logging via tracing and optionally capturing into a bounded buffer.
+fn spawn_passt_log_thread<R>(stream: &'static str, reader: R, capture: Option<Arc<Mutex<VecDeque<String>>>>)
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(reader).lines() {
+            match line {
+                Ok(l) => {
+                    if stream == "stderr" {
+                        warn!("passt: {}", l);
+                    } else {
+                        info!("passt: {}", l);
+                    }
+                    if let Some(ref cap) = capture {
+                        let mut guard = cap.lock().unwrap();
+                        if guard.len() == 20 {
+                            guard.pop_front();
+                        }
+                        guard.push_back(l);
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to read passt {}: {}", stream, e);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Synchronously kill and wait for a running passt `std::process::Child`.
+fn kill_wait_passt_child(cid: u32, child: &mut Option<std::process::Child>) {
+    if let Some(mut passt) = child.take() {
+        match passt.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(e) = passt.kill() {
+                    warn!(cid, error = %e, "failed to kill passt");
+                }
+                if let Err(e) = passt.wait() {
+                    warn!(cid, error = %e, "failed to wait for passt");
+                }
+            }
+            Err(e) => warn!(cid, error = %e, "failed to check passt status"),
+        }
     }
 }
 

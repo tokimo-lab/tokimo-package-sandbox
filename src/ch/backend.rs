@@ -129,6 +129,7 @@ impl SandboxBackend for ChBackend {
             memory_mb: memory_mb.max(256),
             cpu_count: cpu_count.max(1),
             shared_dir: None,
+            network: None,
         };
 
         let vm = self.runtime.block_on(ChVm::spawn(vm_config))?;

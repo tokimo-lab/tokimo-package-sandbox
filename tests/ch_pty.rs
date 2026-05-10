@@ -84,6 +84,7 @@ fn ch_pty_echo_hi() {
         memory_mb: 256,
         cpu_count: 1,
         shared_dir: None,
+        network: None,
     };
 
     // ── Boot VM ──────────────────────────────────────────────────────────────
