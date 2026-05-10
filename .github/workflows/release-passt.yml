@@ -1,0 +1,231 @@
+name: release-passt
+
+on:
+  push:
+    tags:
+      - 'passt-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Passt version (e.g., 2026_05_07.1afd4ed)"
+        required: false
+        default: "2026_05_07.1afd4ed"
+      passt_ref:
+        description: "Git ref to build from upstream (tag/branch/commit)"
+        required: false
+        default: "2026_05_07.1afd4ed"
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      passt_ref: ${{ steps.resolve.outputs.passt_ref }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Resolve version and ref
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PASST_REF: ${{ github.event.inputs.passt_ref }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            PASST_REF="$INPUT_PASST_REF"
+          else
+            # Tag push: passt-v2026_05_07.1afd4ed → 2026_05_07.1afd4ed
+            TAG="${GITHUB_REF_NAME}"
+            if ! printf "%s" "$TAG" | grep -q "^passt-v"; then
+              echo "Tag must start with passt-v" >&2
+              exit 1
+            fi
+            VERSION="${TAG#passt-v}"
+            PASST_REF="$VERSION"
+          fi
+
+          # Validate VERSION and PASST_REF are non-empty
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: VERSION is empty" >&2
+            exit 1
+          fi
+          if [ -z "$PASST_REF" ]; then
+            echo "ERROR: PASST_REF is empty" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "passt_ref=$PASST_REF" >> "$GITHUB_OUTPUT"
+          echo "release_tag=passt-v$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch_label: x86_64
+          - runner: ubuntu-24.04-arm
+            arch_label: aarch64
+    steps:
+      - name: Build and package passt in Alpine container
+        env:
+          ARCH_LABEL: ${{ matrix.arch_label }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PASST_REF: ${{ needs.meta.outputs.passt_ref }}
+        run: |
+          docker run --rm \
+            -e ARCH_LABEL \
+            -e VERSION \
+            -e PASST_REF \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            alpine:3.20 \
+            sh -euxc '
+          # Clean up any previous build artifacts in workspace
+          rm -rf passt-src stage-${ARCH_LABEL} passt-*.tar.zst passt-*.tar.zst.sha256
+
+          # Install build dependencies
+          apk add --no-cache musl-dev gcc make linux-headers git zstd tar file coreutils
+
+          # Fetch upstream passt ref (tag, branch, full ref, or reachable commit)
+          git init passt-src
+          cd passt-src
+          git remote add origin https://passt.top/passt
+          git fetch --depth 1 origin "$PASST_REF"
+          git checkout --detach FETCH_HEAD
+          cd ..
+
+          # Build static binaries
+          cd passt-src
+          make static VERSION="$VERSION"
+          cd ..
+
+          # Verify passt binary is static
+          echo "=== Verifying passt binary ==="
+          file passt-src/passt
+          FILE_OUTPUT="$(file passt-src/passt)"
+          echo "$FILE_OUTPUT"
+          if printf "%s\n" "$FILE_OUTPUT" | grep -q "dynamically linked"; then
+            echo "ERROR: passt binary is dynamically linked" >&2
+            exit 1
+          fi
+
+          set +e
+          LDD_OUTPUT="$(ldd passt-src/passt 2>&1)"
+          LDD_STATUS=$?
+          set -e
+          echo "$LDD_OUTPUT"
+          if printf "%s\n" "$LDD_OUTPUT" | grep -q "=>"; then
+            echo "ERROR: passt ldd output shows dynamic dependencies" >&2
+            exit 1
+          fi
+          if [ "$LDD_STATUS" -ne 0 ]; then
+            echo "ldd exited nonzero as expected for static binary"
+          fi
+
+          # Verify pasta binary/symlink is static
+          echo "=== Verifying pasta binary ==="
+          if [ -e passt-src/pasta ]; then
+            file passt-src/pasta
+            file -L passt-src/pasta
+            FILE_OUTPUT_L="$(file -L passt-src/pasta)"
+            echo "$FILE_OUTPUT_L"
+            if printf "%s\n" "$FILE_OUTPUT_L" | grep -q "dynamically linked"; then
+              echo "ERROR: pasta binary is dynamically linked" >&2
+              exit 1
+            fi
+
+            set +e
+            LDD_OUTPUT="$(ldd passt-src/pasta 2>&1)"
+            LDD_STATUS=$?
+            set -e
+            echo "$LDD_OUTPUT"
+            if printf "%s\n" "$LDD_OUTPUT" | grep -q "=>"; then
+              echo "ERROR: pasta ldd output shows dynamic dependencies" >&2
+              exit 1
+            fi
+            if [ "$LDD_STATUS" -ne 0 ]; then
+              echo "ldd exited nonzero as expected for static binary"
+            fi
+          else
+            echo "WARNING: pasta not found"
+          fi
+
+          # Stage binaries and documentation
+          STAGE="stage-${ARCH_LABEL}"
+          mkdir -p "$STAGE/bin"
+          cp -P passt-src/passt "$STAGE/bin/"
+          if [ -e passt-src/pasta ]; then
+            cp -P passt-src/pasta "$STAGE/bin/"
+          fi
+
+          # Include README.md if present
+          if [ -f passt-src/README.md ]; then
+            cp passt-src/README.md "$STAGE/"
+          fi
+
+          # Include license files if present (non-fatal if missing)
+          set +e
+          find passt-src -maxdepth 1 -type f \( -name "LICENSE*" -o -name "COPYING*" \) -exec cp {} "$STAGE/" \;
+          set -e
+
+          # Include LICENSES directory if present (preserve symlinks)
+          if [ -d passt-src/LICENSES ]; then
+            cp -a passt-src/LICENSES "$STAGE/"
+          fi
+
+          # Create tarball with explicit entries
+          ARCHIVE="passt-${VERSION}-linux-${ARCH_LABEL}.tar.zst"
+          TAR_ITEMS="bin"
+          if [ -f "$STAGE/README.md" ]; then
+            TAR_ITEMS="$TAR_ITEMS README.md"
+          fi
+          for f in "$STAGE"/LICENSE* "$STAGE"/COPYING*; do
+            if [ -f "$f" ]; then
+              TAR_ITEMS="$TAR_ITEMS $(basename "$f")"
+            fi
+          done
+          if [ -d "$STAGE/LICENSES" ]; then
+            TAR_ITEMS="$TAR_ITEMS LICENSES"
+          fi
+          tar -I "zstd -19" -cf "$ARCHIVE" -C "$STAGE" $TAR_ITEMS
+
+          # Generate checksum
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+          # Fix ownership
+          chown -R "$HOST_UID:$HOST_GID" passt-src "$STAGE" "$ARCHIVE" "${ARCHIVE}.sha256"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passt-${{ matrix.arch_label }}
+          path: |
+            passt-*-linux-${{ matrix.arch_label }}.tar.zst
+            passt-*-linux-${{ matrix.arch_label }}.tar.zst.sha256
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: passt-x86_64, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: passt-aarch64, path: dist }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.release_tag }}
+          name: passt ${{ needs.meta.outputs.version }}
+          files: |
+            dist/passt-*-linux-*.tar.zst
+            dist/passt-*-linux-*.tar.zst.sha256
