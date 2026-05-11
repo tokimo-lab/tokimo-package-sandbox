@@ -139,7 +139,7 @@ impl ChVm {
                     "--shared-dir",
                     &shared_dir.to_string_lossy(),
                     "--cache=auto",
-                    "--sandbox=chroot",
+                    "--sandbox=namespace",
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
