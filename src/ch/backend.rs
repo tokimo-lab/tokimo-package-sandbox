@@ -16,7 +16,9 @@ use tracing::warn;
 use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::ch::rpc::{GuestRpc, Response};
-use crate::ch::vmm::{ChVm, ChVmConfig, ch_initrd_path, ch_vmlinux_path, next_cid};
+use crate::ch::vmm::{
+    ChVm, ChVmConfig, NetworkConfig, PortForward, PortProto, ch_initrd_path, ch_vmlinux_path, next_cid, passt_path,
+};
 use crate::ch_probe::ChProbeResult;
 use crate::error::{Error, Result};
 
@@ -107,10 +109,10 @@ impl SandboxBackend for ChBackend {
     // -- VM lifecycle ---------------------------------------------------------
 
     fn create_vm(&self) -> Result<()> {
-        let (memory_mb, cpu_count) = {
+        let (memory_mb, cpu_count, port_forward_specs) = {
             let guard = self.config.lock().unwrap();
             let cfg = guard.as_ref().ok_or(Error::NotConfigured)?;
-            (cfg.memory_mb, cfg.cpu_count)
+            (cfg.memory_mb, cfg.cpu_count, cfg.port_forwards.clone())
         };
 
         {
@@ -121,6 +123,49 @@ impl SandboxBackend for ChBackend {
         }
 
         let cid = next_cid();
+
+        // Build network config if port forwards are configured.
+        let network = if port_forward_specs.is_empty() {
+            None
+        } else {
+            match passt_path() {
+                Ok(passt_binary) => {
+                    let forwards: Vec<PortForward> = port_forward_specs
+                        .into_iter()
+                        .filter_map(|pf| {
+                            let proto = match pf.proto.to_lowercase().as_str() {
+                                "tcp" => PortProto::Tcp,
+                                "udp" => PortProto::Udp,
+                                other => {
+                                    tracing::warn!(proto = other, "skipping port forward with unknown proto");
+                                    return None;
+                                }
+                            };
+                            Some(PortForward {
+                                proto,
+                                host_port: pf.host_port,
+                                guest_port: pf.guest_port,
+                                host_addr: None,
+                            })
+                        })
+                        .collect();
+                    if forwards.is_empty() {
+                        None
+                    } else {
+                        Some(NetworkConfig {
+                            passt_binary,
+                            mac_addr: None,
+                            port_forwards: forwards,
+                        })
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "passt_path() failed; skipping port forward network config");
+                    None
+                }
+            }
+        };
+
         let vm_config = ChVmConfig {
             cid,
             ch_binary: self.ch_binary.clone(),
@@ -129,7 +174,7 @@ impl SandboxBackend for ChBackend {
             memory_mb: memory_mb.max(256),
             cpu_count: cpu_count.max(1),
             shared_dir: None,
-            network: None,
+            network,
         };
 
         let vm = self.runtime.block_on(ChVm::spawn(vm_config))?;

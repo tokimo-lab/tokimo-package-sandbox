@@ -5,6 +5,11 @@ use std::sync::Arc;
 use crate::backend::SandboxBackend;
 use crate::error::Result;
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn backend_for_kind(_kind: crate::backend_kind::SandboxBackendKind) -> Result<Arc<dyn SandboxBackend>> {
+    default_backend()
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
     let b = crate::windows::sandbox::WindowsBackend::connect()?;
@@ -21,24 +26,21 @@ pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
+pub(crate) fn backend_for_kind(kind: crate::backend_kind::SandboxBackendKind) -> Result<Arc<dyn SandboxBackend>> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    use crate::backend_kind::{SandboxBackendKind, detect_backend};
+    use crate::backend_kind::SandboxBackendKind;
     use crate::linux::sandbox::LinuxBackend;
     use crate::shared_backend::{Registry, SharedBackend};
 
-    match detect_backend() {
+    match kind {
         SandboxBackendKind::Ch => {
             let probe = crate::ch_probe::probe_ch();
             let backend = crate::ch::backend::ChBackend::new(probe)?;
             Ok(Arc::new(backend))
         }
-        // Disabled falls through to Bwrap path for now — the caller that set
-        // SANDBOX_BACKEND=disabled should not reach here (Sandbox::connect
-        // checks SAFEBOX_DISABLE separately). Treat as bwrap for safety.
-        SandboxBackendKind::Disabled | SandboxBackendKind::Bwrap => {
+        SandboxBackendKind::Bwrap => {
             static REG: OnceLock<Registry<LinuxBackend>> = OnceLock::new();
             let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
 
@@ -47,7 +49,16 @@ pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
             }
             Ok(Arc::new(SharedBackend::new(reg, factory)))
         }
+        SandboxBackendKind::Disabled => Err(crate::error::Error::not_supported(
+            "sandbox backend is disabled; cannot connect with explicit Disabled kind",
+        )),
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
+    use crate::backend_kind::detect_backend;
+    backend_for_kind(detect_backend())
 }
 
 #[cfg(target_os = "macos")]

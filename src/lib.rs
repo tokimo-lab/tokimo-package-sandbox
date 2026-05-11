@@ -72,8 +72,8 @@ pub(crate) mod macos;
 pub(crate) mod windows;
 
 pub use api::{
-    ConfigureParams, Event, HostExecAction, HostExecCallback, HostExecCtx, JobId, Mount, NetworkPolicy, Sandbox,
-    SessionDetails, SessionSummary, ShellOpts,
+    ConfigureParams, Event, HostExecAction, HostExecCallback, HostExecCtx, JobId, Mount, NetworkPolicy,
+    PortForwardSpec, Sandbox, SessionDetails, SessionSummary, ShellOpts,
 };
 pub use backend::SandboxBackend;
 pub use backend_kind::{SandboxBackendKind, detect_backend};

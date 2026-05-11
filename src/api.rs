@@ -108,6 +108,20 @@ pub struct Mount {
     pub create_host_dir: bool,
 }
 
+/// A port-forward specification passed via [`ConfigureParams::port_forwards`].
+///
+/// Used by the Cloud Hypervisor backend to configure passt port forwarding.
+/// Other backends ignore this field.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PortForwardSpec {
+    /// Protocol: `"tcp"` or `"udp"` (case-insensitive).
+    pub proto: String,
+    /// Host-side port number.
+    pub host_port: u16,
+    /// Guest-side port number.
+    pub guest_port: u16,
+}
+
 /// Configuration passed to [`Sandbox::configure`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureParams {
@@ -183,6 +197,11 @@ pub struct ConfigureParams {
     /// `PATH` for newly-spawned children.
     #[serde(default, skip)]
     pub host_commands: Vec<String>,
+
+    /// Port-forward rules for Cloud Hypervisor networking via passt.
+    /// Ignored by all other backends.
+    #[serde(default)]
+    pub port_forwards: Vec<PortForwardSpec>,
 }
 
 impl Default for ConfigureParams {
@@ -200,6 +219,7 @@ impl Default for ConfigureParams {
             api_probe_url: None,
             session_id: String::new(),
             host_commands: Vec::new(),
+            port_forwards: Vec::new(),
         }
     }
 }
@@ -359,6 +379,15 @@ impl Sandbox {
     /// * macOS   — constructs an in-process backend; no real connection.
     pub fn connect() -> Result<Self> {
         let backend = crate::platform::default_backend()?;
+        Ok(Self::new(backend))
+    }
+
+    /// Connect using an explicit backend kind, bypassing env-var detection.
+    ///
+    /// On Linux: Ch → Cloud Hypervisor, Bwrap → bubblewrap, Disabled → error.
+    /// On other platforms: kind is ignored; falls back to the platform default.
+    pub fn connect_with_backend(kind: crate::backend_kind::SandboxBackendKind) -> Result<Self> {
+        let backend = crate::platform::backend_for_kind(kind)?;
         Ok(Self::new(backend))
     }
 

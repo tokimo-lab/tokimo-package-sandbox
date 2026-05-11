@@ -704,3 +704,14 @@ pub fn virtiofsd_path() -> Result<PathBuf> {
     })?;
     Ok(root.join("bin").join("virtiofsd").join("current").join("virtiofsd"))
 }
+
+/// Resolve the passt path: `{root}/bin/passt/current/bin/passt`.
+pub fn passt_path() -> Result<PathBuf> {
+    let root = locate_project_root().ok_or_else(|| {
+        Error::other(
+            "cannot locate project root (TOKIMO_PROJECT_ROOT unset and bin/cloud-hypervisor not \
+             found in ancestor directories)",
+        )
+    })?;
+    Ok(root.join("bin").join("passt").join("current").join("bin").join("passt"))
+}
