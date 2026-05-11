@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::{Error, Result};
 
@@ -22,6 +24,8 @@ pub const SHARED_TAG: &str = "tokimoshare";
 
 /// Default guest MAC address used when networking is enabled without an override.
 pub const DEFAULT_MAC_ADDR: &str = "9a:55:9a:55:9a:55";
+
+const PROCESS_LOG_CAPTURE_LINES: usize = 20;
 
 // ── CID allocator ────────────────────────────────────────────────────────────
 
@@ -78,6 +82,9 @@ pub struct ChVm {
     pub virtiofsd_socket: Option<PathBuf>,
     pub passt_child: Option<std::process::Child>,
     pub passt_socket: Option<PathBuf>,
+    ch_log_tasks: Vec<JoinHandle<()>>,
+    virtiofsd_log_tasks: Vec<JoinHandle<()>>,
+    passt_log_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ChVm {
@@ -110,6 +117,7 @@ impl ChVm {
         // ── Optional virtiofsd setup ─────────────────────────────────────────
         let mut virtiofsd_child_opt = None;
         let mut virtiofsd_socket_opt = None;
+        let mut virtiofsd_log_tasks = Vec::new();
         let fs_args = if let Some(ref shared_dir) = config.shared_dir {
             let virtiofsd_socket = PathBuf::from(format!("/tmp/tokimo-ch-virtiofsd-{cid}.sock"));
             let _ = std::fs::remove_file(&virtiofsd_socket);
@@ -134,21 +142,25 @@ impl ChVm {
                     "--sandbox=chroot",
                 ])
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| Error::other(format!("failed to spawn virtiofsd: {e}")))?;
 
-            // Stream stderr to warnings
+            if let Some(stdout) = vfsd_child.stdout.take() {
+                virtiofsd_log_tasks.push(spawn_tokio_log_task(cid, "virtiofsd", "stdout", stdout, None));
+            }
+
+            let virtiofsd_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(PROCESS_LOG_CAPTURE_LINES)));
             if let Some(stderr) = vfsd_child.stderr.take() {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, BufReader};
-                    let mut reader = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        warn!("virtiofsd: {}", line);
-                    }
-                });
+                virtiofsd_log_tasks.push(spawn_tokio_log_task(
+                    cid,
+                    "virtiofsd",
+                    "stderr",
+                    stderr,
+                    Some(Arc::clone(&virtiofsd_stderr)),
+                ));
             }
 
             // Wait for virtiofsd socket to appear (up to 5 seconds)
@@ -164,11 +176,14 @@ impl ChVm {
             .await;
 
             if appeared.is_err() {
+                let virtiofsd_stderr_snippet = captured_log_snippet("virtiofsd", "stderr", &virtiofsd_stderr);
                 warn!(cid, "virtiofsd socket did not appear within 5s — killing child");
                 let _ = vfsd_child.kill().await;
-                return Err(Error::other(
-                    "virtiofsd failed to start: socket did not appear within 5s",
-                ));
+                let _ = vfsd_child.wait().await;
+                abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
+                return Err(Error::other(format!(
+                    "virtiofsd failed to start: socket did not appear within 5s{virtiofsd_stderr_snippet}"
+                )));
             }
 
             let fs_arg = format!(
@@ -187,6 +202,7 @@ impl ChVm {
         let mut passt_child_opt: Option<std::process::Child> = None;
         let mut passt_socket_opt = None;
         let mut passt_stderr_opt: Option<Arc<Mutex<VecDeque<String>>>> = None;
+        let mut passt_log_threads = Vec::new();
         let net_args = if let Some(ref network) = config.network {
             let passt_socket = PathBuf::from(format!("/tmp/tokimo-ch-passt-{cid}.sock"));
             let _ = std::fs::remove_file(&passt_socket);
@@ -194,7 +210,9 @@ impl ChVm {
             if !network.passt_binary.exists() {
                 if let Some(mut vfsd) = virtiofsd_child_opt {
                     let _ = vfsd.kill().await;
+                    let _ = vfsd.wait().await;
                 }
+                abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
                 return Err(Error::other(format!(
                     "passt not found at '{}'",
                     network.passt_binary.display()
@@ -211,7 +229,9 @@ impl ChVm {
                 if !ports.insert(pf.host_port) {
                     if let Some(mut vfsd) = virtiofsd_child_opt.take() {
                         let _ = vfsd.kill().await;
+                        let _ = vfsd.wait().await;
                     }
+                    abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
                     return Err(Error::validation(format!(
                         "duplicate host_port {} for {:?} in port_forwards",
                         pf.host_port, pf.proto
@@ -265,23 +285,31 @@ impl ChVm {
             {
                 Ok(child) => child,
                 Err(e) => {
-                    if let Some(mut vfsd) = virtiofsd_child_opt
-                        && let Err(err) = vfsd.kill().await
-                    {
-                        warn!(cid, error = %err, "failed to kill virtiofsd after passt spawn failure");
+                    if let Some(mut vfsd) = virtiofsd_child_opt {
+                        if let Err(err) = vfsd.kill().await {
+                            warn!(cid, error = %err, "failed to kill virtiofsd after passt spawn failure");
+                        }
+                        let _ = vfsd.wait().await;
                     }
+                    abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
                     let _ = std::fs::remove_file(&passt_socket);
                     return Err(Error::other(format!("failed to spawn passt: {e}")));
                 }
             };
 
             if let Some(stdout) = passt_child.stdout.take() {
-                spawn_passt_log_thread("stdout", stdout, None);
+                passt_log_threads.push(spawn_std_log_thread(cid, "passt", "stdout", stdout, None));
             }
 
-            let passt_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
+            let passt_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(PROCESS_LOG_CAPTURE_LINES)));
             if let Some(stderr) = passt_child.stderr.take() {
-                spawn_passt_log_thread("stderr", stderr, Some(Arc::clone(&passt_stderr)));
+                passt_log_threads.push(spawn_std_log_thread(
+                    cid,
+                    "passt",
+                    "stderr",
+                    stderr,
+                    Some(Arc::clone(&passt_stderr)),
+                ));
             }
 
             let sock_poll = passt_socket.clone();
@@ -296,7 +324,7 @@ impl ChVm {
             .await;
 
             if appeared.is_err() {
-                let passt_stderr_snippet = captured_stderr_snippet(&passt_stderr);
+                let passt_stderr_snippet = captured_log_snippet("passt", "stderr", &passt_stderr);
                 warn!(cid, "passt socket did not appear within 5s — killing child");
                 if let Err(e) = passt_child.kill() {
                     warn!(cid, error = %e, "failed to kill passt after socket timeout");
@@ -304,10 +332,13 @@ impl ChVm {
                 if let Err(e) = passt_child.wait() {
                     warn!(cid, error = %e, "failed to wait for passt after socket timeout");
                 }
+                join_std_log_threads(&mut passt_log_threads);
                 let _ = std::fs::remove_file(&passt_socket);
                 if let Some(mut vfsd) = virtiofsd_child_opt {
                     let _ = vfsd.kill().await;
+                    let _ = vfsd.wait().await;
                 }
+                abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
                 return Err(Error::other(format!(
                     "passt failed to start: socket did not appear within 5s{passt_stderr_snippet}"
                 )));
@@ -369,7 +400,7 @@ impl ChVm {
         let mut child = match TokioCommand::new(&config.ch_binary)
             .args(&ch_args)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -377,15 +408,17 @@ impl ChVm {
             Ok(c) => c,
             Err(e) => {
                 let passt_stderr_snippet = if let Some(ref passt_stderr) = passt_stderr_opt {
-                    captured_stderr_snippet(passt_stderr)
+                    captured_log_snippet("passt", "stderr", passt_stderr)
                 } else {
                     String::new()
                 };
-                if let Some(mut vfsd) = virtiofsd_child_opt
-                    && let Err(err) = vfsd.kill().await
-                {
-                    warn!(cid, error = %err, "failed to kill virtiofsd after CH spawn failure");
+                if let Some(mut vfsd) = virtiofsd_child_opt {
+                    if let Err(err) = vfsd.kill().await {
+                        warn!(cid, error = %err, "failed to kill virtiofsd after CH spawn failure");
+                    }
+                    let _ = vfsd.wait().await;
                 }
+                abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
                 if let Some(mut passt) = passt_child_opt {
                     if let Err(err) = passt.kill() {
                         warn!(cid, error = %err, "failed to kill passt after CH spawn failure");
@@ -393,6 +426,7 @@ impl ChVm {
                     if let Err(err) = passt.wait() {
                         warn!(cid, error = %err, "failed to wait for passt after CH spawn failure");
                     }
+                    join_std_log_threads(&mut passt_log_threads);
                 }
                 if let Some(ref sock) = passt_socket_opt {
                     let _ = std::fs::remove_file(sock);
@@ -402,6 +436,21 @@ impl ChVm {
                 )));
             }
         };
+
+        let mut ch_log_tasks = Vec::new();
+        let ch_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(PROCESS_LOG_CAPTURE_LINES)));
+        if let Some(stdout) = child.stdout.take() {
+            ch_log_tasks.push(spawn_tokio_log_task(cid, "cloud-hypervisor", "stdout", stdout, None));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            ch_log_tasks.push(spawn_tokio_log_task(
+                cid,
+                "cloud-hypervisor",
+                "stderr",
+                stderr,
+                Some(Arc::clone(&ch_stderr)),
+            ));
+        }
 
         // Poll for the API socket to appear (signals hypervisor is ready).
         let api_socket_poll = api_socket.clone();
@@ -417,30 +466,20 @@ impl ChVm {
 
         if appeared.is_err() {
             warn!(cid, "API socket did not appear within 3s — killing child");
-            // Try to read stderr for a diagnostic message.
-            let stderr_snippet = if let Some(mut stderr) = child.stderr.take() {
-                let mut buf = Vec::new();
-                use tokio::io::AsyncReadExt;
-                let _ = tokio::time::timeout(Duration::from_millis(200), stderr.read_to_end(&mut buf)).await;
-                let txt = String::from_utf8_lossy(&buf);
-                let last_line = txt.lines().last().unwrap_or("").trim().to_owned();
-                if last_line.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {last_line}")
-                }
-            } else {
-                String::new()
-            };
+            let stderr_snippet = captured_log_snippet("cloud-hypervisor", "stderr", &ch_stderr);
             let passt_stderr_snippet = if let Some(ref passt_stderr) = passt_stderr_opt {
-                captured_stderr_snippet(passt_stderr)
+                captured_log_snippet("passt", "stderr", passt_stderr)
             } else {
                 String::new()
             };
             let _ = child.kill().await;
+            let _ = child.wait().await;
+            abort_tokio_log_tasks(&mut ch_log_tasks);
             if let Some(mut vfsd) = virtiofsd_child_opt {
                 let _ = vfsd.kill().await;
+                let _ = vfsd.wait().await;
             }
+            abort_tokio_log_tasks(&mut virtiofsd_log_tasks);
             if let Some(mut passt) = passt_child_opt {
                 if let Err(e) = passt.kill() {
                     warn!(cid, error = %e, "failed to kill passt after CH API timeout");
@@ -448,6 +487,7 @@ impl ChVm {
                 if let Err(e) = passt.wait() {
                     warn!(cid, error = %e, "failed to wait for passt after CH API timeout");
                 }
+                join_std_log_threads(&mut passt_log_threads);
             }
             if let Some(ref sock) = passt_socket_opt {
                 let _ = std::fs::remove_file(sock);
@@ -467,6 +507,9 @@ impl ChVm {
             virtiofsd_socket: virtiofsd_socket_opt,
             passt_child: passt_child_opt,
             passt_socket: passt_socket_opt,
+            ch_log_tasks,
+            virtiofsd_log_tasks,
+            passt_log_threads,
         })
     }
 
@@ -491,6 +534,7 @@ impl ChVm {
             let _ = self.child.kill().await;
             let _ = self.child.wait().await;
         }
+        drain_tokio_log_tasks(&mut self.ch_log_tasks).await;
 
         // Shutdown virtiofsd if it was spawned
         if let Some(ref mut vfsd) = self.virtiofsd_child {
@@ -510,6 +554,7 @@ impl ChVm {
                 let _ = vfsd.kill().await;
                 let _ = vfsd.wait().await;
             }
+            drain_tokio_log_tasks(&mut self.virtiofsd_log_tasks).await;
         }
 
         // Shutdown passt if it was spawned
@@ -547,6 +592,8 @@ impl ChVm {
             }
         }
 
+        join_std_log_threads(&mut self.passt_log_threads);
+
         // Clean up socket files.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_socket);
@@ -568,27 +615,88 @@ impl ChVm {
 
 impl Drop for ChVm {
     fn drop(&mut self) {
+        abort_tokio_log_tasks(&mut self.ch_log_tasks);
+        abort_tokio_log_tasks(&mut self.virtiofsd_log_tasks);
         kill_wait_passt_child(self.cid, &mut self.passt_child);
+        join_std_log_threads(&mut self.passt_log_threads);
         if let Some(ref sock) = self.passt_socket {
             let _ = std::fs::remove_file(sock);
         }
     }
 }
 
-fn captured_stderr_snippet(lines: &Arc<Mutex<VecDeque<String>>>) -> String {
+fn captured_log_snippet(component: &str, stream: &str, lines: &Arc<Mutex<VecDeque<String>>>) -> String {
     let lines = lines.lock().unwrap();
     if lines.is_empty() {
         return String::new();
     }
     format!(
-        "; passt stderr: {}",
+        "; {component} {stream}: {}",
         lines.iter().cloned().collect::<Vec<_>>().join(" | ")
     )
 }
 
-/// Spawn a background std thread to read a passt stdout/stderr pipe line by
+fn push_captured_line(capture: &Option<Arc<Mutex<VecDeque<String>>>>, line: &str) {
+    if let Some(cap) = capture {
+        let mut guard = cap.lock().unwrap();
+        if guard.len() == PROCESS_LOG_CAPTURE_LINES {
+            guard.pop_front();
+        }
+        guard.push_back(line.to_owned());
+    }
+}
+
+fn log_process_line(cid: u32, component: &str, stream: &str, line: &str) {
+    let lower = line.to_ascii_lowercase();
+    if ["error", "failed", "panic", "fatal"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        error!("ch[{cid}]: {component} {stream}: {line}");
+    } else if ["denied", "refused"].iter().any(|needle| lower.contains(needle)) {
+        warn!("ch[{cid}]: {component} {stream}: {line}");
+    } else {
+        info!("ch[{cid}]: {component} {stream}: {line}");
+    }
+}
+
+fn spawn_tokio_log_task<R>(
+    cid: u32,
+    component: &'static str,
+    stream: &'static str,
+    reader: R,
+    capture: Option<Arc<Mutex<VecDeque<String>>>>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    log_process_line(cid, component, stream, &line);
+                    push_captured_line(&capture, &line);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("ch[{cid}]: {component} {stream}: failed to read stream: {e}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Spawn a background std thread to read a process stdout/stderr pipe line by
 /// line, logging via tracing and optionally capturing into a bounded buffer.
-fn spawn_passt_log_thread<R>(stream: &'static str, reader: R, capture: Option<Arc<Mutex<VecDeque<String>>>>)
+fn spawn_std_log_thread<R>(
+    cid: u32,
+    component: &'static str,
+    stream: &'static str,
+    reader: R,
+    capture: Option<Arc<Mutex<VecDeque<String>>>>,
+) -> std::thread::JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
@@ -596,27 +704,43 @@ where
         use std::io::BufRead;
         for line in std::io::BufReader::new(reader).lines() {
             match line {
-                Ok(l) => {
-                    if stream == "stderr" {
-                        warn!("passt: {}", l);
-                    } else {
-                        info!("passt: {}", l);
-                    }
-                    if let Some(ref cap) = capture {
-                        let mut guard = cap.lock().unwrap();
-                        if guard.len() == 20 {
-                            guard.pop_front();
-                        }
-                        guard.push_back(l);
-                    }
+                Ok(line) => {
+                    log_process_line(cid, component, stream, &line);
+                    push_captured_line(&capture, &line);
                 }
                 Err(e) => {
-                    warn!("failed to read passt {}: {}", stream, e);
+                    warn!("ch[{cid}]: {component} {stream}: failed to read stream: {e}");
                     break;
                 }
             }
         }
-    });
+    })
+}
+
+async fn drain_tokio_log_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    for mut task in tasks.drain(..) {
+        tokio::select! {
+            _ = &mut task => {}
+            _ = sleep(Duration::from_secs(1)) => {
+                warn!("timed out waiting for VM log task to finish");
+                task.abort();
+            }
+        }
+    }
+}
+
+fn abort_tokio_log_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    for task in tasks.drain(..) {
+        task.abort();
+    }
+}
+
+fn join_std_log_threads(threads: &mut Vec<std::thread::JoinHandle<()>>) {
+    for thread in threads.drain(..) {
+        if thread.join().is_err() {
+            warn!("VM log thread panicked while joining");
+        }
+    }
 }
 
 /// Synchronously kill and wait for a running passt `std::process::Child`.
@@ -676,8 +800,9 @@ pub fn ch_vmlinux_path() -> Result<PathBuf> {
         .join("vmlinux"))
 }
 
-/// Resolve the initrd path: `{root}/bin/ch-initrd/dev/linux-x86_64/initrd.cpio.gz`.
-/// Returns `Err` with a human-readable message if the file is missing.
+/// Resolve the initrd path, preferring the released dependency under
+/// `{root}/bin/ch-initrd/current/initrd.cpio.gz` and falling back to the local
+/// development build under `{root}/bin/ch-initrd/dev/linux-x86_64/initrd.cpio.gz`.
 pub fn ch_initrd_path() -> Result<PathBuf> {
     let root = locate_project_root().ok_or_else(|| {
         Error::other(
@@ -685,13 +810,21 @@ pub fn ch_initrd_path() -> Result<PathBuf> {
              found in ancestor directories)",
         )
     })?;
-    let path = root
+    let released = root
+        .join("bin")
+        .join("ch-initrd")
+        .join("current")
+        .join("initrd.cpio.gz");
+    if released.exists() {
+        return Ok(released);
+    }
+
+    Ok(root
         .join("bin")
         .join("ch-initrd")
         .join("dev")
         .join("linux-x86_64")
-        .join("initrd.cpio.gz");
-    Ok(path)
+        .join("initrd.cpio.gz"))
 }
 
 /// Resolve the virtiofsd path: `{root}/bin/virtiofsd/current/virtiofsd`.
