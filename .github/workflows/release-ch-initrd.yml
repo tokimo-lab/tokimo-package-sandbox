@@ -83,7 +83,7 @@ jobs:
             -e HOST_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
-            rust:1.85-alpine3.21 \
+            rust:1.91-alpine3.21 \
             sh -euxc '
           apk add --no-cache build-base musl-dev linux-headers python3 gzip zstd tar file coreutils
           rustup target add "$RUST_TARGET"
