@@ -46,6 +46,8 @@ pub async fn handle_pty_connection(
     argv: Vec<String>,
     cols: u16,
     rows: u16,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
 ) -> anyhow::Result<()> {
     // Validate argv and create CStrings before forking
     if argv.is_empty() {
@@ -90,7 +92,7 @@ pub async fn handle_pty_connection(
 
     if child_pid == 0 {
         // Child process: exec the command
-        exec_child(&argv);
+        exec_child(&argv, &env, cwd.as_deref());
         // exec never returns on success - this line is unreachable
     }
 
@@ -347,7 +349,7 @@ unsafe fn forkpty_blocking(cols: u16, rows: u16) -> anyhow::Result<(RawFd, libc:
 }
 
 /// Exec the command in the child. Never returns on success.
-fn exec_child(argv: &[String]) -> ! {
+fn exec_child(argv: &[String], env: &[(String, String)], cwd: Option<&str>) -> ! {
     use std::ffi::CString;
 
     // CString validation already done in handle_pty_connection, but
@@ -366,6 +368,16 @@ fn exec_child(argv: &[String]) -> ! {
     let c_ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
     let mut c_argv_null = c_ptrs;
     c_argv_null.push(std::ptr::null());
+
+    if let Some(cwd) = cwd
+        && let Err(e) = std::env::set_current_dir(cwd)
+    {
+        eprintln!("chdir {cwd:?}: {e}");
+        std::process::exit(127);
+    }
+    for (key, value) in env {
+        unsafe { std::env::set_var(key, value) };
+    }
 
     unsafe {
         libc::execvp(c_argv_null[0], c_argv_null.as_ptr());

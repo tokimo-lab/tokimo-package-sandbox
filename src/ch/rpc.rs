@@ -258,6 +258,18 @@ impl GuestRpc {
     /// the PTY port is N+1 (default 1025). This separation allows the guest to
     /// run distinct vsock listeners with different protocol semantics.
     pub async fn open_pty(&self, argv: Vec<String>, cols: u16, rows: u16) -> Result<PtySession> {
+        self.open_pty_with_options(argv, cols, rows, &[], None).await
+    }
+
+    /// Open a PTY session with optional environment and cwd overrides.
+    pub async fn open_pty_with_options(
+        &self,
+        argv: Vec<String>,
+        cols: u16,
+        rows: u16,
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<PtySession> {
         // PTY port is one-shot port + 1 by convention
         let pty_port = self.port + 1;
 
@@ -269,12 +281,16 @@ impl GuestRpc {
             argv: &'a [String],
             cols: u16,
             rows: u16,
+            env: &'a [(String, String)],
+            cwd: Option<&'a str>,
         }
 
         let open_req = PtyOpenRequest {
             argv: &argv,
             cols,
             rows,
+            env,
+            cwd,
         };
         let json = serde_json::to_string(&open_req)?;
         br.get_mut().write_all(json.as_bytes()).await?;

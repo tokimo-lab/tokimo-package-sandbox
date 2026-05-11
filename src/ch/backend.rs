@@ -5,17 +5,19 @@
 //!             Implements `shell_id`, `spawn_shell`, `subscribe`, `is_guest_connected`.
 //!             `write_stdin` is a TODO (one-shot model; interactive stdin needs v3.x).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::api::{ConfigureParams, Event, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
 use crate::backend::SandboxBackend;
-use crate::ch::rpc::{GuestRpc, Response};
+use crate::ch::rpc::{GuestRpc, PtyFrame, PtySession, Response};
 use crate::ch::vmm::{
     ChVm, ChVmConfig, NetworkConfig, PortForward, PortProto, ch_initrd_path, ch_vmlinux_path, next_cid, passt_path,
 };
@@ -28,6 +30,12 @@ const GUEST_AGENT_PORT: u32 = 1024;
 /// Timeout for guest-agent to come up after VM spawn.
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const GUEST_PING_INTERVAL: Duration = Duration::from_millis(200);
+
+enum PtyCommand {
+    Write(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Close,
+}
 
 /// Cloud Hypervisor backend.
 ///
@@ -55,6 +63,9 @@ pub struct ChBackend {
     /// Each `SyncSender` is a bounded channel; dead receivers are pruned on
     /// each publish. Shared with spawned tokio tasks via `Arc`.
     subscribers: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Event>>>>,
+
+    /// Live PTY sessions keyed by their public JobId.
+    pty_sessions: Arc<Mutex<HashMap<JobId, mpsc::UnboundedSender<PtyCommand>>>>,
 }
 
 impl ChBackend {
@@ -84,6 +95,7 @@ impl ChBackend {
             config: Mutex::new(None),
             vm: Mutex::new(None),
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            pty_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -252,9 +264,8 @@ impl SandboxBackend for ChBackend {
         Ok(self.runtime.block_on(rpc.ping()).is_ok())
     }
 
-    fn is_process_running(&self, _id: &JobId) -> Result<bool> {
-        // TODO(v3x-interactive-shell): track running jobs by JobId.
-        Err(Error::not_implemented("is_process_running — track jobs by id (v3.x)"))
+    fn is_process_running(&self, id: &JobId) -> Result<bool> {
+        Ok(self.pty_sessions.lock().unwrap().contains_key(id))
     }
 
     // -- Shell management -----------------------------------------------------
@@ -280,11 +291,24 @@ impl SandboxBackend for ChBackend {
                 .ok_or(Error::VmNotRunning)?
         };
 
-        let ShellOpts { pty: _, argv, env, cwd } = opts;
+        let ShellOpts { pty, argv, env, cwd } = opts;
         let argv = argv.unwrap_or_else(|| vec!["/bin/sh".into()]);
         let shell_id = JobId(uuid::Uuid::new_v4().to_string());
         let id = shell_id.clone();
         let subs = Arc::clone(&self.subscribers);
+
+        if let Some((rows, cols)) = pty {
+            let rpc = GuestRpc::new(vsock_socket, GUEST_AGENT_PORT);
+            let session = self
+                .runtime
+                .block_on(rpc.open_pty_with_options(argv, cols, rows, &env, cwd.as_deref()))?;
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.pty_sessions.lock().unwrap().insert(shell_id.clone(), tx);
+            let sessions = Arc::clone(&self.pty_sessions);
+            self.runtime
+                .spawn(run_pty_session(session, id.clone(), Arc::clone(&subs), rx, sessions));
+            return Ok(shell_id);
+        }
 
         self.runtime.spawn(async move {
             let rpc = GuestRpc::new(vsock_socket, GUEST_AGENT_PORT);
@@ -331,27 +355,40 @@ impl SandboxBackend for ChBackend {
         Ok(shell_id)
     }
 
-    fn resize_shell(&self, _id: &JobId, _rows: u16, _cols: u16) -> Result<()> {
-        // TODO(v3x-interactive-shell): resize_pty RPC when PTY shells are supported.
-        Err(Error::not_implemented("resize_shell (v3.x PTY channel)"))
+    fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
+        let tx = self
+            .pty_sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::other(format!("PTY shell {} not found", id.as_str())))?;
+        tx.send(PtyCommand::Resize { rows, cols })
+            .map_err(|_| Error::other(format!("PTY shell {} is closed", id.as_str())))
     }
 
-    fn close_shell(&self, _id: &JobId) -> Result<()> {
-        // TODO(v3x-interactive-shell): close_shell RPC.
-        Err(Error::not_implemented("close_shell (v3.x PTY channel)"))
+    fn close_shell(&self, id: &JobId) -> Result<()> {
+        let tx = self.pty_sessions.lock().unwrap().remove(id);
+        if let Some(tx) = tx {
+            let _ = tx.send(PtyCommand::Close);
+        }
+        Ok(())
     }
 
     fn list_shells(&self) -> Result<Vec<JobId>> {
-        // TODO(v3x-interactive-shell): shell registry.
-        Err(Error::not_implemented("list_shells (v3.x shell registry)"))
+        Ok(self.pty_sessions.lock().unwrap().keys().cloned().collect())
     }
 
-    fn write_stdin(&self, _id: &JobId, _data: &[u8]) -> Result<()> {
-        // The guest-agent one-shot model does not support interactive stdin.
-        // TODO(v3x-interactive-shell): route data over a persistent PTY channel.
-        Err(Error::not_implemented(
-            "write_stdin — interactive stdin not supported in one-shot model (v3.x)",
-        ))
+    fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
+        let tx = self
+            .pty_sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::other(format!("PTY shell {} not found", id.as_str())))?;
+        tx.send(PtyCommand::Write(data.to_vec()))
+            .map_err(|_| Error::other(format!("PTY shell {} is closed", id.as_str())))
     }
 
     fn signal_shell(&self, _id: &JobId, _sig: i32) -> Result<()> {
@@ -420,6 +457,67 @@ impl SandboxBackend for ChBackend {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn run_pty_session(
+    mut session: PtySession,
+    id: JobId,
+    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Event>>>>,
+    mut rx: mpsc::UnboundedReceiver<PtyCommand>,
+    sessions: Arc<Mutex<HashMap<JobId, mpsc::UnboundedSender<PtyCommand>>>>,
+) {
+    loop {
+        tokio::select! {
+            frame = session.read_frame() => {
+                match frame {
+                    Ok(Some(PtyFrame::Stdout { data })) => {
+                        publish_event(&subs, Event::Stdout { id: id.clone(), data: data.into_bytes() });
+                    }
+                    Ok(Some(PtyFrame::Exit { code })) => {
+                        publish_event(&subs, Event::Exit { id: id.clone(), exit_code: code, signal: None });
+                        break;
+                    }
+                    Ok(Some(PtyFrame::Error { msg })) => {
+                        publish_event(&subs, Event::Error { id: Some(id.clone()), message: msg, fatal: false });
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        publish_event(&subs, Event::Error {
+                            id: Some(id.clone()),
+                            message: e.to_string(),
+                            fatal: false,
+                        });
+                        break;
+                    }
+                }
+            }
+            cmd = rx.recv() => {
+                match cmd {
+                    Some(PtyCommand::Write(data)) => {
+                        if let Err(e) = session.write_stdin(&data).await {
+                            publish_event(&subs, Event::Error { id: Some(id.clone()), message: e.to_string(), fatal: false });
+                            break;
+                        }
+                    }
+                    Some(PtyCommand::Resize { rows, cols }) => {
+                        if let Err(e) = session.resize(cols, rows).await {
+                            publish_event(&subs, Event::Error { id: Some(id.clone()), message: e.to_string(), fatal: false });
+                            break;
+                        }
+                    }
+                    Some(PtyCommand::Close) | None => {
+                        if let Err(e) = session.close().await {
+                            publish_event(&subs, Event::Error { id: Some(id.clone()), message: e.to_string(), fatal: false });
+                        }
+                        sessions.lock().unwrap().remove(&id);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    sessions.lock().unwrap().remove(&id);
+}
 
 /// Publish `ev` to all live subscribers, pruning disconnected ones.
 fn publish_event(subs: &Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Event>>>>, ev: Event) {

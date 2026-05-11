@@ -108,9 +108,21 @@ async fn handle_pty_connection_wrapper(mut stream: tokio_vsock::VsockStream) -> 
         argv: Vec<String>,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
 
     let open_req: PtyOpenRequest = serde_json::from_str(&line_str).context("deserialize PTY open request")?;
 
-    crate::pty::handle_pty_connection(stream, open_req.argv, open_req.cols, open_req.rows).await
+    crate::pty::handle_pty_connection(
+        stream,
+        open_req.argv,
+        open_req.cols,
+        open_req.rows,
+        open_req.env,
+        open_req.cwd,
+    )
+    .await
 }
