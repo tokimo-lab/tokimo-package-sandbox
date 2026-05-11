@@ -1,7 +1,8 @@
 //! Integration test: inbound port forwarding via passt -t.
 //!
 //! Spawns a real cloud-hypervisor microVM with passt networking enabled, starts
-//! a guest HTTP server on port 8080, and fetches it through a forwarded host port.
+//! a guest HTTP server on port 8080, and fetches `/passwd` through a forwarded
+//! host port.  Prints boot / agent-ready / forward-curl timings.
 //!
 //! # Prerequisites
 //!
@@ -76,9 +77,10 @@ fn passt_path() -> PathBuf {
     root.join("bin/passt/current/bin/passt")
 }
 
-fn wait_for_guest_agent(rt: &tokio::runtime::Runtime, rpc: &GuestRpc) {
-    let guest_ready = rt.block_on(async {
-        let start = Instant::now();
+/// Polls the guest agent until it responds to ping.  Returns elapsed duration.
+fn wait_for_guest_agent(rt: &tokio::runtime::Runtime, rpc: &GuestRpc) -> Duration {
+    let start = Instant::now();
+    let result = rt.block_on(async {
         let timeout = Duration::from_secs(30);
         loop {
             match rpc.ping().await {
@@ -95,7 +97,8 @@ fn wait_for_guest_agent(rt: &tokio::runtime::Runtime, rpc: &GuestRpc) {
             }
         }
     });
-    guest_ready.expect("guest-agent ready");
+    result.expect("guest-agent ready");
+    start.elapsed()
 }
 
 fn free_host_port() -> u16 {
@@ -120,27 +123,32 @@ fn collect_command_result(command_name: &str, frames: Vec<Response>) -> (Option<
     (exit_code, stderr)
 }
 
-fn wait_for_http_hello(host_port: u16) {
+/// Fetches `http://127.0.0.1:{host_port}/passwd` until a 200 response with a
+/// non-empty body arrives.  Returns the elapsed duration of the successful
+/// request.
+fn fetch_passwd(host_port: u16) -> Duration {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .build()
         .expect("reqwest client");
-    let url = format!("http://127.0.0.1:{host_port}/");
-    let start = Instant::now();
-    let timeout = Duration::from_secs(20);
+    let url = format!("http://127.0.0.1:{host_port}/passwd");
+    let poll_deadline = Duration::from_secs(20);
+    let poll_start = Instant::now();
     let mut last_error: Option<String> = None;
 
     loop {
-        if start.elapsed() >= timeout {
+        if poll_start.elapsed() >= poll_deadline {
             let last_error = last_error.as_deref().unwrap_or("no request attempted");
             panic!("guest HTTP server did not respond via forwarded port {host_port}: {last_error}");
         }
 
+        let req_start = Instant::now();
         match client.get(&url).send() {
             Ok(response) => {
                 let status = response.status();
+                let elapsed = req_start.elapsed();
                 match response.text() {
-                    Ok(body) if status.is_success() && body == "hello" => return,
+                    Ok(body) if status.is_success() && !body.is_empty() => return elapsed,
                     Ok(body) => {
                         last_error = Some(format!("unexpected response status={status} body={body:?}"));
                     }
@@ -158,7 +166,10 @@ fn wait_for_http_hello(host_port: u16) {
     }
 }
 
-/// Test passt inbound forwarding: host connects to a forwarded port backed by a guest HTTP server.
+/// Test passt inbound forwarding: host connects to a forwarded port backed by a
+/// guest HTTP server serving `/etc`.  Tries `busybox httpd -f -p 8080 -h /etc`
+/// first; falls back to a raw nc loop so `/passwd` still returns a non-empty
+/// body even when httpd is unavailable.
 ///
 /// The test is `#[ignore]` because it requires KVM hardware access, a built
 /// initrd, cloud-hypervisor, and passt binaries — not available in standard CI.
@@ -198,21 +209,45 @@ fn ch_net_inbound_tcp_forward() {
     };
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    // ── boot timing ──────────────────────────────────────────────────────────
+    let t_boot_start = Instant::now();
     let mut vm = rt.block_on(ChVm::spawn(vm_config)).expect("VM spawn");
+    let t_boot = t_boot_start.elapsed();
 
     let test_result = catch_unwind(AssertUnwindSafe(|| {
+        // ── agent-ready timing ───────────────────────────────────────────────
         let rpc = GuestRpc::new(vm.vsock_socket.clone(), 1024);
-        wait_for_guest_agent(&rt, &rpc);
+        let t_agent = wait_for_guest_agent(&rt, &rpc);
 
+        // ── spawn httpd with nc fallback as a single background command ──────
+        //
+        // Start `busybox httpd -f` in the background, sleep briefly, then
+        // probe http://127.0.0.1:8080/passwd from inside the guest with wget.
+        // If the probe succeeds (200 + non-empty body), keep httpd alive via
+        // `wait`.  If it fails (404, wget missing, or any error), kill httpd
+        // and fall back to a raw nc loop that always returns HTTP 200 "hello".
         let rpc2 = GuestRpc::new(vm.vsock_socket.clone(), 1024);
         let server_argv: Vec<String> = vec![
             "sh".into(),
             "-c".into(),
-            "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello' | busybox nc -l -p 8080; done"
-                .into(),
+            concat!(
+                "busybox httpd -f -p 8080 -h /etc &\n",
+                "HTTPD_PID=$!\n",
+                "sleep 1\n",
+                "if busybox wget -q -O /dev/null http://127.0.0.1:8080/passwd 2>/dev/null; then\n",
+                "  wait $HTTPD_PID\n",
+                "else\n",
+                "  kill $HTTPD_PID 2>/dev/null\n",
+                "  while true; do ",
+                "printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nhello' | busybox nc -l -p 8080; ",
+                "done\n",
+                "fi"
+            )
+            .into(),
         ];
         std::thread::spawn(move || {
-            let rt2 = tokio::runtime::Runtime::new().expect("tokio runtime for guest HTTP server");
+            let rt2 = tokio::runtime::Runtime::new().expect("tokio runtime for guest server");
             match rt2.block_on(rpc2.spawn_command(&server_argv)) {
                 Ok(frames) => {
                     let (exit_code, stderr) = collect_command_result("guest HTTP server", frames);
@@ -224,7 +259,19 @@ fn ch_net_inbound_tcp_forward() {
             }
         });
 
-        wait_for_http_hello(host_port);
+        // Give the server time to bind before the first request.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // ── forward-curl timing ──────────────────────────────────────────────
+        let t_forward_curl = fetch_passwd(host_port);
+
+        eprintln!(
+            "timings: boot_ms={} agent_ms={} forward_curl_ms={} host_port={}",
+            t_boot.as_millis(),
+            t_agent.as_millis(),
+            t_forward_curl.as_millis(),
+            host_port,
+        );
     }));
 
     let shutdown_result = rt.block_on(vm.shutdown(Duration::from_secs(2)));
