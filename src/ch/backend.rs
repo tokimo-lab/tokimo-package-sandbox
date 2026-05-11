@@ -109,10 +109,19 @@ impl SandboxBackend for ChBackend {
     // -- VM lifecycle ---------------------------------------------------------
 
     fn create_vm(&self) -> Result<()> {
-        let (memory_mb, cpu_count, port_forward_specs) = {
+        let (memory_mb, cpu_count, port_forward_specs, shared_dir) = {
             let guard = self.config.lock().unwrap();
             let cfg = guard.as_ref().ok_or(Error::NotConfigured)?;
-            (cfg.memory_mb, cfg.cpu_count, cfg.port_forwards.clone())
+            (
+                cfg.memory_mb,
+                cfg.cpu_count,
+                cfg.port_forwards.clone(),
+                cfg.mounts
+                    .iter()
+                    .find(|mount| mount.name == "agent-data")
+                    .or_else(|| cfg.mounts.iter().find(|mount| !mount.read_only))
+                    .map(|mount| mount.host_path.clone()),
+            )
         };
 
         {
@@ -173,7 +182,7 @@ impl SandboxBackend for ChBackend {
             initrd: ch_initrd_path()?,
             memory_mb: memory_mb.max(256),
             cpu_count: cpu_count.max(1),
-            shared_dir: None,
+            shared_dir,
             network,
         };
 
@@ -271,14 +280,15 @@ impl SandboxBackend for ChBackend {
                 .ok_or(Error::VmNotRunning)?
         };
 
-        let argv = opts.argv.unwrap_or_else(|| vec!["/bin/sh".into()]);
+        let ShellOpts { pty: _, argv, env, cwd } = opts;
+        let argv = argv.unwrap_or_else(|| vec!["/bin/sh".into()]);
         let shell_id = JobId(uuid::Uuid::new_v4().to_string());
         let id = shell_id.clone();
         let subs = Arc::clone(&self.subscribers);
 
         self.runtime.spawn(async move {
             let rpc = GuestRpc::new(vsock_socket, GUEST_AGENT_PORT);
-            let frames = match rpc.spawn_command(&argv).await {
+            let frames = match rpc.spawn_command_with_options(&argv, &env, cwd.as_deref()).await {
                 Ok(f) => f,
                 Err(e) => {
                     publish_event(

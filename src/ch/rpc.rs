@@ -67,8 +67,14 @@ use crate::error::{Error, Result};
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request<'a> {
     Ping,
-    Spawn { argv: &'a [String] },
-    QueryMount { path: &'a str },
+    Spawn {
+        argv: &'a [String],
+        env: &'a [(String, String)],
+        cwd: Option<&'a str>,
+    },
+    QueryMount {
+        path: &'a str,
+    },
 }
 
 /// Incoming RPC response (mirrors `tokimo-guest-agent::exec::Response`).
@@ -180,9 +186,19 @@ impl GuestRpc {
     /// stdin is not supported with this model; use a dedicated shell channel
     /// in future iterations (TODO v3.x-interactive-shell).
     pub async fn spawn_command(&self, argv: &[String]) -> Result<Vec<Response>> {
+        self.spawn_command_with_options(argv, &[], None).await
+    }
+
+    /// Spawn `argv` with optional environment and cwd overrides.
+    pub async fn spawn_command_with_options(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> Result<Vec<Response>> {
         let mut br = connect_guest_inner(&self.vsock_socket, self.port).await?;
 
-        let req = serde_json::to_string(&Request::Spawn { argv })?;
+        let req = serde_json::to_string(&Request::Spawn { argv, env, cwd })?;
         br.get_mut().write_all(req.as_bytes()).await?;
         br.get_mut().write_all(b"\n").await?;
         br.get_mut().flush().await?;

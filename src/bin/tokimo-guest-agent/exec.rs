@@ -11,7 +11,13 @@ use tokio::process::Command;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// Spawn a subprocess, collect stdout/stderr, return output + exit code.
-    Spawn { argv: Vec<String> },
+    Spawn {
+        argv: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Health-check: reply with `pong`.
     Ping,
     /// Query mount status: check if a path is mounted.
@@ -36,19 +42,25 @@ pub enum Response {
 pub async fn handle_request(req: Request) -> Vec<Response> {
     match req {
         Request::Ping => vec![Response::Pong],
-        Request::Spawn { argv } => handle_spawn(argv).await,
+        Request::Spawn { argv, env, cwd } => handle_spawn(argv, env, cwd).await,
         Request::QueryMount { path } => vec![handle_query_mount(&path)],
     }
 }
 
-async fn handle_spawn(argv: Vec<String>) -> Vec<Response> {
+async fn handle_spawn(argv: Vec<String>, env: Vec<(String, String)>, cwd: Option<String>) -> Vec<Response> {
     if argv.is_empty() {
         return vec![Response::Error {
             msg: "empty argv".into(),
         }];
     }
 
-    let output = match Command::new(&argv[0]).args(&argv[1..]).output().await {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).envs(env);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let output = match cmd.output().await {
         Ok(o) => o,
         Err(e) => return vec![Response::Error { msg: e.to_string() }],
     };
@@ -109,6 +121,8 @@ mod tests {
     async fn test_spawn_echo() {
         let req = Request::Spawn {
             argv: vec!["bash".into(), "-c".into(), "echo hi".into()],
+            env: vec![],
+            cwd: None,
         };
         let resp = handle_request(req).await;
 
@@ -127,6 +141,8 @@ mod tests {
     async fn test_spawn_false_exit_code() {
         let req = Request::Spawn {
             argv: vec!["/bin/false".into()],
+            env: vec![],
+            cwd: None,
         };
         let resp = handle_request(req).await;
 
@@ -140,6 +156,8 @@ mod tests {
     async fn test_spawn_missing_command() {
         let req = Request::Spawn {
             argv: vec!["/nonexistent-tokimo-guest-test".into()],
+            env: vec![],
+            cwd: None,
         };
         let resp = handle_request(req).await;
 
