@@ -85,7 +85,7 @@ jobs:
             -w /work \
             rust:1.91-alpine3.21 \
             sh -euxc '
-          apk add --no-cache build-base musl-dev linux-headers python3 gzip zstd tar file coreutils
+          apk add --no-cache bash build-base musl-dev linux-headers python3 gzip zstd tar file coreutils
           rustup target add "$RUST_TARGET"
 
           cargo build --release --bin tokimo-guest-agent --target "$RUST_TARGET"
