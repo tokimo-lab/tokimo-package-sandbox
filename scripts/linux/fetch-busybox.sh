@@ -2,7 +2,7 @@
 # fetch-busybox.sh — fetch a statically-linked busybox binary for use in the
 # microVM initrd.
 #
-# Uses the official `busybox:musl` Docker image (static-pie linked, x86-64).
+# Uses the official multi-arch `busybox:musl` Docker image (static-pie linked).
 # The binary is placed in target/initrd-deps/busybox and never committed to git
 # (target/ is in .gitignore).
 #
@@ -10,6 +10,7 @@
 #   ./scripts/linux/fetch-busybox.sh [out-path]
 #
 # Default out-path: target/initrd-deps/busybox
+# Override detected Docker platform with BUSYBOX_PLATFORM=linux/amd64|linux/arm64.
 set -euo pipefail
 
 OUT="${1:-target/initrd-deps/busybox}"
@@ -20,10 +21,21 @@ if [ -f "$OUT" ]; then
     exit 0
 fi
 
-echo "fetch-busybox: pulling busybox:musl via docker..."
-docker pull busybox:musl 2>&1 | tail -2
+if [ -z "${BUSYBOX_PLATFORM:-}" ]; then
+    case "$(uname -m)" in
+        x86_64|amd64) BUSYBOX_PLATFORM="linux/amd64" ;;
+        aarch64|arm64) BUSYBOX_PLATFORM="linux/arm64" ;;
+        *)
+            echo "fetch-busybox: unsupported architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+fi
 
-docker run --rm --entrypoint /bin/cat busybox:musl /bin/busybox > "$OUT"
+echo "fetch-busybox: pulling busybox:musl for $BUSYBOX_PLATFORM via docker..."
+docker pull --platform "$BUSYBOX_PLATFORM" busybox:musl 2>&1 | tail -2
+
+docker run --rm --platform "$BUSYBOX_PLATFORM" --entrypoint /bin/cat busybox:musl /bin/busybox > "$OUT"
 chmod +x "$OUT"
 
 # Verify it is not dynamically linked (static or static-pie are both OK).
