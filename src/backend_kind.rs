@@ -16,7 +16,7 @@
 //! | `bwrap`    | Linux bubblewrap + seccomp; fail if unavailable           |
 //! | `ch`       | Cloud Hypervisor microVM; fail if unavailable             |
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +26,44 @@ pub enum SandboxBackendKind {
     Disabled,
     Bwrap,
     Ch,
+}
+
+/// Concrete backend currently driving a [`Sandbox`](crate::Sandbox).
+///
+/// Unlike [`SandboxBackendKind`] — which describes the caller's *request*
+/// (and includes `Auto`) — `ActiveBackend` always names the specific
+/// backend implementation actually in use. Returned by
+/// [`Sandbox::active_backend`](crate::Sandbox::active_backend) so callers
+/// (and CI logs) can confirm which path was selected at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActiveBackend {
+    /// Linux: `bubblewrap` + seccomp; no VM.
+    Bwrap,
+    /// Linux: Cloud Hypervisor micro-VM.
+    Ch,
+    /// macOS: Apple Virtualization.framework micro-VM.
+    Macos,
+    /// Windows: Hyper-V (HCS) micro-VM via `tokimo-sandbox-svc`.
+    Windows,
+}
+
+impl ActiveBackend {
+    /// Lowercase identifier (matches the `serde` form).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ActiveBackend::Bwrap => "bwrap",
+            ActiveBackend::Ch => "ch",
+            ActiveBackend::Macos => "macos",
+            ActiveBackend::Windows => "windows",
+        }
+    }
+}
+
+impl std::fmt::Display for ActiveBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Read `SANDBOX_BACKEND` from the environment and return the selected backend.

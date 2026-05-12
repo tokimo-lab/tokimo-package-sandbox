@@ -112,6 +112,10 @@ impl MacosBackend {
 }
 
 impl SandboxBackend for MacosBackend {
+    fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        crate::backend_kind::ActiveBackend::Macos
+    }
+
     fn configure(&self, params: ConfigureParams) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         match &*state {

@@ -63,6 +63,10 @@ impl WindowsBackend {
 }
 
 impl SandboxBackend for WindowsBackend {
+    fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        crate::backend_kind::ActiveBackend::Windows
+    }
+
     fn configure(&self, params: ConfigureParams) -> Result<()> {
         let v = serde_json::to_value(&params)?;
         self.call(method::CONFIGURE, v, SHORT_CALL_TIMEOUT)?;

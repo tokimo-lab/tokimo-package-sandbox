@@ -60,6 +60,10 @@ pub type Registry<B> = Mutex<HashMap<String, Arc<B>>>;
 pub struct SharedBackend<B: SandboxBackend> {
     registry: &'static Registry<B>,
     factory: fn() -> Result<Arc<B>>,
+    /// Concrete backend identity — constant per inner type. Stored so
+    /// `active_backend()` works without forcing the inner backend to be
+    /// constructed first.
+    kind: crate::backend_kind::ActiveBackend,
     /// Resolved on the first `configure()`; subsequent calls forward to
     /// this instance.  Reset to `None` on `stop_vm()` so a single handle
     /// can be re-configured for a brand new session.
@@ -70,10 +74,15 @@ pub struct SharedBackend<B: SandboxBackend> {
 }
 
 impl<B: SandboxBackend> SharedBackend<B> {
-    pub fn new(registry: &'static Registry<B>, factory: fn() -> Result<Arc<B>>) -> Self {
+    pub fn new(
+        registry: &'static Registry<B>,
+        factory: fn() -> Result<Arc<B>>,
+        kind: crate::backend_kind::ActiveBackend,
+    ) -> Self {
         Self {
             registry,
             factory,
+            kind,
             inner: Mutex::new(None),
             bound_session: Mutex::new(None),
         }
@@ -135,6 +144,10 @@ impl<B: SandboxBackend> SharedBackend<B> {
 }
 
 impl<B: SandboxBackend> SandboxBackend for SharedBackend<B> {
+    fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        self.kind
+    }
+
     fn configure(&self, params: ConfigureParams) -> Result<()> {
         let inner = self.resolve(&params.session_id)?;
         // Idempotent on a running shared session — matches Windows
@@ -341,6 +354,10 @@ mod tests {
     }
 
     impl SandboxBackend for FakeBackend {
+        fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+            crate::backend_kind::ActiveBackend::Bwrap
+        }
+
         fn configure(&self, _p: ConfigureParams) -> Result<()> {
             self.configured.store(true, Ordering::Relaxed);
             Ok(())
@@ -444,7 +461,7 @@ mod tests {
     #[test]
     fn calls_before_configure_error() {
         let reg = fresh_registry();
-        let sb = SharedBackend::new(reg, make_fake);
+        let sb = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
         assert!(matches!(sb.start_vm(), Err(Error::NotConfigured)));
         assert!(matches!(sb.shell_id(), Err(Error::NotConfigured)));
     }
@@ -452,7 +469,7 @@ mod tests {
     #[test]
     fn is_running_is_false_before_configure() {
         let reg = fresh_registry();
-        let sb = SharedBackend::new(reg, make_fake);
+        let sb = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
         assert!(!sb.is_running().unwrap());
         assert!(!sb.is_guest_connected().unwrap());
     }
@@ -460,8 +477,8 @@ mod tests {
     #[test]
     fn same_session_id_shares_backend() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
-        let h2 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
+        let h2 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("S")).unwrap();
         h1.start_vm().unwrap();
@@ -479,8 +496,8 @@ mod tests {
     #[test]
     fn different_session_ids_isolate() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
-        let h2 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
+        let h2 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("A")).unwrap();
         h2.configure(cfg("B")).unwrap();
@@ -491,8 +508,8 @@ mod tests {
     #[test]
     fn empty_session_id_is_untracked() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
-        let h2 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
+        let h2 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("")).unwrap();
         h2.configure(cfg("")).unwrap();
@@ -504,7 +521,7 @@ mod tests {
     #[test]
     fn stop_vm_clears_registry_entry() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("X")).unwrap();
         h1.start_vm().unwrap();
@@ -522,8 +539,8 @@ mod tests {
     #[test]
     fn configure_on_running_session_is_idempotent() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
-        let h2 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
+        let h2 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("Z")).unwrap();
         h1.start_vm().unwrap();
@@ -538,8 +555,8 @@ mod tests {
     #[test]
     fn stop_from_one_handle_tears_down_for_all() {
         let reg = fresh_registry();
-        let h1 = SharedBackend::new(reg, make_fake);
-        let h2 = SharedBackend::new(reg, make_fake);
+        let h1 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
+        let h2 = SharedBackend::new(reg, make_fake, crate::backend_kind::ActiveBackend::Bwrap);
 
         h1.configure(cfg("T")).unwrap();
         h1.start_vm().unwrap();

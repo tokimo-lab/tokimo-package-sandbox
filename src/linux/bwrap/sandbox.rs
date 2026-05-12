@@ -159,6 +159,10 @@ impl LinuxBackend {
 }
 
 impl SandboxBackend for LinuxBackend {
+    fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        crate::backend_kind::ActiveBackend::Bwrap
+    }
+
     fn configure(&self, params: ConfigureParams) -> Result<()> {
         let mut g = self.state.lock().map_err(|_| Error::other("state poisoned"))?;
         if self.running.load(Ordering::Relaxed) {

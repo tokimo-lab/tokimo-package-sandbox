@@ -41,7 +41,11 @@ pub(crate) fn backend_for_kind(kind: crate::backend_kind::SandboxBackendKind) ->
         fn factory() -> Result<Arc<LinuxBackend>> {
             Ok(Arc::new(LinuxBackend::new()?))
         }
-        Ok(Arc::new(SharedBackend::new(reg, factory)))
+        Ok(Arc::new(SharedBackend::new(
+            reg,
+            factory,
+            crate::backend_kind::ActiveBackend::Bwrap,
+        )))
     }
 
     // Shared ch registry — initialised once per process.
@@ -61,7 +65,11 @@ pub(crate) fn backend_for_kind(kind: crate::backend_kind::SandboxBackendKind) ->
         fn factory() -> Result<Arc<crate::linux::ch::backend::ChBackend>> {
             Ok(Arc::new(crate::linux::ch::backend::ChBackend::new()?))
         }
-        Ok(Arc::new(SharedBackend::new(reg, factory)))
+        Ok(Arc::new(SharedBackend::new(
+            reg,
+            factory,
+            crate::backend_kind::ActiveBackend::Ch,
+        )))
     }
 
     match kind {
@@ -113,7 +121,11 @@ pub(crate) fn default_backend() -> Result<Arc<dyn SandboxBackend>> {
     fn factory() -> Result<Arc<MacosBackend>> {
         Ok(Arc::new(MacosBackend::new()?))
     }
-    Ok(Arc::new(SharedBackend::new(reg, factory)))
+    Ok(Arc::new(SharedBackend::new(
+        reg,
+        factory,
+        crate::backend_kind::ActiveBackend::Macos,
+    )))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]

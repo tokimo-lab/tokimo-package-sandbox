@@ -391,6 +391,15 @@ impl Sandbox {
         Ok(Self::new(backend))
     }
 
+    /// Concrete backend implementation actually driving this handle.
+    ///
+    /// Cheap, infallible, and safe to call before [`Sandbox::configure`].
+    /// Useful for tests / CI to confirm which path was selected after a
+    /// `SANDBOX_BACKEND=auto` resolution.
+    pub fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        self.inner.active_backend()
+    }
+
     // ---- Lifecycle ------------------------------------------------------
 
     pub fn configure(&self, params: ConfigureParams) -> Result<()> {

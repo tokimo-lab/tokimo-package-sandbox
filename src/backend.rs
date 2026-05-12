@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 
 use crate::api::{ConfigureParams, Event, HostExecCallback, JobId, Mount, SessionDetails, SessionSummary, ShellOpts};
+use crate::backend_kind::ActiveBackend;
 use crate::error::{Error, Result};
 
 /// Per-platform backend driving a [`Sandbox`](crate::Sandbox).
@@ -12,6 +13,10 @@ use crate::error::{Error, Result};
 /// backend owns its own state and does not require the caller to hold
 /// any locks.
 pub trait SandboxBackend: Send + Sync + 'static {
+    /// The concrete backend implementation in use. Constant for the
+    /// lifetime of the handle; safe to call before [`configure`].
+    fn active_backend(&self) -> ActiveBackend;
+
     fn configure(&self, params: ConfigureParams) -> Result<()>;
     fn create_vm(&self) -> Result<()>;
     fn start_vm(&self) -> Result<()>;

@@ -73,7 +73,7 @@ pub use api::{
     PortForwardSpec, Sandbox, SessionDetails, SessionSummary, ShellOpts,
 };
 pub use backend::SandboxBackend;
-pub use backend_kind::{SandboxBackendKind, detect_backend};
+pub use backend_kind::{ActiveBackend, SandboxBackendKind, detect_backend};
 pub use error::{Error, Result};
 pub use fonts::FontDir;
 #[cfg(target_os = "linux")]

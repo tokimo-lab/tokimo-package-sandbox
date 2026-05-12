@@ -98,6 +98,10 @@ impl ChBackend {
 }
 
 impl SandboxBackend for ChBackend {
+    fn active_backend(&self) -> crate::backend_kind::ActiveBackend {
+        crate::backend_kind::ActiveBackend::Ch
+    }
+
     fn configure(&self, params: ConfigureParams) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         match &*state {
