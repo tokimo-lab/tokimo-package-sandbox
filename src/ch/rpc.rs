@@ -231,7 +231,14 @@ impl GuestRpc {
             }
             let resp: Response = serde_json::from_str(trimmed)
                 .map_err(|e| Error::protocol(format!("spawn_command: deserialize frame: {e} (raw: {trimmed:?})")))?;
+            let is_terminal = matches!(resp, Response::Exit { .. } | Response::Error { .. });
             responses.push(resp);
+            if is_terminal {
+                // Exit / Error is the last frame per protocol; don't wait for
+                // EOF — CH vsock proxy may not propagate FIN promptly and
+                // waiting would trigger EXEC_INACTIVITY_TIMEOUT unnecessarily.
+                break;
+            }
         }
 
         Ok(responses)
