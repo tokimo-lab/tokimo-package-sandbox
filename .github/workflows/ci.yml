@@ -71,7 +71,7 @@ jobs:
           SANDBOX_BACKEND: bwrap
         run: |
           export PATH="$PWD/target/debug:$PATH"
-          cargo test --tests -- --test-threads=1
+          cargo test --tests --no-fail-fast -- --test-threads=1
 
   # ------------------------------------------------------------------
   # Linux integration: ch (cloud-hypervisor) backend.
@@ -116,7 +116,7 @@ jobs:
           SANDBOX_BACKEND: ch
         run: |
           export PATH="$PWD/target/debug:$PATH"
-          cargo test --tests -- --test-threads=1
+          cargo test --tests --no-fail-fast -- --test-threads=1
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)
