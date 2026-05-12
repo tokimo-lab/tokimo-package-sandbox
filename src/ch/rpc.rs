@@ -53,12 +53,18 @@
 //! - `{"type":"error","msg":"..."}`
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 use crate::error::{Error, Result};
+
+pub const PING_TIMEOUT: Duration = Duration::from_secs(2);
+pub const EXEC_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+pub const VSOCK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Protocol types ────────────────────────────────────────────────────────────
 
@@ -129,7 +135,9 @@ async fn connect_guest_inner(uds_path: &Path, port: u32) -> Result<BufReader<Uni
     // Read the "OK <port>" confirmation line.
     let mut br = BufReader::new(stream);
     let mut line = String::new();
-    br.read_line(&mut line).await?;
+    timeout(VSOCK_READ_TIMEOUT, br.read_line(&mut line))
+        .await
+        .map_err(|_| Error::Timeout(VSOCK_READ_TIMEOUT))??;
 
     if !line.trim_start().starts_with("OK") {
         return Err(Error::protocol(format!(
@@ -162,20 +170,24 @@ impl GuestRpc {
     pub async fn ping(&self) -> Result<()> {
         let mut br = connect_guest_inner(&self.vsock_socket, self.port).await?;
 
-        let req = serde_json::to_string(&Request::Ping)?;
-        br.get_mut().write_all(req.as_bytes()).await?;
-        br.get_mut().write_all(b"\n").await?;
-        br.get_mut().flush().await?;
+        timeout(PING_TIMEOUT, async {
+            let req = serde_json::to_string(&Request::Ping)?;
+            br.get_mut().write_all(req.as_bytes()).await?;
+            br.get_mut().write_all(b"\n").await?;
+            br.get_mut().flush().await?;
 
-        let mut line = String::new();
-        br.read_line(&mut line).await?;
-        let resp: Response = serde_json::from_str(line.trim())
-            .map_err(|e| Error::protocol(format!("ping: deserialize response: {e} (raw: {line:?})")))?;
+            let mut line = String::new();
+            br.read_line(&mut line).await?;
+            let resp: Response = serde_json::from_str(line.trim())
+                .map_err(|e| Error::protocol(format!("ping: deserialize response: {e} (raw: {line:?})")))?;
 
-        match resp {
-            Response::Pong => Ok(()),
-            other => Err(Error::protocol(format!("ping: expected Pong, got {other:?}"))),
-        }
+            match resp {
+                Response::Pong => Ok(()),
+                other => Err(Error::protocol(format!("ping: expected Pong, got {other:?}"))),
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout(PING_TIMEOUT))?
     }
 
     /// Spawn `argv` on the guest, wait for the command to finish, and return
@@ -207,7 +219,9 @@ impl GuestRpc {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = br.read_line(&mut line).await?;
+            let n = timeout(EXEC_INACTIVITY_TIMEOUT, br.read_line(&mut line))
+                .await
+                .map_err(|_| Error::Timeout(EXEC_INACTIVITY_TIMEOUT))??;
             if n == 0 {
                 break; // server closed connection — all frames delivered
             }
@@ -236,7 +250,9 @@ impl GuestRpc {
         br.get_mut().flush().await?;
 
         let mut line = String::new();
-        br.read_line(&mut line).await?;
+        timeout(VSOCK_READ_TIMEOUT, br.read_line(&mut line))
+            .await
+            .map_err(|_| Error::Timeout(VSOCK_READ_TIMEOUT))??;
         let resp: Response = serde_json::from_str(line.trim())
             .map_err(|e| Error::protocol(format!("query_mount: deserialize response: {e} (raw: {line:?})")))?;
 
@@ -366,7 +382,9 @@ impl PtySession {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = self.br.read_line(&mut line).await?;
+            let n = timeout(EXEC_INACTIVITY_TIMEOUT, self.br.read_line(&mut line))
+                .await
+                .map_err(|_| Error::Timeout(EXEC_INACTIVITY_TIMEOUT))??;
             if n == 0 {
                 return Ok(());
             }

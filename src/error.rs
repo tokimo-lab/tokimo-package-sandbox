@@ -1,5 +1,7 @@
 //! Error types for the public Sandbox API.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +37,9 @@ pub enum Error {
 
     #[error("guest error: {0}")]
     Guest(String),
+
+    #[error("operation timed out after {0:?}")]
+    Timeout(Duration),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
