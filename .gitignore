@@ -26,3 +26,9 @@ Cargo.lock
 # Local VM working directory (base rootfs template + writable run copy)
 /.vm/
 initrd-extract/
+
+# Runtime binaries fetched by scripts/linux/fetch-vm.sh (or built locally).
+# Mirror of mac/win: never committed.
+/bin/
+# Scratch plan files (use plan/ subdir for permanent docs).
+/plan.md

@@ -17,6 +17,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use crate::protocol::types::{Event, Frame, Op, PROTOCOL_VERSION, Reply, StdioMode, default_features};
 use crate::{Error, Result};
 
+#[cfg(unix)]
+pub mod vsock;
+
 // ---------------------------------------------------------------------------
 // Transport traits
 // ---------------------------------------------------------------------------
@@ -828,7 +831,7 @@ fn reply_id(r: &Reply) -> String {
 // `tokimo_package_sandbox::init_client::{WinInitClient,VsockInitClient,LinuxInitClient}`.
 
 #[cfg(target_os = "linux")]
-pub use crate::linux::init_client::InitClient as LinuxInitClient;
+pub use crate::linux::bwrap::init_client::InitClient as LinuxInitClient;
 #[cfg(target_os = "macos")]
 pub use crate::macos::vsock_init_client::VsockInitClient;
 #[cfg(target_os = "windows")]

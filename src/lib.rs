@@ -23,7 +23,6 @@
 //! ```
 
 pub mod backend_kind;
-pub mod ch_probe;
 
 mod api;
 mod backend;
@@ -63,9 +62,7 @@ pub mod vfs_protocol;
 pub mod netstack;
 
 #[cfg(target_os = "linux")]
-pub mod ch;
-#[cfg(target_os = "linux")]
-pub(crate) mod linux;
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(target_os = "windows")]
@@ -77,9 +74,10 @@ pub use api::{
 };
 pub use backend::SandboxBackend;
 pub use backend_kind::{SandboxBackendKind, detect_backend};
-pub use ch_probe::{ChProbeResult, probe_ch};
 pub use error::{Error, Result};
 pub use fonts::FontDir;
+#[cfg(target_os = "linux")]
+pub use linux::ch::probe::{ChProbeResult, probe_ch};
 
 #[cfg(target_os = "windows")]
 pub use windows::canonicalize_safe;

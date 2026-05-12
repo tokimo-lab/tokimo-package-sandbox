@@ -1,9 +1,9 @@
-//! macOS VSOCK stream transport adapter for the unified `InitClient`.
+//! VSOCK stream transport adapter for the unified `InitClient`.
+//!
+//! Cross-platform (macOS / Linux). Used by macOS VZ backend and ch backend.
 //!
 //! Wraps an `OwnedFd` (virtio-vsock stream socket), `dup(2)`'ing it so the
 //! reader thread and the writer path operate on independent file descriptors.
-
-#![cfg(target_os = "macos")]
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -60,13 +60,13 @@ impl crate::init_client::InitClient<VsockSend> {
     /// Wrap an already-connected VSOCK stream socket and spawn the reader.
     pub fn connect(sock: OwnedFd) -> Result<Self> {
         let (send, recv) = split(sock)?;
-        // macOS VM mode: init is always PID 1.
+        // VM mode: init is always PID 1.
         crate::init_client::InitClient::new(send, recv, true)
     }
 }
 
 // ---------------------------------------------------------------------------
-// FdReader / FdWriter adapters (via nix for macOS compatibility)
+// FdReader / FdWriter adapters (via nix for portability)
 // ---------------------------------------------------------------------------
 
 struct FdReader<'a>(&'a mut OwnedFd);

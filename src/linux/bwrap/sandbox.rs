@@ -28,7 +28,7 @@ use nix::sys::socket::{SockFlag, socketpair};
 use crate::api::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, ShellOpts};
 use crate::backend::SandboxBackend;
 use crate::error::{Error, Result};
-use crate::linux::init_client::{DrainedEvent, InitClient};
+use crate::linux::bwrap::init_client::{DrainedEvent, InitClient};
 use crate::vfs_host::FuseHost;
 use crate::vfs_impls::LocalDirVfs;
 

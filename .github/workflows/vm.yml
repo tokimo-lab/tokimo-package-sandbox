@@ -24,7 +24,12 @@ name: vm
 # Output (per arch), depending on tag prefix:
 #   vm-kernel-* publishes:
 #     tokimo-linux-kernel-{x86_64,arm64}.tar.zst
-#       vmlinuz + initrd.img (init/fuse/tun-pump baked into initrd /bin/)
+#       vmlinuz + initrd.img
+#         vmlinuz     — Debian generic bzImage. All four backends use this
+#                       same artifact (bwrap/mac VZ/Win HCS/Linux ch). cloud-
+#                       hypervisor v36+ accepts bzImage, and the initrd loads
+#                       vmw_vsock_virtio_transport early so ch vsock works.
+#         initrd.img  — busybox initramfs (init/fuse/tun-pump baked in)
 #   vm-rootfs-* publishes:
 #     tokimo-linux-rootfs-{x86_64,arm64}.tar.zst   (Debian, no tokimo bins)
 #     tokimo-linux-rootfs-x86_64.vhdx.zip          (Windows HCS, amd64 only)
@@ -108,7 +113,8 @@ jobs:
       - name: Package kernel + initrd bundle
         run: |
           SFX=${{ matrix.suffix }}
-          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C "packaging/vm-base/tokimo-os-${{ matrix.arch }}" vmlinuz initrd.img
+          STAGE="packaging/vm-base/tokimo-os-${{ matrix.arch }}"
+          tar -cpf "tokimo-linux-kernel-${SFX}.tar" -C "$STAGE" vmlinuz initrd.img
           zstd -10 -T0 "tokimo-linux-kernel-${SFX}.tar" -o "tokimo-linux-kernel-${SFX}.tar.zst"
           sha256sum "tokimo-linux-kernel-${SFX}.tar.zst" > "tokimo-linux-kernel-${SFX}.tar.zst.sha256"
           rm "tokimo-linux-kernel-${SFX}.tar"

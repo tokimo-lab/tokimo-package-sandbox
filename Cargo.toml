@@ -106,10 +106,6 @@ path = "src/bin/tokimo-sandbox-fuse/main.rs"
 name = "tokimo-host-exec"
 path = "src/bin/tokimo-host-exec/main.rs"
 
-[[bin]]
-name = "tokimo-guest-agent"
-path = "src/bin/tokimo-guest-agent/main.rs"
-
 [[bench]]
 name = "vfs_wire"
 harness = false

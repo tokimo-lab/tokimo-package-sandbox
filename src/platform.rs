@@ -31,26 +31,64 @@ pub(crate) fn backend_for_kind(kind: crate::backend_kind::SandboxBackendKind) ->
     use std::sync::{Mutex, OnceLock};
 
     use crate::backend_kind::SandboxBackendKind;
-    use crate::linux::sandbox::LinuxBackend;
+    use crate::linux::bwrap::sandbox::LinuxBackend;
     use crate::shared_backend::{Registry, SharedBackend};
 
-    match kind {
-        SandboxBackendKind::Ch => {
-            let probe = crate::ch_probe::probe_ch();
-            let backend = crate::ch::backend::ChBackend::new(probe)?;
-            Ok(Arc::new(backend))
+    // Shared bwrap registry — initialised once per process.
+    static BWRAP_REG: OnceLock<Registry<LinuxBackend>> = OnceLock::new();
+    fn bwrap_backend() -> Result<Arc<dyn SandboxBackend>> {
+        let reg = BWRAP_REG.get_or_init(|| Mutex::new(HashMap::new()));
+        fn factory() -> Result<Arc<LinuxBackend>> {
+            Ok(Arc::new(LinuxBackend::new()?))
         }
-        SandboxBackendKind::Bwrap => {
-            static REG: OnceLock<Registry<LinuxBackend>> = OnceLock::new();
-            let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+        Ok(Arc::new(SharedBackend::new(reg, factory)))
+    }
 
-            fn factory() -> Result<Arc<LinuxBackend>> {
-                Ok(Arc::new(LinuxBackend::new()?))
-            }
-            Ok(Arc::new(SharedBackend::new(reg, factory)))
+    // Shared ch registry — initialised once per process.
+    static CH_REG: OnceLock<Registry<crate::linux::ch::backend::ChBackend>> = OnceLock::new();
+    fn ch_backend() -> Result<Arc<dyn SandboxBackend>> {
+        // Fail fast when the host clearly can't run a VM (no KVM, no
+        // vsock, missing bundled binaries) so `SandboxBackendKind::Auto`
+        // can degrade to bwrap without paying the cost of a doomed boot.
+        let probe = crate::linux::ch::probe::probe_ch();
+        if !probe.is_ready() {
+            return Err(crate::error::Error::not_supported(format!(
+                "cloud-hypervisor backend not ready:\n{}",
+                probe.report()
+            )));
         }
+        let reg = CH_REG.get_or_init(|| Mutex::new(HashMap::new()));
+        fn factory() -> Result<Arc<crate::linux::ch::backend::ChBackend>> {
+            Ok(Arc::new(crate::linux::ch::backend::ChBackend::new()?))
+        }
+        Ok(Arc::new(SharedBackend::new(reg, factory)))
+    }
+
+    match kind {
+        SandboxBackendKind::Auto => {
+            // Try Cloud Hypervisor first, then degrade to bwrap. If both
+            // fail, propagate the bwrap error (the more user-actionable one).
+            match ch_backend() {
+                Ok(b) => Ok(b),
+                Err(ch_err) => {
+                    tracing::info!(
+                        ch_error = %ch_err,
+                        "Auto: ch backend unavailable, falling back to bwrap"
+                    );
+                    match bwrap_backend() {
+                        Ok(b) => Ok(b),
+                        Err(bwrap_err) => Err(crate::error::Error::not_supported(format!(
+                            "no sandbox backend available on this host\n  ch:    {ch_err}\n  bwrap: {bwrap_err}"
+                        ))),
+                    }
+                }
+            }
+        }
+        // Explicit force: no fallback. Caller asked for this specific backend.
+        SandboxBackendKind::Ch => ch_backend(),
+        SandboxBackendKind::Bwrap => bwrap_backend(),
         SandboxBackendKind::Disabled => Err(crate::error::Error::not_supported(
-            "sandbox backend is disabled; cannot connect with explicit Disabled kind",
+            "sandbox backend is disabled (SANDBOX_BACKEND=disabled)",
         )),
     }
 }

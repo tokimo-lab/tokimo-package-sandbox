@@ -14,9 +14,13 @@
 #   scripts/linux/fetch-vm.sh -f                          # force re-download
 #
 # Layout produced:
-#   .vm/base/vmlinuz        — Linux kernel
+#   .vm/base/vmlinuz        — Linux kernel (mac/win backends)
 #   .vm/base/initrd.img     — initramfs (busybox + tokimo-sandbox-init/fuse/tun-pump)
 #   .vm/base/rootfs/        — extracted Debian rootfs directory (no tokimo bins)
+#
+# For the ch backend, additionally run scripts/linux/fetch-ch-deps.sh to
+# populate bin/cloud-hypervisor/ and bin/virtiofsd/ (ch reuses the same
+# vmlinuz this script fetches — no separate kernel artifact).
 #
 # Dependencies: curl, jq, tar, zstd.
 
@@ -107,7 +111,7 @@ dl() {
 # 1) kernel + initrd
 dl "$KERNEL_BASE/$KERNEL_ASSET" "$WORK/$KERNEL_ASSET"
 zstd -d -f "$WORK/$KERNEL_ASSET" -o "$WORK/kernel.tar"
-tar -xf "$WORK/kernel.tar" -C "$VM_DIR" vmlinuz initrd.img
+tar -xf "$WORK/kernel.tar" -C "$VM_DIR"
 
 # 2) rootfs
 dl "$ROOTFS_BASE/$ROOTFS_ASSET" "$WORK/$ROOTFS_ASSET"

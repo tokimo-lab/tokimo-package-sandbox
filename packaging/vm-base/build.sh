@@ -337,13 +337,12 @@ find /usr/share/zoneinfo -type d -empty -delete 2>/dev/null || true
 # The module-bundle step on the host does `docker cp /var/cache/tokimo-kmods/.` out.
 KVER_INNER=$(ls /lib/modules | head -1)
 KMOD_LIST='hv_vmbus hv_utils vsock hv_sock scsi_common scsi_mod scsi_transport_fc hv_storvsc sd_mod netfs crc16 crc32c_generic libcrc32c jbd2 mbcache ext4 hv_netvsc failover net_failover tun'
-# macOS VZ uses virtio-vsock + virtio-net (not Hyper-V). Add the virtio
-# transport modules for arm64 so the init binary can load them in the
-# guest VM. virtio_net requires net_failover (already listed) for SR-IOV
-# fallback handling.
-if [ "$ARCH" = "arm64" ]; then
-    KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
-fi
+# virtio-vsock + virtio-net transport modules. Needed unconditionally:
+#   * macOS VZ (arm64 + amd64) speaks virtio over the VZ paravirt bus.
+#   * Linux cloud-hypervisor backend (amd64 + arm64) likewise uses virtio.
+# Without vmw_vsock_virtio_transport the guest cannot reach the host
+# over the ch/VZ vsock channel and init handshake times out.
+KMOD_LIST="$KMOD_LIST vmw_vsock_virtio_transport virtio_net"
 # NFS client (used by macOS dynamic mounts over the smoltcp gateway).
 # resolve_deps will pull in lockd/sunrpc/auth_rpcgss/grace/nfs_acl
 # transitively, but listing them explicitly keeps the intent obvious.
