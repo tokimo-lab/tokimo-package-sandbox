@@ -284,10 +284,6 @@ impl SandboxBackend for ChBackend {
 
     fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
         let job_id = JobId(uuid::Uuid::new_v4().to_string());
-        self.spawn_shell_with_id(job_id, opts)
-    }
-
-    fn spawn_shell_with_id(&self, job_id: JobId, opts: ShellOpts) -> Result<JobId> {
         let vsock_socket = {
             let guard = self.vm.lock().unwrap();
             guard

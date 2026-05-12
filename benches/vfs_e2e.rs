@@ -7,25 +7,41 @@
 //! encode/decode, length-prefix framing, real socket I/O, tokio dispatch,
 //! `LocalDirVfs` reading/writing real files.
 
-#![cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
+fn main() {}
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream as StdUnixStream;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
 use std::sync::mpsc;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::vfs_host::FuseHost;
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::vfs_impls::LocalDirVfs;
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::vfs_protocol::handshake;
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
+#[cfg(target_os = "linux")]
 use tokimo_package_sandbox::vfs_protocol::{Frame, Req, Res};
 
+#[cfg(target_os = "linux")]
 type PendingMap = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<Res>>>>;
 
+#[cfg(target_os = "linux")]
 struct Client {
     write_file: std::sync::Mutex<std::fs::File>,
     next_req_id: AtomicU64,
@@ -33,6 +49,7 @@ struct Client {
     bound_mount_id: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl Client {
     fn call(&self, op: Req) -> Res {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -51,6 +68,7 @@ impl Client {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Harness {
     _rt: tokio::runtime::Runtime,
     client: Arc<Client>,
@@ -58,6 +76,7 @@ struct Harness {
     _reader: std::thread::JoinHandle<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl Harness {
     fn new() -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -169,6 +188,7 @@ impl Harness {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn pair() -> (OwnedFd, OwnedFd) {
     let (a, b) = StdUnixStream::pair().unwrap();
     (a.into(), b.into())
@@ -178,6 +198,7 @@ fn pair() -> (OwnedFd, OwnedFd) {
 // Benchmarks
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn bench_small_rpc(c: &mut Criterion) {
     let h = Harness::new();
     let nid = h.lookup("hello.txt");
@@ -199,6 +220,7 @@ fn bench_small_rpc(c: &mut Criterion) {
     g.finish();
 }
 
+#[cfg(target_os = "linux")]
 fn bench_read(c: &mut Criterion) {
     let h = Harness::new();
 
@@ -229,6 +251,7 @@ fn bench_read(c: &mut Criterion) {
     g.finish();
 }
 
+#[cfg(target_os = "linux")]
 fn bench_write(c: &mut Criterion) {
     let h = Harness::new();
     // Pre-create a file we'll repeatedly write into.
@@ -256,5 +279,7 @@ fn bench_write(c: &mut Criterion) {
     g.finish();
 }
 
+#[cfg(target_os = "linux")]
 criterion_group!(benches, bench_small_rpc, bench_read, bench_write);
+#[cfg(target_os = "linux")]
 criterion_main!(benches);

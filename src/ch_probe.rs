@@ -189,6 +189,7 @@ fn current_user_in_kvm_group() -> bool {
     if kvm_gid.is_none() {
         return false;
     }
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let kvm_gid = kvm_gid.unwrap();
 
     // Check primary group first
