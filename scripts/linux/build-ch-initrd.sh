@@ -147,8 +147,22 @@ if busybox_data:
     ino += 1
     listing.append("bin/busybox")
 
-    # Symlinks: /bin/{sh,echo,cat,ls,ip,udhcpc,wget,cut,ipcalc} -> busybox
-    for applet in ("sh", "echo", "cat", "ls", "ip", "udhcpc", "wget", "cut", "ipcalc"):
+    # Symlinks: common busybox applets -> busybox.
+    # Without these the initrd-only environment cannot satisfy `uname`,
+    # `mount`, `pwd`, etc. — which the agent sandbox bash tool exposes
+    # to LLMs. Keep the list aligned with the applets baked into the
+    # static busybox shipped under target/initrd-deps/busybox.
+    for applet in (
+        "sh", "echo", "cat", "ls", "ip", "udhcpc", "wget", "cut", "ipcalc",
+        "uname", "mount", "umount", "pwd", "id", "hostname", "whoami",
+        "mkdir", "rmdir", "rm", "cp", "mv", "ln", "touch", "chmod", "chown",
+        "env", "date", "true", "false", "sleep", "printf", "head", "tail",
+        "grep", "sed", "awk", "wc", "find", "which", "test", "[", "[[",
+        "tar", "gzip", "gunzip", "zcat", "sort", "uniq", "tr", "basename",
+        "dirname", "readlink", "df", "du", "free", "ps", "kill", "stat",
+        "yes", "tee", "xargs", "sh-bb", "expr", "seq", "dd", "cmp", "diff",
+        "less", "more", "vi",
+    ):
         entries.append(newc_symlink(ino, f"bin/{applet}", "busybox"))
         ino += 1
         listing.append(f"bin/{applet}")
