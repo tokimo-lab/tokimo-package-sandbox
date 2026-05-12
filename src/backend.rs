@@ -27,6 +27,18 @@ pub trait SandboxBackend: Send + Sync + 'static {
     /// (events are tagged with this JobId). Errors if the VM isn't
     /// running.
     fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId>;
+
+    /// Spawn a shell using a caller-provided `job_id` instead of generating a
+    /// new one internally. This allows the caller to pre-register an event
+    /// subscription keyed on `job_id` **before** the backend's fire-and-forget
+    /// task starts publishing, eliminating the publish-before-subscribe race.
+    ///
+    /// Default implementation ignores `job_id` and falls back to
+    /// [`spawn_shell`](SandboxBackend::spawn_shell) for backends that do not
+    /// support caller-owned IDs. Only `ChBackend` overrides this.
+    fn spawn_shell_with_id(&self, _job_id: JobId, opts: ShellOpts) -> Result<JobId> {
+        self.spawn_shell(opts)
+    }
     /// Resize a PTY shell. Errors if the shell was spawned in pipes mode.
     fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()>;
     /// Terminate a shell previously returned by `shell_id()` or

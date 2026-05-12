@@ -447,6 +447,19 @@ impl Sandbox {
         self.inner.spawn_shell(opts)
     }
 
+    /// Spawn a shell using a caller-provided `job_id`.
+    ///
+    /// This allows the caller to pre-register an event-subscription keyed on
+    /// `job_id` **before** the backend starts publishing events, eliminating
+    /// the publish-before-subscribe race in `AgentSandbox::exec`.
+    ///
+    /// On backends that do not support caller-owned IDs the provided `job_id`
+    /// is ignored and a fresh one is generated internally (the race is not
+    /// eliminated on those backends, but they are not affected in practice).
+    pub fn spawn_shell_with_id(&self, job_id: JobId, opts: ShellOpts) -> Result<JobId> {
+        self.inner.spawn_shell_with_id(job_id, opts)
+    }
+
     /// Resize a PTY shell's controlling terminal. Sends `TIOCSWINSZ` on
     /// the master fd inside the guest and a `SIGWINCH` to the foreground
     /// process group. Errors if `id` does not refer to a PTY-mode shell.
