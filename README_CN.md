@@ -4,13 +4,25 @@
 
 跨平台原生沙箱库 —— 在隔离环境中运行不受信任的命令。一套 API，三个平台，每个平台使用操作系统原生的隔离原语。
 
-| 平台 | 隔离引擎 | 需要 root | 冷启动 |
+| 平台 | 隔离引擎 | 需要 root | 备注 |
 |---|---|---|---|
-| **Linux** | bubblewrap（用户命名空间）+ smoltcp 用户态网络栈 | 不需要 | ~50 ms |
-| **macOS** | Apple Virtualization.framework → Linux 微型虚拟机 + smoltcp 用户态网络栈 | 不需要 | ~2 s |
+| **Linux (`ch`)** | Cloud Hypervisor 微型虚拟机 (KVM) + virtiofsd + smoltcp 用户态网络栈 | 不需要（用户需在 `kvm` 组中） | 当 `/dev/kvm` + `/dev/vhost-vsock` + `cloud-hypervisor` 二进制可用时优先选择 |
+| **Linux (`bwrap`)** | bubblewrap（用户命名空间）+ smoltcp 用户态网络栈 | 不需要 | CH 不可用时自动回退；~50 ms 启动，无虚拟机 |
+| **macOS** | Apple Virtualization.framework → Linux 微型虚拟机 + smoltcp 用户态网络栈 | 不需要 | ~2 s 冷启动 |
 | **Windows** | Hyper-V HCS → Linux 微型虚拟机 + smoltcp 用户态网络栈（SYSTEM 服务） | 一次性服务安装 | ~600 ms |
 
-三个后端提供完全相同的 `Sandbox` 接口：configure → create → start → spawn shells → stop。同一个 init 二进制（`tokimo-sandbox-init`）在每个沙箱中以 PID 1 运行，使用相同的线路协议，不区分传输层。网络完全统一：三个平台的 `AllowAll` 策略均使用同一套 smoltcp 用户态网络栈。
+所有后端提供完全相同的 `Sandbox` 接口：configure → create → start → spawn shells → stop。同一个 init 二进制（`tokimo-sandbox-init`）在每个沙箱中以 PID 1（bwrap 中为 PID 2）运行，使用相同的线路协议，不区分传输层。网络完全统一：所有后端的 `AllowAll` 策略均使用同一套 smoltcp 用户态网络栈。
+
+**Linux 后端选择**（`SANDBOX_BACKEND` 环境变量）：
+
+| 取值              | 行为                                                                       |
+|-------------------|----------------------------------------------------------------------------|
+| （未设）/ `auto`  | 先探测 `ch`；不可用时优雅地回退到 `bwrap`。                                |
+| `ch`              | 强制使用 Cloud Hypervisor；不可用直接报错（不回退）。                      |
+| `bwrap`           | 强制使用 bubblewrap；不可用报错。                                          |
+| `disabled`        | 拒绝构造任何后端。                                                          |
+
+`Sandbox::active_backend()` 返回运行时实际选中的具体后端，便于调用方 / CI 日志确认走的是哪条路径。
 
 ## 为什么做这个项目
 
@@ -30,26 +42,71 @@
 │   let r = sb.exec(&["uname", "-a"], ExecOpts::default());   │
 │   sb.stop_vm().unwrap();                                    │
 └────────────────────────┬────────────────────────────────────┘
-                         │  三个平台完全相同的 API
-        ┌────────────────┼────────────────┐
-        ▼                ▼                ▼
-   LinuxBackend     MacosBackend    WindowsBackend
-   （进程内）        （进程内）       （命名管道 RPC）
-        │                │                │
-        ▼                ▼                ▼
-   bwrap + 用户      arcbox-vz →     tokimo-sandbox-svc
-   命名空间          VZVirtualMachine   （SYSTEM 服务）
-        │                │                │
-        └────────┬───────┘                │
-                 ▼                        ▼
-        tokimo-sandbox-init       Hyper-V HCS 计算系统
-        （PID 1，共享二进制）              │
-                 │                       │
-                 ▼                       ▼
-          Linux 客机              Linux 微型虚拟机
+                         │  各平台完全相同的 API
+        ┌────────────────┼─────────────────────┬────────────────┐
+        ▼                                      ▼                ▼
+   LinuxBackend  ── Auto：ch → bwrap         MacosBackend   WindowsBackend
+   （进程内；connect() 时决定）              （进程内）      （命名管道 RPC）
+        │                                       │                │
+        ├── ChBackend  ── cloud-hypervisor      ▼                ▼
+        │   （KVM 微型虚拟机、virtiofsd、    arcbox-vz →     tokimo-sandbox-svc
+        │    hybrid-vsock UDS）             VZVirtualMachine    （SYSTEM 服务）
+        │                                       │                │
+        └── BwrapBackend                        │                │
+            （bubblewrap 用户命名空间）         │                │
+                  │                             │                ▼
+                  │                             │          Hyper-V HCS
+                  └────────────┬────────────────┘                │
+                               ▼                                 ▼
+                      tokimo-sandbox-init                 Linux 微型虚拟机
+                      （PID 1，共享二进制）              （HvSocket 传输）
+                               │
+                               ▼
+                          Linux 客机
 ```
 
-### Linux — bubblewrap + smoltcp，无虚拟机
+### Linux —— 双后端，同一套 API
+
+Linux 平台层会在 `Sandbox::connect()` 时探测 Cloud Hypervisor，并选择当前主机上能用且最强的后端。CH 优先（真实 KVM 隔离、完整内核边界、与 macOS/Windows 等价的安全姿态）；bwrap 是回退（无虚拟机、启动最快、能在没有 `/dev/kvm` 的环境下工作，例如未开启虚拟化的嵌套 CI）。
+
+两个后端**除了隔离原语之外完全共享**：同一个 `tokimo-sandbox-init` PID 1 二进制、同一套 `vfs_host`/`tokimo-sandbox-fuse` FUSE 基础设施、同一个 `netstack` smoltcp 代理、同一份协议帧。仅传输层接线不同（SEQPACKET socketpair vs. hybrid-vsock UDS sidecar）。
+
+### Linux —— Cloud Hypervisor（`ch` 后端）
+
+```
+Sandbox::start_vm()
+  │
+  ├─ probe_ch() ✅  (/dev/kvm + /dev/vhost-vsock + cloud-hypervisor + virtiofsd)
+  │
+  ├─ 启动 cloud-hypervisor 子进程：
+  │      --kernel  vmlinuz                  ← 与 crate 版本配对发布
+  │      --initramfs initrd.img
+  │      --cmdline "... tokimo.guest_listens=0 tokimo.init_port=2222 ..."
+  │      --memory size=<MB>                 ← 来自 ConfigureParams
+  │      --cpus boot=<N>
+  │      --vsock cid=3,socket=<vsock_uds>   ← hybrid-vsock；每端口一个 UDS sidecar
+  │      --fs tag=<mount_name>,socket=<virtiofsd.sock>  ← 每个共享一份
+  │      [--net tap=...]                    ← 仅 AllowAll
+  │
+  ├─ 启动 virtiofsd 子进程（每个 ConfigureParams.mount 一个）：
+  │      --shared-dir <host_path>
+  │      --socket-path <virtiofsd.sock>
+  │      [--readonly] [--sandbox=none|chroot]
+  │
+  └─ 宿主侧 hybrid-vsock UDS sidecar (`<vsock_uds>_<port>`) 上的监听器：
+        port 2222 → init 控制通道
+        port 4444 → smoltcp 网络栈 RX/TX
+        port 5555 → FuseHost（进程内 FUSE-over-vsock）
+```
+
+- **无守护进程、无服务、不需要 root。** 每个 `Sandbox` 拥有独立的 `cloud-hypervisor` + `virtiofsd` 进程组。
+- **与 macOS/Windows 同一套打包内核 + initrd + rootfs**（`vm-kernel-*` + `vm-rootfs-*` tag artifact）。
+- **vsock 传输** 使用 CH 的 *hybrid-vsock* —— 宿主以监听每端口 UDS（`<vsock_uds>_<port>`）的方式扮演 vsock，而不是用 `/dev/vhost-vsock`。四个通道（init、网络栈、FUSE、控制台）全部由客机发起（`tokimo.guest_listens=0`）。
+- **文件共享** ConfigureParams 中声明的挂载使用 `virtiofsd`（CH 的天然原语），不走 FUSE-over-vsock。运行时 `add_mount` 仍然通过同一份 `FuseHost` 走 FUSE-over-vsock。
+- **网络：** `AllowAll` 与其他后端使用同一套 smoltcp 用户态网络栈。`Blocked` 直接省略网卡。
+- **PTY：** 主 fd 留在客机；init 通过协议事件（vsock）桥接 I/O。
+
+### Linux —— bubblewrap（`bwrap` 后端）
 
 ```
 Sandbox::start_vm()
@@ -131,14 +188,15 @@ Sandbox（库） ──命名管道──▶ tokimo-sandbox-svc.exe（SYSTEM）
 
 ## 用户态网络栈
 
-三个后端的 `AllowAll` 策略使用同一套 **smoltcp L3/L4 代理**（`src/netstack/`）。一套统一的网络栈，一个拦截点，不区分平台。
+所有后端的 `AllowAll` 策略使用同一套 **smoltcp L3/L4 代理**（`src/netstack/`）。一套统一的网络栈，一个拦截点，不区分平台或 Linux 后端。
 
 ```
 Linux 客机内核
   │ 以太网帧
-  │   Linux：  通过 TAP tk0 → STREAM socketpair
-  │   macOS：  通过 virtio-vsock
-  │   Windows：通过 HvSocket
+  │   Linux bwrap：通过 TAP tk0 → STREAM socketpair
+  │   Linux ch：   通过 TAP tk0 → vsock UDS sidecar
+  │   macOS：      通过 virtio-vsock
+  │   Windows：    通过 HvSocket
   ▼
 StreamDevice（smoltcp，宿主侧）
   │
@@ -147,7 +205,7 @@ StreamDevice（smoltcp，宿主侧）
   └─ ICMP：解析 EchoRequest → 平台特定 send_echo → 构造 EchoReply
 ```
 
-- **三平台统一** — Linux（TAP + socketpair）、macOS（vsock）、Windows（HvSocket）
+- **所有后端统一** —— Linux bwrap（TAP + socketpair）、Linux ch（TAP + vsock）、macOS（vsock）、Windows（HvSocket）
 - **双栈 IPv4/IPv6**，支持扩展头遍历（HopByHop、Route、Opts、Frag）
 - **子网：** 192.168.127.0/24（v4）、fd00:7f::/64（v6），MTU 1400
 - **3 线程：** RX 读取（传输层 → smoltcp）、主轮询循环、TX 写入（smoltcp → 传输层）
@@ -161,6 +219,7 @@ StreamDevice（smoltcp，宿主侧）
 |---|---|---|
 | `SOCK_SEQPACKET`（继承 fd） | Linux bwrap | `SCM_RIGHTS` fd 传递 |
 | `SOCK_SEQPACKET`（监听器） | Linux 独立模式 | `SCM_RIGHTS` fd 传递 |
+| VSOCK 流（客机连接） | Linux ch（hybrid-vsock） | 协议桥接（Stdout/Write 事件） |
 | VSOCK 流（客机监听） | macOS VZ | 协议桥接（Stdout/Write 事件） |
 | VSOCK 流（客机连接） | Windows HCS | 协议桥接（Stdout/Write 事件） |
 
@@ -199,7 +258,7 @@ sb.stop_vm().unwrap();
 
 | 平台 | 要求 |
 |---|---|
-| **Linux** | `sudo apt install bubblewrap` — 运行时不需要 root。需要 `<repo>/.vm/base/` 下的虚拟机产物（rootfs 会被绑定进 bwrap）。 |
+| **Linux** | `bwrap` 后端：`sudo apt install bubblewrap`。`ch` 后端：需要 `cloud-hypervisor` + `virtiofsd` 二进制在 `PATH` 上（或位于 `bin/cloud-hypervisor/current/bin/` 与 `bin/virtiofsd/current/`），`/dev/kvm` 与 `/dev/vhost-vsock` 可访问（通常需要用户在 `kvm` 组中）。需要 `<repo>/.vm/base/` 下的虚拟机产物。两种后端运行时都不需要 root。 |
 | **macOS** | macOS 13+，Apple Silicon。需要 `<repo>/.vm/base/` 下的虚拟机产物（见下方）。代码签名需要 `com.apple.security.virtualization` 权限。 |
 | **Windows** | 启用"虚拟机平台"（Win 10 1903+）。一次性 `sudo` 安装服务。需要 `<repo>/.vm/base/` 下的虚拟机产物。 |
 
@@ -344,10 +403,15 @@ sb.remove_mount("workspace")?;
 34 个集成测试，通过公共 `Sandbox` API 测试真实客机。平台无关的源码；同一套测试在三个平台上运行。
 
 ```bash
-# Linux
+# Linux —— bwrap 后端
 sudo apt install bubblewrap
 cargo build --bin tokimo-sandbox-init
-PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+SANDBOX_BACKEND=bwrap PATH="$PWD/target/debug:$PATH" \
+    cargo test --test sandbox_integration -- --test-threads=1
+
+# Linux —— ch 后端（KVM 微型虚拟机；需要 cloud-hypervisor + virtiofsd + /dev/kvm）
+SANDBOX_BACKEND=ch PATH="$PWD/target/debug:$PATH" \
+    cargo test --test sandbox_integration -- --test-threads=1
 
 # macOS
 cargo test --test sandbox_integration -- --test-threads=1
@@ -356,7 +420,7 @@ cargo test --test sandbox_integration -- --test-threads=1
 sudo cargo test --test sandbox_integration -- --nocapture
 ```
 
-Linux（bwrap 速率限制）和 macOS（VZ 调度队列串行化虚拟机启动）必须使用 `--test-threads=1`。Windows 支持并发。
+Linux（bwrap 用户命名空间速率限制；CH 启动序列化）和 macOS（VZ 调度队列串行化虚拟机启动）必须使用 `--test-threads=1`。Windows 支持并发。
 
 覆盖范围：生命周期、Shell I/O、多 Shell 流 + 信号 + 枚举、PTY 大小/调整/ctrl-c/转义序列、FUSE 挂载添加/移除、网络 blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP、多会话并发。
 
@@ -402,9 +466,16 @@ src/
 │   ├── mod.rs                StreamDevice、TCP/UDP/ICMP 流代理
 │   └── icmp/                 平台特定 ICMP echo 后端
 │
-├── linux/                    Linux 后端（bwrap，进程内）
-│   ├── sandbox.rs            LinuxBackend: SandboxBackend
-│   └── init_client.rs        InitClient（SOCK_SEQPACKET）
+├── linux/                    Linux 后端（Auto：ch → bwrap）
+│   ├── mod.rs                模块声明
+│   ├── bwrap/                bubblewrap 后端（无虚拟机，仅命名空间）
+│   │   ├── sandbox.rs        BwrapBackend: SandboxBackend
+│   │   ├── init_client.rs    InitClient（SOCK_SEQPACKET）
+│   │   └── init_transport.rs 传输层适配
+│   └── ch/                   Cloud Hypervisor 微型虚拟机后端
+│       ├── backend.rs        ChBackend: SandboxBackend（基于 vsock，对照 macOS）
+│       ├── probe.rs          主机就绪检查，驱动 Auto 回退
+│       └── vmm.rs            cloud-hypervisor 子进程 + virtiofsd + vsock UDS 接线
 │
 ├── macos/                    macOS 后端（Virtualization.framework）
 │   ├── sandbox.rs            MacosBackend: SandboxBackend
@@ -443,8 +514,8 @@ src/
 
 | 策略 | 行为 |
 |---|---|
-| `AllowAll`（默认） | 通过 **smoltcp 用户态网络栈** 提供完整网络访问（所有平台）。Linux：TAP + socketpair。macOS：vsock。Windows：HvSocket。 |
-| `Blocked` | 无网络。Linux：仅有 `lo` 的新网络命名空间。macOS：虚拟机配置中无网卡。Windows：内核参数 `tokimo.net=blocked`。 |
+| `AllowAll`（默认） | 通过 **smoltcp 用户态网络栈** 提供完整网络访问（所有后端）。Linux bwrap：TAP + socketpair。Linux ch：TAP + vsock。macOS：vsock。Windows：HvSocket。 |
+| `Blocked` | 无网络。Linux bwrap：仅有 `lo` 的新网络命名空间。Linux ch：CH 配置中无网卡。macOS：虚拟机配置中无网卡。Windows：内核参数 `tokimo.net=blocked`。 |
 
 ## 与 Docker 的对比
 
