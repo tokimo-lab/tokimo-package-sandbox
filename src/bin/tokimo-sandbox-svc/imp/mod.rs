@@ -1198,6 +1198,58 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     }
     slog!("[start_vm] hcs_start_compute_system: {}ms", t2.elapsed().as_millis());
 
+    // Diagnostic: spawn a thread that drains the COM2 named pipe
+    // (\\.\pipe\tokimo-vm-com2-<vm_id>) so kernel + init logs are captured
+    // to disk. Gated on TOKIMO_DEBUG_COM2_DIR to keep prod overhead at zero.
+    if let Ok(dir) = std::env::var("TOKIMO_DEBUG_COM2_DIR") {
+        let pipe = format!(r"\\.\pipe\tokimo-vm-com2-{}", vm_id);
+        let path = std::path::PathBuf::from(&dir).join(format!("vm-com2-{}.log", vm_id));
+        std::thread::Builder::new()
+            .name(format!("com2-drain-{}", vm_id))
+            .spawn(move || {
+                use std::io::{Read, Write};
+                // HCS is the pipe SERVER; we connect as client. Retry briefly
+                // because the server may not be ready instantly after start.
+                let mut file = match std::fs::File::create(&path) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                let start = std::time::Instant::now();
+                let mut f = loop {
+                    match std::fs::OpenOptions::new().read(true).write(true).open(&pipe) {
+                        Ok(f) => break f,
+                        Err(_) if start.elapsed() < Duration::from_secs(5) => {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(e) => {
+                            let _ = writeln!(file, "[drain] cannot open {pipe}: {e}");
+                            return;
+                        }
+                    }
+                };
+                let _ = writeln!(file, "[drain] attached to {pipe}");
+                let _ = file.flush();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = writeln!(file, "[drain] EOF");
+                            break;
+                        }
+                        Ok(n) => {
+                            let _ = file.write_all(&buf[..n]);
+                            let _ = file.flush();
+                        }
+                        Err(e) => {
+                            let _ = writeln!(file, "[drain] read err: {e}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
     // Accept the guest's init connection.
     let t3 = std::time::Instant::now();
     let hv = match hvsock::accept_guest(&init_listener, Duration::from_secs(60)) {
