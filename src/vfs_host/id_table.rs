@@ -228,6 +228,64 @@ impl IdTable {
         }
     }
 
+    /// Re-key any node currently bound to `from` (or any descendant of
+    /// `from` if it's a directory) so it now lives under `to`. Called
+    /// after a successful rename so subsequent ops on existing nodeids
+    /// resolve to the new on-host path.
+    ///
+    /// Also drops any existing node bound to `to` (overwritten by the
+    /// rename target) so it won't shadow the renamed entry.
+    pub fn rename_path(&self, mount_id: u32, from: &std::path::Path, to: &std::path::Path) {
+        let mut inner = self.inner.lock().unwrap();
+        // Drop any existing destination binding first — the rename
+        // overwrites it. Its slot is left in `nodes` until the kernel
+        // forgets it, but the by_path lookup must not return the stale
+        // nodeid for the new file.
+        if let Some(old_nid) = inner.by_path.remove(&(mount_id, to.to_path_buf())) {
+            let idx = (old_nid - 2) as usize;
+            if let Some(n) = inner.nodes.get_mut(idx) {
+                // Mark it as moved-away so it won't accidentally serve
+                // the overwriting file under its original nodeid; the
+                // path field is otherwise unused by lookups but is read
+                // by op_* helpers. Pointing it at the destination is
+                // wrong (would alias the renamed-in node); blank it.
+                n.path = std::path::PathBuf::new();
+            }
+        }
+
+        // Collect nodes to re-key (source path + any descendants).
+        let to_update: Vec<(u64, std::path::PathBuf)> = inner
+            .by_path
+            .iter()
+            .filter_map(|((mid, p), &nid)| {
+                if *mid != mount_id {
+                    return None;
+                }
+                if p == from {
+                    return Some((nid, to.to_path_buf()));
+                }
+                if let Ok(suffix) = p.strip_prefix(from) {
+                    return Some((nid, to.join(suffix)));
+                }
+                None
+            })
+            .collect();
+
+        for (nid, new_path) in to_update {
+            let idx = (nid - 2) as usize;
+            // Remove old binding.
+            if let Some(n) = inner.nodes.get(idx) {
+                let old_path = n.path.clone();
+                inner.by_path.remove(&(mount_id, old_path));
+            }
+            // Insert new binding.
+            inner.by_path.insert((mount_id, new_path.clone()), nid);
+            if let Some(n) = inner.nodes.get_mut(idx) {
+                n.path = new_path;
+            }
+        }
+    }
+
     pub fn alloc_fh(&self, fh: FhEntry) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let idx = inner.fhs.insert(fh);

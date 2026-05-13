@@ -1057,7 +1057,10 @@ impl FuseHost {
             && let Some(r) = mount.backend.as_rename()
         {
             return match r.rename(&from, &to).await {
-                Ok(()) => Res::Ok,
+                Ok(()) => {
+                    self.id_table.rename_path(mount_id, &from, &to);
+                    Res::Ok
+                }
                 Err(e) => Res::Error(errno_for(&e)),
             };
         }
@@ -1067,14 +1070,20 @@ impl FuseHost {
             // copy + delete via Rename. Many drivers offer both.
             if old_name == new_name {
                 return match m.move_file(&from, &np).await {
-                    Ok(()) => Res::Ok,
+                    Ok(()) => {
+                        self.id_table.rename_path(mount_id, &from, &to);
+                        Res::Ok
+                    }
                     Err(e) => Res::Error(errno_for(&e)),
                 };
             }
         }
         if let Some(r) = mount.backend.as_rename() {
             return match r.rename(&from, &to).await {
-                Ok(()) => Res::Ok,
+                Ok(()) => {
+                    self.id_table.rename_path(mount_id, &from, &to);
+                    Res::Ok
+                }
                 Err(e) => Res::Error(errno_for(&e)),
             };
         }
