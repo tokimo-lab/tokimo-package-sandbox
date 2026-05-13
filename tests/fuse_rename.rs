@@ -32,12 +32,12 @@ fn run(label: &str, script: &str) -> String {
     let shell = sb.shell_id().expect("shell_id");
 
     let mut full = String::from("set -e\ncd /work\n");
-    // CI diagnostic: print uid/gid + /work ownership so we can see whether
-    // the in-sandbox shell's uid actually matches what FUSE reports for
-    // /work. Removed once CI is green.
-    full.push_str("echo '[diag] id:' >&2; id >&2 || true\n");
-    full.push_str("echo '[diag] /work:' >&2; stat -c 'uid=%u gid=%g mode=%a' /work >&2 || true\n");
-    full.push_str("echo '[diag] mount:' >&2; cat /proc/self/mountinfo | grep ' /work ' >&2 || true\n");
+    // CI diagnostic — use shell builtins / /proc since `id` and `stat`
+    // may not be on the sandbox PATH.
+    full.push_str("echo \"[diag] uid=$(cat /proc/self/status | grep ^Uid:) gid=$(cat /proc/self/status | grep ^Gid:)\" >&2\n");
+    full.push_str("echo \"[diag] /work perms:\" >&2 ; ls -la /work/.. 2>&1 | head -3 >&2 || true\n");
+    full.push_str("echo \"[diag] mountinfo:\" >&2 ; cat /proc/self/mountinfo | grep -E ' /work | /(home|root) ' >&2 || true\n");
+    full.push_str("echo \"[diag] PATH=$PATH\" >&2\n");
     full.push_str(script);
     full.push_str(&format!("\necho {MARKER}\n"));
 
