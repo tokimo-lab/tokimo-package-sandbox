@@ -51,6 +51,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -66,12 +77,19 @@ jobs:
       - name: Build guest binaries needed by bwrap (init/fuse/tun-pump/host-exec)
         run: cargo build --bin tokimo-sandbox-init --bin tokimo-sandbox-fuse --bin tokimo-tun-pump --bin tokimo-host-exec
 
+      - name: Disk usage before tests
+        run: df -h /
+
       - name: Integration tests (bwrap)
         env:
           SANDBOX_BACKEND: bwrap
         run: |
           export PATH="$PWD/target/debug:$PATH"
           cargo test --tests --no-fail-fast -- --test-threads=1
+
+      - name: Disk usage after tests
+        if: always()
+        run: df -h / && du -sh .vm 2>/dev/null || true
 
   # ------------------------------------------------------------------
   # Linux integration: ch (cloud-hypervisor) backend.
@@ -87,6 +105,17 @@ jobs:
     needs: linux
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -111,12 +140,19 @@ jobs:
       - name: Build guest binaries needed by ch (init/fuse/tun-pump/host-exec)
         run: cargo build --bin tokimo-sandbox-init --bin tokimo-sandbox-fuse --bin tokimo-tun-pump --bin tokimo-host-exec
 
+      - name: Disk usage before tests
+        run: df -h /
+
       - name: Integration tests (ch)
         env:
           SANDBOX_BACKEND: ch
         run: |
           export PATH="$PWD/target/debug:$PATH"
           cargo test --tests --no-fail-fast -- --test-threads=1
+
+      - name: Disk usage after tests
+        if: always()
+        run: df -h / && du -sh .vm 2>/dev/null || true
 
   # ------------------------------------------------------------------
   # macOS: build + test (lib only; VZ needs entitlement signing)

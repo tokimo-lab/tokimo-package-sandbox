@@ -1,8 +1,10 @@
 //! Shared helpers for integration tests.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use tokimo_package_sandbox::{ConfigureParams, Event, JobId, Mount, NetworkPolicy, Sandbox};
@@ -10,8 +12,50 @@ use tokimo_package_sandbox::{ConfigureParams, Event, JobId, Mount, NetworkPolicy
 /// Counter to make per-test session_id unique within a single test process.
 pub static N: AtomicU32 = AtomicU32::new(0);
 
+/// Process-wide queue of `vm_dir` paths to remove. Populated by
+/// `config()`, drained by `config()` (at the start of the next test)
+/// and by `SandboxGuard::drop()` (success path).
+///
+/// CI runs the integration suite with `--test-threads=1`, so tests are
+/// strictly serial within a binary and cleaning previously-registered
+/// dirs at the start of each test is safe. (A thread-local won't work
+/// — libtest can dispatch each test on a fresh worker thread, so
+/// cleanup state cannot survive panicking tests via thread-locals.)
+static VM_DIRS_TO_CLEAN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Per-process once-init that wipes any pre-existing `.vm/run-*`
+/// directories left over by a previous test binary in the same suite
+/// invocation. Cargo runs each `tests/*.rs` as a separate process, so
+/// the global mutex above does not survive across binaries, and the
+/// last test of the previous binary leaks its ~2 GB `vm_dir`.
+static INITIAL_SWEEP: Once = Once::new();
+
+fn drain_pending_vm_dirs() {
+    let dirs: Vec<PathBuf> = std::mem::take(&mut VM_DIRS_TO_CLEAN.lock().unwrap());
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn sweep_existing_run_dirs() {
+    let Ok(entries) = std::fs::read_dir(".vm") else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("run-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// RAII guard that calls `stop_vm()` on drop. Prevents VM leaks when a
 /// test panics before reaching its explicit `stop_vm()` call.
+///
+/// On drop the guard also removes any `vm_dir` paths registered by
+/// `config()` on this thread. Each per-test `vm_dir` is ~2 GB (full
+/// rootfs copy), and CI runners have ~14 GB of free disk — without
+/// cleanup the integration suite would exhaust disk after a handful of
+/// tests. Cleanup is best-effort: errors are swallowed.
 ///
 /// Usage: `let _guard = SandboxGuard(sb.clone());` after `start_vm()`.
 /// The guard's `stop_vm()` is idempotent — calling it again in the test
@@ -21,6 +65,7 @@ pub struct SandboxGuard(pub Sandbox);
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
         self.0.stop_vm().ok();
+        drain_pending_vm_dirs();
     }
 }
 
@@ -31,6 +76,9 @@ pub fn workspace_dir(label: &str) -> std::path::PathBuf {
 }
 
 pub fn config(label: &str) -> ConfigureParams {
+    INITIAL_SWEEP.call_once(sweep_existing_run_dirs);
+    drain_pending_vm_dirs();
+
     let base_rootfs = std::path::PathBuf::from(".vm/base");
     let base_rootfs = if base_rootfs.exists() {
         base_rootfs.canonicalize().expect("canonicalize .vm/base")
@@ -42,6 +90,8 @@ pub fn config(label: &str) -> ConfigureParams {
     let vm_dir = std::path::PathBuf::from(format!(".vm/run-{label}-{counter}"));
     std::fs::create_dir_all(&vm_dir).expect("create vm_dir directory");
     let vm_dir = vm_dir.canonicalize().expect("canonicalize vm_dir directory");
+
+    VM_DIRS_TO_CLEAN.lock().unwrap().push(vm_dir.clone());
 
     ConfigureParams {
         user_data_name: "test".into(),
