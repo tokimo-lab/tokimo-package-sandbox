@@ -85,6 +85,12 @@ pub struct ChVm {
     pub vsock_uds: PathBuf,
     pub api_socket: PathBuf,
     pub virtiofsd_socket: PathBuf,
+    /// Short-path scratch dir (under /tmp) that holds the UDS files; kept
+    /// separate from `vm_dir` so socket paths stay well below SUN_LEN even
+    /// when the caller's `vm_dir` is deep (e.g. GitHub Actions runners
+    /// have `cwd` ~60 chars, which would push `<vm_dir>/ch-vsock-XXX.sock_NNNN`
+    /// past 108 bytes).
+    sock_dir: PathBuf,
     ch_child: Option<Child>,
     virtiofsd_child: Option<Child>,
 }
@@ -110,6 +116,8 @@ impl Drop for ChVm {
         ] {
             let _ = std::fs::remove_file(p);
         }
+        // Best-effort: remove the short-path scratch dir once empty.
+        let _ = std::fs::remove_dir(&self.sock_dir);
     }
 }
 
@@ -215,10 +223,18 @@ pub fn boot_ch_vm(config: &ChVmConfig) -> Result<BootedChVm> {
 
     let cid = alloc_cid();
 
+    // Place all UDS files under a short-path scratch dir so that
+    // `<dir>/ch-vsock-<cid>.sock_<port>` stays well under SUN_LEN (108).
+    // The caller's `vm_dir` may live deep under a long cwd (GitHub
+    // Actions runners use ~60-char cwds, which would overflow).
+    let sock_dir = std::env::temp_dir().join(format!("tk-ch-{cid}"));
+    std::fs::create_dir_all(&sock_dir)
+        .map_err(|e| Error::other(format!("create sock dir {}: {e}", sock_dir.display())))?;
+
     // Unique socket paths per VM (one cloud-hypervisor instance per ChVm).
-    let vsock_uds = config.vm_dir.join(format!("ch-vsock-{cid}.sock"));
-    let api_socket = config.vm_dir.join(format!("ch-api-{cid}.sock"));
-    let virtiofsd_socket = config.vm_dir.join(format!("virtiofsd-{cid}.sock"));
+    let vsock_uds = sock_dir.join(format!("v{cid}.sock"));
+    let api_socket = sock_dir.join(format!("a{cid}.sock"));
+    let virtiofsd_socket = sock_dir.join(format!("f{cid}.sock"));
 
     // Remove any stale files from a previous crashed run before binding.
     for p in [&vsock_uds, &api_socket, &virtiofsd_socket] {
@@ -310,6 +326,7 @@ pub fn boot_ch_vm(config: &ChVmConfig) -> Result<BootedChVm> {
         vsock_uds: vsock_uds.clone(),
         api_socket,
         virtiofsd_socket,
+        sock_dir,
         ch_child: Some(ch_child),
         virtiofsd_child: Some(virtiofsd_child),
     };
