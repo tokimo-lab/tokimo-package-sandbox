@@ -546,8 +546,13 @@ impl FuseHost {
             mtime: 0,
             mode: 0o755,
             nlink: 2,
-            // See attr_from() for the rationale on always reporting 0/0.
+            #[cfg(target_os = "linux")]
+            uid: unsafe { libc::getuid() },
+            #[cfg(target_os = "linux")]
+            gid: unsafe { libc::getgid() },
+            #[cfg(not(target_os = "linux"))]
             uid: 0,
+            #[cfg(not(target_os = "linux"))]
             gid: 0,
             kind: NodeKind::Dir,
         };
@@ -574,7 +579,9 @@ impl FuseHost {
             });
         }
 
-        // See attr_from() for why we always report 0/0.
+        #[cfg(target_os = "linux")]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        #[cfg(not(target_os = "linux"))]
         let (uid, gid) = (0u32, 0u32);
 
         for (i, (name, snap)) in entries.into_iter().enumerate().skip(off.saturating_sub(2)) {
@@ -1165,17 +1172,14 @@ fn attr_from(info: &VfsFileInfo) -> AttrOut {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // Always report uid=0/gid=0. The guest runs inside an unshared user
-    // namespace (bwrap on Linux, full VM on macOS/Windows) where the
-    // process that touches the FUSE mount is mapped to root. With
-    // DefaultPermissions the kernel checks the FUSE-reported owner
-    // against the accessor — reporting raw host uids breaks bwrap on
-    // any non-root caller because host uid N maps to in-ns 0, but
-    // any uid the FUSE host hands back that *isn't* mapped (i.e.
-    // anything other than 0) appears as overflow ("nobody") inside the
-    // namespace, and CAP_DAC_OVERRIDE-from-userns does not bypass that
-    // for unmapped owners. Always say uid=0 → always matches the
-    // in-guest accessor.
+    // On Linux the FuseHost runs in-process (bwrap path) so the calling
+    // UID matches the host user — return real uid/gid so DefaultPermissions
+    // allows writes. On macOS/Windows the FuseHost serves a Linux VM
+    // where processes run as root — return 0/0 so root-owned files are
+    // writable inside the guest.
+    #[cfg(target_os = "linux")]
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    #[cfg(not(target_os = "linux"))]
     let (uid, gid) = (0u32, 0u32);
     AttrOut {
         size: info.size,
