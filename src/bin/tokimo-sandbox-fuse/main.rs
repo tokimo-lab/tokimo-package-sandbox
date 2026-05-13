@@ -106,10 +106,16 @@ mod linux {
                 "--target" => target = argv.next().map(PathBuf::from),
                 "--read-only" => read_only = true,
                 "--owner-uid" => {
-                    owner_uid = argv.next().and_then(|s| s.parse().ok()).ok_or("--owner-uid needs u32")?;
+                    owner_uid = argv
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or("--owner-uid needs u32")?;
                 }
                 "--owner-gid" => {
-                    owner_gid = argv.next().and_then(|s| s.parse().ok()).ok_or("--owner-gid needs u32")?;
+                    owner_gid = argv
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or("--owner-gid needs u32")?;
                 }
                 "--allow-other" => {} // accepted for backward compat, always enabled
                 "-h" | "--help" => {
