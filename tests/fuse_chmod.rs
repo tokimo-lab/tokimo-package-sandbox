@@ -28,10 +28,10 @@ cat > hello.sh <<'EOF'
 #!/bin/sh
 echo HELLO_FROM_CHMOD
 EOF
-# Force a non-executable starting mode regardless of host default
-# (Windows hosts synthesize 0o755 from NTFS attributes), then test
-# that chmod +x in the guest actually makes the file executable.
+# Verify chmod 0644 is persistent (EA-backed on Windows), then test chmod +x.
 chmod 0644 hello.sh
+pre_mode=$(stat -c %a hello.sh)
+test "$pre_mode" = "644" || { echo "BAD_PRE_MODE=$pre_mode"; exit 7; }
 chmod +x hello.sh
 mode=$(stat -c %a hello.sh)
 # At minimum owner-exec bit must be set (mode contains 1/3/5/7 in owner column).
