@@ -18,6 +18,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# $PSScriptRoot = .../packages/tokimo-package-sandbox/scripts/windows
+# So $repoRoot here is actually the sandbox package root, not the workspace
+# repo root. That's intentional: svc reads .vm/base relative to its cwd
+# (set to the sandbox package by tests), so we output to <sandbox>/.vm/base/.
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vmDir = Join-Path $repoRoot ".vm/base"
 $pkgDir = Join-Path $repoRoot "packaging/vm-local"
@@ -55,37 +59,58 @@ if (-not $SkipInitBuild) {
 }
 
 # ---------------------------------------------------------------------------
-# 2) Full VM build using CI script
+# 2) Full VM build using CI script. We invoke via WSL bash with absolute
+#    /mnt/<drive>/ paths and TOKIMO_SKIP_LOCAL_EXTRACT=1 so the host-side
+#    rootfs extraction (which needs root) is bypassed; Step 3 below does
+#    the rootfs.tar -> vhdx conversion inside docker instead.
 # ---------------------------------------------------------------------------
-Write-Host "==> [2/3] Building VM artifacts (packaging/vm-base/build.sh $Arch)" -ForegroundColor Cyan
-$env:TOKIMO_INIT_BIN = Join-Path $pkgDir "tokimo-sandbox-init"
-$env:TOKIMO_TUN_PUMP_BIN = Join-Path $pkgDir "tokimo-tun-pump"
-$env:TOKIMO_FUSE_BIN = Join-Path $pkgDir "tokimo-sandbox-fuse"
-& bash (Join-Path $vmBaseDir "build.sh") $Arch
+Write-Host "==> [2/3] Building VM artifacts (packaging/vm-base/build.sh $Arch via WSL)" -ForegroundColor Cyan
+function ConvertTo-WslPath([string]$winPath) {
+    $p = $winPath -replace '\\','/'
+    if ($p -match '^([A-Za-z]):/(.*)$') {
+        return "/mnt/$($Matches[1].ToLower())/$($Matches[2])"
+    }
+    return $p
+}
+$wslVmBase  = ConvertTo-WslPath $vmBaseDir
+$wslInitBin = ConvertTo-WslPath (Join-Path $pkgDir "tokimo-sandbox-init")
+$wslTunBin  = ConvertTo-WslPath (Join-Path $pkgDir "tokimo-tun-pump")
+$wslFuseBin = ConvertTo-WslPath (Join-Path $pkgDir "tokimo-sandbox-fuse")
+$bashCmd = "cd $wslVmBase && TOKIMO_SKIP_LOCAL_EXTRACT=1 TOKIMO_INIT_BIN=$wslInitBin TOKIMO_TUN_PUMP_BIN=$wslTunBin TOKIMO_FUSE_BIN=$wslFuseBin bash build.sh $Arch"
+& bash -c $bashCmd
 if ($LASTEXITCODE -ne 0) { throw "VM build failed" }
 
 # ---------------------------------------------------------------------------
-# 3) Convert rootfs to vhdx + copy to .vm/base/
+# 3) Convert rootfs.tar to vhdx + copy to .vm/base/
+#    Everything happens inside docker so we don't need root on the host
+#    (host extraction in build.sh would need passwordless sudo, which WSL
+#    doesn't provide by default).
 # ---------------------------------------------------------------------------
 $outputDir = Join-Path $vmBaseDir "tokimo-os-$Arch"
-Write-Host "==> [3/3] Converting rootfs to vhdx + copying to $vmDir" -ForegroundColor Cyan
+$rootfsTar = Join-Path $vmBaseDir "rootfs.tar"
+if (-not (Test-Path $rootfsTar)) { throw "rootfs.tar not found at $rootfsTar" }
+Write-Host "==> [3/3] Converting rootfs.tar to vhdx + copying to $vmDir" -ForegroundColor Cyan
 
-$rootfsDir = Join-Path $outputDir "rootfs"
-$rootfsSizeMB = [math]::Floor((Get-ChildItem $rootfsDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB)
-$imgSizeMB = $rootfsSizeMB + 256
+$tarSizeMB = [math]::Floor((Get-Item $rootfsTar).Length / 1MB)
+$imgSizeMB = $tarSizeMB * 3 + 512
+Write-Host "    rootfs.tar: ${tarSizeMB}MB, image: ${imgSizeMB}MB"
 
-Write-Host "    rootfs: ${rootfsSizeMB}MB, image: ${imgSizeMB}MB"
-
-# Create raw ext4 image from rootfs directory, then convert to vhdx
-# This needs to run inside a docker container with qemu-utils + e2fsprogs
-$outputMount = $outputDir -replace '\\','/'
+$vmBaseMount = $vmBaseDir -replace '\\','/'
 $vmMount = $vmDir -replace '\\','/'
+New-Item -ItemType Directory -Force -Path $vmDir | Out-Null
+
 docker run --rm --platform "linux/$Arch" `
-    -v "${outputMount}:/input:ro" `
+    -v "${vmBaseMount}:/input:ro" `
     -v "${vmMount}:/out" `
-    debian:13 bash -c "apt-get update -qq && apt-get install -y -qq e2fsprogs qemu-utils >/dev/null 2>&1 && qemu-img create -f raw /tmp/rootfs.img ${imgSizeMB}M >/dev/null && mkfs.ext4 -F -L tokimo-rootfs -d /input/rootfs /tmp/rootfs.img >/dev/null && qemu-img convert -f raw -O vhdx -o subformat=dynamic /tmp/rootfs.img /out/rootfs.vhdx"
+    -v "${vmBaseMount}/mkvhdx.sh:/mkvhdx.sh:ro" `
+    -e "IMG_MB=$imgSizeMB" `
+    debian:13 bash /mkvhdx.sh
 if ($LASTEXITCODE -ne 0) { throw "rootfs vhdx conversion failed" }
 
+# vmlinuz + initrd are direct outputs of build.sh under tokimo-os-{arch}/
+if (-not (Test-Path (Join-Path $outputDir "vmlinuz"))) {
+    throw "vmlinuz not found at $outputDir/vmlinuz (build.sh did not run, or failed)"
+}
 Copy-Item (Join-Path $outputDir "vmlinuz") $vmDir -Force
 Copy-Item (Join-Path $outputDir "initrd.img") $vmDir -Force
 

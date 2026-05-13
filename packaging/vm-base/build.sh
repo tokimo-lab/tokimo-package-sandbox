@@ -618,6 +618,21 @@ echo "==> [6/6] Exporting rootfs..."
 docker export "$CONTAINER_NAME" -o "$ROOTFS_TAR"
 echo "    rootfs.tar: $(du -sh "$ROOTFS_TAR" | cut -f1)"
 
+# When run from a context that doesn't have host root (e.g. WSL without
+# passwordless sudo), the caller can set TOKIMO_SKIP_LOCAL_EXTRACT=1 and
+# do the rootfs -> image conversion downstream inside docker. We still
+# need vmlinuz/initrd.img (already produced in [4-5]) and rootfs.tar.
+if [[ "${TOKIMO_SKIP_LOCAL_EXTRACT:-0}" == "1" ]]; then
+    echo "==> Cleaning up (skipping host-side rootfs extraction)..."
+    docker rm -f "$CONTAINER_NAME"
+    echo ""
+    echo "Done (rootfs.tar only)! Output: $OUTPUT_DIR + $ROOTFS_TAR"
+    echo "  vmlinuz    ($(du -sh "$OUTPUT_DIR/vmlinuz" | cut -f1))"
+    echo "  initrd.img ($(du -sh "$OUTPUT_DIR/initrd.img" | cut -f1))"
+    echo "  rootfs.tar ($(du -sh "$ROOTFS_TAR" | cut -f1))"
+    exit 0
+fi
+
 mkdir -p "$ROOTFS_DIR"
 # IMPORTANT: --numeric-owner so we keep the docker container's uid space
 # (notably tokimo=1000), NOT --no-same-owner which would re-stamp every
