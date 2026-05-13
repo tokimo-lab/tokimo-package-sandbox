@@ -55,7 +55,7 @@ pub struct ShellOpts {
     pub argv: Option<Vec<String>>,
     /// Optional env overlay applied on top of the session-wide env.
     pub env: Vec<(String, String)>,
-    /// Optional initial cwd; defaults to `/work`.
+    /// Optional initial cwd; `None` means no chdir.
     pub cwd: Option<String>,
 }
 

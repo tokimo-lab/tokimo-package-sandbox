@@ -56,7 +56,7 @@ mod windows_persistence {
             mounts: vec![Mount {
                 name: "ws".into(),
                 host_path: ws_host,
-                guest_path: "/work".into(),
+                guest_path: "/tmp/tokimo-share".into(),
                 read_only: false,
                 create_host_dir: false,
             }],

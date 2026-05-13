@@ -31,7 +31,7 @@ fn run(label: &str, script: &str) -> String {
     let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
-    let mut full = String::from("set -e\ncd /work\n");
+    let mut full = String::from("set -e\ncd /tmp/tokimo-share\n");
     full.push_str(script);
     full.push_str(&format!("\necho {MARKER}\n"));
 

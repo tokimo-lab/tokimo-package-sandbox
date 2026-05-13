@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mounts: vec![Mount {
             name: "work".into(),
             host_path: cwd,
-            guest_path: "/work".into(),
+            guest_path: "/tmp/tokimo-share".into(),
             read_only: false,
             create_host_dir: false,
         }],

@@ -536,7 +536,8 @@ fi
 
 # --- bake tokimo-sandbox-fuse (Linux-only static musl) into initrd ---
 # FUSE-over-vsock dynamic mount transport. init.sh spawns this once the
-# guest mounts /work; it serves directory ops back to the host.
+# guest mounts virtiofs share "work" at /mnt/work; it serves directory
+# ops back to the host.
 if [ -n "$TOKIMO_FUSE_BIN" ] && [ -f "$TOKIMO_FUSE_BIN" ]; then
     echo "    embedding tokimo-sandbox-fuse: $TOKIMO_FUSE_BIN ($(du -sh "$TOKIMO_FUSE_BIN" | cut -f1))"
     cp "$TOKIMO_FUSE_BIN" "$INITRD_DIR/bin/tokimo-sandbox-fuse"

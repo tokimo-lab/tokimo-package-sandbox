@@ -246,7 +246,8 @@ pub struct ShellOpts {
     /// Env overlay applied on top of the session-wide environment.
     #[serde(default)]
     pub env: Vec<(String, String)>,
-    /// Optional initial cwd; backend default is `/work`.
+    /// Optional initial cwd; `None` means the backend will not `chdir`,
+    /// leaving the child in whatever cwd the init/shell process inherits.
     #[serde(default)]
     pub cwd: Option<String>,
 }

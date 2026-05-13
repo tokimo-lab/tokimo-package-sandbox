@@ -36,7 +36,7 @@ fn fopen_keep_cache_warm_reads_are_faster() {
     // the *delta* between cold and warm runs is dominated by FUSE I/O).
     let timed_read = |round: u32| -> Duration {
         let marker = format!("__done_{round}__");
-        let cmd = format!("dd if=/work/{FNAME} of=/dev/null bs=1M 2>/dev/null; echo {marker}\n");
+        let cmd = format!("dd if=/tmp/tokimo-share/{FNAME} of=/dev/null bs=1M 2>/dev/null; echo {marker}\n");
         let t0 = Instant::now();
         sb.write_stdin(&shell, cmd.as_bytes()).expect("write_stdin");
         let _ = drain_until(&rx, &shell, &marker, Duration::from_secs(30));

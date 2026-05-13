@@ -284,7 +284,8 @@ print("NETPERF_DONE")
     let ws = workspace_dir(LABEL);
     std::fs::write(ws.join("netperf.py"), &script).expect("write netperf.py");
 
-    sb.write_stdin(&shell, b"python3 /work/netperf.py\n").unwrap();
+    sb.write_stdin(&shell, b"python3 /tmp/tokimo-share/netperf.py\n")
+        .unwrap();
     let out = drain_until(&rx, &shell, "NETPERF_DONE", Duration::from_secs(240));
 
     sb.stop_vm().ok();

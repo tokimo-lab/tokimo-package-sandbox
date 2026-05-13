@@ -79,8 +79,8 @@ pub fn workspace_dir(label: &str) -> std::path::PathBuf {
     // With DefaultPermissions, the kernel uses the FUSE-reported mode
     // + owner to decide whether the in-sandbox shell can write. By
     // setting 0o777 here we sidestep all userns-mapping subtleties:
-    // every test, on every host, can write to /work regardless of how
-    // bwrap chose to map uids.
+    // every test, on every host, can write to /tmp/tokimo-share
+    // regardless of how bwrap chose to map uids.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -116,7 +116,7 @@ pub fn config(label: &str) -> ConfigureParams {
         mounts: vec![Mount {
             name: "ws".into(),
             host_path: workspace_dir(label),
-            guest_path: "/work".into(),
+            guest_path: "/tmp/tokimo-share".into(),
             read_only: false,
             create_host_dir: false,
         }],

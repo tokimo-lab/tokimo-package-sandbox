@@ -59,7 +59,7 @@
 │         │                                                          │
 │         └─ /bin/bash + 用户命令 (支持多个并发 job)                 │
 │                                                                    │
-│   /mnt/work  = FUSE-over-vsock share "work"  (port 5555)           │
+│   /mnt/work  = virtiofs share "work" (staging mount pre-chroot)   │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```

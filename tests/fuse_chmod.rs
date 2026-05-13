@@ -22,7 +22,7 @@ fn chmod_x_makes_script_executable() {
 
     let script = r#"
 set -e
-cd /work
+cd /tmp/tokimo-share
 rm -f hello.sh
 cat > hello.sh <<'EOF'
 #!/bin/sh

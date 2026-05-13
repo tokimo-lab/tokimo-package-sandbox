@@ -52,7 +52,7 @@ fn fuse_host_file_visible_in_guest() {
 
     // We need to write the file on the host *before* configure picks up
     // the workspace path. config(label) creates a per-label tmp dir and
-    // shares it as /work — write the sentinel into that exact dir.
+    // shares it as /tmp/tokimo-share — write the sentinel into that exact dir.
     let label = "p9visible";
     let host_path = workspace_dir(label).join(FNAME);
     std::fs::write(&host_path, BODY).expect("write sentinel on host");
@@ -64,7 +64,7 @@ fn fuse_host_file_visible_in_guest() {
     let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
-    sb.write_stdin(&shell, format!("cat /work/{FNAME}\n").as_bytes())
+    sb.write_stdin(&shell, format!("cat /tmp/tokimo-share/{FNAME}\n").as_bytes())
         .unwrap();
 
     let captured = drain_until(&rx, &shell, BODY, Duration::from_secs(30));
@@ -151,7 +151,11 @@ fn fuse_glob_no_io_error() {
         std::fs::write(ws.join(name), b"fake-jpeg").expect("write seed file");
     }
 
-    let captured = run_sandbox_command(label, b"ls /work/slide-*.jpg 2>&1; echo GLOB_DONE_A1B2\n", MARKER);
+    let captured = run_sandbox_command(
+        label,
+        b"ls /tmp/tokimo-share/slide-*.jpg 2>&1; echo GLOB_DONE_A1B2\n",
+        MARKER,
+    );
 
     for name in &["slide-01.jpg", "slide-02.jpg", "slide-03.jpg"] {
         let _ = std::fs::remove_file(ws.join(name));
@@ -175,7 +179,7 @@ fn fuse_bash_echo_glob_expands() {
     let ws = seed_slide_files(label);
     let captured = run_sandbox_command(
         label,
-        b"bash -c 'cd /work && echo slide-*.jpg'; echo BASH_ECHO_GLOB_DONE_C3D4\n",
+        b"bash -c 'cd /tmp/tokimo-share && echo slide-*.jpg'; echo BASH_ECHO_GLOB_DONE_C3D4\n",
         MARKER,
     );
     cleanup_slide_files(&ws);
@@ -195,7 +199,7 @@ fn fuse_bash_dash_c_ls_glob() {
     let ws = seed_slide_files(label);
     let captured = run_sandbox_command(
         label,
-        b"bash -c 'ls /work/slide-*.jpg' 2>&1; echo BASH_LS_GLOB_DONE_E5F6\n",
+        b"bash -c 'ls /tmp/tokimo-share/slide-*.jpg' 2>&1; echo BASH_LS_GLOB_DONE_E5F6\n",
         MARKER,
     );
     cleanup_slide_files(&ws);
@@ -214,7 +218,7 @@ fn fuse_bash_glob_no_match() {
     let label = "fusebashglobnomatch";
     let captured = run_sandbox_command(
         label,
-        b"bash -c 'ls /work/nonexistent-*.jpg' 2>&1 || true; echo BASH_GLOB_NO_MATCH_DONE_A7B8\n",
+        b"bash -c 'ls /tmp/tokimo-share/nonexistent-*.jpg' 2>&1 || true; echo BASH_GLOB_NO_MATCH_DONE_A7B8\n",
         MARKER,
     );
 
