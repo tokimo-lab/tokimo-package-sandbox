@@ -119,7 +119,12 @@ pub fn drain_until(rx: &Receiver<Event>, shell: &JobId, needle: &str, timeout: D
     let mut buf = Vec::<u8>::new();
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(Event::Stdout { id, data }) if id == *shell => {
+            // Capture stderr in addition to stdout. The needle still has
+            // to come over stdout (so assertions remain unambiguous), but
+            // including stderr in the returned buffer means panicked-test
+            // diagnostics actually show the bash error that aborted a
+            // `set -e` script, instead of an opaque empty string.
+            Ok(Event::Stdout { id, data }) | Ok(Event::Stderr { id, data }) if id == *shell => {
                 buf.extend_from_slice(&data);
                 if std::str::from_utf8(&buf).map(|s| s.contains(needle)).unwrap_or(false) {
                     break;
