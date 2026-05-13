@@ -344,6 +344,7 @@ impl VfsBackend for LocalDirVfs {
 /// attribute is checked: if the file is read-only, `0o222` (write bits) is
 /// cleared from the fallback mode. EA-hit paths are not affected by the
 /// readonly bit — `$LXMOD` EA is the authoritative source.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> VfsFileInfo {
     let mode = {
         #[cfg(unix)]
