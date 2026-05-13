@@ -78,6 +78,8 @@ mod linux {
         mount_name: String,
         target: PathBuf,
         read_only: bool,
+        owner_uid: u32,
+        owner_gid: u32,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -88,6 +90,13 @@ mod linux {
         let mut mount_name: Option<String> = None;
         let mut target: Option<PathBuf> = None;
         let mut read_only = false;
+        // Defaults match the single-user VM model (tokimo uid=1000, gid=1000).
+        // Linux bwrap mode passes explicit --owner-uid/--owner-gid because the
+        // caller's uid (typically 1001 on CI runners) is the only uid mapped
+        // into the user_ns; foreign uids translate to the overflow uid and
+        // become unwritable.
+        let mut owner_uid: u32 = 1000;
+        let mut owner_gid: u32 = 1000;
         while let Some(a) = argv.next() {
             match a.as_str() {
                 "--transport" => transport_kind = argv.next(),
@@ -96,6 +105,12 @@ mod linux {
                 "--mount-name" => mount_name = argv.next(),
                 "--target" => target = argv.next().map(PathBuf::from),
                 "--read-only" => read_only = true,
+                "--owner-uid" => {
+                    owner_uid = argv.next().and_then(|s| s.parse().ok()).ok_or("--owner-uid needs u32")?;
+                }
+                "--owner-gid" => {
+                    owner_gid = argv.next().and_then(|s| s.parse().ok()).ok_or("--owner-gid needs u32")?;
+                }
                 "--allow-other" => {} // accepted for backward compat, always enabled
                 "-h" | "--help" => {
                     eprintln!("{}", USAGE);
@@ -121,6 +136,8 @@ mod linux {
             mount_name: mount_name.ok_or("missing --mount-name")?,
             target: target.ok_or("missing --target")?,
             read_only,
+            owner_uid,
+            owner_gid,
         })
     }
 
@@ -138,6 +155,9 @@ mod linux {
                 return ExitCode::from(2);
             }
         };
+
+        OWNER_UID.store(args.owner_uid, std::sync::atomic::Ordering::Relaxed);
+        OWNER_GID.store(args.owner_gid, std::sync::atomic::Ordering::Relaxed);
 
         // Open transport.
         let stream = match open_transport(&args.transport) {
@@ -250,52 +270,16 @@ mod linux {
             return ExitCode::from(5);
         }
 
-        // Diag: report our identity & userns state so we can correlate with
-        // FUSE permission errors.
-        unsafe {
-            eprintln!(
-                "[tokimo-fuse] diag: target={} uid={} gid={} euid={} egid={}",
-                args.target.display(),
-                libc::getuid(),
-                libc::getgid(),
-                libc::geteuid(),
-                libc::getegid(),
-            );
-        }
-        if let Ok(s) = std::fs::read_to_string("/proc/self/uid_map") {
-            eprintln!("[tokimo-fuse] diag: uid_map=\n{s}");
-        }
-        if let Ok(s) = std::fs::read_to_string("/proc/self/gid_map") {
-            eprintln!("[tokimo-fuse] diag: gid_map=\n{s}");
-        }
-        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
-            for line in s.lines().filter(|l| l.starts_with("Cap")) {
-                eprintln!("[tokimo-fuse] diag: {line}");
-            }
-        }
-
         // We use Session::new (instead of fuser::mount2) so we can grab a
         // Notifier handle and push FUSE_NOTIFY_INVAL_ENTRY messages after
         // ops that the kernel does not auto-invalidate.
         let mut session = match Session::new(fs, &args.target, &opts) {
-            Ok(s) => {
-                eprintln!("[tokimo-fuse] Session::new OK for {}", args.target.display());
-                s
-            }
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("[tokimo-fuse] Session::new: {e}");
                 return ExitCode::from(6);
             }
         };
-        // Dump the mountinfo entry for our target so we can see who owns
-        // the FUSE superblock (fusermount3 fallback → root:root from init
-        // user_ns; direct mount(2) → our in-bwrap uid).
-        if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
-            let target_str = args.target.display().to_string();
-            for line in mi.lines().filter(|l| l.contains(&target_str)) {
-                eprintln!("[tokimo-fuse] diag: mountinfo: {line}");
-            }
-        }
         let _ = notifier_cell.set(session.notifier());
 
         let run_res = session.run();
@@ -489,6 +473,12 @@ mod linux {
         attr_to_fileattr(&e.attr, e.nodeid)
     }
 
+    /// Owner uid/gid the kernel sees on every inode. Set once at startup
+    /// from the `--owner-uid`/`--owner-gid` CLI flags (default 1000/1000).
+    /// See the comment in `attr_to_fileattr` for why this exists.
+    static OWNER_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+    static OWNER_GID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
     fn attr_to_fileattr(a: &AttrOut, ino: u64) -> FileAttr {
         let kind = match a.kind {
             NodeKind::File => FileType::RegularFile,
@@ -513,13 +503,15 @@ mod linux {
             kind,
             perm: (a.mode & 0o7777) as u16,
             nlink: a.nlink,
-            // Single-user sandbox model: all guest processes run as tokimo
-            // (uid=1000, gid=1000). vfs_host on Windows/macOS returns uid=0
-            // because it can't map host ACLs to a Linux uid, which would make
-            // the mount unwritable by tokimo with DefaultPermissions enabled.
-            // Override here so guest processes see themselves as the owner.
-            uid: 1000,
-            gid: 1000,
+            // Single-user sandbox model. Override the on-wire uid/gid so
+            // the kernel always sees the sandbox's own caller as owner.
+            //  * VM mode (macOS/Windows): tokimo user, uid=1000/gid=1000.
+            //  * Linux bwrap mode: the runner's uid (e.g. 1001 on CI),
+            //    because that's the only uid mapped into the user_ns —
+            //    anything else translates to overflow uid (65534) and
+            //    makes the mount unwritable from inside the sandbox.
+            uid: OWNER_UID.load(std::sync::atomic::Ordering::Relaxed),
+            gid: OWNER_GID.load(std::sync::atomic::Ordering::Relaxed),
             rdev: 0,
             blksize: 4096,
             flags: 0,

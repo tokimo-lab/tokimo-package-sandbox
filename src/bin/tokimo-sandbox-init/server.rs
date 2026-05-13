@@ -938,6 +938,17 @@ fn handle_mount_fuse(
             "tokimo-sandbox-fuse".to_string()
         };
         let mut cmd = std::process::Command::new(&exe);
+        // Owner uid/gid the kernel sees on every inode in this mount.
+        //  * Bwrap mode: init runs at the runner's uid (the only uid mapped
+        //    in the user_ns); pass that through so the shell can write.
+        //  * VM mode: hardcoded tokimo uid (1000) because that's who the
+        //    guest shell drops to.
+        let (owner_uid, owner_gid) = if attached_fd.is_some() {
+            // SAFETY: getuid/getgid are always-succeed POSIX calls.
+            unsafe { (libc::getuid(), libc::getgid()) }
+        } else {
+            (1000, 1000)
+        };
         if let Some(fd) = attached_fd {
             // Linux bwrap path: fd received via SCM_RIGHTS from host.
             let fuse_fd = fd.as_raw_fd();
@@ -958,6 +969,8 @@ fn handle_mount_fuse(
         }
         cmd.arg("--mount-name").arg(&name);
         cmd.arg("--target").arg(&target);
+        cmd.arg("--owner-uid").arg(owner_uid.to_string());
+        cmd.arg("--owner-gid").arg(owner_gid.to_string());
         if read_only {
             cmd.arg("--read-only");
         }
