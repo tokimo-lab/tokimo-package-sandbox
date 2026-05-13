@@ -72,6 +72,20 @@ impl Drop for SandboxGuard {
 pub fn workspace_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("tokimo-test-{label}"));
     std::fs::create_dir_all(&dir).ok();
+    // Make the host-side workspace world-writable. Tests run as
+    // whichever user invokes `cargo test` (root in dev, uid 1001 on
+    // GitHub runners), but the in-sandbox shell runs in a separate
+    // user namespace where the host caller's uid may not be mapped.
+    // With DefaultPermissions, the kernel uses the FUSE-reported mode
+    // + owner to decide whether the in-sandbox shell can write. By
+    // setting 0o777 here we sidestep all userns-mapping subtleties:
+    // every test, on every host, can write to /work regardless of how
+    // bwrap chose to map uids.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+    }
     dir
 }
 
