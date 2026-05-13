@@ -14,6 +14,8 @@ Cargo.lock
 /.claude/
 /.ida-mcp/
 /packaging/vm-base/tokimo-os-arm64/
+/packaging/vm-base/tokimo-os-amd64/
+/packaging/vm-base/rootfs.tar
 .github/copilot-instructions.md
 
 # Per-user IDE config
