@@ -349,7 +349,7 @@ impl FuseHost {
         &self,
         mount_id: u32,
         nodeid: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         size: Option<u64>,
         _atime: Option<i64>,
         _mtime: Option<i64>,
@@ -365,8 +365,9 @@ impl FuseHost {
             return Res::Error(errno_for(&VfsError::PermissionDenied));
         }
 
-        // Only `size` truncation is honoured for now (matches what most
-        // callers do via `O_TRUNC` at open time).
+        // Only `size` truncation and local-backend `mode` changes are
+        // honoured for now (matches what most callers do via `O_TRUNC` at
+        // open time).
         if let Some(sz) = size {
             // Try resolve_local + std::fs truncate; otherwise read-modify-put.
             if let Some(resolver) = mount.backend.as_resolve_local() {
@@ -405,6 +406,14 @@ impl FuseHost {
                 return Res::Error(errno_for(&VfsError::NotImplemented("truncate".into())));
             }
         }
+
+        if let Some(m) = mode
+            && let Some(resolver) = mount.backend.as_resolve_local()
+            && let Some(host_path) = resolver.resolve_real_path(&path)
+        {
+            apply_host_mode(&host_path, m);
+        }
+        // Non-local backends: chmod is a no-op, but not an error.
 
         // Re-stat for fresh attrs.
         let Some(mount) = self.get_mount(mount_id) else {
@@ -1162,6 +1171,28 @@ fn op_is_cheap(op: &Req) -> bool {
             | Req::Statfs { .. }
     )
 }
+
+#[cfg(unix)]
+fn apply_host_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+}
+
+#[cfg(windows)]
+fn apply_host_mode(path: &std::path::Path, mode: u32) {
+    // NTFS has no unix mode bits. Best-effort: map owner-write to !readonly.
+    // The execute bit is irrelevant on Windows; `meta_to_info` synthesizes
+    // 0o755 for files so the guest can exec them regardless.
+    if let Ok(md) = std::fs::metadata(path) {
+        let mut perms = md.permissions();
+        let writable = (mode & 0o200) != 0;
+        perms.set_readonly(!writable);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_host_mode(_path: &std::path::Path, _mode: u32) {}
 
 fn attr_from(info: &VfsFileInfo) -> AttrOut {
     let kind = if info.is_symlink {
