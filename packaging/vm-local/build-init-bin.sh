@@ -15,17 +15,24 @@ esac
 # Use a separate target dir to avoid conflicts with host-side build artifacts.
 export CARGO_TARGET_DIR=/tmp/target
 
-# Override the host-specific linker from .cargo/config.toml with the
-# container's musl-gcc wrapper.
-if [ "$ARCH" = "arm64" ]; then
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-else
-    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-fi
-
 apt-get update -qq
 apt-get install -y -qq musl-tools >/dev/null
 rustup target add "$RUST_TARGET" >/dev/null
+
+# Force fully-static linkage. Rust 1.71+ defaults *-linux-musl targets to
+# *dynamic* musl, embedding an ELF INTERP pointing at /lib/ld-musl-x86_64.so.1.
+# Neither our initrd nor the guest rootfs ships that interpreter, so the
+# binaries fail with ENOENT ("chroot: can't execute ...: No such file or
+# directory") even though the file is right there.
+#
+# We:
+#   - drop any musl-gcc linker override so rustc's bundled rust-lld is used
+#     (musl-gcc emits a dynamic exe even with +crt-static)
+#   - use rust's self-contained musl libs (link-self-contained=yes)
+#   - require +crt-static so PT_INTERP is omitted
+unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C link-self-contained=yes"
 
 echo "==> Building guest binaries for $ARCH ($RUST_TARGET)"
 cargo build --release --target "$RUST_TARGET" \
