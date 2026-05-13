@@ -28,6 +28,7 @@ tests/
 ├── rootfs.rs              — packaged rootfs tool versions (node, python)
 ├── fuse_rename.rs         — FUSE rename negative-dentry invalidation
 ├── fuse_symlink.rs        — FUSE symlink / readlink operations
+├── fuse_chmod.rs          — FUSE setattr mode propagation (chmod +x)
 ├── macos_nfs.rs           — macOS-only NFS dynamic mount write-back
 └── README.md              — this file
 ```
@@ -37,7 +38,7 @@ them at once with `cargo test` (no `--test` flag needed).
 
 ## Test inventory
 
-48 tests (+ platform-specific), all currently green:
+49 tests (+ platform-specific), all currently green:
 
 | # | File | Test | What it asserts |
 |---|------|------|-----------------|
@@ -89,6 +90,7 @@ them at once with `cargo test` (no `--test` flag needed).
 | 46 | fuse_symlink | `symlink_dangling` | dangling symlink stats OK, traversal returns ENOENT |
 | 47 | fuse_symlink | `symlink_via_tar_extract` | tarball with symlinks round-trips through FUSE |
 | 48 | fuse_symlink | `git_clone_with_symlink` | `git clone` with symlink in working tree succeeds |
+| 49 | fuse_chmod | `chmod_x_makes_script_executable` | `chmod +x` propagates to host; script becomes executable in guest |
 
 ## Windows
 
