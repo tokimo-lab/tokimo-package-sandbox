@@ -4,13 +4,25 @@
 
 Cross-platform native sandbox library for running untrusted commands in isolated environments. One API, three platforms, each using the isolation primitive that is native to the OS.
 
-| Platform | Isolation engine | Root privilege | Startup |
+| Platform | Isolation engine | Root privilege | Notes |
 |---|---|---|---|
-| **Linux** | bubblewrap (user namespaces) + smoltcp netstack | not required | ~50 ms |
+| **Linux (`ch`)** | Cloud Hypervisor micro-VM (KVM) + virtiofsd + smoltcp netstack | not required (membership in `kvm` group) | Preferred when `/dev/kvm` + `/dev/vhost-vsock` + `cloud-hypervisor` binary are available |
+| **Linux (`bwrap`)** | bubblewrap (user namespaces) + smoltcp netstack | not required | Auto-fallback when CH is unavailable; ~50 ms start, no VM |
 | **macOS** | Apple Virtualization.framework → Linux micro-VM + smoltcp netstack | not required | ~2 s cold |
 | **Windows** | Hyper-V HCS → Linux micro-VM + smoltcp netstack via SYSTEM service | one-time service install | ~600 ms |
 
-All three backends present the same `Sandbox` handle with identical semantics: configure → create → start → spawn shells → stop. A single init binary (`tokimo-sandbox-init`) runs as PID 1 inside every sandbox, speaking the same wire protocol regardless of transport. Networking is unified: all three platforms use the same smoltcp userspace netstack for `AllowAll` policy.
+All backends present the same `Sandbox` handle with identical semantics: configure → create → start → spawn shells → stop. A single init binary (`tokimo-sandbox-init`) runs as PID 1 (or PID 2 inside bwrap) in every sandbox, speaking the same wire protocol regardless of transport. Networking is unified: every backend uses the same smoltcp userspace netstack for `AllowAll`.
+
+**Linux backend selection** (`SANDBOX_BACKEND` env):
+
+| Value           | Behavior                                                                 |
+|-----------------|--------------------------------------------------------------------------|
+| (unset) / `auto`| Probe `ch` first; gracefully fall back to `bwrap` if CH is unavailable.  |
+| `ch`            | Force Cloud Hypervisor; fail (no fallback) if unavailable.               |
+| `bwrap`         | Force bubblewrap; fail if unavailable.                                   |
+| `disabled`      | Refuse to construct any backend.                                         |
+
+`Sandbox::active_backend()` returns the concrete backend chosen at runtime so callers / CI can confirm which path was selected.
 
 ## Why this project exists
 
@@ -31,25 +43,70 @@ This project fills that gap.
 │   sb.stop_vm().unwrap();                                    │
 └────────────────────────┬────────────────────────────────────┘
                          │  same API on all platforms
-        ┌────────────────┼────────────────┐
-        ▼                ▼                ▼
-   LinuxBackend     MacosBackend    WindowsBackend
-   (in-process)     (in-process)    (named-pipe RPC)
-        │                │                │
-        ▼                ▼                ▼
-   bwrap + user     arcbox-vz →     tokimo-sandbox-svc
-   namespaces       VZVirtualMachine    (SYSTEM service)
-        │                │                │
-        └────────┬───────┘                │
-                 ▼                        ▼
-        tokimo-sandbox-init       Hyper-V HCS compute system
-        (PID 1, shared binary)           │
-                 │                       │
-                 ▼                       ▼
-          Linux guest              Linux micro-VM
+        ┌────────────────┼─────────────────────┬────────────────┐
+        ▼                                      ▼                ▼
+   LinuxBackend  ── Auto: ch → bwrap        MacosBackend   WindowsBackend
+   (in-process; pick at connect())          (in-process)   (named-pipe RPC)
+        │                                       │                │
+        ├── ChBackend  ── cloud-hypervisor      ▼                ▼
+        │   (KVM micro-VM, virtiofsd,      arcbox-vz →     tokimo-sandbox-svc
+        │    hybrid-vsock UDS)             VZVirtualMachine    (SYSTEM service)
+        │                                       │                │
+        └── BwrapBackend                        │                │
+            (bubblewrap user namespaces)        │                │
+                  │                             │                ▼
+                  │                             │          Hyper-V HCS
+                  └────────────┬────────────────┘                │
+                               ▼                                 ▼
+                      tokimo-sandbox-init                 Linux micro-VM
+                      (PID 1, shared binary)              (HvSocket transport)
+                               │
+                               ▼
+                        Linux guest
 ```
 
-### Linux — bubblewrap + smoltcp, no VM
+### Linux — two backends, one API
+
+The Linux platform layer probes for Cloud Hypervisor at `Sandbox::connect()` time and picks the strongest backend that works on the host. CH is preferred (real KVM isolation, full kernel boundary, identical posture to macOS/Windows); bwrap is the fallback (no VM, fastest startup, works in environments without `/dev/kvm` such as nested CI without virtualization).
+
+Both backends share **everything except the isolation primitive**: the same `tokimo-sandbox-init` PID 1 binary, the same `vfs_host`/`tokimo-sandbox-fuse` FUSE infrastructure, the same `netstack` smoltcp proxy, the same protocol frames. Only the transport wiring differs (SEQPACKET socketpairs vs. hybrid-vsock UDS sidecars).
+
+### Linux — Cloud Hypervisor (`ch` backend)
+
+```
+Sandbox::start_vm()
+  │
+  ├─ probe_ch() ✅  (/dev/kvm + /dev/vhost-vsock + cloud-hypervisor + virtiofsd)
+  │
+  ├─ spawn cloud-hypervisor child:
+  │      --kernel  vmlinuz                  ← packaged with crate version
+  │      --initramfs initrd.img
+  │      --cmdline "... tokimo.guest_listens=0 tokimo.init_port=2222 ..."
+  │      --memory size=<MB>                 ← from ConfigureParams
+  │      --cpus boot=<N>
+  │      --vsock cid=3,socket=<vsock_uds>   ← hybrid-vsock; UDS sidecars per port
+  │      --fs tag=<mount_name>,socket=<virtiofsd.sock>  ← repeated per share
+  │      [--net tap=...]                    ← AllowAll only
+  │
+  ├─ spawn virtiofsd children (one per ConfigureParams.mount):
+  │      --shared-dir <host_path>
+  │      --socket-path <virtiofsd.sock>
+  │      [--readonly] [--sandbox=none|chroot]
+  │
+  └─ host listeners on hybrid-vsock UDS sidecars (<vsock_uds>_<port>):
+        port 2222 → init control plane
+        port 4444 → smoltcp netstack RX/TX
+        port 5555 → FuseHost (in-process FUSE-over-vsock)
+```
+
+- **No daemon, no service, no root.** Each `Sandbox` owns its own `cloud-hypervisor` + `virtiofsd` process group.
+- **Same packaged kernel + initrd + rootfs** as macOS/Windows (`vm-kernel-*` + `vm-rootfs-*` tag artifacts).
+- **vsock transport** uses CH's *hybrid-vsock* — host plays the vsock by listening on per-port UDS files (`<vsock_uds>_<port>`) instead of `/dev/vhost-vsock`. All four channels (init, netstack, FUSE, console) are guest-initiated (`tokimo.guest_listens=0`).
+- **File sharing** uses `virtiofsd` rather than the FUSE-over-vsock bridge for ConfigureParams mounts (it's the natural CH primitive). Runtime `add_mount` still uses FUSE-over-vsock through the same `FuseHost` as the other backends.
+- **Networking:** `AllowAll` uses the same smoltcp userspace netstack as every other backend. `Blocked` omits the network device.
+- **PTY:** Master fd stays in guest; init bridges I/O through protocol events over vsock.
+
+### Linux — bubblewrap (`bwrap` backend)
 
 ```
 Sandbox::start_vm()
@@ -131,14 +188,15 @@ Sandbox (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (SYSTEM)
 
 ## Userspace network stack
 
-All three backends use the same **smoltcp-based L3/L4 proxy** (`src/netstack/`) for `NetworkPolicy::AllowAll`. One unified netstack, one interception point, regardless of platform.
+All backends use the same **smoltcp-based L3/L4 proxy** (`src/netstack/`) for `NetworkPolicy::AllowAll`. One unified netstack, one interception point, regardless of platform or Linux backend choice.
 
 ```
 Guest Linux kernel
   │ Ethernet frames
-  │   Linux:   via TAP tk0 → STREAM socketpair
-  │   macOS:   via virtio-vsock
-  │   Windows: via HvSocket
+  │   Linux bwrap: via TAP tk0 → STREAM socketpair
+  │   Linux ch:    via TAP tk0 → vsock UDS sidecar
+  │   macOS:       via virtio-vsock
+  │   Windows:     via HvSocket
   ▼
 StreamDevice (smoltcp) on host
   │
@@ -147,7 +205,7 @@ StreamDevice (smoltcp) on host
   └─ ICMP: parse EchoRequest → OS-specific send_echo → fabricate EchoReply
 ```
 
-- **All three platforms** — Linux (TAP + socketpair), macOS (vsock), Windows (HvSocket)
+- **All backends** — Linux bwrap (TAP + socketpair), Linux ch (TAP + vsock), macOS (vsock), Windows (HvSocket)
 - **Dual-stack IPv4/IPv6** with extension header walking (HopByHop, Route, Opts, Frag)
 - **Subnet:** 192.168.127.0/24 (v4), fd00:7f::/64 (v6), MTU 1400
 - **3 threads:** RX reader (transport → smoltcp), main poll loop, TX writer (smoltcp → transport)
@@ -161,6 +219,7 @@ StreamDevice (smoltcp) on host
 |---|---|---|
 | `SOCK_SEQPACKET` (inherited fd) | Linux bwrap | `SCM_RIGHTS` fd transfer |
 | `SOCK_SEQPACKET` (listener) | Linux standalone | `SCM_RIGHTS` fd transfer |
+| VSOCK stream (guest connects) | Linux ch (hybrid-vsock) | Protocol bridge (Stdout/Write events) |
 | VSOCK stream (guest listens) | macOS VZ | Protocol bridge (Stdout/Write events) |
 | VSOCK stream (guest connects) | Windows HCS | Protocol bridge (Stdout/Write events) |
 
@@ -199,7 +258,7 @@ sb.stop_vm().unwrap();
 
 | Platform | Requirement |
 |---|---|
-| **Linux** | `sudo apt install bubblewrap` — no root at runtime. VM artifacts under `<repo>/.vm/base/` (rootfs is bind-mounted into bwrap). |
+| **Linux** | For `bwrap`: `sudo apt install bubblewrap`. For `ch`: `cloud-hypervisor` + `virtiofsd` binaries on `PATH` (or under `bin/cloud-hypervisor/current/bin/` and `bin/virtiofsd/current/`), `/dev/kvm` + `/dev/vhost-vsock` accessible (typically requires the user to be in the `kvm` group). VM artifacts under `<repo>/.vm/base/`. No root at runtime in either case. |
 | **macOS** | macOS 13+, Apple Silicon. VM artifacts under `<repo>/.vm/base/` (see below). Code-sign with `com.apple.security.virtualization` entitlement. |
 | **Windows** | "Virtual Machine Platform" enabled (Win 10 1903+). One-time `sudo` to install service. VM artifacts under `<repo>/.vm/base/`. |
 
@@ -346,10 +405,15 @@ sb.remove_mount("workspace")?;
 34 integration tests exercising the real guest through the public `Sandbox` API. Platform-agnostic source; same suite runs on all three platforms.
 
 ```bash
-# Linux
+# Linux — bwrap backend
 sudo apt install bubblewrap
 cargo build --bin tokimo-sandbox-init
-PATH="$PWD/target/debug:$PATH" cargo test --test sandbox_integration -- --test-threads=1
+SANDBOX_BACKEND=bwrap PATH="$PWD/target/debug:$PATH" \
+    cargo test --test sandbox_integration -- --test-threads=1
+
+# Linux — ch backend (KVM micro-VM; needs cloud-hypervisor + virtiofsd + /dev/kvm)
+SANDBOX_BACKEND=ch PATH="$PWD/target/debug:$PATH" \
+    cargo test --test sandbox_integration -- --test-threads=1
 
 # macOS
 cargo test --test sandbox_integration -- --test-threads=1
@@ -358,7 +422,7 @@ cargo test --test sandbox_integration -- --test-threads=1
 sudo cargo test --test sandbox_integration -- --nocapture
 ```
 
-`--test-threads=1` is required on Linux (bwrap rate limits) and macOS (VZ dispatch queue serializes VM starts). Windows runs with concurrency.
+`--test-threads=1` is required on Linux (bwrap user-namespace rate limits; CH boot serialization) and macOS (VZ dispatch queue serializes VM starts). Windows runs with concurrency.
 
 Coverage: lifecycle, shell I/O, multi-shell streams + signals + enumeration, PTY size/resize/ctrl-c/escape codes, FUSE mount add/remove, network blocked/allow-all/ICMPv4/ICMPv6/IPv6 TCP, multi-session concurrency.
 
@@ -404,9 +468,16 @@ src/
 │   ├── mod.rs                StreamDevice, TCP/UDP/ICMP flow proxy
 │   └── icmp/                 OS-specific ICMP echo backends
 │
-├── linux/                    Linux backend (bwrap, in-process)
-│   ├── sandbox.rs            LinuxBackend: SandboxBackend
-│   └── init_client.rs        InitClient over SOCK_SEQPACKET
+├── linux/                    Linux backends (Auto: ch → bwrap)
+│   ├── mod.rs                Module declarations
+│   ├── bwrap/                bubblewrap backend (no VM, namespaces only)
+│   │   ├── sandbox.rs        BwrapBackend: SandboxBackend
+│   │   ├── init_client.rs    InitClient over SOCK_SEQPACKET
+│   │   └── init_transport.rs Transport adapter
+│   └── ch/                   Cloud Hypervisor microVM backend
+│       ├── backend.rs        ChBackend: SandboxBackend (vsock-based, mirrors macOS)
+│       ├── probe.rs          Host readiness checks driving Auto fallback
+│       └── vmm.rs            cloud-hypervisor child + virtiofsd + vsock UDS plumbing
 │
 ├── macos/                    macOS backend (Virtualization.framework)
 │   ├── sandbox.rs            MacosBackend: SandboxBackend
@@ -445,8 +516,8 @@ src/
 
 | Policy | Behavior |
 |---|---|
-| `AllowAll` (default) | Full network access via **smoltcp userspace netstack** (all platforms). Linux: TAP + socketpair. macOS: vsock. Windows: HvSocket. |
-| `Blocked` | No network. Linux: new netns with only `lo`. macOS: no NIC in VM config. Windows: `tokimo.net=blocked` kernel param. |
+| `AllowAll` (default) | Full network access via **smoltcp userspace netstack** (all backends). Linux bwrap: TAP + socketpair. Linux ch: TAP + vsock. macOS: vsock. Windows: HvSocket. |
+| `Blocked` | No network. Linux bwrap: new netns with only `lo`. Linux ch: no NIC in CH config. macOS: no NIC in VM config. Windows: `tokimo.net=blocked` kernel param. |
 
 ## Comparison with Docker
 
