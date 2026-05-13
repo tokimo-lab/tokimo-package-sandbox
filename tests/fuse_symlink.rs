@@ -29,7 +29,13 @@ fn run(label: &str, script: &str) -> String {
     let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
-    let mut full = String::from("set -e\ncd /work\n");
+    let mut full = String::from("set -e\n");
+    full.push_str("echo DIAG_ID=$(id)\n");
+    full.push_str("echo DIAG_UIDMAP=$(cat /proc/self/uid_map | tr '\\n' '|')\n");
+    full.push_str("echo DIAG_GIDMAP=$(cat /proc/self/gid_map | tr '\\n' '|')\n");
+    full.push_str("ls -ldn /work || true\n");
+    full.push_str("mkdir /work/__probe__ 2>&1 && echo PROBE_OK || echo PROBE_FAIL=$?\n");
+    full.push_str("cd /work\n");
     full.push_str(script);
     full.push_str(&format!("\necho {MARKER}\n"));
 

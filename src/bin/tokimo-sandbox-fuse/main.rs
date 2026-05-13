@@ -250,16 +250,52 @@ mod linux {
             return ExitCode::from(5);
         }
 
+        // Diag: report our identity & userns state so we can correlate with
+        // FUSE permission errors.
+        unsafe {
+            eprintln!(
+                "[tokimo-fuse] diag: target={} uid={} gid={} euid={} egid={}",
+                args.target.display(),
+                libc::getuid(),
+                libc::getgid(),
+                libc::geteuid(),
+                libc::getegid(),
+            );
+        }
+        if let Ok(s) = std::fs::read_to_string("/proc/self/uid_map") {
+            eprintln!("[tokimo-fuse] diag: uid_map=\n{s}");
+        }
+        if let Ok(s) = std::fs::read_to_string("/proc/self/gid_map") {
+            eprintln!("[tokimo-fuse] diag: gid_map=\n{s}");
+        }
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines().filter(|l| l.starts_with("Cap")) {
+                eprintln!("[tokimo-fuse] diag: {line}");
+            }
+        }
+
         // We use Session::new (instead of fuser::mount2) so we can grab a
         // Notifier handle and push FUSE_NOTIFY_INVAL_ENTRY messages after
         // ops that the kernel does not auto-invalidate.
         let mut session = match Session::new(fs, &args.target, &opts) {
-            Ok(s) => s,
+            Ok(s) => {
+                eprintln!("[tokimo-fuse] Session::new OK for {}", args.target.display());
+                s
+            }
             Err(e) => {
                 eprintln!("[tokimo-fuse] Session::new: {e}");
                 return ExitCode::from(6);
             }
         };
+        // Dump the mountinfo entry for our target so we can see who owns
+        // the FUSE superblock (fusermount3 fallback → root:root from init
+        // user_ns; direct mount(2) → our in-bwrap uid).
+        if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
+            let target_str = args.target.display().to_string();
+            for line in mi.lines().filter(|l| l.contains(&target_str)) {
+                eprintln!("[tokimo-fuse] diag: mountinfo: {line}");
+            }
+        }
         let _ = notifier_cell.set(session.notifier());
 
         let run_res = session.run();

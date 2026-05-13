@@ -947,8 +947,10 @@ impl FuseHost {
         };
         let path = Self::child_path(&parent, name);
         if let Err(e) = mk.mkdir(&path).await {
+            eprintln!("[vfs_host] op_mkdir host-side FAILED: parent={parent:?} name={name:?} err={e:?}");
             return Res::Error(errno_for(&e));
         }
+        eprintln!("[vfs_host] op_mkdir host-side OK: path={path:?}");
         match mount.backend.stat(&path).await {
             Ok(info) => {
                 let (nodeid, _) = self.id_table.intern(mount_id, path);
