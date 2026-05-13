@@ -940,6 +940,7 @@ impl FuseHost {
         Res::Ok
     }
 
+    #[cfg_attr(not(windows), allow(unused_variables))]
     async fn op_mkdir(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
@@ -958,7 +959,12 @@ impl FuseHost {
         if let Err(e) = mk.mkdir(&path).await {
             return Res::Error(errno_for(&e));
         }
-        // Persist mode on local backends (Windows: write EA; all platforms: chmod).
+        // On Windows, persist mode via NTFS EA (and mirror readonly bit).
+        // On Unix the OS create syscall already honours the mode via umask,
+        // so applying an additional chmod here is unnecessary and breaks
+        // workflows like `git clone` where objects are created read-only
+        // (0o444) before being renamed into place.
+        #[cfg(windows)]
         if let Some(resolver) = mount.backend.as_resolve_local()
             && let Some(host_path) = resolver.resolve_real_path(&path)
         {
@@ -977,6 +983,7 @@ impl FuseHost {
         }
     }
 
+    #[cfg_attr(not(windows), allow(unused_variables))]
     async fn op_create(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
@@ -995,7 +1002,12 @@ impl FuseHost {
         if let Err(e) = put.put(&path, Vec::new()).await {
             return Res::Error(errno_for(&e));
         }
-        // Persist mode on local backends (Windows: write EA; all platforms: chmod).
+        // On Windows, persist mode via NTFS EA (and mirror readonly bit).
+        // On Unix the OS create syscall already honours the mode via umask,
+        // so applying an additional chmod here is unnecessary and breaks
+        // workflows like `git clone` where objects are created read-only
+        // (0o444) before being renamed into place.
+        #[cfg(windows)]
         if let Some(resolver) = mount.backend.as_resolve_local()
             && let Some(host_path) = resolver.resolve_real_path(&path)
         {
