@@ -236,13 +236,13 @@ impl FuseHost {
             Req::Mkdir {
                 parent_nodeid,
                 name,
-                mode: _,
-            } => self.op_mkdir(mount_id, parent_nodeid, &name).await,
+                mode,
+            } => self.op_mkdir(mount_id, parent_nodeid, &name, mode).await,
             Req::Create {
                 parent_nodeid,
                 name,
-                mode: _,
-            } => self.op_create(mount_id, parent_nodeid, &name).await,
+                mode,
+            } => self.op_create(mount_id, parent_nodeid, &name, mode).await,
             Req::Rmdir { parent_nodeid, name } => self.op_rmdir(mount_id, parent_nodeid, &name).await,
             Req::Unlink { parent_nodeid, name } => self.op_unlink(mount_id, parent_nodeid, &name).await,
             Req::Rename {
@@ -940,7 +940,7 @@ impl FuseHost {
         Res::Ok
     }
 
-    async fn op_mkdir(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+    async fn op_mkdir(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -958,6 +958,12 @@ impl FuseHost {
         if let Err(e) = mk.mkdir(&path).await {
             return Res::Error(errno_for(&e));
         }
+        // Persist mode on local backends (Windows: write EA; all platforms: chmod).
+        if let Some(resolver) = mount.backend.as_resolve_local()
+            && let Some(host_path) = resolver.resolve_real_path(&path)
+        {
+            apply_host_mode(&host_path, mode);
+        }
         match mount.backend.stat(&path).await {
             Ok(info) => {
                 let (nodeid, _) = self.id_table.intern(mount_id, path);
@@ -971,7 +977,7 @@ impl FuseHost {
         }
     }
 
-    async fn op_create(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+    async fn op_create(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -988,6 +994,12 @@ impl FuseHost {
         let path = Self::child_path(&parent, name);
         if let Err(e) = put.put(&path, Vec::new()).await {
             return Res::Error(errno_for(&e));
+        }
+        // Persist mode on local backends (Windows: write EA; all platforms: chmod).
+        if let Some(resolver) = mount.backend.as_resolve_local()
+            && let Some(host_path) = resolver.resolve_real_path(&path)
+        {
+            apply_host_mode(&host_path, mode);
         }
         match mount.backend.stat(&path).await {
             Ok(info) => {
@@ -1180,9 +1192,19 @@ fn apply_host_mode(path: &std::path::Path, mode: u32) {
 
 #[cfg(windows)]
 fn apply_host_mode(path: &std::path::Path, mode: u32) {
-    // NTFS has no unix mode bits. Best-effort: map owner-write to !readonly.
-    // The execute bit is irrelevant on Windows; `meta_to_info` synthesizes
-    // 0o755 for files so the guest can exec them regardless.
+    use crate::windows::ntfs_mode::{FileKind, volume_supports_ea, write_mode_ea};
+
+    if volume_supports_ea(path) {
+        let kind = match std::fs::symlink_metadata(path).map(|m| m.file_type()) {
+            Ok(ft) if ft.is_dir() => FileKind::Dir,
+            Ok(ft) if ft.is_symlink() => FileKind::Symlink,
+            _ => FileKind::File,
+        };
+        if let Err(e) = write_mode_ea(path, mode & 0o7777, kind) {
+            tracing::warn!(?path, error = %e, "write_mode_ea failed; falling back to readonly bit only");
+        }
+    }
+    // Best-effort: keep NTFS readonly bit in sync so Explorer reflects writability.
     if let Ok(md) = std::fs::metadata(path) {
         let mut perms = md.permissions();
         let writable = (mode & 0o200) != 0;
@@ -1439,7 +1461,7 @@ mod tests {
         let (host, mid) = host_with_mount(mem, false);
 
         // mkdir /d
-        assert!(matches!(host.op_mkdir(mid, 1, "d").await, Res::Entry(_)));
+        assert!(matches!(host.op_mkdir(mid, 1, "d", 0o755).await, Res::Entry(_)));
 
         // populate /d/x via backend
         host.get_mount(mid)

@@ -19,14 +19,8 @@
 //!   Writing them would cause WSL to reassign host file ownership to unexpected values.
 //! - WSL DrvFs double-compatible: `$LXMOD` is a published Microsoft convention.
 //! - Volume EA support cached per volume root to avoid per-stat `GetVolumeInformationW` calls.
-//!
-//! **Phase 1 note**: this module exposes the public API that Phase 2 will connect to
-//! `meta_to_info` and `apply_host_mode`. Items are intentionally unused until then.
 
 #![cfg(target_os = "windows")]
-// Public API will be wired in Phase 2 (meta_to_info / apply_host_mode integration).
-// Suppress dead_code until then so clippy stays clean.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io;

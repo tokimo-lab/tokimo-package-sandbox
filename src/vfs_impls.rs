@@ -103,7 +103,11 @@ impl VfsReader for LocalDirVfs {
                 Ok(m) => m,
                 Err(_) => continue, // skip racing-deleted entries
             };
-            out.push(meta_to_info(entry.file_name().to_string_lossy().into_owned(), md));
+            out.push(meta_to_info(
+                entry.file_name().to_string_lossy().into_owned(),
+                &entry.path(),
+                md,
+            ));
         }
         Ok(out)
     }
@@ -121,7 +125,7 @@ impl VfsReader for LocalDirVfs {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Ok(meta_to_info(name, md))
+        Ok(meta_to_info(name, &host, md))
     }
 
     async fn read_bytes(&self, path: &Path, offset: u64, limit: Option<u64>) -> VfsResult<Vec<u8>> {
@@ -316,7 +320,7 @@ impl VfsBackend for LocalDirVfs {
     }
 }
 
-fn meta_to_info(name: String, md: std::fs::Metadata) -> VfsFileInfo {
+fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> VfsFileInfo {
     let mode = {
         #[cfg(unix)]
         {
@@ -325,15 +329,35 @@ fn meta_to_info(name: String, md: std::fs::Metadata) -> VfsFileInfo {
         }
         #[cfg(windows)]
         {
-            // NTFS has no unix mode bits. Synthesize a permissive default so
-            // binaries dropped into a Windows-hosted FUSE mount are
-            // executable inside the Linux guest. Drop write bits when the
-            // underlying file is marked read-only.
+            use crate::windows::ntfs_mode::{read_mode_ea, volume_supports_ea};
+            let ft_local = md.file_type();
             let writable = !md.permissions().readonly();
-            Some(if writable { 0o755 } else { 0o555 })
+            let mode = if volume_supports_ea(path) {
+                read_mode_ea(path).unwrap_or_else(|| {
+                    let base = if md.is_dir() {
+                        0o755
+                    } else if ft_local.is_symlink() {
+                        0o777
+                    } else {
+                        0o644
+                    };
+                    if writable { base } else { base & !0o222 }
+                })
+            } else {
+                let base = if md.is_dir() {
+                    0o755
+                } else if ft_local.is_symlink() {
+                    0o777
+                } else {
+                    0o755
+                };
+                if writable { base } else { base & !0o222 }
+            };
+            Some(mode)
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = path;
             None
         }
     };
