@@ -320,6 +320,28 @@ impl VfsBackend for LocalDirVfs {
     }
 }
 
+/// Converts raw filesystem metadata into [`VfsFileInfo`].
+///
+/// **Unix**: reads `st_mode` directly via `PermissionsExt::mode()`.
+///
+/// **Windows**: reads the `$LXMOD` NTFS Extended Attribute (4-byte LE u32,
+/// WSL2 DrvFs `metadata` format).  `$LXUID` / `$LXGID` are intentionally
+/// NOT read — uid/gid are always derived from the calling process token.
+///
+/// Fallback ladder when `$LXMOD` EA is absent or the volume does not support EA:
+///
+/// | Scenario                               | Returned mode      |
+/// |----------------------------------------|--------------------|
+/// | NTFS + `$LXMOD` EA present             | EA value           |
+/// | NTFS + no EA + regular file            | 0o644              |
+/// | NTFS + no EA + directory               | 0o755              |
+/// | NTFS + no EA + symlink                 | 0o777              |
+/// | non-NTFS (FAT32/exFAT/network) + file  | 0o755 (keep +x)    |
+/// | non-NTFS + directory                   | 0o755              |
+/// | non-NTFS + symlink                     | 0o777              |
+///
+/// In all cases the NTFS readonly attribute is checked: if the file is
+/// read-only, `0o222` (write bits) is cleared from the fallback mode.
 fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> VfsFileInfo {
     let mode = {
         #[cfg(unix)]
@@ -332,6 +354,7 @@ fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> 
             use crate::windows::ntfs_mode::{read_mode_ea, volume_supports_ea};
             let ft_local = md.file_type();
             let writable = !md.permissions().readonly();
+            // NTFS/ReFS volume: attempt to read $LXMOD EA; fall back to 0o644/0o755/0o777.
             let mode = if volume_supports_ea(path) {
                 read_mode_ea(path).unwrap_or_else(|| {
                     let base = if md.is_dir() {
@@ -343,6 +366,7 @@ fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> 
                     };
                     if writable { base } else { base & !0o222 }
                 })
+            // Non-NTFS volume (FAT32/exFAT/network): EA unavailable; keep +x for scripts.
             } else {
                 let base = if md.is_dir() {
                     0o755

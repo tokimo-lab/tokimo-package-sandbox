@@ -1190,6 +1190,22 @@ fn apply_host_mode(path: &std::path::Path, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
 }
 
+/// Persists `mode` (12 low bits) via the `$LXMOD` NTFS Extended Attribute —
+/// a 4-byte little-endian `u32` containing `S_IFMT | perm_bits`, byte-compatible
+/// with WSL2 DrvFs `metadata` mount option.
+///
+/// On NTFS volumes:
+/// - Writes `$LXMOD` EA using `NtSetEaFile` (see `src/windows/ntfs_mode.rs`).
+///   The EA value includes the high `S_IFMT` bits derived from the file type
+///   (S_IFREG / S_IFDIR / S_IFLNK) ORed with the low 12 permission bits.
+/// - Synchronises the NTFS readonly attribute so that owner write bit
+///   (`mode & 0o200`) is reflected in Explorer / Windows ACL read-only flag.
+///
+/// On non-NTFS volumes (FAT32, exFAT, network shares):
+/// - `write_mode_ea` is a silent no-op (volume_supports_ea returns false).
+/// - Only the NTFS readonly bit is updated (owner-write / readonly mapping).
+///   The full 12-bit mode cannot be persisted; subsequent `stat` returns the
+///   fallback mode (0o755 for files, 0o755 for dirs, 0o777 for symlinks).
 #[cfg(windows)]
 fn apply_host_mode(path: &std::path::Path, mode: u32) {
     use crate::windows::ntfs_mode::{FileKind, volume_supports_ea, write_mode_ea};

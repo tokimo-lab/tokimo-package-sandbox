@@ -422,3 +422,76 @@ pwsh scripts\build-msix.ps1 -Sign -Thumbprint <cert-thumbprint>
 | `session_spawn_exec_mixed` | exec + spawn 混合顺序 |
 
 
+
+
+---
+
+## 9. Windows FUSE Mode 持久化（NTFS EA `$LXMOD`）
+
+### 问题
+
+Windows 没有原生 unix mode 概念。WinFsp 默认通过 NTFS readonly attribute 合成
+0o755 / 0o555，所有 chmod 调用（除 owner write 位外）静默丢失。
+
+### 方案：NTFS Extended Attribute `$LXMOD`
+
+与 WSL2 DrvFs `metadata` mount 选项字节兼容：
+
+- **EA name**: `$LXMOD`（ASCII，5 字节 + 1 字节 NUL 终止 = 6 字节）
+- **EA value**: 4 字节小端 u32 `st_mode`
+  - 高位含 S_IFMT 文件类型（S_IFREG=0o100000 / S_IFDIR=0o040000 / S_IFLNK=0o120000）
+  - 低 12 位含 setuid/setgid/sticky/rwx perm bits
+
+实例（实证自 WSL2，`fsutil file queryEA`）：
+
+| chmod | 原始 mode | EA payload |
+|---|---|---|
+| `chmod 0700 foo`   | `0o100700` | `c0 81 00 00` |
+| `chmod 04755 foo`  | `0o104755` | `ed 89 00 00` |
+| `mkdir d`          | `0o040755` | `ed 41 00 00` |
+
+### 实现
+
+- 读：`read_mode_ea(path) -> Option<u32>`（`NtQueryEaFile`，返回 12 位 perm，已剥离 S_IFMT）
+- 写：`write_mode_ea(path, mode, FileKind)`（`NtSetEaFile`，自动 OR 上对应 S_IFMT 高位）
+- 卷探测：`volume_supports_ea(path) -> bool`（`GetVolumeInformationW`，检查 `FILE_SUPPORTS_EXTENDED_ATTRIBUTES`，按 volume root 缓存）
+
+源码：`src/windows/ntfs_mode.rs`
+
+### Fallback 策略
+
+| 场景 | 返回 mode |
+|---|---|
+| NTFS 卷 + 有 `$LXMOD` EA | EA 中的 mode |
+| NTFS 卷 + 无 EA + 文件 | 0o644 |
+| NTFS 卷 + 无 EA + 目录 | 0o755 |
+| NTFS 卷 + 无 EA + symlink | 0o777 |
+| 非 NTFS 卷（FAT32/exFAT/网络盘）+ 文件 | 0o755（保留 +x，否则 .sh 不可执行） |
+| 非 NTFS 卷 + 目录 | 0o755 |
+| 非 NTFS 卷 + symlink | 0o777 |
+
+NTFS 卷上 chmod 静默 no-op 的情况：`write_mode_ea` 失败（降级为 readonly bit only）。
+非 NTFS 卷上 chmod 始终静默 no-op，后续 stat 仍返回 fallback。
+
+### 与 WSL2 互通
+
+在同一 NTFS 卷上：
+
+1. Tokimo sandbox 在 `F:\some\path\foo` 执行 `chmod 0700`
+2. WSL2 通过 `/mnt/f/some/path/foo` 访问（需 `metadata` mount 选项）
+3. WSL2 `stat -c %a foo` 返回 `700`
+
+反向同理：WSL2 chmod 后 Tokimo sandbox stat 读取相同 EA 字节。
+
+### 不持久化的字段
+
+- `$LXUID` / `$LXGID`：uid/gid 始终用调用进程 token，不读不写
+- atime / mtime / ctime：使用 NTFS 原生时间戳（FILETIME），不映射到 EA
+- symlink mode：Unix 语义不允许 chmod symlink 自身，不写 EA
+
+### 限制
+
+- 必须 NTFS（不支持 FAT32、exFAT、SMB 网络盘等非 NTFS 卷）
+- 卷必须支持 EA（`GetVolumeInformationW` 检查 `FILE_SUPPORTS_EXTENDED_ATTRIBUTES`）
+- 用 `fsutil file queryEA <path>` 可在命令行验证 EA 存在
+- EA 在跨 FS 复制时可能被剥离（OneDrive、部分杀软、FAT32 目标），属预期行为
