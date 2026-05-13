@@ -298,8 +298,11 @@ fn network_allow_all_tcp_recv_payload() {
     // Use raw bash /dev/tcp to avoid relying on curl in rootfs.
     // Send minimal HTTP/1.0 request, read response with `cat` until peer
     // closes (server signals EOF), then count bytes + check status line.
+    // Use the hostname (resolved via the host netstack's DNS) rather
+    // than a hard-coded IP — example.com migrated off 93.184.216.34
+    // in 2024 and that IP is now unreachable.
     let probe = b"timeout 15 bash -c '\
-	exec 3<>/dev/tcp/93.184.216.34/80; \
+	exec 3<>/dev/tcp/example.com/80; \
 	printf \"GET / HTTP/1.0\\r\\nHost: example.com\\r\\n\\r\\n\" >&3; \
 	out=$(cat <&3); \
 	echo BYTES=${#out}; \
