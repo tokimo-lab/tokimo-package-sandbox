@@ -29,7 +29,16 @@ fn run(label: &str, script: &str) -> String {
     let _guard = SandboxGuard(sb.clone());
     let shell = sb.shell_id().expect("shell_id");
 
-    let mut full = String::from("set -e\ncd /work\n");
+    let mut full = String::from(
+        "set -e\n\
+         echo '---DIAG---'\n\
+         id || true\n\
+         stat -c '/work uid=%u gid=%g mode=%A (%a)' /work || true\n\
+         ls -la / | grep -E ' work$' || true\n\
+         (mkdir /work/__probe_dir__ && echo PROBE_MKDIR_OK && rmdir /work/__probe_dir__) 2>&1 || echo PROBE_MKDIR_FAIL=$?\n\
+         echo '---END_DIAG---'\n\
+         cd /work\n",
+    );
     full.push_str(script);
     full.push_str(&format!("\necho {MARKER}\n"));
 
