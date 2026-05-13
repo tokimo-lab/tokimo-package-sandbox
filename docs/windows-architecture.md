@@ -462,16 +462,33 @@ Windows 没有原生 unix mode 概念。WinFsp 默认通过 NTFS readonly attrib
 
 | 场景 | 返回 mode |
 |---|---|
-| NTFS 卷 + 有 `$LXMOD` EA | EA 中的 mode |
-| NTFS 卷 + 无 EA + 文件 | 0o644 |
-| NTFS 卷 + 无 EA + 目录 | 0o755 |
+| NTFS 卷 + 有 `$LXMOD` EA | EA 中的 mode（不受 readonly bit 影响） |
+| NTFS 卷 + 无 EA + 文件 | 0o644，readonly=true 时清 0o222 |
+| NTFS 卷 + 无 EA + 目录 | 0o755，readonly=true 时清 0o222 |
 | NTFS 卷 + 无 EA + symlink | 0o777 |
-| 非 NTFS 卷（FAT32/exFAT/网络盘）+ 文件 | 0o755（保留 +x，否则 .sh 不可执行） |
-| 非 NTFS 卷 + 目录 | 0o755 |
+| 非 NTFS 卷（FAT32/exFAT/网络盘）+ 文件 | 0o755（保留 +x），readonly=true 时清 0o222 |
+| 非 NTFS 卷 + 目录 | 0o755，readonly=true 时清 0o222 |
 | 非 NTFS 卷 + symlink | 0o777 |
 
-NTFS 卷上 chmod 静默 no-op 的情况：`write_mode_ea` 失败（降级为 readonly bit only）。
+NTFS 卷上 chmod 静默 no-op 的情况：`write_mode_ea` 失败。
 非 NTFS 卷上 chmod 始终静默 no-op，后续 stat 仍返回 fallback。
+
+### Why not sync the NTFS readonly bit?
+
+早期实现曾将 owner write 位（`mode & 0o200`）镜像到 NTFS `FILE_ATTRIBUTE_READONLY`，
+使 Explorer 能直观反映文件可写性。但该行为引入了严重的工具链副作用：
+
+- **git**：`chmod 0444` loose object 后，NTFS readonly bit 导致后续
+  `add_loose_object_to_object_database` 失败（"insufficient permission for adding
+  an object to repository database .git/objects"），`git_clone_with_symlink`
+  集成测试因此回归。
+- **atomic write**：部分工具先 rename 临时文件再设权限，NTFS readonly bit
+  会干扰 rename 路径。
+
+`$LXMOD` EA 已存完整 12-bit mode，stat() 从 EA 读取；Explorer 中 readonly
+显示无法准确反映 unix mode 是已知限制，可接受。
+readonly bit 的**读路径**（`meta_to_info` fallback）不受影响：仅在 EA 缺失
+或非 NTFS 卷时才从 readonly bit 反推 write 位，无写侧副作用。
 
 ### 与 WSL2 互通
 

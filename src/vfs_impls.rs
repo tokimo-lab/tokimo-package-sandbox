@@ -340,8 +340,10 @@ impl VfsBackend for LocalDirVfs {
 /// | non-NTFS + directory                   | 0o755              |
 /// | non-NTFS + symlink                     | 0o777              |
 ///
-/// In all cases the NTFS readonly attribute is checked: if the file is
-/// read-only, `0o222` (write bits) is cleared from the fallback mode.
+/// On the fallback path (EA missing or non-NTFS volume) the NTFS readonly
+/// attribute is checked: if the file is read-only, `0o222` (write bits) is
+/// cleared from the fallback mode. EA-hit paths are not affected by the
+/// readonly bit — `$LXMOD` EA is the authoritative source.
 fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> VfsFileInfo {
     let mode = {
         #[cfg(unix)]

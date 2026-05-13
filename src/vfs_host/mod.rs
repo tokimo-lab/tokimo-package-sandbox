@@ -1198,34 +1198,34 @@ fn apply_host_mode(path: &std::path::Path, mode: u32) {
 /// - Writes `$LXMOD` EA using `NtSetEaFile` (see `src/windows/ntfs_mode.rs`).
 ///   The EA value includes the high `S_IFMT` bits derived from the file type
 ///   (S_IFREG / S_IFDIR / S_IFLNK) ORed with the low 12 permission bits.
-/// - Synchronises the NTFS readonly attribute so that owner write bit
-///   (`mode & 0o200`) is reflected in Explorer / Windows ACL read-only flag.
+/// - The NTFS readonly attribute is **not** touched. Reason: Linux tools such
+///   as git rely on `chmod 0444` not affecting subsequent directory-level
+///   operations (creating loose objects, atomic rename/write). NTFS readonly
+///   has tool-chain side effects (e.g. git fails with "insufficient permission
+///   for adding an object to repository database .git/objects"). Explorer
+///   display fidelity is a known limitation — `$LXMOD` EA carries the full
+///   12-bit mode, which is authoritative for all sandbox stat() calls.
 ///
 /// On non-NTFS volumes (FAT32, exFAT, network shares):
-/// - `write_mode_ea` is a silent no-op (volume_supports_ea returns false).
-/// - Only the NTFS readonly bit is updated (owner-write / readonly mapping).
-///   The full 12-bit mode cannot be persisted; subsequent `stat` returns the
-///   fallback mode (0o755 for files, 0o755 for dirs, 0o777 for symlinks).
+/// - `volume_supports_ea` returns false; mode cannot be persisted.
+/// - Subsequent `stat` returns the fallback mode (0o755 for files/dirs,
+///   0o777 for symlinks). The NTFS readonly bit is not touched here either.
 #[cfg(windows)]
 fn apply_host_mode(path: &std::path::Path, mode: u32) {
     use crate::windows::ntfs_mode::{FileKind, volume_supports_ea, write_mode_ea};
 
-    if volume_supports_ea(path) {
-        let kind = match std::fs::symlink_metadata(path).map(|m| m.file_type()) {
-            Ok(ft) if ft.is_dir() => FileKind::Dir,
-            Ok(ft) if ft.is_symlink() => FileKind::Symlink,
-            _ => FileKind::File,
-        };
-        if let Err(e) = write_mode_ea(path, mode & 0o7777, kind) {
-            tracing::warn!(?path, error = %e, "write_mode_ea failed; falling back to readonly bit only");
-        }
+    if !volume_supports_ea(path) {
+        // Non-NTFS volume: mode cannot be persisted; stat() will return
+        // fallback (0o755 file / 0o755 dir / 0o777 symlink).
+        return;
     }
-    // Best-effort: keep NTFS readonly bit in sync so Explorer reflects writability.
-    if let Ok(md) = std::fs::metadata(path) {
-        let mut perms = md.permissions();
-        let writable = (mode & 0o200) != 0;
-        perms.set_readonly(!writable);
-        let _ = std::fs::set_permissions(path, perms);
+    let kind = match std::fs::symlink_metadata(path).map(|m| m.file_type()) {
+        Ok(ft) if ft.is_dir() => FileKind::Dir,
+        Ok(ft) if ft.is_symlink() => FileKind::Symlink,
+        _ => FileKind::File,
+    };
+    if let Err(e) = write_mode_ea(path, mode & 0o7777, kind) {
+        tracing::warn!(?path, error = %e, "write_mode_ea failed");
     }
 }
 
