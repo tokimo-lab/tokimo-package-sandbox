@@ -32,6 +32,12 @@ fn run(label: &str, script: &str) -> String {
     let shell = sb.shell_id().expect("shell_id");
 
     let mut full = String::from("set -e\ncd /work\n");
+    // CI diagnostic: print uid/gid + /work ownership so we can see whether
+    // the in-sandbox shell's uid actually matches what FUSE reports for
+    // /work. Removed once CI is green.
+    full.push_str("echo '[diag] id:' >&2; id >&2 || true\n");
+    full.push_str("echo '[diag] /work:' >&2; stat -c 'uid=%u gid=%g mode=%a' /work >&2 || true\n");
+    full.push_str("echo '[diag] mount:' >&2; cat /proc/self/mountinfo | grep ' /work ' >&2 || true\n");
     full.push_str(script);
     full.push_str(&format!("\necho {MARKER}\n"));
 
