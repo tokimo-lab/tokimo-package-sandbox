@@ -323,7 +323,16 @@ fn meta_to_info(name: String, md: std::fs::Metadata) -> VfsFileInfo {
             use std::os::unix::fs::PermissionsExt;
             Some(md.permissions().mode() & 0o7777)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // NTFS has no unix mode bits. Synthesize a permissive default so
+            // binaries dropped into a Windows-hosted FUSE mount are
+            // executable inside the Linux guest. Drop write bits when the
+            // underlying file is marked read-only.
+            let writable = !md.permissions().readonly();
+            Some(if writable { 0o755 } else { 0o555 })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
