@@ -71,6 +71,18 @@ jobs:
       - name: Install runtime deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap curl jq zstd tar
 
+      - name: Relax AppArmor unprivileged-userns restriction
+        # Ubuntu 24.04 ships with an AppArmor profile that strips
+        # capabilities (notably CAP_NET_ADMIN) from unprivileged user
+        # namespaces. Bubblewrap relies on CAP_NET_ADMIN inside the new
+        # netns to bring up `lo`; without this knob it fails with
+        # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+        # and every test that needs `start_vm()` panics with an
+        # ECONNRESET on the init handshake.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 || true
+
       - name: Fetch VM artifacts (vmlinuz + initrd + rootfs)
         run: scripts/linux/fetch-vm.sh -k vm-kernel-0.2.1 -r vm-rootfs-0.2.1
 
@@ -125,6 +137,13 @@ jobs:
 
       - name: Install runtime deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap curl jq zstd tar
+
+      - name: Relax AppArmor unprivileged-userns restriction
+        # Mirrors the bwrap job: virtiofsd uses --sandbox namespace which
+        # also requires CAP_NET_ADMIN-style perms inside the new userns.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 || true
 
       - name: Verify /dev/kvm is available
         run: |
