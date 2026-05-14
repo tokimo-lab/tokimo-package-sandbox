@@ -316,6 +316,119 @@ export default function () {
     );
 }
 
+/// Throughput benchmark with NO `sleep()` between iterations.
+///
+/// Same shape as `k6_real_regression` (5 VUs, 5s, GET baidu) but the
+/// k6 script omits `sleep(1)`, so each VU loops as fast as the network
+/// allows. The goal is to *measure* raw end-to-end RPS the sandbox
+/// netstack can sustain — NOT to assert a floor (baidu rate-limits
+/// aggressively, and the failure rate is itself part of the reported
+/// number).
+///
+/// `#[ignore]` because:
+///  - depends on external internet (baidu)
+///  - baidu rate-limiting means absolute numbers vary run-to-run
+///  - it's a one-shot diagnostic, not a regression guard
+#[test]
+#[ignore]
+fn k6_no_sleep_throughput() {
+    let ws = workspace_dir("k6-nosleep");
+    let k6_host = ensure_k6_binary().expect("provision k6 binary");
+
+    std::fs::copy(&k6_host, ws.join("k6")).expect("copy k6 into workspace");
+    let script = r#"import http from 'k6/http';
+import { check } from 'k6';
+export const options = {
+  vus: 5,
+  duration: '5s',
+};
+export default function () {
+  const res = http.get('https://www.baidu.com');
+  check(res, { 'status 200': (r) => r.status === 200 });
+  // NO sleep
+}
+"#;
+    std::fs::write(ws.join("k6-test.js"), script).expect("write k6 script");
+    let _ = std::fs::remove_file(ws.join("k6-summary.json"));
+
+    let mut cfg = config("k6-nosleep");
+    cfg.cpu_count = 8;
+    cfg.memory_mb = 2048;
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    let cmd = format!(
+        "chmod +x /tmp/tokimo-share/k6 && \
+         /tmp/tokimo-share/k6 run --quiet \
+           --summary-export=/tmp/tokimo-share/k6-summary.json \
+           /tmp/tokimo-share/k6-test.js; \
+         echo K6_EXIT=$?; echo {PROBE_END}_K6NS\n"
+    );
+    sb.write_stdin(&shell, cmd.as_bytes()).unwrap();
+    let out = drain_until(&rx, &shell, &format!("{PROBE_END}_K6NS"), Duration::from_secs(60));
+    eprintln!("=== k6 stdout/stderr ===\n{out}\n");
+
+    let summary_path = ws.join("k6-summary.json");
+    let summary_raw = std::fs::read_to_string(&summary_path).unwrap_or_else(|e| {
+        sb.stop_vm().ok();
+        panic!(
+            "failed to read k6 summary {}: {e}.\nk6 stdout:\n{out}",
+            summary_path.display()
+        );
+    });
+    let summary: serde_json::Value = serde_json::from_str(&summary_raw)
+        .unwrap_or_else(|e| panic!("parse k6 summary JSON: {e}\nraw:\n{summary_raw}"));
+
+    let m = &summary["metrics"];
+    // `--summary-export` legacy flat schema: metric fields live on the
+    // metric object directly (not under `.values`). Durations are in ms,
+    // rates are per-second.
+    let iterations_count = m["iterations"]["count"].as_f64().unwrap_or(f64::NAN);
+    let iterations_rate = m["iterations"]["rate"].as_f64().unwrap_or(f64::NAN);
+    let http_reqs_count = m["http_reqs"]["count"].as_f64().unwrap_or(f64::NAN);
+    let http_reqs_rate = m["http_reqs"]["rate"].as_f64().unwrap_or(f64::NAN);
+    let http_req_failed_rate = m["http_req_failed"]["value"].as_f64().unwrap_or(f64::NAN);
+    let http_req_failed_passes = m["http_req_failed"]["passes"].as_f64().unwrap_or(f64::NAN);
+    let http_req_failed_fails = m["http_req_failed"]["fails"].as_f64().unwrap_or(f64::NAN);
+    let dur_avg = m["http_req_duration"]["avg"].as_f64().unwrap_or(f64::NAN);
+    let dur_p95 = m["http_req_duration"]["p(95)"].as_f64().unwrap_or(f64::NAN);
+    let dur_max = m["http_req_duration"]["max"].as_f64().unwrap_or(f64::NAN);
+    let iter_dur_avg = m["iteration_duration"]["avg"].as_f64().unwrap_or(f64::NAN);
+    let connecting_avg = m["http_req_connecting"]["avg"].as_f64().unwrap_or(f64::NAN);
+    let tls_avg = m["http_req_tls_handshaking"]["avg"].as_f64().unwrap_or(f64::NAN);
+
+    eprintln!(
+        "=== k6 no-sleep throughput ===\n\
+         iterations.count            = {iterations_count}\n\
+         iterations.rate             = {iterations_rate:.3} /s\n\
+         http_reqs.count             = {http_reqs_count}\n\
+         http_reqs.rate              = {http_reqs_rate:.3} /s   (avg RPS)\n\
+         http_req_failed.rate        = {http_req_failed_rate:.4}   (passes={http_req_failed_passes}, fails={http_req_failed_fails})\n\
+         http_req_duration.avg       = {dur_avg:.2} ms\n\
+         http_req_duration.p(95)     = {dur_p95:.2} ms\n\
+         http_req_duration.max       = {dur_max:.2} ms\n\
+         iteration_duration.avg      = {iter_dur_avg:.2} ms   (≈ http_req_duration when no sleep)\n\
+         http_req_connecting.avg     = {connecting_avg:.2} ms   (TCP)\n\
+         http_req_tls_handshaking.avg= {tls_avg:.2} ms   (TLS)\n"
+    );
+
+    sb.stop_vm().ok();
+
+    // Only assert we actually ran. No throughput floor — baidu's rate
+    // limiter makes absolute numbers unreliable. No http_req_failed
+    // assertion for the same reason.
+    assert!(
+        iterations_count > 0.0,
+        "iterations.count = {iterations_count}, expected > 0 (test didn't run)"
+    );
+}
+
 /// Ensures the k6 amd64 binary exists under `target/integration/k6-cache/`
 /// and returns its host path. Downloads + extracts on first run, no-ops
 /// on subsequent runs.
