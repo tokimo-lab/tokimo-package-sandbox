@@ -597,7 +597,11 @@ for ($i = 0; $i -lt 60; $i++) {{
     let summary: serde_json::Value = serde_json::from_str(&summary_raw).unwrap_or(serde_json::Value::Null);
     let m = &summary["metrics"];
     let reqs = m["http_reqs"]["count"].as_f64().unwrap_or(f64::NAN);
-    let fail = m["http_req_failed"]["fails"].as_f64().unwrap_or(f64::NAN);
+    // `http_req_failed` is a k6 Rate metric: `value` is the failure rate
+    // (0.0 == all succeeded). The `passes`/`fails` siblings on a Rate
+    // count truthy/falsy samples and are easy to misread — `passes` is
+    // the failure count, `fails` is the success count. Use `value`.
+    let fail_rate = m["http_req_failed"]["value"].as_f64().unwrap_or(f64::NAN);
     let p95 = m["http_req_duration"]["p(95)"].as_f64().unwrap_or(f64::NAN);
 
     let mb = |b: i64| (b as f64) / (1024.0 * 1024.0);
@@ -616,7 +620,7 @@ for ($i = 0; $i -lt 60; $i++) {{
     );
     eprintln!("[k6-resource-profile] host TCP sockets: start={tcp_start} peak={tcp_peak} end={tcp_end}");
     eprintln!("[k6-resource-profile] host UDP sockets: start={udp_start} peak={udp_peak} end={udp_end}");
-    eprintln!("[k6-resource-profile] k6 stats: {reqs} reqs / {fail} fail / p95={p95:.0}ms");
+    eprintln!("[k6-resource-profile] k6 stats: {reqs} reqs / fail_rate={fail_rate:.4} / p95={p95:.0}ms");
     eprintln!(
         "[k6-resource-profile] (k6 stdout tail)\n{}",
         out.lines()
