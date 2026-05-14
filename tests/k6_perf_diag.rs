@@ -205,7 +205,16 @@ fn concurrent_curl_burst_regression() {
 /// and reuses it on subsequent runs. The cached binary is copied into
 /// the host-side workspace (mounted at `/tmp/tokimo-share` inside the
 /// VM) so the guest can execute it.
+///
+/// `#[ignore]` because: depends on external internet (baidu) and is
+/// sensitive to CI network latency. On CI Linux runners with the
+/// cloud-hypervisor backend, `iteration_duration` is dominated by the
+/// real RTT between the runner and baidu (~1-2s), which we cannot
+/// assert numeric thresholds against. The CI regression for the UDP
+/// demux fix is covered by `concurrent_curl_burst_regression` (which
+/// asserts all 200 + wall < 2s and is robust to network conditions).
 #[test]
+#[ignore]
 fn k6_real_regression() {
     let ws = workspace_dir("k6-real");
     let k6_host = ensure_k6_binary().expect("provision k6 binary");
