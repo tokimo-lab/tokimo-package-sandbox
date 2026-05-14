@@ -120,6 +120,11 @@ harness = false
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 tracing-subscriber = "0.3"
+# Used by tests/k6_perf_diag.rs::k6_real_regression to fetch + unpack the
+# k6 release tarball into a host-mounted workspace so the in-sandbox VM
+# can execute it. amd64 linux static binary, ~25 MB compressed.
+flate2 = "1"
+tar = "0.4"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
     "socket-tcp-pause-synack",

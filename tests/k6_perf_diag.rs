@@ -23,12 +23,17 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{SandboxGuard, config, drain_until};
+use common::{SandboxGuard, config, drain_until, workspace_dir};
 use tokimo_package_sandbox::{NetworkPolicy, Sandbox};
 
 const PROBE_END: &str = "K6DIAG_PROBE_END_8F2A";
+
+const K6_VERSION: &str = "v0.55.0";
+const K6_URL: &str = "https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz";
+const K6_DIR_IN_TARBALL: &str = "k6-v0.55.0-linux-amd64";
 
 #[test]
 #[ignore]
@@ -184,4 +189,178 @@ fn concurrent_curl_burst_regression() {
         max_total < 2.0,
         "concurrent curls should all finish < 2s; slowest = {max_total:.3}s.\nfull output:\n{out}"
     );
+}
+
+/// End-to-end regression test for the real k6 workload that originally
+/// surfaced the smoltcp UDP-by-dst_port collapse bug.
+///
+/// User script: 5 VUs / 5s / GET https://www.baidu.com / sleep(1).
+/// Before the fix: http_req_duration avg ~16ms but iteration_duration
+/// avg ~6.06s, because 4 of 5 concurrent DNS lookups timed out at
+/// glibc's resolver retry budget. After the fix: iterations should
+/// complete in roughly sleep(1) + network overhead.
+///
+/// k6 itself is not in the rootfs; this test downloads the official
+/// linux-amd64 release tarball once into `target/integration/k6-cache/`
+/// and reuses it on subsequent runs. The cached binary is copied into
+/// the host-side workspace (mounted at `/tmp/tokimo-share` inside the
+/// VM) so the guest can execute it.
+#[test]
+fn k6_real_regression() {
+    let ws = workspace_dir("k6-real");
+    let k6_host = ensure_k6_binary().expect("provision k6 binary");
+
+    // Stage k6 + script in the shared workspace so the guest can see them.
+    std::fs::copy(&k6_host, ws.join("k6")).expect("copy k6 into workspace");
+    let script = r#"import http from 'k6/http';
+import { sleep, check } from 'k6';
+export const options = {
+  vus: 5,
+  duration: '5s',
+  thresholds: {
+    http_req_duration: ['p(95)<5000'],
+    http_req_failed: ['rate<0.05'],
+  },
+};
+export default function () {
+  const res = http.get('https://www.baidu.com');
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'duration < 3s': (r) => r.timings.duration < 3000,
+  });
+  sleep(1);
+}
+"#;
+    std::fs::write(ws.join("k6-test.js"), script).expect("write k6 script");
+    // Wipe any stale summary so we don't accidentally validate the previous run.
+    let _ = std::fs::remove_file(ws.join("k6-summary.json"));
+
+    let mut cfg = config("k6-real");
+    cfg.cpu_count = 8;
+    cfg.memory_mb = 2048;
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    // Run k6. --quiet keeps stdout small; the summary JSON is the
+    // authoritative source of truth for assertions.
+    let cmd = format!(
+        "chmod +x /tmp/tokimo-share/k6 && \
+         /tmp/tokimo-share/k6 run --quiet \
+           --summary-export=/tmp/tokimo-share/k6-summary.json \
+           /tmp/tokimo-share/k6-test.js; \
+         echo K6_EXIT=$?; echo {PROBE_END}_K6\n"
+    );
+    sb.write_stdin(&shell, cmd.as_bytes()).unwrap();
+    // Generous timeout: k6 runs for 5s + setup/teardown. Allow 60s.
+    let out = drain_until(&rx, &shell, &format!("{PROBE_END}_K6"), Duration::from_secs(60));
+    eprintln!("=== k6 stdout/stderr ===\n{out}\n");
+
+    let exit_line = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("K6_EXIT="))
+        .unwrap_or("");
+    let summary_path = ws.join("k6-summary.json");
+    let summary_raw = std::fs::read_to_string(&summary_path).unwrap_or_else(|e| {
+        sb.stop_vm().ok();
+        panic!(
+            "failed to read k6 summary {}: {e}.\nk6 exit code line: {exit_line:?}\nk6 stdout:\n{out}",
+            summary_path.display()
+        );
+    });
+    let summary: serde_json::Value = serde_json::from_str(&summary_raw)
+        .unwrap_or_else(|e| panic!("parse k6 summary JSON: {e}\nraw:\n{summary_raw}"));
+
+    let metrics = &summary["metrics"];
+    // Note: `--summary-export` uses a flatter legacy schema than the
+    // newer `summary.json`. Metric fields live directly on the metric
+    // object (not nested under a `values` map). For rate metrics like
+    // `http_req_failed`, the rate is exposed as `value` (with `passes`
+    // counting the "true" cases — i.e. failed requests — and `fails`
+    // counting the "false" cases). Durations are reported in ms.
+    let http_req_failed_rate = metrics["http_req_failed"]["value"].as_f64().unwrap_or(f64::NAN);
+    let http_req_duration_p95 = metrics["http_req_duration"]["p(95)"].as_f64().unwrap_or(f64::NAN);
+    let iteration_duration_avg = metrics["iteration_duration"]["avg"].as_f64().unwrap_or(f64::NAN);
+    let iterations_count = metrics["iterations"]["count"].as_f64().unwrap_or(f64::NAN);
+
+    eprintln!(
+        "=== k6 key metrics ===\n  http_req_failed.rate       = {http_req_failed_rate:.4}\n  http_req_duration.p(95)    = {http_req_duration_p95:.1} ms\n  iteration_duration.avg     = {iteration_duration_avg:.1} ms\n  iterations.count           = {iterations_count}\n"
+    );
+
+    sb.stop_vm().ok();
+
+    assert_eq!(exit_line, "0", "k6 exited non-zero: {exit_line:?}\nstdout:\n{out}");
+    assert!(
+        http_req_failed_rate < 0.05,
+        "http_req_failed.rate = {http_req_failed_rate:.4}, expected < 0.05. Indicates request failures (regression of DNS demux fix?)."
+    );
+    assert!(
+        iteration_duration_avg < 1500.0,
+        "iteration_duration.avg = {iteration_duration_avg:.1}ms, expected < 1500ms. \
+         Bug signature: iterations stretched to ~6000ms because concurrent DNS lookups starved each other. \
+         http_req_duration.p95 = {http_req_duration_p95:.1}ms, http_req_failed.rate = {http_req_failed_rate:.4}, iterations = {iterations_count}."
+    );
+    assert!(
+        http_req_duration_p95 < 5000.0,
+        "http_req_duration.p(95) = {http_req_duration_p95:.1}ms, expected < 5000ms (k6 threshold)."
+    );
+    assert!(
+        iterations_count > 10.0,
+        "iterations.count = {iterations_count}, expected > 10. \
+         5 VUs × 5s with sleep(1) should yield ~20 iterations; the bug capped it at 5 because each VU hung for ~5s on DNS."
+    );
+}
+
+/// Ensures the k6 amd64 binary exists under `target/integration/k6-cache/`
+/// and returns its host path. Downloads + extracts on first run, no-ops
+/// on subsequent runs.
+fn ensure_k6_binary() -> anyhow::Result<PathBuf> {
+    let cache_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("integration")
+        .join("k6-cache");
+    std::fs::create_dir_all(&cache_root)?;
+    let k6_path = cache_root.join("k6");
+    if k6_path.exists()
+        && std::fs::metadata(&k6_path)
+            .map(|m| m.len() > 1_000_000)
+            .unwrap_or(false)
+    {
+        eprintln!("[k6] using cached binary: {}", k6_path.display());
+        return Ok(k6_path);
+    }
+
+    eprintln!("[k6] downloading {K6_VERSION} from {K6_URL}");
+    let body = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?
+        .get(K6_URL)
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    eprintln!("[k6] downloaded {} bytes, extracting", body.len());
+
+    let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
+    let mut archive = tar::Archive::new(gz);
+    let mut found = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let want = Path::new(K6_DIR_IN_TARBALL).join("k6");
+        if path == want {
+            entry.unpack(&k6_path)?;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        anyhow::bail!("k6 binary not found in tarball entry {K6_DIR_IN_TARBALL}/k6");
+    }
+    eprintln!("[k6] extracted to {}", k6_path.display());
+    Ok(k6_path)
 }
