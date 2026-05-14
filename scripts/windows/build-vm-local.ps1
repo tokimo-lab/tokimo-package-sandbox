@@ -92,8 +92,13 @@ if (-not (Test-Path $rootfsTar)) { throw "rootfs.tar not found at $rootfsTar" }
 Write-Host "==> [3/3] Converting rootfs.tar to vhdx + copying to $vmDir" -ForegroundColor Cyan
 
 $tarSizeMB = [math]::Floor((Get-Item $rootfsTar).Length / 1MB)
-$imgSizeMB = $tarSizeMB * 3 + 512
-Write-Host "    rootfs.tar: ${tarSizeMB}MB, image: ${imgSizeMB}MB"
+# Virtual disk size for rootfs.vhdx (dynamic VHDX, so host file only
+# grows as the guest writes). 256 GB gives plenty of headroom for apt /
+# pip / model caches; mkfs.ext4 metadata occupies ~3 GB of that. Users
+# can later grow it online with `Resize-VHD` + guest `resize2fs /dev/sda`
+# (ext4 was created without 64bit feature → 16 TiB single-volume cap).
+$imgSizeMB = 256 * 1024
+Write-Host "    rootfs.tar: ${tarSizeMB}MB, image: ${imgSizeMB}MB (256 GB dynamic VHDX)"
 
 $vmBaseMount = $vmBaseDir -replace '\\','/'
 $vmMount = $vmDir -replace '\\','/'
