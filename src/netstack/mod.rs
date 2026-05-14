@@ -408,6 +408,35 @@ struct UdpSubFlowKey {
     src_port: u16,
 }
 
+/// Per-(src_ip, src_port) demux entry under a `UdpListener`.
+///
+/// # Lifecycle
+///
+/// **Creation**: lazily by `register_udp_flow` (called from `dispatch_l4`)
+/// on the first guest datagram of a new 4-tuple. Creating the sub-flow
+/// also creates the `UdpListener` if `(dst_ip, dst_port)` is new.
+///
+/// **Activity tracking**: `last_activity` is bumped on every guest→upstream
+/// send AND every upstream→guest reply (see lines ~869 / ~912 / ~923).
+///
+/// **Reaping**: in the main loop after each UDP service pass:
+///   - `last_activity > 15 s ago` (`udp_idle_timeout`), or
+///   - upstream `recv_from` returned a non-`WouldBlock`/`TimedOut` error
+///   → removed from `listener.sub_flows`; mio `deregister(&mut sub.upstream)`
+///   drops the upstream UdpSocket and releases its `Token`. The `Token`
+///   value itself (a `usize`) is never re-issued — `next_token` is
+///   monotonic with wrapping (`wrapping_add(1).max(1)`), so a sustained
+///   leak would only manifest as wrap-around after `usize::MAX` allocations.
+///
+/// **Listener reaping**: once `listener.sub_flows.is_empty()`, the
+/// listener itself + its smoltcp `udp::Socket` are removed in the same
+/// iteration. A subsequent guest datagram to the same `(dst_ip, dst_port)`
+/// transparently re-creates listener + sub-flow.
+///
+/// **DNS burst bound**: each new ephemeral src_port = one sub-flow.
+/// With 15s idle timeout, sustained burst rate `r` qps to distinct
+/// ports yields peak `~15·r` concurrent sub-flows; this is traffic-bounded,
+/// not unbounded. No persistent leak.
 struct UdpSubFlow {
     upstream: MioUdpSocket,
     #[allow(dead_code)]
