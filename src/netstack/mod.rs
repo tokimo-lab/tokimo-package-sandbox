@@ -372,33 +372,47 @@ enum TcpUpstreamState {
     Failed,
 }
 
-/// State for one upstream UDP flow (keyed by full 4-tuple).
+/// UDP listener key — one smoltcp UDP socket per `(dst_ip, dst_port)`.
 ///
-/// Each (src_ip, src_port, dst_ip, dst_port) gets its own smoltcp
-/// `udp::Socket` and upstream `UdpSocket`.  Reply Ethernet frames are
-/// built manually (bypassing smoltcp ARP resolution which has no neighbor
-/// entry for the guest — TCP populates it via SYN/SYN-ACK, but UDP doesn't).
+/// **Important**: smoltcp's interface dispatch routes each inbound UDP
+/// packet to the *first* socket whose `accepts()` returns true; multiple
+/// sockets bound to the same port are silently dead. The previous design
+/// keyed each flow by the full 4-tuple and gave every flow its own smoltcp
+/// socket bound to `dst_port`, which broke as soon as the guest fired two
+/// concurrent UDP queries to the same destination (e.g. five parallel
+/// curls each doing a DNS lookup to gateway:53 — only one curl got its
+/// reply, the others timed out at ~9.78 s and curl returned `code=000`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct UdpKey {
-    src_ip: IpAddress,
-    src_port: u16,
+struct UdpListenerKey {
     dst_ip: IpAddress,
     dst_port: u16,
 }
 
-struct UdpFlow {
+/// Shared smoltcp socket bound to `(dst_ip, dst_port)`; demuxes inbound
+/// guest datagrams to the matching `UdpSubFlow` by `(src_ip, src_port)`.
+struct UdpListener {
     sock_handle: SocketHandle,
-    upstream: MioUdpSocket,
-    /// Guest-side sender endpoint (used to address reply Ethernet frames).
-    remote: smoltcp::wire::IpEndpoint,
-    /// IP family; v4↔v6 replies from wrong family are discarded.
+    /// IP family of the listener; v4↔v6 replies from wrong family discarded.
     family_v4: bool,
-    last_activity: Instant,
-    /// If `Some`, this flow is a guest→gateway:53 DNS proxy: outbound
-    /// packets are sent to this resolver instead of the literal gateway IP,
-    /// and reply frames spoof their source as the gateway:53 so the guest
+    /// If `Some`, all sub-flows under this listener are DNS-proxied: outbound
+    /// datagrams are sent to this resolver instead of the literal dst_ip,
+    /// and reply frames spoof their source as the gateway so the guest
     /// resolver accepts them.
     dns_rewrite: Option<SocketAddr>,
+    sub_flows: HashMap<UdpSubFlowKey, UdpSubFlow>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpSubFlowKey {
+    src_ip: IpAddress,
+    src_port: u16,
+}
+
+struct UdpSubFlow {
+    upstream: MioUdpSocket,
+    #[allow(dead_code)]
+    token: Token,
+    last_activity: Instant,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -543,7 +557,7 @@ fn run(
 
     let mut sockets = SocketSet::new(Vec::new());
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
-    let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
+    let mut udp_listeners: HashMap<UdpListenerKey, UdpListener> = HashMap::new();
 
     eprintln!(
         "[netstack] gateway {}/{} [v6 {}/{}] ↔ guest {}/{} ready (egress={:?}, local_services={})",
@@ -583,7 +597,7 @@ fn run(
                 &frame,
                 &mut sockets,
                 &mut tcp_flows,
-                &mut udp_flows,
+                &mut udp_listeners,
                 &tx_out_tx,
                 &ctx,
                 &mut io,
@@ -817,95 +831,149 @@ fn run(
             }
         }
 
-        // 3. Service UDP flows: forward guest ↔ upstream via smoltcp sockets.
-        let mut udp_to_remove: Vec<UdpKey> = Vec::new();
-        for (&key, flow) in udp_flows.iter_mut() {
-            let sock = sockets.get_mut::<udp::Socket>(flow.sock_handle);
+        // 3. Service UDP flows: forward guest ↔ upstream via the shared
+        //    smoltcp listener for each (dst_ip, dst_port), demuxed by
+        //    (src_ip, src_port) sub-flow.
+        let mut listeners_to_remove: Vec<UdpListenerKey> = Vec::new();
+        for (&lkey, listener) in udp_listeners.iter_mut() {
+            let sock = sockets.get_mut::<udp::Socket>(listener.sock_handle);
 
-            // Guest → upstream: drain smoltcp recv buffer, forward to real server.
+            // Guest → upstream: drain smoltcp recv buffer; demux each
+            // datagram to its matching sub-flow (by guest src endpoint).
+            // dispatch_l4 always creates the sub-flow before the packet is
+            // ingested by smoltcp, so an unknown src here is a bug — log
+            // and skip rather than create a sub-flow lazily (lazy creation
+            // would race with idle-reap and risk leaking mio tokens).
             if sock.can_recv() {
                 while let Ok((data, meta)) = sock.recv() {
-                    let dst = if let Some(rewrite) = flow.dns_rewrite {
+                    let src_ip = meta.endpoint.addr;
+                    let src_port = meta.endpoint.port;
+                    let sub_key = UdpSubFlowKey { src_ip, src_port };
+                    let sub = match listener.sub_flows.get_mut(&sub_key) {
+                        Some(s) => s,
+                        None => {
+                            eprintln!(
+                                "[netstack] udp recv from unregistered src {}:{} on listener {}:{}",
+                                src_ip, src_port, lkey.dst_ip, lkey.dst_port,
+                            );
+                            continue;
+                        }
+                    };
+                    let dst = if let Some(rewrite) = listener.dns_rewrite {
                         rewrite
                     } else {
                         let dst_ip = meta.local_address.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED));
-                        SocketAddr::new(ipaddr_to_std(dst_ip), key.dst_port)
+                        SocketAddr::new(ipaddr_to_std(dst_ip), lkey.dst_port)
                     };
-                    let _ = flow.upstream.send_to(data, dst);
-                    flow.remote = meta.endpoint;
-                    flow.last_activity = now;
+                    let _ = sub.upstream.send_to(data, dst);
+                    sub.last_activity = now;
                 }
             }
 
-            // Upstream → guest: non-blocking recv, build Ethernet frame
-            // manually (bypasses smoltcp ARP resolution, same as ICMP).
+            // Upstream → guest: drain each sub-flow's mio upstream socket
+            // and inject the reply addressed back to that sub-flow's guest
+            // src endpoint. This is the critical fix: replies always go
+            // back to the *specific* guest src_port that issued the
+            // request, not to whichever flow happened to update
+            // `flow.remote` last.
             let mut buf = vec![0u8; 2048];
-            loop {
-                match flow.upstream.recv_from(&mut buf) {
-                    Ok((n, from)) => {
-                        // For DNS-proxied flows the guest sent to the gateway,
-                        // so the reply must appear to come from the gateway —
-                        // not from the real upstream resolver. Otherwise the
-                        // guest resolver discards it as a martian response.
-                        let (src_ip_addr, src_port) = if flow.dns_rewrite.is_some() {
-                            (
-                                if flow.family_v4 {
-                                    IpAddr::V4(std::net::Ipv4Addr::from(HOST_IP.octets()))
-                                } else {
-                                    IpAddr::V6(std::net::Ipv6Addr::from(HOST_IP6.octets()))
-                                },
-                                key.dst_port,
-                            )
-                        } else {
-                            (from.ip(), from.port())
-                        };
-                        match (src_ip_addr, flow.remote.addr, flow.family_v4) {
-                            (IpAddr::V4(s), IpAddress::Ipv4(d), true) => {
-                                let frame = build_udp_reply_ethernet_frame_v4(
-                                    &s.octets(),
-                                    &d.octets(),
-                                    src_port,
-                                    flow.remote.port,
-                                    &buf[..n],
-                                );
-                                let _ = tx_out_tx.send(frame);
-                                flow.last_activity = now;
+            let mut subs_to_remove: Vec<UdpSubFlowKey> = Vec::new();
+            for (sub_key, sub) in listener.sub_flows.iter_mut() {
+                loop {
+                    match sub.upstream.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            // For DNS-proxied flows the guest sent to the
+                            // gateway, so the reply must appear to come
+                            // from the gateway — not from the real
+                            // upstream resolver. Otherwise the guest
+                            // resolver discards it as a martian response.
+                            let (src_ip_addr, src_port) = if listener.dns_rewrite.is_some() {
+                                (
+                                    if listener.family_v4 {
+                                        IpAddr::V4(std::net::Ipv4Addr::from(HOST_IP.octets()))
+                                    } else {
+                                        IpAddr::V6(std::net::Ipv6Addr::from(HOST_IP6.octets()))
+                                    },
+                                    lkey.dst_port,
+                                )
+                            } else {
+                                (from.ip(), from.port())
+                            };
+                            match (src_ip_addr, sub_key.src_ip, listener.family_v4) {
+                                (IpAddr::V4(s), IpAddress::Ipv4(d), true) => {
+                                    let frame = build_udp_reply_ethernet_frame_v4(
+                                        &s.octets(),
+                                        &d.octets(),
+                                        src_port,
+                                        sub_key.src_port,
+                                        &buf[..n],
+                                    );
+                                    let _ = tx_out_tx.send(frame);
+                                    sub.last_activity = now;
+                                }
+                                (IpAddr::V6(s), IpAddress::Ipv6(d), false) => {
+                                    let frame = build_udp_reply_ethernet_frame_v6(
+                                        &s.octets(),
+                                        &d.octets(),
+                                        src_port,
+                                        sub_key.src_port,
+                                        &buf[..n],
+                                    );
+                                    let _ = tx_out_tx.send(frame);
+                                    sub.last_activity = now;
+                                }
+                                // Cross-family or mismatched flow record: drop.
+                                _ => continue,
                             }
-                            (IpAddr::V6(s), IpAddress::Ipv6(d), false) => {
-                                let frame = build_udp_reply_ethernet_frame_v6(
-                                    &s.octets(),
-                                    &d.octets(),
-                                    src_port,
-                                    flow.remote.port,
-                                    &buf[..n],
-                                );
-                                let _ = tx_out_tx.send(frame);
-                                flow.last_activity = now;
-                            }
-                            // Cross-family or mismatched flow record: drop.
-                            _ => continue,
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            break;
+                        }
+                        Err(_) => {
+                            subs_to_remove.push(*sub_key);
+                            break;
                         }
                     }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
-                    }
-                    Err(_) => {
-                        udp_to_remove.push(key);
-                        break;
-                    }
+                }
+                if now.duration_since(sub.last_activity) > udp_idle_timeout {
+                    subs_to_remove.push(*sub_key);
+                }
+            }
+            for sk in subs_to_remove {
+                if let Some(mut sub) = listener.sub_flows.remove(&sk) {
+                    let _ = poll.registry().deregister(&mut sub.upstream);
                 }
             }
 
-            if now.duration_since(flow.last_activity) > udp_idle_timeout {
-                udp_to_remove.push(key);
+            // Listener has no remaining sub-flows → reap the smoltcp socket.
+            if listener.sub_flows.is_empty() {
+                listeners_to_remove.push(lkey);
             }
         }
-        for key in udp_to_remove {
-            if let Some(mut flow) = udp_flows.remove(&key) {
-                let _ = poll.registry().deregister(&mut flow.upstream);
-                sockets.remove(flow.sock_handle);
+        for lkey in listeners_to_remove {
+            if let Some(listener) = udp_listeners.remove(&lkey) {
+                sockets.remove(listener.sock_handle);
+            }
+        }
+
+        // Drain smoltcp again so any state changes from the per-flow loops
+        // above (SYN-ACK release after `pause_synack(false)`, freshly-queued
+        // bytes from `socket.send_slice`, ACKs in response to upstream
+        // reads, FIN after `socket.close`) get serialized into outbound
+        // Ethernet frames BEFORE we sleep. Without this, those packets sit
+        // in smoltcp until the *next* poll iteration; if `poll_delay` then
+        // returns `None` (which it can for a freshly-readied listening
+        // socket whose synack was just unpaused), we'd sleep up to the
+        // fallback (previously 1 s) before the guest sees the SYN-ACK.
+        // Concurrent N-flow setup was hitting this and stretching to N×1 s.
+        loop {
+            use smoltcp::iface::PollResult;
+            match iface.poll(smol_now(), &mut device, &mut sockets) {
+                PollResult::SocketStateChanged => continue,
+                PollResult::None => break,
             }
         }
 
@@ -913,10 +981,16 @@ fn run(
         // UDP socket becomes readable (registered tokens), a TCP proxy
         // pushes data or a state change (tcp_proxy waker), or smoltcp's
         // own retransmit/keepalive timer expires.
+        //
+        // Fallback cap (10 ms, was 1 s) is defence-in-depth: if any
+        // upstream-readiness signal is ever missed by mio on a given
+        // platform (Windows IOCP edge-cases around connect completion in
+        // particular) we still re-probe within bounded latency instead
+        // of waiting an extra second per flow setup.
         let poll_delay = iface
             .poll_delay(smol_now(), &sockets)
             .map(|d| Duration::from_micros(d.total_micros()))
-            .unwrap_or(Duration::from_secs(1));
+            .unwrap_or(Duration::from_millis(10));
         events.clear();
         let _ = poll.poll(&mut events, Some(poll_delay));
     }
@@ -929,7 +1003,7 @@ fn inspect_and_register(
     frame: &[u8],
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    udp_listeners: &mut HashMap<UdpListenerKey, UdpListener>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
     io: &mut IoCtx<'_>,
@@ -953,7 +1027,7 @@ fn inspect_and_register(
                 dst_ip,
                 sockets,
                 tcp_flows,
-                udp_flows,
+                udp_listeners,
                 tx_out_tx,
                 ctx,
                 io,
@@ -972,7 +1046,16 @@ fn inspect_and_register(
                 None => return,
             };
             dispatch_l4(
-                proto, l4_payload, src_ip, dst_ip, sockets, tcp_flows, udp_flows, tx_out_tx, ctx, io,
+                proto,
+                l4_payload,
+                src_ip,
+                dst_ip,
+                sockets,
+                tcp_flows,
+                udp_listeners,
+                tx_out_tx,
+                ctx,
+                io,
             );
         }
         _ => {}
@@ -1027,7 +1110,7 @@ fn dispatch_l4(
     dst_ip: IpAddress,
     sockets: &mut SocketSet<'_>,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    udp_listeners: &mut HashMap<UdpListenerKey, UdpListener>,
     tx_out_tx: &chan::Sender<Vec<u8>>,
     ctx: &RouteCtx,
     io: &mut IoCtx<'_>,
@@ -1050,9 +1133,6 @@ fn dispatch_l4(
             if tcp_flows.contains_key(&key) {
                 return;
             }
-            // Resolve upstream destination per egress + local-service rules.
-            // Blocked + non-local destination → drop the SYN; smoltcp never
-            // listens, guest sees connection timeout / RST.
             let upstream = match ctx.resolve_tcp(key.dst_ip, key.dst_port) {
                 Some(addr) => addr,
                 None => {
@@ -1073,20 +1153,23 @@ fn dispatch_l4(
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let key = UdpKey {
-                src_ip,
-                src_port: udp.src_port(),
+            let lkey = UdpListenerKey {
                 dst_ip,
                 dst_port: udp.dst_port(),
             };
-            // If the 4-tuple is already tracked, smoltcp will deliver this
-            // packet to the existing socket in the next burst poll.  The main
-            // loop reads it from sock.recv() and forwards it upstream then.
-            // (Forwarding it here too would double-send.)
-            if udp_flows.contains_key(&key) {
+            let sub_key = UdpSubFlowKey {
+                src_ip,
+                src_port: udp.src_port(),
+            };
+            // If both the listener and the sub-flow exist, smoltcp will deliver
+            // this packet to the existing shared socket in the next burst poll;
+            // the main loop drains it then. Forwarding here would double-send.
+            if let Some(l) = udp_listeners.get(&lkey)
+                && l.sub_flows.contains_key(&sub_key)
+            {
                 return;
             }
-            register_udp_flow(key, sockets, udp_flows, ctx, io);
+            register_udp_flow(lkey, sub_key, sockets, udp_listeners, ctx, io);
             let _ = tx_out_tx;
         }
         IpProtocol::Icmp => {
@@ -1193,42 +1276,82 @@ fn register_tcp_flow(
     eprintln!("[netstack] tcp flow opened {} → {}", key.src_port, upstream);
 }
 
+/// Look up or create the shared smoltcp UDP listener for `lkey`, then
+/// add a per-guest-src sub-flow under it.
+///
+/// **Why a single shared smoltcp socket per `(dst_ip, dst_port)`:** smoltcp
+/// 0.13's interface dispatch routes inbound UDP packets to the *first*
+/// socket whose `accepts()` returns true; matching is purely by destination
+/// port. Two sockets bound to the same port silently swallow each other's
+/// traffic. We therefore keep exactly one smoltcp UDP socket per
+/// destination and demultiplex guest senders at the application layer
+/// using their (src_ip, src_port).
 fn register_udp_flow(
-    key: UdpKey,
+    lkey: UdpListenerKey,
+    sub_key: UdpSubFlowKey,
     sockets: &mut SocketSet<'_>,
-    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    udp_listeners: &mut HashMap<UdpListenerKey, UdpListener>,
     ctx: &RouteCtx,
     io: &mut IoCtx<'_>,
 ) {
-    // smoltcp UDP socket bound to key.dst_port.  With any_ip=true this catches
-    // all guest traffic to that port regardless of dst IP.  Note: two concurrent
-    // flows with the same dst_port but different src will both try to bind; the
-    // second bind fails and is logged — this is acceptable for the common case.
-    let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
-    let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 8192]);
-    let mut sock = udp::Socket::new(rx_buf, tx_buf);
-    if let Err(e) = sock.bind(key.dst_port) {
-        eprintln!("[netstack] udp bind port {}: {e}", key.dst_port);
-        return;
-    }
-    let sock_handle = sockets.add(sock);
+    // 1. Ensure the listener exists (one smoltcp socket per dst port).
+    let listener = match udp_listeners.entry(lkey) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0; 32768]);
+            let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0; 32768]);
+            let mut sock = udp::Socket::new(rx_buf, tx_buf);
+            if let Err(e) = sock.bind(lkey.dst_port) {
+                eprintln!("[netstack] udp bind port {}: {e}", lkey.dst_port);
+                return;
+            }
+            let sock_handle = sockets.add(sock);
 
-    // DNS proxy: guest queries to (gateway, 53) get redirected to the host's
-    // real resolver so the guest's /etc/resolv.conf can safely point at the
-    // gateway IP without leaking host DNS topology.
-    let is_gateway = matches!(key.dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
-        || matches!(key.dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
-    let dns_rewrite = if is_gateway && key.dst_port == 53 {
-        ctx.host_dns
-    } else {
-        None
+            // DNS proxy: guest queries to (gateway, 53) get redirected to the
+            // host's real resolver so the guest's /etc/resolv.conf can safely
+            // point at the gateway IP without leaking host DNS topology.
+            let is_gateway = matches!(lkey.dst_ip, IpAddress::Ipv4(ip) if ip == HOST_IP)
+                || matches!(lkey.dst_ip, IpAddress::Ipv6(ip) if ip == HOST_IP6);
+            let dns_rewrite = if is_gateway && lkey.dst_port == 53 {
+                ctx.host_dns
+            } else {
+                None
+            };
+
+            v.insert(UdpListener {
+                sock_handle,
+                family_v4: matches!(lkey.dst_ip, IpAddress::Ipv4(_)),
+                dns_rewrite,
+                sub_flows: HashMap::new(),
+            })
+        }
     };
 
-    // Determine the actual upstream target address and bind the socket to the
-    // matching family. When DNS proxy rewrites to a different family (e.g.
-    // guest→v4 gateway but host DNS is v6), the socket must be bound to the
-    // target family.
-    let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(key.dst_ip), key.dst_port));
+    // 2. Create the per-guest-src sub-flow with its own mio upstream socket.
+    let sub = match make_udp_subflow(io, listener.dns_rewrite, lkey) {
+        Some(s) => s,
+        None => return,
+    };
+    listener.sub_flows.insert(sub_key, sub);
+
+    eprintln!(
+        "[netstack] udp sub-flow opened {}:{} → {}:{}{}",
+        sub_key.src_ip,
+        sub_key.src_port,
+        lkey.dst_ip,
+        lkey.dst_port,
+        if listener.dns_rewrite.is_some() {
+            " (dns proxy)"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Open a mio UDP socket on the host side for one guest sub-flow.
+/// Returns `None` on bind / register failure.
+fn make_udp_subflow(io: &mut IoCtx<'_>, dns_rewrite: Option<SocketAddr>, lkey: UdpListenerKey) -> Option<UdpSubFlow> {
+    let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(lkey.dst_ip), lkey.dst_port));
     let bind_addr: SocketAddr = if upstream_dst.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -1238,45 +1361,19 @@ fn register_udp_flow(
         Ok(s) => s,
         Err(e) => {
             eprintln!("[netstack] upstream udp bind: {e}");
-            sockets.remove(sock_handle);
-            return;
+            return None;
         }
     };
     let token = io.alloc_token();
     if let Err(e) = io.registry.register(&mut upstream, token, Interest::READABLE) {
         eprintln!("[netstack] mio register udp: {e}");
-        sockets.remove(sock_handle);
-        return;
+        return None;
     }
-
-    // The initial payload is NOT forwarded here — smoltcp will deliver it to
-    // the newly-created socket in the next burst poll and the main loop will
-    // forward it then.  Forwarding here too would double-send the packet.
-
-    udp_flows.insert(
-        key,
-        UdpFlow {
-            sock_handle,
-            upstream,
-            remote: smoltcp::wire::IpEndpoint {
-                addr: key.src_ip,
-                port: key.src_port,
-            },
-            // family_v4 tracks the guest's original request family so reply
-            // frames are built in the correct format.
-            family_v4: matches!(key.dst_ip, IpAddress::Ipv4(_)),
-            last_activity: Instant::now(),
-            dns_rewrite,
-        },
-    );
-
-    eprintln!(
-        "[netstack] udp flow opened {}:{} → {}{}",
-        key.src_ip,
-        key.src_port,
-        upstream_dst,
-        if dns_rewrite.is_some() { " (dns proxy)" } else { "" }
-    );
+    Some(UdpSubFlow {
+        upstream,
+        token,
+        last_activity: Instant::now(),
+    })
 }
 
 // ─── UDP reply frame builders ───────────────────────────────────────────────
