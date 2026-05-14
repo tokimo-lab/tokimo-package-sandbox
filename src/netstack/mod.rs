@@ -422,6 +422,7 @@ struct UdpSubFlowKey {
 /// **Reaping**: in the main loop after each UDP service pass:
 ///   - `last_activity > 15 s ago` (`udp_idle_timeout`), or
 ///   - upstream `recv_from` returned a non-`WouldBlock`/`TimedOut` error
+///
 ///   → removed from `listener.sub_flows`; mio `deregister(&mut sub.upstream)`
 ///   drops the upstream UdpSocket and releases its `Token`. The `Token`
 ///   value itself (a `usize`) is never re-issued — `next_token` is

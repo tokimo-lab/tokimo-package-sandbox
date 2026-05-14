@@ -438,6 +438,242 @@ export default function () {
     );
 }
 
+/// Resource profile during a no-sleep k6 burst. Spawns a PowerShell
+/// sampler child that polls `tokimo-sandbox-svc` process metrics
+/// (WorkingSet, CPU time delta, owned TCP/UDP endpoint count) every
+/// ~500 ms while k6 runs 5 VU × 5s × no-sleep × baidu, then asserts:
+///
+///   - memory `end ≤ start + 50 MB` (no obvious leak)
+///   - host TCP/UDP socket count `end ≤ start + 2` (no socket leak)
+///   - CPU peak < 200% (double-core saturation OK; runaway is not)
+///
+/// `#[ignore]` because:
+///   - depends on external internet (baidu) like its sibling tests
+///   - assertions are conservative, not regression-grade
+///   - PowerShell sampler is Windows-only (CI Linux runners would skip
+///     `Get-Process tokimo-sandbox-svc` anyway)
+///
+/// The sampler is embedded as a PowerShell `-Command` string; each
+/// sample is one JSON object on its own line in the child's stdout.
+#[test]
+#[ignore]
+fn k6_resource_profile() {
+    let ws = workspace_dir("k6-resprof");
+    let k6_host = ensure_k6_binary().expect("provision k6 binary");
+    std::fs::copy(&k6_host, ws.join("k6")).expect("copy k6 into workspace");
+
+    let script = r#"import http from 'k6/http';
+import { check } from 'k6';
+export const options = {
+  vus: 5,
+  duration: '5s',
+};
+export default function () {
+  const res = http.get('https://www.baidu.com');
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+"#;
+    std::fs::write(ws.join("k6-test.js"), script).expect("write k6 script");
+    let _ = std::fs::remove_file(ws.join("k6-summary.json"));
+
+    // 1. Find tokimo-sandbox-svc PID before configuring the sandbox.
+    let svc_pid = find_sandbox_svc_pid().expect("locate tokimo-sandbox-svc process");
+    eprintln!("[k6-resource-profile] tokimo-sandbox-svc PID = {svc_pid}");
+
+    // 2. Spawn background sampler. Emits one JSON record per line every
+    //    ~500ms with WorkingSet, CPU times, TCP/UDP endpoint counts.
+    let sampler_script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$pidNum = {svc_pid}
+for ($i = 0; $i -lt 60; $i++) {{
+  $p = Get-Process -Id $pidNum
+  if (-not $p) {{ break }}
+  $tcp = (Get-NetTCPConnection -OwningProcess $pidNum | Measure-Object).Count
+  $udp = (Get-NetUDPEndpoint -OwningProcess $pidNum | Measure-Object).Count
+  $obj = [ordered]@{{
+    t_ms      = [int64]([datetime]::UtcNow - [datetime]'1970-01-01').TotalMilliseconds
+    ws        = [int64]$p.WorkingSet64
+    user_ms   = [int64]$p.UserProcessorTime.TotalMilliseconds
+    kernel_ms = [int64]$p.PrivilegedProcessorTime.TotalMilliseconds
+    tcp       = [int]$tcp
+    udp       = [int]$udp
+  }}
+  $obj | ConvertTo-Json -Compress
+  Start-Sleep -Milliseconds 500
+}}
+"#
+    );
+
+    let mut sampler = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &sampler_script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn powershell sampler");
+
+    // Give the sampler one full interval to record the baseline before
+    // we kick the VM.
+    std::thread::sleep(Duration::from_millis(800));
+
+    // 3. Run the same no-sleep k6 fixture as k6_no_sleep_throughput.
+    let mut cfg = config("k6-resprof");
+    cfg.cpu_count = 8;
+    cfg.memory_mb = 2048;
+    cfg.network = NetworkPolicy::AllowAll;
+
+    let sb = Sandbox::connect().expect("connect");
+    sb.configure(cfg).expect("configure");
+    let rx = sb.subscribe().expect("subscribe");
+    sb.start_vm().expect("start_vm");
+    let _guard = SandboxGuard(sb.clone());
+    let shell = sb.shell_id().expect("shell_id");
+
+    let cmd = format!(
+        "chmod +x /tmp/tokimo-share/k6 && \
+         /tmp/tokimo-share/k6 run --quiet \
+           --summary-export=/tmp/tokimo-share/k6-summary.json \
+           /tmp/tokimo-share/k6-test.js; \
+         echo K6_EXIT=$?; echo {PROBE_END}_K6RP\n"
+    );
+    sb.write_stdin(&shell, cmd.as_bytes()).unwrap();
+    let out = drain_until(&rx, &shell, &format!("{PROBE_END}_K6RP"), Duration::from_secs(60));
+    sb.stop_vm().ok();
+
+    // Tail of sampling window: let the sampler capture post-run state.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // 4. Stop sampler and collect stdout.
+    let _ = sampler.kill();
+    let sampler_out = sampler.wait_with_output().expect("collect sampler output");
+    let stdout = String::from_utf8_lossy(&sampler_out.stdout);
+    let samples: Vec<Sample> = stdout
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Sample>(l).ok()
+        })
+        .collect();
+    assert!(
+        samples.len() >= 3,
+        "expected ≥3 sampler records, got {}; stderr={}",
+        samples.len(),
+        String::from_utf8_lossy(&sampler_out.stderr)
+    );
+
+    // 5. Compute CPU% from cumulative user+kernel ms deltas.
+    let mut cpu_pcts: Vec<f64> = Vec::new();
+    for w in samples.windows(2) {
+        let dt = (w[1].t_ms - w[0].t_ms) as f64;
+        if dt <= 0.0 {
+            continue;
+        }
+        let dcpu = ((w[1].user_ms + w[1].kernel_ms) - (w[0].user_ms + w[0].kernel_ms)) as f64;
+        cpu_pcts.push(100.0 * dcpu / dt);
+    }
+    let cpu_avg = if cpu_pcts.is_empty() {
+        0.0
+    } else {
+        cpu_pcts.iter().sum::<f64>() / cpu_pcts.len() as f64
+    };
+    let cpu_peak = cpu_pcts.iter().cloned().fold(0.0_f64, f64::max);
+
+    let ws_start = samples.first().unwrap().ws;
+    let ws_end = samples.last().unwrap().ws;
+    let ws_peak = samples.iter().map(|s| s.ws).max().unwrap();
+    let tcp_start = samples.first().unwrap().tcp;
+    let tcp_end = samples.last().unwrap().tcp;
+    let tcp_peak = samples.iter().map(|s| s.tcp).max().unwrap();
+    let udp_start = samples.first().unwrap().udp;
+    let udp_end = samples.last().unwrap().udp;
+    let udp_peak = samples.iter().map(|s| s.udp).max().unwrap();
+
+    // 6. Parse k6 summary to print alongside resource numbers.
+    let summary_path = ws.join("k6-summary.json");
+    let summary_raw = std::fs::read_to_string(&summary_path).unwrap_or_default();
+    let summary: serde_json::Value = serde_json::from_str(&summary_raw).unwrap_or(serde_json::Value::Null);
+    let m = &summary["metrics"];
+    let reqs = m["http_reqs"]["count"].as_f64().unwrap_or(f64::NAN);
+    let fail = m["http_req_failed"]["fails"].as_f64().unwrap_or(f64::NAN);
+    let p95 = m["http_req_duration"]["p(95)"].as_f64().unwrap_or(f64::NAN);
+
+    let mb = |b: i64| (b as f64) / (1024.0 * 1024.0);
+    eprintln!("[k6-resource-profile] tokimo-sandbox-svc PID = {svc_pid}");
+    eprintln!(
+        "[k6-resource-profile] CPU%: avg={:.0}% peak={:.0}% samples={}",
+        cpu_avg,
+        cpu_peak,
+        cpu_pcts.len()
+    );
+    eprintln!(
+        "[k6-resource-profile] RSS: start={:.0}MB peak={:.0}MB end={:.0}MB",
+        mb(ws_start),
+        mb(ws_peak),
+        mb(ws_end)
+    );
+    eprintln!("[k6-resource-profile] host TCP sockets: start={tcp_start} peak={tcp_peak} end={tcp_end}");
+    eprintln!("[k6-resource-profile] host UDP sockets: start={udp_start} peak={udp_peak} end={udp_end}");
+    eprintln!("[k6-resource-profile] k6 stats: {reqs} reqs / {fail} fail / p95={p95:.0}ms");
+    eprintln!(
+        "[k6-resource-profile] (k6 stdout tail)\n{}",
+        out.lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // 7. Conservative assertions (CI-unfriendly → #[ignore]).
+    let leak_mb = mb(ws_end - ws_start);
+    assert!(
+        leak_mb <= 50.0,
+        "memory grew {leak_mb:.1} MB > 50 MB (start={:.0}MB end={:.0}MB)",
+        mb(ws_start),
+        mb(ws_end)
+    );
+    assert!(
+        tcp_end <= tcp_start + 2,
+        "TCP socket leak: start={tcp_start} end={tcp_end}"
+    );
+    assert!(
+        udp_end <= udp_start + 2,
+        "UDP socket leak: start={udp_start} end={udp_end}"
+    );
+    assert!(cpu_peak < 200.0, "CPU peak {cpu_peak:.0}% ≥ 200%");
+}
+
+#[derive(serde::Deserialize)]
+struct Sample {
+    t_ms: i64,
+    ws: i64,
+    user_ms: i64,
+    kernel_ms: i64,
+    tcp: u32,
+    udp: u32,
+}
+
+/// Locate the running `tokimo-sandbox-svc` PID via PowerShell. Returns
+/// `None` on non-Windows or if no such process is running.
+fn find_sandbox_svc_pid() -> Option<u32> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Process tokimo-sandbox-svc -ErrorAction SilentlyContinue | Select-Object -First 1).Id",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<u32>().ok()
+}
+
 /// Ensures the k6 amd64 binary exists under `target/integration/k6-cache/`
 /// and returns its host path. Downloads + extracts on first run, no-ops
 /// on subsequent runs.
