@@ -72,7 +72,7 @@ apt-get update -qq
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   gnupg vim nano less procps \
-  wget git jq unzip zip bzip2 xz-utils zstd \
+  wget git openssh-client jq unzip zip bzip2 xz-utils zstd \
   iputils-ping rsync \
   dnsutils ffmpeg \
   python3 python3-pip python3-venv \
