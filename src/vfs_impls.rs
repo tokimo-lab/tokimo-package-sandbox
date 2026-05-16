@@ -984,7 +984,7 @@ mod tests {
     /// FUSE mount: without `mknod` returning Ok and `stat` round-tripping
     /// the S_IFSOCK bits, AF_UNIX bind/connect on a FUSE-backed path
     /// fails with ENOSYS or ENOTSOCK.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_mknod_socket_roundtrip() {
         let dir = tempdir().unwrap();
@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     /// Same as above but for FIFOs.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_mknod_fifo_roundtrip() {
         let dir = tempdir().unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
     /// Unprivileged callers cannot create device nodes; mknod should
     /// surface EPERM (mapped to PermissionDenied) rather than silently
     /// creating a regular file.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn local_mknod_blockdev_returns_eperm() {
         let dir = tempdir().unwrap();
