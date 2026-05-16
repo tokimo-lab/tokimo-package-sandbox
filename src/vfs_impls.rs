@@ -22,6 +22,75 @@ use crate::vfs_backend::{
 };
 
 // ---------------------------------------------------------------------------
+// macOS xattr fallback for socket / FIFO nodes
+//
+// Darwin's `mknod(2)` requires root for *every* node kind, including
+// `S_IFSOCK` and `S_IFIFO`. The FUSE bridge runs as an unprivileged
+// user, so when guest code inside the Linux micro-VM does `bind(AF_UNIX)`
+// the host-side `LocalDirVfs::mknod` falls back to creating an empty
+// regular file plus a single-byte `com.tokimo.kind` extended attribute
+// recording the *logical* node type. On lookup we read the xattr back
+// and report `is_socket=true` / `is_fifo=true`, so the FUSE bridge tells
+// the Linux kernel `S_ISSOCK(inode->i_mode)` and `connect(2)` works.
+//
+// This is the moral equivalent of the `$LXMOD` NTFS EA on the Windows
+// backend — same problem (host FS has no native socket inode kind for
+// unprivileged callers), same solution (out-of-band kind marker).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod macos_kind_xattr {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const XATTR_NAME: &[u8] = b"com.tokimo.kind\0";
+    pub const KIND_SOCKET: u8 = 1;
+    pub const KIND_FIFO: u8 = 2;
+
+    fn cpath(path: &Path) -> std::io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has NUL byte"))
+    }
+
+    pub fn set(path: &Path, kind: u8) -> std::io::Result<()> {
+        let cpath = cpath(path)?;
+        let value = [kind];
+        let ret = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                XATTR_NAME.as_ptr() as *const _,
+                value.as_ptr() as *const _,
+                value.len(),
+                0, // position (only used for resource forks)
+                0, // options
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub fn get(path: &Path) -> Option<u8> {
+        let cpath = cpath(path).ok()?;
+        let mut buf = [0u8; 1];
+        let ret = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                XATTR_NAME.as_ptr() as *const _,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        if ret == 1 { Some(buf[0]) } else { None }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Path sanitisation
 // ---------------------------------------------------------------------------
 
@@ -318,6 +387,32 @@ impl VfsMknod for LocalDirVfs {
             .map_err(|e| VfsError::Io(e.to_string()))?;
             match res {
                 Ok(()) => Ok(()),
+                // macOS requires root for mknod(2) of ANY type, including
+                // S_IFSOCK and S_IFIFO. Fall back to a regular file +
+                // `com.tokimo.kind` xattr so AF_UNIX bind/connect still
+                // round-trips correctly via the FUSE bridge.
+                #[cfg(target_os = "macos")]
+                Err(nix::errno::Errno::EPERM) if matches!(sflag, SFlag::S_IFSOCK | SFlag::S_IFIFO) => {
+                    let kind_byte = if sflag == SFlag::S_IFSOCK {
+                        macos_kind_xattr::KIND_SOCKET
+                    } else {
+                        macos_kind_xattr::KIND_FIFO
+                    };
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&host)
+                        .await?;
+                    let host_for_xattr = host.clone();
+                    tokio::task::spawn_blocking(move || macos_kind_xattr::set(&host_for_xattr, kind_byte))
+                        .await
+                        .map_err(|e| VfsError::Io(e.to_string()))?
+                        .map_err(|e| {
+                            let _ = std::fs::remove_file(&host);
+                            VfsError::Io(format!("setxattr: {e}"))
+                        })?;
+                    Ok(())
+                }
                 Err(nix::errno::Errno::EPERM) => Err(VfsError::PermissionDenied),
                 Err(nix::errno::Errno::EEXIST) => Err(VfsError::AlreadyExists),
                 Err(nix::errno::Errno::ENOENT) => Err(VfsError::NotFound),
@@ -471,6 +566,20 @@ fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> 
                 k = 0o060000;
             } else if ft.is_char_device() {
                 k = 0o020000;
+            }
+            // macOS: an unprivileged FUSE host can't create real
+            // socket/FIFO inodes (mknod requires root), so we fall back
+            // to a regular file with `com.tokimo.kind` xattr. Promote
+            // the recorded kind here so consumers see `is_socket=true`.
+            #[cfg(target_os = "macos")]
+            if k == 0 && ft.is_file() {
+                if let Some(b) = macos_kind_xattr::get(path) {
+                    if b == macos_kind_xattr::KIND_SOCKET {
+                        k = 0o140000;
+                    } else if b == macos_kind_xattr::KIND_FIFO {
+                        k = 0o010000;
+                    }
+                }
             }
             (k, md.rdev() as u32)
         }
@@ -984,7 +1093,7 @@ mod tests {
     /// FUSE mount: without `mknod` returning Ok and `stat` round-tripping
     /// the S_IFSOCK bits, AF_UNIX bind/connect on a FUSE-backed path
     /// fails with ENOSYS or ENOTSOCK.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn local_mknod_socket_roundtrip() {
         let dir = tempdir().unwrap();
@@ -1001,7 +1110,7 @@ mod tests {
     }
 
     /// Same as above but for FIFOs.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn local_mknod_fifo_roundtrip() {
         let dir = tempdir().unwrap();
