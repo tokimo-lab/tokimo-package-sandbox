@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::vfs_backend::{
-    VfsBackend, VfsCopy, VfsDeleteDir, VfsDeleteFile, VfsError, VfsFileInfo, VfsMkdir, VfsMknod, VfsMove, VfsPut,
-    VfsReader, VfsReadlink, VfsRename, VfsResolveLocal, VfsResult, VfsSymlink,
+    VfsAccess, VfsBackend, VfsCopy, VfsDeleteDir, VfsDeleteFile, VfsError, VfsFileInfo, VfsLink, VfsMkdir, VfsMknod,
+    VfsMove, VfsPut, VfsReader, VfsReadlink, VfsRename, VfsResolveLocal, VfsResult, VfsSymlink, VfsXattr,
 };
 
 use super::meta::meta_to_info;
@@ -362,6 +362,126 @@ impl VfsResolveLocal for LocalDirVfs {
     }
 }
 
+#[async_trait]
+impl VfsLink for LocalDirVfs {
+    async fn hard_link(&self, src: &Path, dst: &Path) -> VfsResult<()> {
+        let s = self.host_join(src)?;
+        let d = self.host_join(dst)?;
+        tokio::task::spawn_blocking(move || std::fs::hard_link(&s, &d))
+            .await
+            .map_err(|e| VfsError::Io(e.to_string()))?
+            .map_err(VfsError::from)
+    }
+}
+
+#[async_trait]
+impl VfsXattr for LocalDirVfs {
+    async fn get_xattr(&self, path: &Path, name: &str) -> VfsResult<Vec<u8>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let host = self.host_join(path)?;
+            let name_owned = name.to_string();
+            let name_cl = name_owned.clone();
+            tokio::task::spawn_blocking(move || xattr::get(&host, &name_cl))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?
+                .map_err(VfsError::from)?
+                .ok_or_else(|| VfsError::NoData(format!("xattr {name_owned} not present")))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (path, name);
+            Err(VfsError::NotSupported("xattr".into()))
+        }
+    }
+
+    async fn set_xattr(&self, path: &Path, name: &str, value: &[u8], _flags: u32) -> VfsResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let host = self.host_join(path)?;
+            let name = name.to_string();
+            let value = value.to_vec();
+            tokio::task::spawn_blocking(move || xattr::set(&host, &name, &value))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?
+                .map_err(VfsError::from)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (path, name, value);
+            Err(VfsError::NotSupported("xattr".into()))
+        }
+    }
+
+    async fn list_xattr(&self, path: &Path) -> VfsResult<Vec<u8>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let host = self.host_join(path)?;
+            let names = tokio::task::spawn_blocking(move || xattr::list(&host))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?
+                .map_err(VfsError::from)?;
+            let mut out = Vec::new();
+            for n in names {
+                out.extend_from_slice(n.as_encoded_bytes());
+                out.push(0);
+            }
+            Ok(out)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = path;
+            Err(VfsError::NotSupported("xattr".into()))
+        }
+    }
+
+    async fn remove_xattr(&self, path: &Path, name: &str) -> VfsResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let host = self.host_join(path)?;
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || xattr::remove(&host, &name))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?
+                .map_err(VfsError::from)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (path, name);
+            Err(VfsError::NotSupported("xattr".into()))
+        }
+    }
+}
+
+#[async_trait]
+impl VfsAccess for LocalDirVfs {
+    async fn access(&self, path: &Path, mask: u32) -> VfsResult<()> {
+        let host = self.host_join(path)?;
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                use std::ffi::CString;
+                use std::os::unix::ffi::OsStrExt;
+                let c = CString::new(host.as_os_str().as_bytes())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let rc = unsafe { libc::access(c.as_ptr(), mask as i32) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mask;
+                std::fs::symlink_metadata(&host).map(|_| ())
+            }
+        })
+        .await
+        .map_err(|e| VfsError::Io(e.to_string()))?
+        .map_err(VfsError::from)
+    }
+}
+
 impl VfsBackend for LocalDirVfs {
     fn as_mkdir(&self) -> Option<&dyn VfsMkdir> {
         Some(self)
@@ -394,6 +514,15 @@ impl VfsBackend for LocalDirVfs {
         Some(self)
     }
     fn as_resolve_local(&self) -> Option<&dyn VfsResolveLocal> {
+        Some(self)
+    }
+    fn as_link(&self) -> Option<&dyn VfsLink> {
+        Some(self)
+    }
+    fn as_xattr(&self) -> Option<&dyn VfsXattr> {
+        Some(self)
+    }
+    fn as_access(&self) -> Option<&dyn VfsAccess> {
         Some(self)
     }
 }

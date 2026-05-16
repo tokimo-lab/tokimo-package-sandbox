@@ -170,3 +170,193 @@ pub(crate) fn create(
         _ => reply.error(libc::EIO),
     }
 }
+
+// ---------------------------------------------------------------------------
+// v3 fh-based ops
+// ---------------------------------------------------------------------------
+
+pub(crate) fn fsync(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    match b.dispatcher.call(Req::Fsync { fh, datasync }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fallocate(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino: u64,
+    fh: u64,
+    offset: i64,
+    length: i64,
+    mode: i32,
+    reply: ReplyEmpty,
+) {
+    match b.dispatcher.call(Req::Fallocate {
+        fh,
+        offset,
+        length,
+        mode: mode as u32,
+    }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_file_range(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino_in: u64,
+    fh_in: u64,
+    off_in: i64,
+    _ino_out: u64,
+    fh_out: u64,
+    off_out: i64,
+    len: u64,
+    flags: u32,
+    reply: fuser::ReplyWrite,
+) {
+    match b.dispatcher.call(Req::CopyFileRange {
+        fh_in,
+        off_in,
+        fh_out,
+        off_out,
+        len,
+        flags,
+    }) {
+        Res::Written { size } => reply.written(size),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn lseek(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino: u64,
+    fh: u64,
+    offset: i64,
+    whence: i32,
+    reply: fuser::ReplyLseek,
+) {
+    match b.dispatcher.call(Req::Lseek {
+        fh,
+        offset,
+        whence: whence as u32,
+    }) {
+        Res::Offset(o) => reply.offset(o),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn getlk(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino: u64,
+    fh: u64,
+    owner: u64,
+    start: u64,
+    end: u64,
+    typ: i32,
+    pid: u32,
+    reply: fuser::ReplyLock,
+) {
+    use tokimo_package_sandbox::vfs_protocol::{LockSpec, LockType};
+    let lt = match typ {
+        x if x == libc::F_RDLCK as i32 => LockType::Read,
+        x if x == libc::F_WRLCK as i32 => LockType::Write,
+        _ => LockType::Unlock,
+    };
+    match b.dispatcher.call(Req::Getlk {
+        fh,
+        owner,
+        lk: LockSpec {
+            typ: lt,
+            whence: 0,
+            start,
+            end,
+            pid,
+        },
+    }) {
+        Res::Lock(s) => {
+            let t = match s.typ {
+                LockType::Read => libc::F_RDLCK as i32,
+                LockType::Write => libc::F_WRLCK as i32,
+                LockType::Unlock => libc::F_UNLCK as i32,
+            };
+            reply.locked(s.start, s.end, t, s.pid);
+        }
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn setlk(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino: u64,
+    fh: u64,
+    owner: u64,
+    start: u64,
+    end: u64,
+    typ: i32,
+    pid: u32,
+    sleep: bool,
+    reply: ReplyEmpty,
+) {
+    use tokimo_package_sandbox::vfs_protocol::{LockSpec, LockType};
+    let lt = match typ {
+        x if x == libc::F_RDLCK as i32 => LockType::Read,
+        x if x == libc::F_WRLCK as i32 => LockType::Write,
+        _ => LockType::Unlock,
+    };
+    match b.dispatcher.call(Req::Setlk {
+        fh,
+        owner,
+        lk: LockSpec {
+            typ: lt,
+            whence: 0,
+            start,
+            end,
+            pid,
+        },
+        sleep,
+    }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ioctl(
+    b: &mut FuseBridge,
+    _r: &Request,
+    _ino: u64,
+    fh: u64,
+    flags: u32,
+    cmd: u32,
+    in_data: &[u8],
+    out_size: u32,
+    reply: fuser::ReplyIoctl,
+) {
+    match b.dispatcher.call(Req::Ioctl {
+        fh,
+        cmd,
+        arg: 0,
+        in_data: in_data.to_vec(),
+        out_size,
+        flags,
+    }) {
+        Res::Ioctl { result, data } => reply.ioctl(result, &data),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}

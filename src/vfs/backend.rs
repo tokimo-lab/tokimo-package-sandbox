@@ -67,6 +67,22 @@ pub enum VfsError {
     Timeout,
     #[error("{0}")]
     Other(String),
+    /// Operation not supported by this backend on this platform.
+    /// Maps to `ENOTSUP` (95) on the wire.
+    #[error("not supported: {0}")]
+    NotSupported(String),
+    /// Provided buffer too small (e.g. `getxattr` probe).
+    /// Maps to `ERANGE` (34).
+    #[error("out of range: {0}")]
+    OutOfRange(String),
+    /// Attribute / data not present (e.g. xattr name missing).
+    /// Maps to `ENODATA` (61).
+    #[error("no data: {0}")]
+    NoData(String),
+    /// No such device or address (e.g. `SEEK_DATA` past EOF).
+    /// Maps to `ENXIO` (6).
+    #[error("no such device or address: {0}")]
+    NoSuchDeviceOrAddress(String),
 }
 
 impl From<std::io::Error> for VfsError {
@@ -77,6 +93,7 @@ impl From<std::io::Error> for VfsError {
             ErrorKind::AlreadyExists => VfsError::AlreadyExists,
             ErrorKind::PermissionDenied => VfsError::PermissionDenied,
             ErrorKind::TimedOut => VfsError::Timeout,
+            ErrorKind::Unsupported => VfsError::NotSupported(err.to_string()),
             ErrorKind::InvalidInput | ErrorKind::InvalidData => VfsError::InvalidArgument(err.to_string()),
             _ => VfsError::Io(err.to_string()),
         }
@@ -130,6 +147,11 @@ pub struct VfsFileInfo {
     /// `st_rdev` for char/block device nodes. `0` for everything else.
     #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     pub rdev: u32,
+    /// Hard-link count (`st_nlink`). Defaults to 1. Backends that don't
+    /// track links (in-memory, etc.) can leave the default; passthrough
+    /// backends read this from host metadata so `stat -c %h` reports the
+    /// correct count after `link(2)`.
+    pub nlink: u32,
 }
 
 impl VfsFileInfo {
@@ -150,6 +172,7 @@ impl VfsFileInfo {
             modified,
             mode,
             rdev: 0,
+            nlink: 1,
         }
     }
 }
@@ -266,6 +289,33 @@ pub trait VfsResolveLocal: Send + Sync + 'static {
     fn resolve_real_path(&self, path: &Path) -> Option<PathBuf>;
 }
 
+/// Hard-link an existing path to a new path. Both paths must live under
+/// the same mount; cross-mount links return `InvalidArgument` (mapped to
+/// `EXDEV`-equivalent `EINVAL`).
+#[async_trait]
+pub trait VfsLink: Send + Sync + 'static {
+    async fn hard_link(&self, src: &Path, dst: &Path) -> VfsResult<()>;
+}
+
+/// Extended attribute capability (`*xattr(2)` family). All names are
+/// arbitrary opaque strings (the kernel pre-validates namespace prefixes
+/// on Linux).
+#[async_trait]
+pub trait VfsXattr: Send + Sync + 'static {
+    async fn get_xattr(&self, path: &Path, name: &str) -> VfsResult<Vec<u8>>;
+    async fn set_xattr(&self, path: &Path, name: &str, value: &[u8], flags: u32) -> VfsResult<()>;
+    async fn list_xattr(&self, path: &Path) -> VfsResult<Vec<u8>>;
+    async fn remove_xattr(&self, path: &Path, name: &str) -> VfsResult<()>;
+}
+
+/// `access(2)` permission probe. Implementations may consult the host
+/// kernel or the backend's own ACL model. `mask` is a bitmask of POSIX
+/// `R_OK = 4`, `W_OK = 2`, `X_OK = 1`, `F_OK = 0`.
+#[async_trait]
+pub trait VfsAccess: Send + Sync + 'static {
+    async fn access(&self, path: &Path, mask: u32) -> VfsResult<()>;
+}
+
 // ---------------------------------------------------------------------------
 // The umbrella trait
 // ---------------------------------------------------------------------------
@@ -308,6 +358,15 @@ pub trait VfsBackend: VfsReader {
         None
     }
     fn as_resolve_local(&self) -> Option<&dyn VfsResolveLocal> {
+        None
+    }
+    fn as_link(&self) -> Option<&dyn VfsLink> {
+        None
+    }
+    fn as_xattr(&self) -> Option<&dyn VfsXattr> {
+        None
+    }
+    fn as_access(&self) -> Option<&dyn VfsAccess> {
         None
     }
 }

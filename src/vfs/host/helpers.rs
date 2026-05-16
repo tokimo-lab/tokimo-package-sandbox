@@ -26,6 +26,15 @@ pub(in crate::vfs::host) fn op_is_cheap(op: &Req) -> bool {
             | Req::ReleaseDir { .. }
             | Req::Flush { .. }
             | Req::Statfs { .. }
+            | Req::Fsync { .. }
+            | Req::Fsyncdir { .. }
+            | Req::Access { .. }
+            | Req::Lseek { .. }
+            | Req::Getlk { .. }
+            | Req::Setlk { .. }
+            | Req::Bmap { .. }
+            | Req::Ioctl { .. }
+            | Req::Poll { .. }
     )
 }
 
@@ -119,7 +128,7 @@ pub(in crate::vfs::host) fn attr_from(info: &VfsFileInfo) -> AttrOut {
         blocks: info.size.div_ceil(512),
         mtime,
         mode,
-        nlink: 1,
+        nlink: info.nlink.max(1),
         uid,
         gid,
         kind,

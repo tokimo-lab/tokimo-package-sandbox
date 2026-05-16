@@ -168,4 +168,71 @@ impl FuseHost {
             Err(e) => Res::Error(errno_for(&e)),
         }
     }
+
+    /// Hard-link an existing inode (`nodeid`) into `new_parent`/`new_name`.
+    /// Both paths must live under the same mount.
+    pub(in crate::vfs::host) async fn op_link(
+        &self,
+        mount_id: u32,
+        nodeid: u64,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Res {
+        let src = match self.resolve_path(mount_id, nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let parent = match self.resolve_path(mount_id, new_parent) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        if mount.read_only {
+            return Res::Error(errno_for(&VfsError::PermissionDenied));
+        }
+        let Some(link) = mount.backend.as_link() else {
+            return Res::Error(errno_for(&VfsError::NotImplemented("link".into())));
+        };
+        let dst = Self::child_path(&parent, new_name);
+        if let Err(e) = link.hard_link(&src, &dst).await {
+            return Res::Error(errno_for(&e));
+        }
+        match mount.backend.stat(&dst).await {
+            Ok(info) => {
+                let (nid, _) = self.id_table.intern(mount_id, dst);
+                Res::Entry(EntryOut {
+                    nodeid: nid,
+                    generation: self.id_table.generation(),
+                    attr: attr_from(&info),
+                })
+            }
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
+
+    /// `access(2)`. With `default_permissions` enabled on the FUSE mount
+    /// the kernel does its own checks based on `getattr`, so this op is
+    /// rarely invoked — but implement it anyway for correctness.
+    pub(in crate::vfs::host) async fn op_access(&self, mount_id: u32, nodeid: u64, mask: u32) -> Res {
+        let path = match self.resolve_path(mount_id, nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        if let Some(a) = mount.backend.as_access() {
+            return match a.access(&path, mask).await {
+                Ok(()) => Res::Ok,
+                Err(e) => Res::Error(errno_for(&e)),
+            };
+        }
+        // Fallback: existence check via stat.
+        match mount.backend.stat(&path).await {
+            Ok(_) => Res::Ok,
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
 }

@@ -49,6 +49,7 @@ crossbeam-channel = "0.5"
 # compatible with the Debian bookworm kernel shipped in the initrd.
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 tokio-vsock = "0.7"
+xattr = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.29", features = ["process", "signal", "socket", "poll", "uio", "fs", "event", "ioctl", "term"] }
@@ -63,6 +64,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-tcp-pause-synack",
 ] }
 crossbeam-channel = "0.5"
+xattr = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros"] }

@@ -278,6 +278,52 @@ impl FuseHost {
                 target,
             } => self.op_symlink(mount_id, parent_nodeid, &name, &target).await,
             Req::Readlink { nodeid } => self.op_readlink(mount_id, nodeid).await,
+
+            // ---- v3 ----
+            Req::Link {
+                nodeid,
+                new_parent,
+                new_name,
+            } => self.op_link(mount_id, nodeid, new_parent, &new_name).await,
+            Req::Fsync { fh, datasync } => self.op_fsync(fh, datasync).await,
+            Req::Fsyncdir { fh, datasync } => self.op_fsyncdir(fh, datasync).await,
+            Req::Setxattr {
+                nodeid,
+                name,
+                value,
+                flags,
+            } => self.op_setxattr(mount_id, nodeid, &name, value, flags).await,
+            Req::Getxattr { nodeid, name, size } => self.op_getxattr(mount_id, nodeid, &name, size).await,
+            Req::Listxattr { nodeid, size } => self.op_listxattr(mount_id, nodeid, size).await,
+            Req::Removexattr { nodeid, name } => self.op_removexattr(mount_id, nodeid, &name).await,
+            Req::Access { nodeid, mask } => self.op_access(mount_id, nodeid, mask).await,
+            Req::Fallocate {
+                fh,
+                offset,
+                length,
+                mode,
+            } => self.op_fallocate(fh, offset, length, mode).await,
+            Req::CopyFileRange {
+                fh_in,
+                off_in,
+                fh_out,
+                off_out,
+                len,
+                flags,
+            } => self.op_copy_file_range(fh_in, off_in, fh_out, off_out, len, flags).await,
+            Req::Getlk { fh, owner, lk } => self.op_getlk(fh, owner, lk).await,
+            Req::Setlk { fh, owner, lk, sleep } => self.op_setlk(fh, owner, lk, sleep).await,
+            Req::Lseek { fh, offset, whence } => self.op_lseek(fh, offset, whence).await,
+            Req::Bmap { nodeid, blocksize, idx } => self.op_bmap(mount_id, nodeid, blocksize, idx).await,
+            Req::Ioctl {
+                fh,
+                cmd,
+                arg,
+                in_data,
+                out_size,
+                flags,
+            } => self.op_ioctl(fh, cmd, arg, in_data, out_size, flags).await,
+            Req::Poll { fh, events, flags } => self.op_poll(fh, events, flags).await,
         }
     }
 

@@ -255,4 +255,64 @@ mod tests {
             "unexpected err: {err:?}"
         );
     }
+
+    // ---- v3: link / access / xattrs ---------------------------------------
+
+    #[tokio::test]
+    async fn local_link_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+        vfs.as_put()
+            .unwrap()
+            .put(Path::new("/src.txt"), b"hi".to_vec())
+            .await
+            .unwrap();
+
+        let lk = vfs.as_link().expect("link cap");
+        lk.hard_link(Path::new("/src.txt"), Path::new("/dst.txt"))
+            .await
+            .unwrap();
+
+        let stat = vfs.stat(Path::new("/dst.txt")).await.unwrap();
+        assert_eq!(stat.size, 2);
+    }
+
+    #[tokio::test]
+    async fn local_access_grants_existing_file() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+        vfs.as_put().unwrap().put(Path::new("/a"), b"x".to_vec()).await.unwrap();
+
+        let ac = vfs.as_access().expect("access cap");
+        // F_OK = 0
+        ac.access(Path::new("/a"), 0).await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_xattr_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+        vfs.as_put().unwrap().put(Path::new("/x"), b"d".to_vec()).await.unwrap();
+
+        let xa = vfs.as_xattr().expect("xattr cap");
+        // tmpfs may reject user.* xattrs depending on mount options; tolerate.
+        let set = xa.set_xattr(Path::new("/x"), "user.foo", b"bar", 0).await;
+        if set.is_err() {
+            return;
+        }
+        let got = xa.get_xattr(Path::new("/x"), "user.foo").await.unwrap();
+        assert_eq!(got, b"bar");
+
+        let names = xa.list_xattr(Path::new("/x")).await.unwrap();
+        // NUL-separated names — check presence of "user.foo".
+        let contains = names
+            .split(|b| *b == 0)
+            .any(|n| n == b"user.foo");
+        assert!(contains, "names blob did not contain user.foo: {names:?}");
+
+        xa.remove_xattr(Path::new("/x"), "user.foo").await.unwrap();
+        let err = xa.get_xattr(Path::new("/x"), "user.foo").await.unwrap_err();
+        assert!(matches!(err, VfsError::NoData(_)), "expected NoData, got {err:?}");
+    }
 }

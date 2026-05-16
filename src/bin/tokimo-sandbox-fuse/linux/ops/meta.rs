@@ -167,3 +167,99 @@ pub(crate) fn statfs(b: &mut FuseBridge, _r: &Request, ino: u64, reply: ReplySta
         _ => reply.error(libc::EIO),
     }
 }
+
+// ---------------------------------------------------------------------------
+// v3 ops: fsyncdir, xattrs, bmap
+// ---------------------------------------------------------------------------
+
+pub(crate) fn fsyncdir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
+    match b.dispatcher.call(Req::Fsyncdir { fh, datasync }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn setxattr(
+    b: &mut FuseBridge,
+    _r: &Request,
+    ino: u64,
+    name: &OsStr,
+    value: &[u8],
+    flags: i32,
+    _position: u32,
+    reply: fuser::ReplyEmpty,
+) {
+    let n = match name.to_str() {
+        Some(s) => s.to_string(),
+        None => return reply.error(libc::EINVAL),
+    };
+    match b.dispatcher.call(Req::Setxattr {
+        nodeid: ino,
+        name: n,
+        value: value.to_vec(),
+        flags: flags as u32,
+    }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn getxattr(
+    b: &mut FuseBridge,
+    _r: &Request,
+    ino: u64,
+    name: &OsStr,
+    size: u32,
+    reply: fuser::ReplyXattr,
+) {
+    let n = match name.to_str() {
+        Some(s) => s.to_string(),
+        None => return reply.error(libc::EINVAL),
+    };
+    match b.dispatcher.call(Req::Getxattr {
+        nodeid: ino,
+        name: n,
+        size,
+    }) {
+        Res::XattrSize(sz) => reply.size(sz),
+        Res::Bytes(data) => reply.data(&data),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn listxattr(b: &mut FuseBridge, _r: &Request, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+    match b.dispatcher.call(Req::Listxattr { nodeid: ino, size }) {
+        Res::XattrSize(sz) => reply.size(sz),
+        Res::XattrList(data) => reply.data(&data),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn removexattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+    let n = match name.to_str() {
+        Some(s) => s.to_string(),
+        None => return reply.error(libc::EINVAL),
+    };
+    match b.dispatcher.call(Req::Removexattr { nodeid: ino, name: n }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn bmap(b: &mut FuseBridge, _r: &Request, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
+    match b.dispatcher.call(Req::Bmap {
+        nodeid: ino,
+        blocksize,
+        idx,
+    }) {
+        Res::BmapBlock(block) => reply.bmap(block),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}

@@ -26,7 +26,19 @@ use crate::vfs_backend::VfsError;
 ///   - [`Req::Mknod`] op for AF_UNIX socket / FIFO / device-node creation.
 ///   - [`NodeKind`] extended with `Socket`, `Fifo`, `BlockDev`, `CharDev`.
 ///   - [`AttrOut::rdev`] field for char/block devices.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 (added in tokimo-sandbox 0.x):
+///   - [`Req::Link`] / [`Req::Fsync`] / [`Req::Fsyncdir`] / [`Req::Access`]
+///   - [`Req::Setxattr`] / [`Req::Getxattr`] / [`Req::Listxattr`] /
+///     [`Req::Removexattr`] (and responses [`Res::XattrSize`] /
+///     [`Res::XattrList`]).
+///   - [`Req::Fallocate`] / [`Req::CopyFileRange`] / [`Req::Lseek`] /
+///     [`Req::Bmap`] / [`Req::Ioctl`] / [`Req::Poll`].
+///   - [`Req::Getlk`] / [`Req::Setlk`] plus [`LockSpec`] / [`LockType`].
+///   - [`Errno`] extended with `Enxio`, `Erange`, `Enodata`, `Enotsup`.
+///   - [`VfsError`] extended with `NotSupported`, `OutOfRange`, `NoData`,
+///     `NoSuchDeviceOrAddress`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum payload size (excluding the 4-byte length prefix). Sized to
 /// hold a 1 MiB read with metadata overhead.
@@ -248,6 +260,150 @@ pub enum Req {
     Readlink {
         nodeid: u64,
     },
+
+    // ---- v3 ----
+    /// Create a hard link `new_name` under `new_parent` pointing at
+    /// the same inode as `nodeid`. Response: [`Res::Entry`]. Backends
+    /// without hard-link support reply `Errno::Enosys`. Cross-mount
+    /// links return `Errno::Exdev`-equivalent (`Einval`).
+    Link {
+        nodeid: u64,
+        new_parent: u64,
+        new_name: String,
+    },
+
+    /// Flush in-flight data for an open file. `datasync = true` ⇒ data
+    /// only (POSIX `fdatasync`); `false` ⇒ data + metadata. Backends
+    /// that have no concept of dirty data reply `Res::Ok` directly.
+    Fsync {
+        fh: u64,
+        datasync: bool,
+    },
+
+    /// Like [`Req::Fsync`] but for an open directory handle.
+    Fsyncdir {
+        fh: u64,
+        datasync: bool,
+    },
+
+    /// Set an extended attribute. `flags` follows Linux `setxattr(2)`
+    /// (`XATTR_CREATE`/`XATTR_REPLACE`). Response: [`Res::Ok`].
+    Setxattr {
+        nodeid: u64,
+        name: String,
+        value: Vec<u8>,
+        flags: u32,
+    },
+
+    /// Get an extended attribute. If `size == 0` the host replies with
+    /// [`Res::XattrSize`] reporting the required buffer size. Otherwise
+    /// the host replies with [`Res::Bytes`] containing the value (or
+    /// `Errno::Erange` if `size` is too small).
+    Getxattr {
+        nodeid: u64,
+        name: String,
+        size: u32,
+    },
+
+    /// List extended attribute names. Same size/probe protocol as
+    /// [`Req::Getxattr`]: `size == 0` ⇒ [`Res::XattrSize`]; otherwise
+    /// [`Res::XattrList`] with NUL-separated names.
+    Listxattr {
+        nodeid: u64,
+        size: u32,
+    },
+
+    Removexattr {
+        nodeid: u64,
+        name: String,
+    },
+
+    /// Permission probe (`access(2)`). `mask` is a bitmask of `R_OK`,
+    /// `W_OK`, `X_OK`. Response: [`Res::Ok`] when access is permitted,
+    /// [`Res::Error`] otherwise.
+    Access {
+        nodeid: u64,
+        mask: u32,
+    },
+
+    /// Preallocate or punch a hole in an open file. `mode` follows
+    /// `fallocate(2)` (`FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_PUNCH_HOLE`,
+    /// ...). Linux-only; other platforms reply `Errno::Enotsup`.
+    Fallocate {
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: u32,
+    },
+
+    /// Server-side range copy between two open files of the same mount.
+    /// On Linux this maps to `copy_file_range(2)`; other platforms reply
+    /// `Errno::Enotsup`. Response: [`Res::Written`].
+    CopyFileRange {
+        fh_in: u64,
+        off_in: i64,
+        fh_out: u64,
+        off_out: i64,
+        len: u64,
+        flags: u32,
+    },
+
+    /// Probe for a conflicting lock. Response: [`Res::Lock`] echoing
+    /// the existing conflict (or `LockType::Unlock` when the range is
+    /// free).
+    Getlk {
+        fh: u64,
+        owner: u64,
+        lk: LockSpec,
+    },
+
+    /// Acquire / release a lock on the open file. `sleep == true` ⇒
+    /// blocking variant (`F_OFD_SETLKW`); otherwise non-blocking
+    /// (`F_OFD_SETLK`). Response: [`Res::Ok`] or [`Res::Error`]
+    /// (`Eagain`/`Eintr`/`Edeadlk`).
+    Setlk {
+        fh: u64,
+        owner: u64,
+        lk: LockSpec,
+        sleep: bool,
+    },
+
+    /// `lseek(2)` SEEK_DATA / SEEK_HOLE on a sparse file. `whence`
+    /// follows the kernel constants (`SEEK_SET=0`, `SEEK_CUR=1`,
+    /// `SEEK_END=2`, `SEEK_DATA=3`, `SEEK_HOLE=4`). Response:
+    /// [`Res::Offset`].
+    Lseek {
+        fh: u64,
+        offset: i64,
+        whence: u32,
+    },
+
+    /// Block map (block-device backed filesystems). Almost always
+    /// `Errno::Enosys` — our FUSE mounts are never `blkdev`.
+    Bmap {
+        nodeid: u64,
+        blocksize: u32,
+        idx: u64,
+    },
+
+    /// Pass-through ioctl on an open file. Almost always
+    /// `Errno::Enotsup` — we don't trust arbitrary host ioctls.
+    Ioctl {
+        fh: u64,
+        cmd: u32,
+        arg: u64,
+        in_data: Vec<u8>,
+        out_size: u32,
+        flags: u32,
+    },
+
+    /// Poll an open file for readiness. Almost always `Errno::Enosys`
+    /// — FUSE clients fall back to local polling.
+    Poll {
+        fh: u64,
+        events: u32,
+        flags: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +428,45 @@ pub enum Res {
     Statfs(StatfsOut),
     /// Symlink target string (response to [`Req::Readlink`]).
     Linkname(String),
+
+    // ---- v3 ----
+    /// Size probe reply for [`Req::Getxattr`] / [`Req::Listxattr`] with
+    /// `size == 0`.
+    XattrSize(u32),
+    /// NUL-separated xattr names (response to [`Req::Listxattr`] with
+    /// `size > 0`).
+    XattrList(Vec<u8>),
+    /// Lock probe reply (response to [`Req::Getlk`]).
+    Lock(LockSpec),
+    /// File offset reply (response to [`Req::Lseek`]).
+    Offset(i64),
+    /// Block-map reply (response to [`Req::Bmap`]).
+    BmapBlock(u64),
+    /// Ioctl reply: `result` is the integer return value, `data` is the
+    /// out buffer (may be empty).
+    Ioctl { result: i32, data: Vec<u8> },
+    /// Poll reply (response to [`Req::Poll`]).
+    Poll { revents: u32 },
+}
+
+/// Lock range / type used by [`Req::Getlk`] / [`Req::Setlk`] /
+/// [`Res::Lock`]. `whence` is informational and follows POSIX
+/// (`SEEK_SET = 0`). On the host we always serialise to absolute
+/// offsets before any syscall.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockSpec {
+    pub typ: LockType,
+    pub whence: u32,
+    pub start: u64,
+    pub end: u64,
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockType {
+    Read,
+    Write,
+    Unlock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +565,7 @@ pub enum Errno {
     Eperm = 1,
     Enoent = 2,
     Eio = 5,
+    Enxio = 6,
     Eacces = 13,
     Eexist = 17,
     Enotdir = 20,
@@ -379,6 +575,12 @@ pub enum Errno {
     Enosys = 38,
     Etimedout = 110,
     Enotempty = 39,
+    /// `ERANGE` — passed buffer too small (getxattr/listxattr probe).
+    Erange = 34,
+    /// `ENODATA` — xattr not present.
+    Enodata = 61,
+    /// `ENOTSUP` — operation not supported on this backend / platform.
+    Enotsup = 95,
 }
 
 /// Map a [`VfsError`] to the wire error.
@@ -388,6 +590,10 @@ pub fn errno_for(err: &VfsError) -> WireError {
         VfsError::AlreadyExists => (Errno::Eexist, err.to_string()),
         VfsError::PermissionDenied | VfsError::Unauthorized => (Errno::Eacces, err.to_string()),
         VfsError::NotImplemented(_) => (Errno::Enosys, err.to_string()),
+        VfsError::NotSupported(_) => (Errno::Enotsup, err.to_string()),
+        VfsError::OutOfRange(_) => (Errno::Erange, err.to_string()),
+        VfsError::NoData(_) => (Errno::Enodata, err.to_string()),
+        VfsError::NoSuchDeviceOrAddress(_) => (Errno::Enxio, err.to_string()),
         VfsError::IsDir => (Errno::Eisdir, err.to_string()),
         VfsError::NotDir => (Errno::Enotdir, err.to_string()),
         VfsError::InvalidArgument(_) => (Errno::Einval, err.to_string()),
@@ -506,6 +712,10 @@ mod tests {
             VfsError::Unauthorized,
             VfsError::Timeout,
             VfsError::Other("o".into()),
+            VfsError::NotSupported("ns".into()),
+            VfsError::OutOfRange("r".into()),
+            VfsError::NoData("nd".into()),
+            VfsError::NoSuchDeviceOrAddress("nx".into()),
         ] {
             let we = errno_for(&v);
             assert!(we.errno > 0, "{:?} → 0", v);
@@ -524,5 +734,83 @@ mod tests {
         assert!(bytes.len() < MAX_FRAME_BYTES as usize);
         // postcard varint length encoding adds <8 bytes overhead
         assert!(bytes.len() < MAX_IO_CHUNK + 64);
+    }
+
+    #[test]
+    fn v3_req_res_roundtrip() {
+        let reqs = [
+            Req::Link {
+                nodeid: 7,
+                new_parent: 1,
+                new_name: "h".into(),
+            },
+            Req::Fsync { fh: 9, datasync: true },
+            Req::Setxattr {
+                nodeid: 1,
+                name: "user.foo".into(),
+                value: b"bar".to_vec(),
+                flags: 0,
+            },
+            Req::Getxattr {
+                nodeid: 1,
+                name: "user.foo".into(),
+                size: 0,
+            },
+            Req::Fallocate {
+                fh: 1,
+                offset: 0,
+                length: 4096,
+                mode: 0,
+            },
+            Req::Lseek {
+                fh: 1,
+                offset: 0,
+                whence: 3,
+            },
+        ];
+        for r in reqs {
+            let f = Frame::Request {
+                req_id: 1,
+                mount_id: 0,
+                op: r.clone(),
+            };
+            let bytes = postcard::to_allocvec(&f).unwrap();
+            let back: Frame = postcard::from_bytes(&bytes).unwrap();
+            match back {
+                Frame::Request { op, .. } => {
+                    // Just confirm same discriminant via Debug.
+                    assert_eq!(format!("{:?}", op), format!("{:?}", r));
+                }
+                _ => panic!("expected request frame"),
+            }
+        }
+
+        let resps = [
+            Res::XattrSize(42),
+            Res::XattrList(b"user.a\0user.b\0".to_vec()),
+            Res::Lock(LockSpec {
+                typ: LockType::Read,
+                whence: 0,
+                start: 0,
+                end: 100,
+                pid: 1,
+            }),
+            Res::Offset(4096),
+            Res::BmapBlock(0),
+            Res::Ioctl {
+                result: 0,
+                data: vec![1, 2, 3],
+            },
+            Res::Poll { revents: 0 },
+        ];
+        for r in resps {
+            let f = Frame::Response {
+                req_id: 1,
+                result: r.clone(),
+            };
+            let bytes = postcard::to_allocvec(&f).unwrap();
+            let back: Frame = postcard::from_bytes(&bytes).unwrap();
+            assert!(matches!(back, Frame::Response { .. }));
+        }
     }
 }

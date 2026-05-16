@@ -270,4 +270,134 @@ impl Filesystem for FuseBridge {
     fn statfs(&mut self, r: &Request, ino: u64, reply: ReplyStatfs) {
         ops::meta::statfs(self, r, ino, reply)
     }
+
+    // ----- v3 ops -----
+
+    fn link(&mut self, r: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        ops::mutate::link(self, r, ino, newparent, newname, reply)
+    }
+
+    fn access(&mut self, r: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+        ops::mutate::access(self, r, ino, mask, reply)
+    }
+
+    fn fsync(&mut self, r: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        ops::file::fsync(self, r, ino, fh, datasync, reply)
+    }
+
+    fn fsyncdir(&mut self, r: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        ops::meta::fsyncdir(self, r, ino, fh, datasync, reply)
+    }
+
+    fn setxattr(
+        &mut self,
+        r: &Request,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        ops::meta::setxattr(self, r, ino, name, value, flags, position, reply)
+    }
+
+    fn getxattr(&mut self, r: &Request, ino: u64, name: &OsStr, size: u32, reply: fuser::ReplyXattr) {
+        ops::meta::getxattr(self, r, ino, name, size, reply)
+    }
+
+    fn listxattr(&mut self, r: &Request, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        ops::meta::listxattr(self, r, ino, size, reply)
+    }
+
+    fn removexattr(&mut self, r: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        ops::meta::removexattr(self, r, ino, name, reply)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate(
+        &mut self,
+        r: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        ops::file::fallocate(self, r, ino, fh, offset, length, mode, reply)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &mut self,
+        r: &Request,
+        ino_in: u64,
+        fh_in: u64,
+        off_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        off_out: i64,
+        len: u64,
+        flags: u32,
+        reply: ReplyWrite,
+    ) {
+        ops::file::copy_file_range(self, r, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags, reply)
+    }
+
+    fn lseek(&mut self, r: &Request, ino: u64, fh: u64, offset: i64, whence: i32, reply: fuser::ReplyLseek) {
+        ops::file::lseek(self, r, ino, fh, offset, whence, reply)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn getlk(
+        &mut self,
+        r: &Request,
+        ino: u64,
+        fh: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        ops::file::getlk(self, r, ino, fh, owner, start, end, typ, pid, reply)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setlk(
+        &mut self,
+        r: &Request,
+        ino: u64,
+        fh: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        ops::file::setlk(self, r, ino, fh, owner, start, end, typ, pid, sleep, reply)
+    }
+
+    fn bmap(&mut self, r: &Request, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
+        ops::meta::bmap(self, r, ino, blocksize, idx, reply)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &mut self,
+        r: &Request,
+        ino: u64,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        ops::file::ioctl(self, r, ino, fh, flags, cmd, in_data, out_size, reply)
+    }
 }

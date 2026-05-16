@@ -135,6 +135,26 @@ pub(super) fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Me
     // inodes (socket/fifo/dev) are not directories even though the
     // host metadata's "is_dir" can never be true for them anyway.
     let is_special = is_socket || is_fifo || is_block_device || is_char_device;
+    let nlink: u32 = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            md.nlink() as u32
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            // Windows: number_of_links is unavailable on Metadata; FUSE
+            // hosts on Windows don't expose link(2) as a fast path, so
+            // a default of 1 is correct for non-hard-linked files.
+            let _ = &md;
+            1
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            1
+        }
+    };
     VfsFileInfo {
         name,
         size: md.len(),
@@ -147,5 +167,6 @@ pub(super) fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Me
         modified: md.modified().ok(),
         mode,
         rdev: kind_rdev,
+        nlink,
     }
 }

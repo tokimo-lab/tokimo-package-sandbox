@@ -116,3 +116,40 @@ pub(crate) fn symlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsSt
         _ => reply.error(libc::EIO),
     }
 }
+
+pub(crate) fn link(
+    b: &mut FuseBridge,
+    _r: &Request,
+    ino: u64,
+    newparent: u64,
+    newname: &OsStr,
+    reply: ReplyEntry,
+) {
+    let n = match newname.to_str() {
+        Some(s) => s.to_string(),
+        None => return reply.error(libc::EINVAL),
+    };
+    match b.dispatcher.call(Req::Link {
+        nodeid: ino,
+        new_parent: newparent,
+        new_name: n,
+    }) {
+        Res::Entry(e) => {
+            let attr = entry_to_attr(&e);
+            reply.entry(&TTL, &attr, e.generation);
+        }
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
+
+pub(crate) fn access(b: &mut FuseBridge, _r: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+    match b.dispatcher.call(Req::Access {
+        nodeid: ino,
+        mask: mask as u32,
+    }) {
+        Res::Ok => reply.ok(),
+        Res::Error(we) => reply.error(errno_of(&we)),
+        _ => reply.error(libc::EIO),
+    }
+}
