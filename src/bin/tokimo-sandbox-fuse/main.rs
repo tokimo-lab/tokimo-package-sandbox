@@ -434,6 +434,10 @@ mod linux {
             NodeKind::File => FileType::RegularFile,
             NodeKind::Dir => FileType::Directory,
             NodeKind::Symlink => FileType::Symlink,
+            NodeKind::Socket => FileType::Socket,
+            NodeKind::Fifo => FileType::NamedPipe,
+            NodeKind::BlockDev => FileType::BlockDevice,
+            NodeKind::CharDev => FileType::CharDevice,
         };
         let to_st = |secs: i64| {
             if secs > 0 {
@@ -462,7 +466,7 @@ mod linux {
             //    makes the mount unwritable from inside the sandbox.
             uid: OWNER_UID.load(std::sync::atomic::Ordering::Relaxed),
             gid: OWNER_GID.load(std::sync::atomic::Ordering::Relaxed),
-            rdev: 0,
+            rdev: a.rdev,
             blksize: 4096,
             flags: 0,
         }
@@ -647,6 +651,10 @@ mod linux {
                             NodeKind::Dir => FileType::Directory,
                             NodeKind::Symlink => FileType::Symlink,
                             NodeKind::File => FileType::RegularFile,
+                            NodeKind::Socket => FileType::Socket,
+                            NodeKind::Fifo => FileType::NamedPipe,
+                            NodeKind::BlockDev => FileType::BlockDevice,
+                            NodeKind::CharDev => FileType::CharDevice,
                         };
                         // ReplyDirectory::add returns true if buffer full.
                         if reply.add(e.nodeid, e.offset as i64, kind, e.name) {
@@ -792,6 +800,30 @@ mod linux {
                 parent_nodeid: parent,
                 name: n,
                 mode,
+            }) {
+                Res::Entry(e) => {
+                    let attr = entry_to_attr(&e);
+                    reply.entry(&TTL, &attr, e.generation);
+                }
+                Res::Error(we) => reply.error(errno_of(&we)),
+                _ => reply.error(libc::EIO),
+            }
+        }
+
+        /// `mknod(2)` — the kernel invokes this for `bind(2)` of AF_UNIX
+        /// sockets, `mkfifo(3)`, and device-node creation. The `mode`
+        /// argument arrives with `S_IFMT` already encoded so the host
+        /// VFS knows which kind of inode to materialise.
+        fn mknod(&mut self, _r: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, rdev: u32, reply: ReplyEntry) {
+            let n = match name.to_str() {
+                Some(s) => s.to_string(),
+                None => return reply.error(libc::EINVAL),
+            };
+            match self.dispatcher.call(Req::Mknod {
+                parent_nodeid: parent,
+                name: n,
+                mode,
+                rdev,
             }) {
                 Res::Entry(e) => {
                     let attr = entry_to_attr(&e);

@@ -21,7 +21,12 @@ use crate::vfs_backend::VfsError;
 
 /// Bumped on any breaking shape change. Both sides validate this in the
 /// `Hello` exchange.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (added in tokimo-sandbox 0.x):
+///   - [`Req::Mknod`] op for AF_UNIX socket / FIFO / device-node creation.
+///   - [`NodeKind`] extended with `Socket`, `Fifo`, `BlockDev`, `CharDev`.
+///   - [`AttrOut::rdev`] field for char/block devices.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum payload size (excluding the 4-byte length prefix). Sized to
 /// hold a 1 MiB read with metadata overhead.
@@ -177,6 +182,23 @@ pub enum Req {
         name: String,
         mode: u32,
     },
+    /// Create a non-regular, non-directory inode (Unix domain socket,
+    /// FIFO, or device node). The `mode` includes the S_IFMT bits
+    /// (S_IFSOCK / S_IFIFO / S_IFCHR / S_IFBLK) which the host inspects
+    /// to pick the right creation primitive. `rdev` is meaningful only
+    /// for `S_IFCHR` / `S_IFBLK` (ignored for socket/fifo). Hosts that
+    /// can't create the requested type respond with `Errno::Enosys` or
+    /// `Errno::Eperm` (e.g. char/block devs without `CAP_MKNOD`).
+    ///
+    /// Added in protocol v2. The most common driver is AF_UNIX
+    /// `bind(2)` on a FUSE-backed path, which the kernel translates
+    /// into `FUSE_MKNOD` with `mode = S_IFSOCK | <perm>`.
+    Mknod {
+        parent_nodeid: u64,
+        name: String,
+        mode: u32,
+        rdev: u32,
+    },
     /// Create an empty regular file. Returns an entry the guest can
     /// immediately Open. Added in protocol v1.1 — host stubs that don't
     /// support it should respond with `Errno::Enosys` so the kernel
@@ -269,6 +291,10 @@ pub struct AttrOut {
     pub uid: u32,
     pub gid: u32,
     pub kind: NodeKind,
+    /// Device id for char/block device nodes. `0` for every other kind.
+    /// Added in protocol v2.
+    #[serde(default)]
+    pub rdev: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -276,6 +302,14 @@ pub enum NodeKind {
     File,
     Dir,
     Symlink,
+    /// AF_UNIX socket on-disk inode (S_IFSOCK).
+    Socket,
+    /// Named pipe / FIFO (S_IFIFO).
+    Fifo,
+    /// Block device node (S_IFBLK).
+    BlockDev,
+    /// Character device node (S_IFCHR).
+    CharDev,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +484,7 @@ mod tests {
                     uid: 0,
                     gid: 0,
                     kind: NodeKind::File,
+                    rdev: 0,
                 },
             }),
         };

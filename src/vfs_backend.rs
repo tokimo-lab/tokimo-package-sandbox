@@ -109,10 +109,49 @@ pub struct VfsFileInfo {
     /// can ignore this and leave it `false`.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub is_symlink: bool,
+    /// `true` if this entry is an AF_UNIX socket on-disk inode
+    /// (`S_IFSOCK`). Created via [`VfsMknod`]. The flag is mutually
+    /// exclusive with `is_dir` / `is_symlink` / `is_fifo` / `is_*_device`.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    pub is_socket: bool,
+    /// `true` if this entry is a named pipe / FIFO (`S_IFIFO`).
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    pub is_fifo: bool,
+    /// `true` if this entry is a block device node (`S_IFBLK`).
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    pub is_block_device: bool,
+    /// `true` if this entry is a character device node (`S_IFCHR`).
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    pub is_char_device: bool,
     pub modified: Option<SystemTime>,
     /// POSIX mode bits (lower 12). `None` → bridge picks 0o755 (dir) or
     /// 0o644 (file).
     pub mode: Option<u32>,
+    /// `st_rdev` for char/block device nodes. `0` for everything else.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+    pub rdev: u32,
+}
+
+impl VfsFileInfo {
+    /// Construct a default `VfsFileInfo` carrying just the common fields
+    /// (`name`/`size`/`is_dir`/`mode`/`modified`). All special-inode
+    /// flags default to `false` / `0`. Intended for in-memory backends
+    /// where socket/FIFO/device nodes don't apply.
+    pub fn basic(name: String, size: u64, is_dir: bool, mode: Option<u32>, modified: Option<SystemTime>) -> Self {
+        Self {
+            name,
+            size,
+            is_dir,
+            is_symlink: false,
+            is_socket: false,
+            is_fifo: false,
+            is_block_device: false,
+            is_char_device: false,
+            modified,
+            mode,
+            rdev: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +220,22 @@ pub trait VfsReadlink: Send + Sync + 'static {
     async fn readlink(&self, link_path: &Path) -> VfsResult<String>;
 }
 
+/// Create a non-regular, non-directory inode (Unix domain socket, FIFO,
+/// or device node). `mode` includes the `S_IFMT` bits — the
+/// implementation inspects them to choose the right creation primitive
+/// (`mknod(2)` on Unix; an empty file with `$LXMOD` EA on Windows for
+/// sockets/FIFOs since NTFS has no native S_IFSOCK/S_IFIFO inode type).
+///
+/// `rdev` is meaningful only when `mode & S_IFMT` is `S_IFCHR` or
+/// `S_IFBLK`. Implementations that cannot create the requested kind
+/// return `VfsError::NotImplemented` (mapped to `ENOSYS` on the wire).
+/// Block/char-device creation typically requires `CAP_MKNOD` and will
+/// return `PermissionDenied` (→ `EPERM`) when the host runs unprivileged.
+#[async_trait]
+pub trait VfsMknod: Send + Sync + 'static {
+    async fn mknod(&self, path: &Path, mode: u32, rdev: u32) -> VfsResult<()>;
+}
+
 #[async_trait]
 pub trait VfsMove: Send + Sync + 'static {
     async fn move_file(&self, from: &Path, to_dir: &Path) -> VfsResult<()>;
@@ -235,6 +290,9 @@ pub trait VfsBackend: VfsReader {
         None
     }
     fn as_readlink(&self) -> Option<&dyn VfsReadlink> {
+        None
+    }
+    fn as_mknod(&self) -> Option<&dyn VfsMknod> {
         None
     }
     fn as_move(&self) -> Option<&dyn VfsMove> {

@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::vfs_backend::{
-    VfsBackend, VfsCopy, VfsDeleteDir, VfsDeleteFile, VfsError, VfsFileInfo, VfsMkdir, VfsMove, VfsPut, VfsReader,
-    VfsReadlink, VfsRename, VfsResolveLocal, VfsResult, VfsSymlink,
+    VfsBackend, VfsCopy, VfsDeleteDir, VfsDeleteFile, VfsError, VfsFileInfo, VfsMkdir, VfsMknod, VfsMove, VfsPut,
+    VfsReader, VfsReadlink, VfsRename, VfsResolveLocal, VfsResult, VfsSymlink,
 };
 
 // ---------------------------------------------------------------------------
@@ -280,6 +280,108 @@ impl VfsPut for LocalDirVfs {
     }
 }
 
+#[async_trait]
+impl VfsMknod for LocalDirVfs {
+    async fn mknod(&self, path: &Path, mode: u32, rdev: u32) -> VfsResult<()> {
+        let host = self.host_join(path)?;
+        let kind_bits = mode & 0o170000;
+        let perm_bits = mode & 0o7777;
+        #[cfg(unix)]
+        {
+            use nix::sys::stat::{Mode, SFlag, mknod as nix_mknod};
+            // Map S_IFMT → nix::SFlag. Reject unsupported kinds explicitly.
+            let sflag = match kind_bits {
+                0o140000 => SFlag::S_IFSOCK,
+                0o010000 => SFlag::S_IFIFO,
+                0o060000 => SFlag::S_IFBLK,
+                0o020000 => SFlag::S_IFCHR,
+                // Regular file (S_IFREG=0o100000) — fall through to a normal create.
+                0o100000 | 0 => {
+                    let _ = (rdev, perm_bits);
+                    tokio::fs::write(&host, &[] as &[u8]).await?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(VfsError::InvalidArgument(format!(
+                        "mknod: unsupported S_IFMT bits 0o{:o}",
+                        kind_bits
+                    )));
+                }
+            };
+            // mknod(2) is blocking; offload to spawn_blocking.
+            let host_cl = host.clone();
+            let res = tokio::task::spawn_blocking(move || -> nix::Result<()> {
+                let m = Mode::from_bits_truncate(perm_bits);
+                nix_mknod(&host_cl, sflag, m, rdev as nix::libc::dev_t)
+            })
+            .await
+            .map_err(|e| VfsError::Io(e.to_string()))?;
+            match res {
+                Ok(()) => Ok(()),
+                Err(nix::errno::Errno::EPERM) => Err(VfsError::PermissionDenied),
+                Err(nix::errno::Errno::EEXIST) => Err(VfsError::AlreadyExists),
+                Err(nix::errno::Errno::ENOENT) => Err(VfsError::NotFound),
+                Err(e) => Err(VfsError::Io(format!("mknod: {e}"))),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use crate::windows::ntfs_mode::{FileKind, volume_supports_ea, write_mode_ea};
+            // NTFS has no native socket/fifo/dev inode type. For sockets
+            // and FIFOs we create an empty regular file and persist the
+            // S_IFMT bits in the `$LXMOD` EA so subsequent stat()s
+            // continue to report the right NodeKind. Without the EA
+            // (non-NTFS volume), or for block/char devices, return
+            // ENOSYS — guest code that needs real device nodes has no
+            // sensible Windows fallback anyway.
+            let host_cl = host.clone();
+            let kind = match kind_bits {
+                0o140000 => FileKind::Socket,
+                0o010000 => FileKind::Fifo,
+                0o100000 | 0 => {
+                    // Plain regular file.
+                    tokio::fs::write(&host, &[] as &[u8]).await?;
+                    return Ok(());
+                }
+                0o060000 | 0o020000 => return Err(VfsError::PermissionDenied),
+                _ => {
+                    return Err(VfsError::InvalidArgument(format!(
+                        "mknod: unsupported S_IFMT bits 0o{:o}",
+                        kind_bits
+                    )));
+                }
+            };
+            // Create the placeholder file (must not exist yet).
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&host)
+                .await?;
+            // Persist the type + perm bits via $LXMOD EA. Without EA
+            // support the inode silently degrades to a regular file —
+            // surface that as ENOSYS so callers know AF_UNIX won't work.
+            if !volume_supports_ea(&host_cl) {
+                let _ = tokio::fs::remove_file(&host).await;
+                return Err(VfsError::NotImplemented(
+                    "mknod: volume does not support extended attributes".into(),
+                ));
+            }
+            let _ = rdev;
+            let host_for_blocking = host.clone();
+            tokio::task::spawn_blocking(move || write_mode_ea(&host_for_blocking, perm_bits, kind))
+                .await
+                .map_err(|e| VfsError::Io(e.to_string()))?
+                .map_err(|e| VfsError::Io(format!("write_mode_ea: {e}")))?;
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (host, mode, rdev, kind_bits, perm_bits);
+            Err(VfsError::NotImplemented("mknod".into()))
+        }
+    }
+}
+
 impl VfsResolveLocal for LocalDirVfs {
     fn resolve_real_path(&self, path: &Path) -> Option<PathBuf> {
         sanitize(path).ok()?;
@@ -315,6 +417,9 @@ impl VfsBackend for LocalDirVfs {
     fn as_put(&self) -> Option<&dyn VfsPut> {
         Some(self)
     }
+    fn as_mknod(&self) -> Option<&dyn VfsMknod> {
+        Some(self)
+    }
     fn as_resolve_local(&self) -> Option<&dyn VfsResolveLocal> {
         Some(self)
     }
@@ -346,6 +451,51 @@ impl VfsBackend for LocalDirVfs {
 /// readonly bit — `$LXMOD` EA is the authoritative source.
 #[cfg_attr(not(windows), allow(unused_variables))]
 fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> VfsFileInfo {
+    // Unix: inspect the real file_type bits for socket/fifo/dev nodes.
+    // Windows: derive the "logical" Unix type from `$LXMOD` EA so that
+    // FUSE_MKNOD'd S_IFSOCK / S_IFIFO files round-trip across stat()
+    // calls. Without this, an AF_UNIX socket bound on the host shows up
+    // as a regular file on the next lookup and `connect()` fails with
+    // ENOTSOCK in the guest.
+    let (kind_mode, kind_rdev) = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let ft = md.file_type();
+            let mut k = 0u32;
+            if ft.is_socket() {
+                k = libc::S_IFSOCK as u32;
+            } else if ft.is_fifo() {
+                k = libc::S_IFIFO as u32;
+            } else if ft.is_block_device() {
+                k = libc::S_IFBLK as u32;
+            } else if ft.is_char_device() {
+                k = libc::S_IFCHR as u32;
+            }
+            (k, md.rdev() as u32)
+        }
+        #[cfg(windows)]
+        {
+            use crate::windows::ntfs_mode::{read_mode_ea_full, volume_supports_ea};
+            let raw = if volume_supports_ea(path) {
+                read_mode_ea_full(path).unwrap_or(0)
+            } else {
+                0
+            };
+            // S_IFMT = 0o170000
+            let t = raw & 0o170000;
+            (t, 0u32)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            (0u32, 0u32)
+        }
+    };
+    let is_socket = kind_mode == 0o140000; // S_IFSOCK
+    let is_fifo = kind_mode == 0o010000; // S_IFIFO
+    let is_block_device = kind_mode == 0o060000; // S_IFBLK
+    let is_char_device = kind_mode == 0o020000; // S_IFCHR
+
     let mode = {
         #[cfg(unix)]
         {
@@ -390,16 +540,22 @@ fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> 
     };
     let ft = md.file_type();
     let is_symlink = ft.is_symlink();
+    // is_dir takes precedence only for *real* directories — special
+    // inodes (socket/fifo/dev) are not directories even though the
+    // host metadata's "is_dir" can never be true for them anyway.
+    let is_special = is_socket || is_fifo || is_block_device || is_char_device;
     VfsFileInfo {
         name,
         size: md.len(),
-        // lstat semantics: a symlink is reported as a symlink, NOT as
-        // its target's type. The bridge maps `is_symlink` →
-        // `NodeKind::Symlink` ahead of `Dir`/`File`.
-        is_dir: !is_symlink && md.is_dir(),
+        is_dir: !is_symlink && !is_special && md.is_dir(),
         is_symlink,
+        is_socket,
+        is_fifo,
+        is_block_device,
+        is_char_device,
         modified: md.modified().ok(),
         mode,
+        rdev: kind_rdev,
     }
 }
 
@@ -639,22 +795,10 @@ impl VfsBackend for MemFsVfs {
 
 fn entry_to_info(name: String, entry: &MemEntry) -> VfsFileInfo {
     match entry {
-        MemEntry::Dir { modified } => VfsFileInfo {
-            name,
-            size: 0,
-            is_dir: true,
-            is_symlink: false,
-            modified: Some(*modified),
-            mode: Some(0o755),
-        },
-        MemEntry::File { data, modified } => VfsFileInfo {
-            name,
-            size: data.len() as u64,
-            is_dir: false,
-            is_symlink: false,
-            modified: Some(*modified),
-            mode: Some(0o644),
-        },
+        MemEntry::Dir { modified } => VfsFileInfo::basic(name, 0, true, Some(0o755), Some(*modified)),
+        MemEntry::File { data, modified } => {
+            VfsFileInfo::basic(name, data.len() as u64, false, Some(0o644), Some(*modified))
+        }
     }
 }
 
@@ -832,5 +976,64 @@ mod tests {
 
         vfs.as_put().unwrap().put(Path::new("/f"), b"x".to_vec()).await.unwrap();
         assert!(matches!(vfs.list(Path::new("/f")).await, Err(VfsError::NotDir)));
+    }
+
+    /// Verify that LocalDirVfs::mknod creates a real AF_UNIX socket
+    /// inode and that meta_to_info reports it back as `is_socket=true`.
+    /// This is the unit-level analogue of `bind(2)` succeeding inside a
+    /// FUSE mount: without `mknod` returning Ok and `stat` round-tripping
+    /// the S_IFSOCK bits, AF_UNIX bind/connect on a FUSE-backed path
+    /// fails with ENOSYS or ENOTSOCK.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_mknod_socket_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+
+        let mk = vfs.as_mknod().expect("LocalDirVfs supports mknod");
+        // S_IFSOCK | 0666
+        mk.mknod(Path::new("/foo.sock"), 0o140666, 0).await.unwrap();
+
+        let info = vfs.stat(Path::new("/foo.sock")).await.unwrap();
+        assert!(info.is_socket, "expected is_socket=true, got {info:?}");
+        assert!(!info.is_dir);
+        assert!(!info.is_fifo);
+    }
+
+    /// Same as above but for FIFOs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_mknod_fifo_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+
+        let mk = vfs.as_mknod().unwrap();
+        // S_IFIFO | 0644
+        mk.mknod(Path::new("/p"), 0o010644, 0).await.unwrap();
+
+        let info = vfs.stat(Path::new("/p")).await.unwrap();
+        assert!(info.is_fifo, "expected is_fifo=true, got {info:?}");
+        assert!(!info.is_socket);
+    }
+
+    /// Unprivileged callers cannot create device nodes; mknod should
+    /// surface EPERM (mapped to PermissionDenied) rather than silently
+    /// creating a regular file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_mknod_blockdev_returns_eperm() {
+        let dir = tempdir().unwrap();
+        let vfs = LocalDirVfs::new(dir.path());
+
+        let mk = vfs.as_mknod().unwrap();
+        // S_IFBLK | 0600
+        let err = mk
+            .mknod(Path::new("/blk"), 0o060600, 0)
+            .await
+            .expect_err("block dev mknod must fail unprivileged");
+        assert!(
+            matches!(err, VfsError::PermissionDenied | VfsError::Io(_)),
+            "unexpected err: {err:?}"
+        );
     }
 }

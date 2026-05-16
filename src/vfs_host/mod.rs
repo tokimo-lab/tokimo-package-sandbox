@@ -52,6 +52,7 @@ pub struct DirSnapshot {
     pub size: u64,
     pub mode: u32,
     pub mtime: i64,
+    pub rdev: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +239,12 @@ impl FuseHost {
                 name,
                 mode,
             } => self.op_mkdir(mount_id, parent_nodeid, &name, mode).await,
+            Req::Mknod {
+                parent_nodeid,
+                name,
+                mode,
+                rdev,
+            } => self.op_mknod(mount_id, parent_nodeid, &name, mode, rdev).await,
             Req::Create {
                 parent_nodeid,
                 name,
@@ -446,6 +453,7 @@ impl FuseHost {
                     size: attr.size,
                     mode: attr.mode,
                     mtime: attr.mtime,
+                    rdev: attr.rdev,
                 };
                 (info.name, snap)
             })
@@ -564,6 +572,7 @@ impl FuseHost {
             #[cfg(not(target_os = "linux"))]
             gid: 0,
             kind: NodeKind::Dir,
+            rdev: 0,
         };
         if off == 0 {
             out.push(WireDirEntryPlus {
@@ -613,6 +622,7 @@ impl FuseHost {
                         uid,
                         gid,
                         kind: snap.kind,
+                        rdev: snap.rdev,
                     },
                 },
             });
@@ -1026,6 +1036,41 @@ impl FuseHost {
         }
     }
 
+    /// Create a non-regular non-directory inode (AF_UNIX socket, FIFO,
+    /// or device node). The kernel invokes `FUSE_MKNOD` here when an
+    /// application calls `bind(2)` on an AF_UNIX socket whose path
+    /// resides on this FUSE mount.
+    async fn op_mknod(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32, rdev: u32) -> Res {
+        let parent = match self.resolve_path(mount_id, parent_nodeid) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let Some(mount) = self.get_mount(mount_id) else {
+            return Res::Error(errno_for(&VfsError::NotFound));
+        };
+        if mount.read_only {
+            return Res::Error(errno_for(&VfsError::PermissionDenied));
+        }
+        let Some(mk) = mount.backend.as_mknod() else {
+            return Res::Error(errno_for(&VfsError::NotImplemented("mknod".into())));
+        };
+        let path = Self::child_path(&parent, name);
+        if let Err(e) = mk.mknod(&path, mode, rdev).await {
+            return Res::Error(errno_for(&e));
+        }
+        match mount.backend.stat(&path).await {
+            Ok(info) => {
+                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                Res::Entry(EntryOut {
+                    nodeid,
+                    generation: self.id_table.generation(),
+                    attr: attr_from(&info),
+                })
+            }
+            Err(e) => Res::Error(errno_for(&e)),
+        }
+    }
+
     async fn op_rmdir(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
@@ -1247,6 +1292,14 @@ fn apply_host_mode(_path: &std::path::Path, _mode: u32) {}
 fn attr_from(info: &VfsFileInfo) -> AttrOut {
     let kind = if info.is_symlink {
         NodeKind::Symlink
+    } else if info.is_socket {
+        NodeKind::Socket
+    } else if info.is_fifo {
+        NodeKind::Fifo
+    } else if info.is_block_device {
+        NodeKind::BlockDev
+    } else if info.is_char_device {
+        NodeKind::CharDev
     } else if info.is_dir {
         NodeKind::Dir
     } else {
@@ -1255,6 +1308,8 @@ fn attr_from(info: &VfsFileInfo) -> AttrOut {
     let mode = info.mode.unwrap_or(match kind {
         NodeKind::Dir => 0o755,
         NodeKind::Symlink => 0o777,
+        NodeKind::Socket | NodeKind::Fifo => 0o666,
+        NodeKind::BlockDev | NodeKind::CharDev => 0o600,
         NodeKind::File => 0o644,
     });
     let mtime = info
@@ -1280,6 +1335,7 @@ fn attr_from(info: &VfsFileInfo) -> AttrOut {
         uid,
         gid,
         kind,
+        rdev: info.rdev,
     }
 }
 

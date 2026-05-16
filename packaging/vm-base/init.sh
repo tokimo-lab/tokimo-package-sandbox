@@ -169,6 +169,10 @@ if ! [ -e /newroot/dev/ptmx ]; then
 fi
 /bin/busybox mount -t tmpfs tmpfs /newroot/tmp 2>/dev/null || true
 /bin/busybox mount -t tmpfs tmpfs /newroot/run 2>/dev/null || true
+# POSIX shm: many shm_open(3) implementations and tools (e.g. Python's
+# multiprocessing) require /dev/shm to be a real tmpfs.
+/bin/busybox mkdir -p /newroot/dev/shm 2>/dev/null || true
+/bin/busybox mount -t tmpfs -o mode=1777 tmpfs /newroot/dev/shm 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Decode and run the command inside the rootfs (chrooted).

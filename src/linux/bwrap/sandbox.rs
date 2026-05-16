@@ -403,6 +403,11 @@ impl SandboxBackend for LinuxBackend {
                 "/tmp",
                 "--tmpfs",
                 "/run",
+                // POSIX shared memory — /dev/shm must be its own tmpfs.
+                // Bwrap creates the parent /dev as `--tmpfs` above, but
+                // doesn't auto-create nested mounts; declare it here.
+                "--tmpfs",
+                "/dev/shm",
                 "--unshare-pid",
                 "--unshare-ipc",
                 "--unshare-uts",

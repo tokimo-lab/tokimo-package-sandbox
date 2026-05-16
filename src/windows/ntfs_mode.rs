@@ -45,6 +45,13 @@ pub enum FileKind {
     File,
     Dir,
     Symlink,
+    /// AF_UNIX socket (S_IFSOCK). Created via `mknod(2)` equivalent in
+    /// FUSE_MKNOD; on NTFS we materialise an empty regular file and
+    /// rely on the `$LXMOD` EA's type bits to surface it as a socket
+    /// on subsequent stat()s.
+    Socket,
+    /// Named pipe / FIFO (S_IFIFO).
+    Fifo,
 }
 
 fn s_ifmt(kind: &FileKind) -> u32 {
@@ -52,6 +59,8 @@ fn s_ifmt(kind: &FileKind) -> u32 {
         FileKind::File => 0o100000,
         FileKind::Dir => 0o040000,
         FileKind::Symlink => 0o120000,
+        FileKind::Socket => 0o140000,
+        FileKind::Fifo => 0o010000,
     }
 }
 
@@ -60,6 +69,18 @@ fn s_ifmt(kind: &FileKind) -> u32 {
 /// Returns the low 12 permission bits (S_IFMT stripped).
 /// Returns `None` when the EA is absent, the volume doesn't support EA, or an I/O error occurs.
 pub fn read_mode_ea(path: &Path) -> Option<u32> {
+    read_mode_ea_full(path).map(|m| m & 0o7777)
+}
+
+/// Read the raw `$LXMOD` EA from `path` — full 32-bit `st_mode` including
+/// `S_IFMT` type bits. Returns `None` under the same conditions as
+/// [`read_mode_ea`].
+///
+/// Used by `meta_to_info` to recover the on-disk inode type for
+/// FUSE_MKNOD'd AF_UNIX sockets and FIFOs (NTFS has no native
+/// S_IFSOCK/S_IFIFO file type, so the type information is only
+/// preserved via the EA).
+pub fn read_mode_ea_full(path: &Path) -> Option<u32> {
     let handle = open_handle(path, GENERIC_READ.0).ok()?;
     let result = query_lxmod_ea(handle);
     let _ = unsafe { CloseHandle(handle) };
@@ -204,7 +225,7 @@ fn query_lxmod_ea(handle: HANDLE) -> Option<u32> {
     ]);
 
     tracing::trace!("read_mode_ea: raw st_mode={:#010o}, perm={:#06o}", mode, mode & 0o7777);
-    Some(mode & 0o7777)
+    Some(mode)
 }
 
 /// Construct a `FILE_FULL_EA_INFORMATION` buffer for `$LXMOD` and call `NtSetEaFile`.

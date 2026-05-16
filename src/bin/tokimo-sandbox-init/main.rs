@@ -191,7 +191,14 @@ fn run() -> Result<(), String> {
             ("proc", "/proc", "proc"),
             ("sysfs", "/sys", "sysfs"),
             ("devtmpfs", "/dev", "devtmpfs"),
+            ("tmpfs", "/dev/shm", "tmpfs"),
         ] {
+            // /dev/shm sits underneath /dev so it must exist after the
+            // devtmpfs mount above; create it lazily here so we don't
+            // depend on the rootfs shipping the directory.
+            if *tgt == "/dev/shm" {
+                let _ = std::fs::create_dir_all(tgt);
+            }
             match mount_fs(src, tgt, fstype, 0, "") {
                 Ok(()) => {}
                 Err(e) if e.contains("Resource busy") || e.contains("16") => {
@@ -268,6 +275,17 @@ fn run() -> Result<(), String> {
             }
             Err(e) if e.contains("Resource busy") || e.contains("16") => {}
             Err(e) => eprintln!("[tokimo-sandbox-init] WARN: mount devpts: {e}"),
+        }
+
+        // POSIX shared memory (`shm_open(3)`, AF_UNIX `SOCK_DGRAM` over
+        // abstract names is unaffected, but anything via `/dev/shm/*`
+        // needs a real tmpfs). The host stages `/dev` as `--tmpfs /dev`
+        // but doesn't recurse into subdirs, so `/dev/shm` is missing.
+        let _ = std::fs::create_dir_all("/dev/shm");
+        match mount_fs("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777") {
+            Ok(()) => {}
+            Err(e) if e.contains("Resource busy") || e.contains("16") => {}
+            Err(e) => eprintln!("[tokimo-sandbox-init] WARN: mount /dev/shm: {e}"),
         }
     }
 
