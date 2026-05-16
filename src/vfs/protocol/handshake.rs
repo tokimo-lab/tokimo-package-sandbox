@@ -41,7 +41,7 @@ pub async fn server_handshake<R, W>(
     rx: &mut R,
     tx: &mut W,
     mount_lookup: impl Fn(&str) -> Option<u32>,
-) -> io::Result<Option<u32>>
+) -> io::Result<Option<(u32, Option<u32>)>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -103,7 +103,7 @@ where
             )
             .await?;
 
-            Ok(Some(max_inflight))
+            Ok(Some((max_inflight, bound_mount_id)))
         }
         other => {
             tracing::warn!("vfs: first frame not Hello: {:?}", other);

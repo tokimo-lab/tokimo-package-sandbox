@@ -186,7 +186,12 @@ impl FuseHost {
             })
             .await;
             return match res {
-                Ok(Ok(())) => Res::Written { size: written },
+                Ok(Ok(())) => {
+                    if let Some((mid, dev, ino)) = self.fh_inode_key(fh) {
+                        self.notify_inode(mid, dev, ino);
+                    }
+                    Res::Written { size: written }
+                }
                 Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
                 Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
             };

@@ -109,6 +109,14 @@ impl FuseHost {
             return match r.rename(&from, &to).await {
                 Ok(()) => {
                     self.id_table.rename_path(mount_id, &from, &to);
+                    // Source dentry now points at a vanished name.
+                    // Kick the guest kernel's dcache so a subsequent
+                    // `ls old_name` doesn't return a cached hit. The
+                    // destination side carries fresh EntryOut via the
+                    // rename reply path, so no notify_entry needed there.
+                    if old_name != new_name {
+                        self.notify_entry(mount_id, old_parent, old_name);
+                    }
                     Res::Ok
                 }
                 Err(e) => Res::Error(errno_for(&e)),
@@ -122,6 +130,9 @@ impl FuseHost {
                 return match m.move_file(&from, &np).await {
                     Ok(()) => {
                         self.id_table.rename_path(mount_id, &from, &to);
+                        if old_parent != new_parent {
+                            self.notify_entry(mount_id, old_parent, old_name);
+                        }
                         Res::Ok
                     }
                     Err(e) => Res::Error(errno_for(&e)),
@@ -132,6 +143,7 @@ impl FuseHost {
             return match r.rename(&from, &to).await {
                 Ok(()) => {
                     self.id_table.rename_path(mount_id, &from, &to);
+                    self.notify_entry(mount_id, old_parent, old_name);
                     Res::Ok
                 }
                 Err(e) => Res::Error(errno_for(&e)),
@@ -216,6 +228,14 @@ impl FuseHost {
                 // both names (matching the bare-host hard-link
                 // semantics that `stat -c %i a == stat -c %i b`).
                 let (nid, _) = self.id_table.intern_with_inode(mount_id, dst, info.dev, info.ino);
+                // Link bumps the inode's nlink and ctime. If any prior
+                // path-only-interned alias of this inode is still alive
+                // (dedup couldn't collapse it onto `nid` because its
+                // inode_key was unknown at intern time), its kernel
+                // attr cache is now stale. Fire the cross-alias
+                // invalidate unconditionally — `notify_inode` is a
+                // no-op when there's only one nodeid for this inode.
+                self.notify_inode(mount_id, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid: nid,
                     generation: self.id_table.generation(),

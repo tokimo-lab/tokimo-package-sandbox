@@ -387,7 +387,6 @@ impl IdTable {
     /// host-side. In the common (deduped) case this returns at most one
     /// nodeid; the helper exists for backends that couldn't dedup and
     /// therefore have multiple nodeids per inode.
-    #[allow(dead_code)] // Wired into op_write etc. via a future cfg-gated path.
     pub fn nodeids_for_inode(&self, mount_id: u32, dev: u64, ino: u64) -> Vec<u64> {
         if dev == 0 && ino == 0 {
             return Vec::new();

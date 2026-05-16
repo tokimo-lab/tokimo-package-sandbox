@@ -32,16 +32,18 @@ mod ops;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 
 use crate::vfs_backend::{SharedVfsBackend, VfsError};
 use crate::vfs_protocol::wire::{read_frame, write_frame};
-use crate::vfs_protocol::{Frame, NodeKind, Req, Res, StatfsOut, errno_for};
+use crate::vfs_protocol::{Frame, Inval, NodeKind, Req, Res, StatfsOut, errno_for};
 use helpers::op_is_cheap;
-use id_table::IdTable;
+use id_table::{FhEntry, IdTable};
 
 /// Lightweight clone of [`VfsFileInfo`](crate::vfs_backend::VfsFileInfo)
 /// used inside `FhEntry::Dir` snapshots. Carries enough metadata for
@@ -71,6 +73,25 @@ pub struct DirSnapshot {
 pub struct FuseHost {
     mounts: parking_lot_compat::RwLock<Vec<Option<MountEntry>>>,
     id_table: IdTable,
+    /// Per-connection notification senders. Each [`Self::serve`] task
+    /// registers one on Hello and removes it on drop. Used by
+    /// [`Self::notify_inode`] / [`Self::notify_entry`] to push
+    /// `Frame::Notify(Inval::*)` to the guest kernel for cache
+    /// invalidation when a host-side mutation could leave an aliased
+    /// nodeid stale.
+    notifiers: parking_lot_compat::RwLock<Vec<NotifyEntry>>,
+    next_notifier_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct NotifyEntry {
+    id: u64,
+    /// `None` = wildcard (matches every mount). Bound at handshake to
+    /// the mount the client requested in `Hello.mount_name`; if the
+    /// client passed no mount_name, we leave this `None` and let the
+    /// guest's nodeid space (allocated by the same IdTable) discriminate.
+    mount_id: Option<u32>,
+    tx: mpsc::UnboundedSender<Inval>,
 }
 
 #[derive(Clone)]
@@ -103,6 +124,8 @@ impl FuseHost {
         Self {
             mounts: parking_lot_compat::RwLock::new(Vec::new()),
             id_table: IdTable::new(generation),
+            notifiers: parking_lot_compat::RwLock::new(Vec::new()),
+            next_notifier_id: AtomicU64::new(1),
         }
     }
 
@@ -160,7 +183,7 @@ impl FuseHost {
         let tx = Arc::new(AsyncMutex::new(tx));
 
         // 1. Hello handshake.
-        let max_inflight = {
+        let (max_inflight, bound_mount_id) = {
             let mut guard = tx.lock().await;
             match crate::vfs_protocol::handshake::server_handshake(&mut rx, &mut *guard, |n| self.mount_id_by_name(n))
                 .await?
@@ -171,6 +194,51 @@ impl FuseHost {
         };
 
         let _ = max_inflight; // backpressure not enforced server-side yet
+
+        // 1a. Register a notification sender for this connection. A
+        // dedicated writer task owns the receiver end and shares the
+        // serialized `tx` mutex with the request-response path; this
+        // keeps the read loop simple (no tokio::select! interleaving).
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Inval>();
+        let notifier_id = {
+            let id = self.next_notifier_id.fetch_add(1, Ordering::Relaxed);
+            self.notifiers.write().push(NotifyEntry {
+                id,
+                mount_id: bound_mount_id,
+                tx: notify_tx,
+            });
+            id
+        };
+        let notify_writer = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(inval) = notify_rx.recv().await {
+                    let mut tx_guard = tx.lock().await;
+                    if let Err(e) = write_frame(&mut *tx_guard, &Frame::Notify(inval)).await {
+                        tracing::warn!("vfs_host: write notify failed: {e}");
+                        break;
+                    }
+                }
+            })
+        };
+        // RAII guard: drop our notifier registration + abort the writer
+        // task when this serve loop exits for any reason.
+        struct NotifyGuard {
+            host: Arc<FuseHost>,
+            id: u64,
+            writer: tokio::task::JoinHandle<()>,
+        }
+        impl Drop for NotifyGuard {
+            fn drop(&mut self) {
+                self.host.notifiers.write().retain(|e| e.id != self.id);
+                self.writer.abort();
+            }
+        }
+        let _notify_guard = NotifyGuard {
+            host: self.clone(),
+            id: notifier_id,
+            writer: notify_writer,
+        };
 
         // 2. Steady state.
         loop {
@@ -362,6 +430,78 @@ impl FuseHost {
             let mut p = parent.to_path_buf();
             p.push(name);
             p
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Notification fan-out (FUSE_NOTIFY_INVAL_INODE / INVAL_ENTRY)
+    // -----------------------------------------------------------------
+
+    /// Look up the `(mount_id, dev, ino)` triple for an open fh. Used
+    /// by fh-based mutating ops to decide whether the post-mutation
+    /// state requires a cross-alias invalidate.
+    pub(in crate::vfs::host) fn fh_inode_key(&self, fh: u64) -> Option<(u32, u64, u64)> {
+        let (mount_id, nodeid) = self.id_table.with_fh_mut(fh, |entry| match entry {
+            FhEntry::File { mount_id, nodeid, .. } => Some((*mount_id, *nodeid)),
+            _ => None,
+        })??;
+        let node = self.id_table.lookup(nodeid)?;
+        let (dev, ino) = node.inode_key?;
+        Some((mount_id, dev, ino))
+    }
+
+    /// Fire `FUSE_NOTIFY_INVAL_INODE` for every aliased nodeid of
+    /// `(mount_id, dev, ino)` — but only when at least two aliases
+    /// exist. The single-alias common case relies on the kernel page
+    /// cache being consistent with our own writes through that nodeid,
+    /// so there's nothing to invalidate.
+    ///
+    /// Backends that don't expose `(dev, ino)` (typically returning
+    /// `(0, 0)`) short-circuit early; their content is path-keyed and
+    /// can't be deduped anyway.
+    pub(in crate::vfs::host) fn notify_inode(&self, mount_id: u32, dev: u64, ino: u64) {
+        if dev == 0 && ino == 0 {
+            return;
+        }
+        let nodeids = self.id_table.nodeids_for_inode(mount_id, dev, ino);
+        if nodeids.len() < 2 {
+            return;
+        }
+        // Snapshot the senders (cheap clone — UnboundedSender is just
+        // an Arc inside) so we don't hold the registry lock across
+        // sends.
+        let targets: Vec<_> = {
+            let guard = self.notifiers.read();
+            guard
+                .iter()
+                .filter(|e| e.mount_id.is_none_or(|m| m == mount_id))
+                .map(|e| e.tx.clone())
+                .collect()
+        };
+        for nodeid in nodeids {
+            for tx in &targets {
+                let _ = tx.send(Inval::Inode { nodeid, off: 0, len: 0 });
+            }
+        }
+    }
+
+    /// Fire `FUSE_NOTIFY_INVAL_ENTRY` so the guest kernel drops any
+    /// cached dentry for `(parent_nodeid, name)`. Used by rename to
+    /// evict the source-side dentry.
+    pub(in crate::vfs::host) fn notify_entry(&self, mount_id: u32, parent_nodeid: u64, name: &str) {
+        let targets: Vec<_> = {
+            let guard = self.notifiers.read();
+            guard
+                .iter()
+                .filter(|e| e.mount_id.is_none_or(|m| m == mount_id))
+                .map(|e| e.tx.clone())
+                .collect()
+        };
+        for tx in targets {
+            let _ = tx.send(Inval::Entry {
+                parent_nodeid,
+                name: name.to_string(),
+            });
         }
     }
 }

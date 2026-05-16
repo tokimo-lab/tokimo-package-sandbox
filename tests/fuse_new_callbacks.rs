@@ -374,3 +374,75 @@ echo CFR_OK
         "captured = {captured}"
     );
 }
+
+#[test]
+fn hard_link_cross_name_propagation_after_eviction() {
+    // Regression guard for the host-side `Frame::Notify(Inval::Inode)`
+    // emitter. The IdTable's `(mount_id, dev, ino)` dedup will collapse
+    // two `ln` aliases onto a single nodeid in this script, so the
+    // kernel actually sees one page cache and one nodeid — but that's
+    // exactly the trivial case the **emitter** is meant to handle on
+    // its own when dedup *fails* (e.g. cold-queue eviction or a
+    // path-only intern race).
+    //
+    // To exercise the emit fan-out itself we force the host to
+    // re-stat both names via `cat` *before* the cross-name write, so
+    // the kernel has populated its attr+data caches under whichever
+    // nodeids it currently holds. We then write through one name and
+    // assert the other immediately reflects it — if dedup ever
+    // regresses (or if eviction tears the alias apart at runtime), the
+    // notify path is the only thing that can rescue this assertion.
+    let captured = run(
+        "fuse-link-notify",
+        r#"
+rm -rf notify_dir && mkdir notify_dir && cd notify_dir
+echo original > a.txt
+ln a.txt b.txt
+# Populate kernel caches for *both* names so a subsequent write
+# through one would otherwise serve stale content through the other.
+cat a.txt > /dev/null
+cat b.txt > /dev/null
+# Cross-name write.
+echo updated > a.txt
+got=$(cat b.txt)
+[ "$got" = "updated" ] || { echo "BAD_CROSS_AFTER_CACHE=$got"; exit 1; }
+echo NOTIFY_OK
+"#,
+    );
+    assert!(captured.contains("NOTIFY_OK"), "captured = {captured}");
+    assert!(!captured.contains("BAD_"), "captured = {captured}");
+}
+
+#[test]
+fn rename_invalidates_source_dentry() {
+    // Verify the rename source dentry is invalidated host-side via
+    // `Frame::Notify(Inval::Entry)`. Modern kernels also eagerly drop
+    // the source dentry when servicing the RENAME reply, so this test
+    // is primarily a regression guard for the **emitter path** —
+    // without our explicit notify_entry, a stricter kernel (or a
+    // future FUSE version) could legitimately keep the cached dentry
+    // for one attr_timeout and briefly answer `ls old.txt` from cache.
+    let captured = run(
+        "fuse-rename-notify",
+        r#"
+rm -rf rename_dir && mkdir rename_dir && cd rename_dir
+echo content > old.txt
+# Populate dentry cache.
+ls old.txt >/dev/null
+mv old.txt new.txt
+# Immediate negative lookup (no sleep) must return ENOENT.
+if ls old.txt >/dev/null 2>&1; then
+    echo "OLD_STILL_VISIBLE"
+    exit 1
+fi
+[ -f new.txt ] || { echo "NEW_MISSING"; exit 1; }
+[ "$(cat new.txt)" = "content" ] || { echo "BAD_CONTENT=$(cat new.txt)"; exit 1; }
+echo RENAME_NOTIFY_OK
+"#,
+    );
+    assert!(captured.contains("RENAME_NOTIFY_OK"), "captured = {captured}");
+    assert!(
+        !captured.contains("OLD_STILL_VISIBLE") && !captured.contains("BAD_") && !captured.contains("NEW_MISSING"),
+        "captured = {captured}"
+    );
+}

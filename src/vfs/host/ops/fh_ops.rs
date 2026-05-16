@@ -129,7 +129,12 @@ impl FuseHost {
         })
         .await;
         match res {
-            Ok(Ok(())) => Res::Ok,
+            Ok(Ok(())) => {
+                if let Some((mid, dev, ino)) = self.fh_inode_key(fh) {
+                    self.notify_inode(mid, dev, ino);
+                }
+                Res::Ok
+            }
             Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
             Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
         }
@@ -189,7 +194,12 @@ impl FuseHost {
         })
         .await;
         match res {
-            Ok(Ok(n)) => Res::Written { size: n },
+            Ok(Ok(n)) => {
+                if let Some((mid, dev, ino)) = self.fh_inode_key(fh_out) {
+                    self.notify_inode(mid, dev, ino);
+                }
+                Res::Written { size: n }
+            }
             Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
             Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
         }

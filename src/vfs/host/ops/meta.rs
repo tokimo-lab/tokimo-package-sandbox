@@ -120,7 +120,15 @@ impl FuseHost {
             return Res::Error(errno_for(&VfsError::NotFound));
         };
         match mount.backend.stat(&path).await {
-            Ok(info) => Res::Attr(attr_from(&info)),
+            Ok(info) => {
+                // Size changes (truncate via SetAttr.size) on a multi-
+                // alias inode leave the kernel page cache of any sister
+                // nodeid stale. notify_inode is a no-op when not aliased.
+                if size.is_some() {
+                    self.notify_inode(mount_id, info.dev, info.ino);
+                }
+                Res::Attr(attr_from(&info))
+            }
             Err(e) => Res::Error(errno_for(&e)),
         }
     }
