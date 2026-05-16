@@ -26,12 +26,25 @@ pub(crate) struct Dispatcher {
     pending: Mutex<HashMap<u64, mpsc::Sender<Res>>>,
     bound_mount_id: u32,
     /// FUSE kernel notifier, attached after [`fuser::Session::new`]
-    /// returns. Set once; cloned per use. The reader thread snapshots
-    /// it on each `Frame::Notify` and silently drops the notification
+    /// returns. Set once; cloned per use. The invalidator thread
+    /// snapshots it on each `Inval` and silently drops the notification
     /// if the notifier hasn't been installed yet (only possible during
     /// the brief window between Dispatcher construction and the call
     /// to [`Self::install_notifier`] in `linux/mod.rs::main`).
     notifier: Mutex<Option<fuser::Notifier>>,
+    /// Channel that the reader thread pushes `Inval` items onto. A
+    /// dedicated invalidator thread drains it and calls
+    /// `Notifier::inval_entry` / `inval_inode`. We MUST decouple this
+    /// from the reader thread because `inval_entry` can block on the
+    /// kernel's parent-dir i_rwsem, which is held while the
+    /// corresponding `FUSE_RENAME` is still in flight. If we invoked
+    /// `inval_entry` directly from the reader, the reader would park
+    /// and stop delivering the rename response — which is exactly what
+    /// the rename worker is waiting for. Classic 1-thread reentrancy
+    /// deadlock; symptom is fuse_rename + fuse_symlink tests timing
+    /// out with empty captured output. See the rationale section of
+    /// commit 7357b87.
+    inval_tx: Mutex<Option<mpsc::Sender<Inval>>>,
 }
 
 impl Dispatcher {
@@ -44,16 +57,35 @@ impl Dispatcher {
             pending: Mutex::new(HashMap::new()),
             bound_mount_id,
             notifier: Mutex::new(None),
+            inval_tx: Mutex::new(None),
         })
     }
 
     /// Attach the FUSE kernel notifier obtained from
     /// [`fuser::Session::notifier`] *after* the session has been
-    /// constructed. Required for the reader thread to translate
-    /// host-pushed [`Frame::Notify`] frames into actual kernel-side
-    /// cache invalidations.
-    pub(crate) fn install_notifier(&self, n: fuser::Notifier) {
-        *self.notifier.lock().unwrap() = Some(n);
+    /// constructed, and spawn the dedicated invalidator thread that
+    /// drains incoming `Inval` items off the wire and forwards them to
+    /// the kernel. Returns the thread join handle so the caller can
+    /// keep it alive for the lifetime of the bridge.
+    pub(crate) fn install_notifier(self: &Arc<Self>, n: fuser::Notifier) -> thread::JoinHandle<()> {
+        *self.notifier.lock().unwrap() = Some(n.clone());
+        let (tx, rx) = mpsc::channel::<Inval>();
+        *self.inval_tx.lock().unwrap() = Some(tx);
+        thread::Builder::new()
+            .name("tokimo-fuse-inval".into())
+            .spawn(move || {
+                while let Ok(inval) = rx.recv() {
+                    match inval {
+                        Inval::Inode { nodeid, off, len } => {
+                            let _ = n.inval_inode(nodeid, off, len);
+                        }
+                        Inval::Entry { parent_nodeid, name } => {
+                            let _ = n.inval_entry(parent_nodeid, std::ffi::OsStr::new(&name));
+                        }
+                    }
+                }
+            })
+            .expect("spawn tokimo-fuse-inval")
     }
 
     /// Spawn the reader thread that demuxes frames from the host.
@@ -90,23 +122,15 @@ impl Dispatcher {
                         }
                     }
                     Frame::Notify(inval) => {
-                        let notifier = me.notifier.lock().unwrap().clone();
-                        match (notifier, inval) {
-                            (Some(n), Inval::Inode { nodeid, off, len }) => {
-                                // Best-effort: -ENOENT means the kernel
-                                // already forgot the inode, which is
-                                // fine for an invalidation hint.
-                                let _ = n.inval_inode(nodeid, off, len);
-                            }
-                            (Some(n), Inval::Entry { parent_nodeid, name }) => {
-                                let _ = n.inval_entry(parent_nodeid, std::ffi::OsStr::new(&name));
-                            }
-                            (None, _) => {
-                                // Notifier not yet installed: drop. In
-                                // practice this is impossible because
-                                // the host only emits Notify frames
-                                // long after `Session::new` returned.
-                            }
+                        // Hand off to the dedicated invalidator thread.
+                        // Calling `Notifier::inval_entry` directly from
+                        // this thread can deadlock against an in-flight
+                        // rename whose response has not yet been
+                        // delivered (the rename worker is parked
+                        // waiting for our next `Frame::Response`).
+                        let tx = me.inval_tx.lock().unwrap().clone();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(inval);
                         }
                     }
                     other => {

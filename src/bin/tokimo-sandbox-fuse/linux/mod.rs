@@ -202,7 +202,7 @@ pub fn main() -> ExitCode {
     // the live channel fd) and *before* `session.run` (so the reader
     // thread, already running, sees the notifier as soon as the host
     // emits its first invalidation).
-    dispatcher.install_notifier(session.notifier());
+    let _inval_handle = dispatcher.install_notifier(session.notifier());
 
     let run_res = session.run();
 
