@@ -126,12 +126,6 @@ fn dev_shm_is_writable_tmpfs() {
     );
 
     let out = run("devshm", &script, MARKER);
-    assert!(
-        out.contains("tmpfs"),
-        "/dev/shm is not tmpfs. captured: {out:?}"
-    );
-    assert!(
-        out.contains("HELLO"),
-        "/dev/shm not writable. captured: {out:?}"
-    );
+    assert!(out.contains("tmpfs"), "/dev/shm is not tmpfs. captured: {out:?}");
+    assert!(out.contains("HELLO"), "/dev/shm not writable. captured: {out:?}");
 }

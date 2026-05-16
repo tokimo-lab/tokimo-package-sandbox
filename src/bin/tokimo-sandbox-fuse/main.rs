@@ -814,7 +814,16 @@ mod linux {
         /// sockets, `mkfifo(3)`, and device-node creation. The `mode`
         /// argument arrives with `S_IFMT` already encoded so the host
         /// VFS knows which kind of inode to materialise.
-        fn mknod(&mut self, _r: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, rdev: u32, reply: ReplyEntry) {
+        fn mknod(
+            &mut self,
+            _r: &Request,
+            parent: u64,
+            name: &OsStr,
+            mode: u32,
+            _umask: u32,
+            rdev: u32,
+            reply: ReplyEntry,
+        ) {
             let n = match name.to_str() {
                 Some(s) => s.to_string(),
                 None => return reply.error(libc::EINVAL),

@@ -39,6 +39,7 @@ fn make_entry_response() -> Frame {
                 uid: 1000,
                 gid: 1000,
                 kind: NodeKind::File,
+                rdev: 0,
             },
         }),
     }

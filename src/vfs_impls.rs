@@ -464,13 +464,13 @@ fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Metadata) -> 
             let ft = md.file_type();
             let mut k = 0u32;
             if ft.is_socket() {
-                k = libc::S_IFSOCK as u32;
+                k = 0o140000;
             } else if ft.is_fifo() {
-                k = libc::S_IFIFO as u32;
+                k = 0o010000;
             } else if ft.is_block_device() {
-                k = libc::S_IFBLK as u32;
+                k = 0o060000;
             } else if ft.is_char_device() {
-                k = libc::S_IFCHR as u32;
+                k = 0o020000;
             }
             (k, md.rdev() as u32)
         }
