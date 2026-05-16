@@ -109,14 +109,14 @@ impl FuseHost {
             return match r.rename(&from, &to).await {
                 Ok(()) => {
                     self.id_table.rename_path(mount_id, &from, &to);
-                    // Source dentry now points at a vanished name.
-                    // Kick the guest kernel's dcache so a subsequent
-                    // `ls old_name` doesn't return a cached hit. The
-                    // destination side carries fresh EntryOut via the
-                    // rename reply path, so no notify_entry needed there.
+                    // Both names need their dentries invalidated:
+                    //   * old_name: now points at a vanished file
+                    //   * new_name: kernel may have cached it as negative
+                    //               (the canonical `git init` failure mode)
                     if old_name != new_name {
                         self.notify_entry(mount_id, old_parent, old_name);
                     }
+                    self.notify_entry(mount_id, new_parent, new_name);
                     Res::Ok
                 }
                 Err(e) => Res::Error(errno_for(&e)),
@@ -133,6 +133,7 @@ impl FuseHost {
                         if old_parent != new_parent {
                             self.notify_entry(mount_id, old_parent, old_name);
                         }
+                        self.notify_entry(mount_id, new_parent, new_name);
                         Res::Ok
                     }
                     Err(e) => Res::Error(errno_for(&e)),
@@ -144,6 +145,7 @@ impl FuseHost {
                 Ok(()) => {
                     self.id_table.rename_path(mount_id, &from, &to);
                     self.notify_entry(mount_id, old_parent, old_name);
+                    self.notify_entry(mount_id, new_parent, new_name);
                     Res::Ok
                 }
                 Err(e) => Res::Error(errno_for(&e)),
