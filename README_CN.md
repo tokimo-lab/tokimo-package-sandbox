@@ -39,7 +39,8 @@
 │   let sb = Sandbox::connect().unwrap();                     │
 │   sb.configure(params).unwrap();                            │
 │   sb.start_vm().unwrap();                                   │
-│   let r = sb.exec(&["uname", "-a"], ExecOpts::default());   │
+│   let shell = sb.shell_id().unwrap();                       │
+│   sb.write_stdin(&shell, b"uname -a\n").unwrap();           │
 │   sb.stop_vm().unwrap();                                    │
 └────────────────────────┬────────────────────────────────────┘
                          │  各平台完全相同的 API
@@ -69,7 +70,7 @@
 
 Linux 平台层会在 `Sandbox::connect()` 时探测 Cloud Hypervisor，并选择当前主机上能用且最强的后端。CH 优先（真实 KVM 隔离、完整内核边界、与 macOS/Windows 等价的安全姿态）；bwrap 是回退（无虚拟机、启动最快、能在没有 `/dev/kvm` 的环境下工作，例如未开启虚拟化的嵌套 CI）。
 
-两个后端**除了隔离原语之外完全共享**：同一个 `tokimo-sandbox-init` PID 1 二进制、同一套 `vfs_host`/`tokimo-sandbox-fuse` FUSE 基础设施、同一个 `netstack` smoltcp 代理、同一份协议帧。仅传输层接线不同（SEQPACKET socketpair vs. hybrid-vsock UDS sidecar）。
+两个后端**除了隔离原语之外完全共享**：同一个 `tokimo-sandbox-init` PID 1 二进制、同一套 `FuseHost`/`tokimo-sandbox-fuse` FUSE 基础设施、同一个 smoltcp 网络栈、同一份协议帧。仅传输层接线不同（SEQPACKET socketpair vs. hybrid-vsock UDS sidecar）。
 
 ### Linux —— Cloud Hypervisor（`ch` 后端）
 
@@ -188,7 +189,7 @@ Sandbox（库） ──命名管道──▶ tokimo-sandbox-svc.exe（SYSTEM）
 
 ## 用户态网络栈
 
-所有后端的 `AllowAll` 策略使用同一套 **smoltcp L3/L4 代理**（`src/netstack/`）。一套统一的网络栈，一个拦截点，不区分平台或 Linux 后端。
+所有后端的 `AllowAll` 策略使用同一套 **smoltcp L3/L4 代理**（`src/net/netstack/`）。一套统一的网络栈，一个拦截点，不区分平台或 Linux 后端。
 
 ```
 Linux 客机内核
@@ -440,74 +441,117 @@ cargo run --example smoltcp_netstack
 
 ```
 src/
-├── lib.rs                    公共接口，re-exports
-├── api.rs                    Sandbox 句柄、ConfigureParams、Event、Mount
-├── backend.rs                SandboxBackend trait（22 个方法）
-├── error.rs                  Error 枚举 + Result 别名
-├── platform.rs               每平台 default_backend()
-├── session_registry.rs       平台无关的会话 HashMap
-├── svc_protocol.rs           Windows 服务 JSON-RPC 协议
+├── lib.rs                        Crate 根：7 个顶层模块，向后兼容 re-export shim
 │
-├── protocol/                 宿主 ↔ init 线路协议（所有后端共享）
-│   ├── types.rs              Frame、Op、Reply、Event、StdioMode
-│   └── wire.rs               长度前缀 JSON + SCM_RIGHTS 帧
+├── api/                          公共 Sandbox API
+│   ├── mod.rs                    Sandbox 句柄（~30 个方法）、ConfigureParams、ShellOpts、
+│   │                             Mount、NetworkPolicy、Event、HostExecCtx/Action/Callback、
+│   │                             JobId、SessionSummary/Details、PortForwardSpec
+│   ├── backend.rs                SandboxBackend trait — 每平台实现契约
+│   ├── backend_kind.rs           SandboxBackendKind（Auto/Disabled/Bwrap/Ch）、ActiveBackend
+│   ├── error.rs                  Error 枚举 + Result 别名 + bail! 宏
+│   └── platform.rs               每平台 default_backend()
 │
-├── vfs_host/                 FUSE-over-vsock/socketpair 宿主端（三平台统一）
-│   ├── mod.rs                FuseHost：accept 循环、每挂载分发
-│   └── id_table.rs           Nodeid + fh 分配器
+├── backends/                     平台特定后端实现
+│   ├── mod.rs                    条件编译：linux、macos、shared、svc_protocol、windows
+│   ├── shared.rs                 SharedBackend<B> — 进程级会话共享（Linux/macOS）
+│   ├── svc_protocol.rs           Windows 宿主 ↔ 服务 JSON-RPC 协议
+│   ├── linux/
+│   │   ├── bwrap/                bubblewrap 后端（无虚拟机，仅命名空间）
+│   │   │   ├── sandbox.rs        LinuxBackend: SandboxBackend
+│   │   │   ├── init_client.rs    InitClient（SOCK_SEQPACKET）
+│   │   │   └── init_transport.rs SEQPACKET 帧 + SCM_RIGHTS
+│   │   └── ch/                   Cloud Hypervisor 微型虚拟机后端
+│   │       ├── backend.rs        ChBackend: SandboxBackend
+│   │       ├── vmm.rs            CH + virtiofsd 子进程生命周期
+│   │       └── probe.rs          probe_ch() — KVM/vsock/二进制可用性检查
+│   ├── macos/
+│   │   ├── sandbox.rs            MacosBackend: SandboxBackend
+│   │   ├── vm.rs                 VZ 虚拟机生命周期、BOOT_LOCK
+│   │   └── vsock_init_client.rs  VsockInitClient（VSOCK 传输）
+│   └── windows/
+│       ├── sandbox.rs            WindowsBackend: SandboxBackend（命名管道 JSON-RPC）
+│       ├── client.rs             命名管道客户端
+│       ├── init_client.rs        透明管道隧道上的 init 客户端
+│       ├── init_transport.rs     Windows init 传输层适配
+│       ├── ov_pipe.rs            OVERLAPPED Read/Write 封装
+│       ├── safe_path.rs          TOCTOU 安全的 canonicalize_safe
+│       └── ntfs_mode.rs          NTFS mode-bit 辅助函数
 │
-├── vfs_protocol/             客机 ↔ 宿主 VFS 线路协议
-│   ├── mod.rs                Frame、Req、Res、AttrOut、EntryOut
-│   └── wire.rs               长度前缀 postcard 帧
+├── init/                         宿主侧 init 客户端 + 协议（所有后端共享）
+│   ├── client/
+│   │   ├── mod.rs                InitClient<S: TransportSend> — 泛型宿主侧客户端
+│   │   └── vsock.rs              VSOCK 传输实现
+│   └── protocol/
+│       ├── types.rs              Frame、Op、Reply、Event、StdioMode
+│       └── wire.rs               帧编解码、SEQPACKET + 流传输辅助
 │
-├── vfs_impls.rs              LocalDirVfs：宿主目录 VfsBackend 实现
+├── vfs/                          VFS 子系统（FUSE-over-vsock/socketpair）
+│   ├── backend.rs                VfsBackend trait 层次结构 + VfsFileInfo
+│   ├── protocol/
+│   │   ├── mod.rs                VFS 线路协议：Frame、Req（~35 个操作）、Res、Errno
+│   │   ├── wire.rs               长度前缀 postcard 帧 + bulk-bypass 优化
+│   │   └── handshake.rs          Hello/HelloAck 握手
+│   ├── host/
+│   │   ├── mod.rs                FuseHost：accept 循环、每挂载分发
+│   │   ├── id_table.rs           Nodeid + fh 分配器（带引用计数）
+│   │   └── ops/                  每操作处理器：dir、file、meta、mutate、xattr
+│   └── impls/
+│       ├── local.rs              LocalDirVfs — 宿主目录透传
+│       ├── mem.rs                MemFsVfs — 内存文件系统（测试用）
+│       ├── meta.rs               meta_to_info() 辅助函数
+│       ├── sanitize.rs           路径清理
+│       └── macos_xattr.rs        macOS xattr 处理
 │
-├── netstack/                 用户态 smoltcp L3/L4 代理（三平台统一）
-│   ├── mod.rs                StreamDevice、TCP/UDP/ICMP 流代理
-│   └── icmp/                 平台特定 ICMP echo 后端
+├── net/                          网络
+│   ├── constants.rs              共享拓扑常量（IP、MAC、子网、MTU）
+│   ├── ifreq.rs                  Linux ioctl 辅助函数
+│   └── netstack/
+│       ├── mod.rs                用户态 smoltcp L3/L4 代理（~1750 行）
+│       ├── host_dns.rs           宿主 DNS 解析器检测
+│       └── icmp/                 平台特定 ICMP echo 后端
 │
-├── linux/                    Linux 后端（Auto：ch → bwrap）
-│   ├── mod.rs                模块声明
-│   ├── bwrap/                bubblewrap 后端（无虚拟机，仅命名空间）
-│   │   ├── sandbox.rs        BwrapBackend: SandboxBackend
-│   │   ├── init_client.rs    InitClient（SOCK_SEQPACKET）
-│   │   └── init_transport.rs 传输层适配
-│   └── ch/                   Cloud Hypervisor 微型虚拟机后端
-│       ├── backend.rs        ChBackend: SandboxBackend（基于 vsock，对照 macOS）
-│       ├── probe.rs          主机就绪检查，驱动 Auto 回退
-│       └── vmm.rs            cloud-hypervisor 子进程 + virtiofsd + vsock UDS 接线
+├── host_exec/                    Host-Exec 桥接（客机命令 → 宿主回调）
+│   ├── mod.rs                    HostExecBridge、BridgeStream trait、handle_one()
+│   ├── linux_relay.rs            SCM_RIGHTS 中继读取线程
+│   ├── macos_listener.rs         vsock accept 循环
+│   ├── transport.rs              传输层抽象
+│   └── protocol/
+│       ├── mod.rs                线路协议：Frame 枚举、版本 1
+│       └── wire.rs               Postcard 帧封装
 │
-├── macos/                    macOS 后端（Virtualization.framework）
-│   ├── sandbox.rs            MacosBackend: SandboxBackend
-│   ├── vm.rs                 虚拟机引导、BOOT_LOCK
-│   └── vsock_init_client.rs  VsockInitClient（VSOCK 流）
-│
-├── windows/                  Windows 后端（通过 SYSTEM 服务的 HCS）
-│   ├── sandbox.rs            WindowsBackend: SandboxBackend
-│   ├── client.rs             命名管道 JSON-RPC 客户端
-│   ├── init_client.rs        WinInitClient（HvSocket）
-│   ├── ov_pipe.rs            OVERLAPPED 管道封装
-│   └── safe_path.rs          TOCTOU 安全路径规范化
+├── util/                         工具函数
+│   ├── affinity.rs               CPU 亲和性辅助
+│   ├── fonts.rs                  宿主字体目录发现
+│   ├── raw_io.rs                 底层 I/O 辅助（Unix）
+│   ├── rootfs_init.rs            Rootfs 初始化
+│   ├── session_registry.rs       SessionRegistry（Windows 服务）
+│   ├── vm_dir.rs                 虚拟机目录管理
+│   └── vsock_util.rs             VSOCK 连接辅助（Linux）
 │
 └── bin/
-    ├── tokimo-sandbox-init/  PID 1 客机二进制（所有平台）
-    │   ├── main.rs           传输层分发、挂载设置
-    │   ├── server.rs         事件循环（mio::Poll）
-    │   ├── child.rs          fork/exec 辅助函数
-    │   └── pty.rs            PTY 分配
+    ├── tokimo-sandbox-init/      客机 PID 1 二进制（三平台共用）
+    │   ├── main.rs               传输层分发、挂载设置、chroot
+    │   ├── server.rs             主请求循环（mio::Poll）
+    │   ├── child.rs              子进程管理
+    │   ├── pty.rs                PTY 分配
+    │   └── pump.rs               TUN ↔ vsock 桥接
     │
-    ├── tokimo-sandbox-fuse/   客机侧 FUSE 桥接二进制
-    │   └── main.rs           将内核 FUSE 操作翻译为 VfsProtocol 线路请求
+    ├── tokimo-sandbox-fuse/      客机侧 FUSE 桥接二进制
+    │   └── main.rs               内核 FUSE 操作 → VFS 线路请求
     │
-    ├── tokimo-sandbox-svc/   Windows SYSTEM 服务
+    ├── tokimo-sandbox-svc/       Windows SYSTEM 服务
     │   └── imp/
-    │       ├── mod.rs        SCM 生命周期、管道服务器、会话处理
-    │       ├── hcs.rs        ComputeCore.dll 加载器
-    │       ├── hvsock.rs     AF_HYPERV socket 辅助函数
-    │       ├── vmconfig.rs   HCS Schema 2.5 JSON 构建器
-    │       └── vhdx_pool.rs  每会话 VHDX 租赁
+    │       ├── mod.rs            SCM 生命周期、管道服务器、会话处理
+    │       ├── hcs.rs            ComputeCore.dll 加载器
+    │       ├── hvsock.rs         AF_HYPERV socket 辅助
+    │       ├── vmconfig.rs       HCS Schema 2.5 JSON 构建器
+    │       ├── vhdx_pool.rs      每会话 VHDX 租赁
+    │       ├── netstack.rs       smoltcp 用户态网络栈
+    │       └── svclog.rs         日志
     │
-    └── tokimo-tun-pump/      客机侧 TUN pump 二进制
+    ├── tokimo-tun-pump/          客机侧 TUN ↔ vsock 桥接
+    └── tokimo-host-exec/         客机侧 host-exec 桩
 ```
 
 ## 网络策略

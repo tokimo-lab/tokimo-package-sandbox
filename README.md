@@ -39,7 +39,8 @@ This project fills that gap.
 │   let sb = Sandbox::connect().unwrap();                     │
 │   sb.configure(params).unwrap();                            │
 │   sb.start_vm().unwrap();                                   │
-│   let r = sb.exec(&["uname", "-a"], ExecOpts::default());   │
+│   let shell = sb.shell_id().unwrap();                       │
+│   sb.write_stdin(&shell, b"uname -a\n").unwrap();           │
 │   sb.stop_vm().unwrap();                                    │
 └────────────────────────┬────────────────────────────────────┘
                          │  same API on all platforms
@@ -69,7 +70,7 @@ This project fills that gap.
 
 The Linux platform layer probes for Cloud Hypervisor at `Sandbox::connect()` time and picks the strongest backend that works on the host. CH is preferred (real KVM isolation, full kernel boundary, identical posture to macOS/Windows); bwrap is the fallback (no VM, fastest startup, works in environments without `/dev/kvm` such as nested CI without virtualization).
 
-Both backends share **everything except the isolation primitive**: the same `tokimo-sandbox-init` PID 1 binary, the same `vfs_host`/`tokimo-sandbox-fuse` FUSE infrastructure, the same `netstack` smoltcp proxy, the same protocol frames. Only the transport wiring differs (SEQPACKET socketpairs vs. hybrid-vsock UDS sidecars).
+Both backends share **everything except the isolation primitive**: the same `tokimo-sandbox-init` PID 1 binary, the same `FuseHost`/`tokimo-sandbox-fuse` FUSE infrastructure, the same smoltcp netstack, the same protocol frames. Only the transport wiring differs (SEQPACKET socketpairs vs. hybrid-vsock UDS sidecars).
 
 ### Linux — Cloud Hypervisor (`ch` backend)
 
@@ -188,7 +189,7 @@ Sandbox (library)  ──named pipe──▶  tokimo-sandbox-svc.exe (SYSTEM)
 
 ## Userspace network stack
 
-All backends use the same **smoltcp-based L3/L4 proxy** (`src/netstack/`) for `NetworkPolicy::AllowAll`. One unified netstack, one interception point, regardless of platform or Linux backend choice.
+All backends use the same **smoltcp-based L3/L4 proxy** (`src/net/netstack/`) for `NetworkPolicy::AllowAll`. One unified netstack, one interception point, regardless of platform or Linux backend choice.
 
 ```
 Guest Linux kernel
@@ -442,74 +443,117 @@ cargo run --example smoltcp_netstack
 
 ```
 src/
-├── lib.rs                    Public surface, re-exports
-├── api.rs                    Sandbox handle, ConfigureParams, Event, Mount
-├── backend.rs                SandboxBackend trait (22 methods)
-├── error.rs                  Error enum + Result alias
-├── platform.rs               default_backend() per OS
-├── session_registry.rs       Platform-agnostic session HashMap
-├── svc_protocol.rs           Windows service JSON-RPC protocol
+├── lib.rs                        Crate root: 7 top-level modules, re-export shims
 │
-├── protocol/                 Host ↔ init wire protocol (shared across all backends)
-│   ├── types.rs              Frame, Op, Reply, Event, StdioMode
-│   └── wire.rs               Length-prefixed JSON + SCM_RIGHTS framing
+├── api/                          Public Sandbox API
+│   ├── mod.rs                    Sandbox handle (~30 methods), ConfigureParams, ShellOpts,
+│   │                             Mount, NetworkPolicy, Event, HostExecCtx/Action/Callback,
+│   │                             JobId, SessionSummary/Details, PortForwardSpec
+│   ├── backend.rs                SandboxBackend trait — per-platform implementation contract
+│   ├── backend_kind.rs           SandboxBackendKind (Auto/Disabled/Bwrap/Ch), ActiveBackend
+│   ├── error.rs                  Error enum + Result alias + bail! macro
+│   └── platform.rs               default_backend() per OS
 │
-├── vfs_host/                 FUSE-over-vsock/socketpair host (all platforms)
-│   ├── mod.rs                FuseHost: accept loop, per-mount dispatch
-│   └── id_table.rs           Nodeid + fh allocator
+├── backends/                     Platform-specific backend implementations
+│   ├── mod.rs                    Conditional compilation: linux, macos, shared, svc_protocol, windows
+│   ├── shared.rs                 SharedBackend<B> — process-wide session sharing (Linux/macOS)
+│   ├── svc_protocol.rs           Windows host ↔ service JSON-RPC protocol
+│   ├── linux/
+│   │   ├── bwrap/                bubblewrap backend (no VM, namespaces only)
+│   │   │   ├── sandbox.rs        LinuxBackend: SandboxBackend
+│   │   │   ├── init_client.rs    InitClient over SOCK_SEQPACKET
+│   │   │   └── init_transport.rs SEQPACKET framing + SCM_RIGHTS
+│   │   └── ch/                   Cloud Hypervisor micro-VM backend
+│   │       ├── backend.rs        ChBackend: SandboxBackend
+│   │       ├── vmm.rs            CH + virtiofsd child lifecycle
+│   │       └── probe.rs          probe_ch() — KVM/vsock/binary check
+│   ├── macos/
+│   │   ├── sandbox.rs            MacosBackend: SandboxBackend
+│   │   ├── vm.rs                 VZ VM lifecycle, BOOT_LOCK
+│   │   └── vsock_init_client.rs  VsockInitClient (VSOCK transport)
+│   └── windows/
+│       ├── sandbox.rs            WindowsBackend: SandboxBackend (JSON-RPC over named pipe)
+│       ├── client.rs             Named-pipe client
+│       ├── init_client.rs        Init client over transparent pipe tunnel
+│       ├── init_transport.rs     Windows init transport adapter
+│       ├── ov_pipe.rs            OVERLAPPED Read/Write wrapper
+│       ├── safe_path.rs          TOCTOU-safe canonicalize_safe
+│       └── ntfs_mode.rs          NTFS mode-bit helpers
 │
-├── vfs_protocol/             Guest ↔ host VFS wire protocol
-│   ├── mod.rs                Frame, Req, Res, AttrOut, EntryOut
-│   └── wire.rs               Length-prefixed postcard framing
+├── init/                         Host-side init client + protocol (shared across all backends)
+│   ├── client/
+│   │   ├── mod.rs                InitClient<S: TransportSend> — generic host-side client
+│   │   └── vsock.rs              VSOCK transport implementation
+│   └── protocol/
+│       ├── types.rs              Frame, Op, Reply, Event, StdioMode
+│       └── wire.rs               Frame encode/decode, SEQPACKET + stream helpers
 │
-├── vfs_impls.rs              LocalDirVfs: host-directory VfsBackend impl
+├── vfs/                          VFS subsystem (FUSE-over-vsock/socketpair)
+│   ├── backend.rs                VfsBackend trait hierarchy + VfsFileInfo
+│   ├── protocol/
+│   │   ├── mod.rs                VFS wire protocol: Frame, Req (~35 ops), Res, Errno
+│   │   ├── wire.rs               Length-prefixed postcard framing + bulk-bypass
+│   │   └── handshake.rs          Hello/HelloAck handshake
+│   ├── host/
+│   │   ├── mod.rs                FuseHost: accept loop, per-mount dispatch
+│   │   ├── id_table.rs           Nodeid + fh allocator with refcounting
+│   │   └── ops/                  Per-op handlers: dir, file, meta, mutate, xattr
+│   └── impls/
+│       ├── local.rs              LocalDirVfs — host directory passthrough
+│       ├── mem.rs                MemFsVfs — in-memory filesystem for tests
+│       ├── meta.rs               meta_to_info() helper
+│       ├── sanitize.rs           Path sanitization
+│       └── macos_xattr.rs        macOS xattr handling
 │
-├── netstack/                 Userspace smoltcp L3/L4 proxy (all platforms)
-│   ├── mod.rs                StreamDevice, TCP/UDP/ICMP flow proxy
-│   └── icmp/                 OS-specific ICMP echo backends
+├── net/                          Networking
+│   ├── constants.rs              Shared topology constants (IPs, MACs, subnet, MTU)
+│   ├── ifreq.rs                  Linux ioctl helpers
+│   └── netstack/
+│       ├── mod.rs                Userspace smoltcp L3/L4 proxy (~1750 lines)
+│       ├── host_dns.rs           Host DNS resolver detection
+│       └── icmp/                 OS-specific ICMP echo backends
 │
-├── linux/                    Linux backends (Auto: ch → bwrap)
-│   ├── mod.rs                Module declarations
-│   ├── bwrap/                bubblewrap backend (no VM, namespaces only)
-│   │   ├── sandbox.rs        BwrapBackend: SandboxBackend
-│   │   ├── init_client.rs    InitClient over SOCK_SEQPACKET
-│   │   └── init_transport.rs Transport adapter
-│   └── ch/                   Cloud Hypervisor microVM backend
-│       ├── backend.rs        ChBackend: SandboxBackend (vsock-based, mirrors macOS)
-│       ├── probe.rs          Host readiness checks driving Auto fallback
-│       └── vmm.rs            cloud-hypervisor child + virtiofsd + vsock UDS plumbing
+├── host_exec/                    Host-Exec Bridge (guest commands → host callback)
+│   ├── mod.rs                    HostExecBridge, BridgeStream trait, handle_one()
+│   ├── linux_relay.rs            SCM_RIGHTS relay reader thread
+│   ├── macos_listener.rs         vsock accept loop
+│   ├── transport.rs              Transport abstractions
+│   └── protocol/
+│       ├── mod.rs                Wire protocol: Frame enum, version 1
+│       └── wire.rs               Postcard-based framing
 │
-├── macos/                    macOS backend (Virtualization.framework)
-│   ├── sandbox.rs            MacosBackend: SandboxBackend
-│   ├── vm.rs                 VM bootstrap, BOOT_LOCK
-│   └── vsock_init_client.rs  VsockInitClient over VSOCK stream
-│
-├── windows/                  Windows backend (HCS via SYSTEM service)
-│   ├── sandbox.rs            WindowsBackend: SandboxBackend
-│   ├── client.rs             Named-pipe JSON-RPC client
-│   ├── init_client.rs        WinInitClient over HvSocket
-│   ├── ov_pipe.rs            OVERLAPPED pipe wrapper
-│   └── safe_path.rs          TOCTOU-safe path canonicalization
+├── util/                         Utilities
+│   ├── affinity.rs               CPU affinity helpers
+│   ├── fonts.rs                  Host font directory discovery
+│   ├── raw_io.rs                 Low-level I/O helpers (Unix)
+│   ├── rootfs_init.rs            Rootfs initialization
+│   ├── session_registry.rs       SessionRegistry (Windows service)
+│   ├── vm_dir.rs                 VM directory management
+│   └── vsock_util.rs             VSOCK connection helpers (Linux)
 │
 └── bin/
-    ├── tokimo-sandbox-init/  PID 1 guest binary (all platforms)
-    │   ├── main.rs           Transport dispatch, mount setup
-    │   ├── server.rs         Event loop (mio::Poll)
-    │   ├── child.rs          fork/exec helpers
-    │   └── pty.rs            PTY allocation
+    ├── tokimo-sandbox-init/      Guest PID 1 binary (all 3 platforms)
+    │   ├── main.rs               Transport dispatch, mount setup, chroot
+    │   ├── server.rs             Main request loop (mio::Poll)
+    │   ├── child.rs              Child process management
+    │   ├── pty.rs                PTY allocation
+    │   └── pump.rs               TUN ↔ vsock bridge
     │
-    ├── tokimo-sandbox-fuse/   Guest-side FUSE bridge binary
-    │   └── main.rs           Translates kernel FUSE ops → VfsProtocol wire reqs
+    ├── tokimo-sandbox-fuse/      Guest-side FUSE bridge binary
+    │   └── main.rs               Kernel FUSE ops → VFS wire reqs
     │
-    ├── tokimo-sandbox-svc/   Windows SYSTEM service
+    ├── tokimo-sandbox-svc/       Windows SYSTEM service
     │   └── imp/
-    │       ├── mod.rs        SCM lifecycle, pipe server, session handler
-    │       ├── hcs.rs        ComputeCore.dll loader
-    │       ├── hvsock.rs     AF_HYPERV socket helpers
-    │       ├── vmconfig.rs   HCS Schema 2.5 JSON builder
-    │       └── vhdx_pool.rs  Per-session VHDX leasing
+    │       ├── mod.rs            SCM lifecycle, pipe server, session handler
+    │       ├── hcs.rs            ComputeCore.dll loader
+    │       ├── hvsock.rs         AF_HYPERV socket helpers
+    │       ├── vmconfig.rs       HCS Schema 2.5 JSON builder
+    │       ├── vhdx_pool.rs      Per-session VHDX leasing
+    │       ├── netstack.rs       smoltcp userspace netstack
+    │       └── svclog.rs         Logging
     │
-    └── tokimo-tun-pump/      Guest-side TUN pump binary
+    ├── tokimo-tun-pump/          Guest-side TUN ↔ vsock bridge
+    └── tokimo-host-exec/         Guest-side host-exec stub
 ```
 
 ## Network policies
