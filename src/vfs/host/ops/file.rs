@@ -14,7 +14,7 @@ use super::super::helpers::{attr_from, drain_staging_to_backend};
 use super::super::id_table::{FhEntry, StagingFile};
 
 impl FuseHost {
-    pub(in crate::vfs_host) async fn op_open(self: Arc<Self>, mount_id: u32, nodeid: u64, flags: u32) -> Res {
+    pub(in crate::vfs::host) async fn op_open(self: Arc<Self>, mount_id: u32, nodeid: u64, flags: u32) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -87,7 +87,7 @@ impl FuseHost {
         Res::OpenOk { fh }
     }
 
-    pub(in crate::vfs_host) async fn op_read(&self, fh: u64, offset: u64, size: u32) -> Res {
+    pub(in crate::vfs::host) async fn op_read(&self, fh: u64, offset: u64, size: u32) -> Res {
         let info = self.id_table.with_fh_mut(fh, |entry| match entry {
             FhEntry::File {
                 mount_id,
@@ -151,7 +151,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_write(&self, fh: u64, offset: u64, data: Vec<u8>) -> Res {
+    pub(in crate::vfs::host) async fn op_write(&self, fh: u64, offset: u64, data: Vec<u8>) -> Res {
         let written = data.len() as u32;
 
         // Fastpath: pwrite directly to the local host file.
@@ -244,7 +244,7 @@ impl FuseHost {
         Res::Written { size: written }
     }
 
-    pub(in crate::vfs_host) async fn op_flush(&self, fh: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_flush(&self, fh: u64) -> Res {
         // Snapshot fh state without taking ownership.
         let fh_state = self.id_table.with_fh_mut(fh, |entry| match entry {
             FhEntry::File {
@@ -296,7 +296,7 @@ impl FuseHost {
         Res::Ok
     }
 
-    pub(in crate::vfs_host) async fn op_release(&self, fh: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_release(&self, fh: u64) -> Res {
         let Some(entry) = self.id_table.take_fh(fh) else {
             return Res::Ok; // tolerate double-release
         };
@@ -335,7 +335,13 @@ impl FuseHost {
     }
 
     #[cfg_attr(not(windows), allow(unused_variables))]
-    pub(in crate::vfs_host) async fn op_create(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
+    pub(in crate::vfs::host) async fn op_create(
+        &self,
+        mount_id: u32,
+        parent_nodeid: u64,
+        name: &str,
+        mode: u32,
+    ) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,

@@ -22,62 +22,78 @@
 //! sb.stop_vm().unwrap();
 //! ```
 
-pub mod backend_kind;
-
-mod api;
-mod backend;
-mod error;
-pub mod fonts;
+// ── Module tree ──────────────────────────────────────────────────────────────
+pub mod api;
+pub mod backends;
 pub mod host_exec;
-pub mod host_exec_protocol;
-pub mod init_client;
-mod platform;
-pub mod session_registry;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) mod shared_backend;
+pub mod init;
+pub mod net;
+pub mod util;
+pub mod vfs;
 
-pub mod net_constants;
-pub mod protocol;
-pub mod rootfs_init;
-pub mod svc_protocol;
-pub mod vm_dir;
+// ── Backward-compat shims: internal `crate::OLDNAME` paths ──────────────────
+// These allow all existing `use crate::X` statements in the internal source
+// files to continue compiling without modification.
 
-pub mod affinity;
+// api group
+pub(crate) use api::backend;
+pub use api::backend_kind;
+pub(crate) use api::error;
+pub(crate) use api::platform;
+
+// vfs group
+pub use vfs::backend as vfs_backend;
+pub use vfs::host as vfs_host;
+pub use vfs::impls as vfs_impls;
+pub use vfs::protocol as vfs_protocol;
+
+// init group
+pub use init::client as init_client;
+pub use init::protocol;
+
+// host_exec group
+pub use host_exec::protocol as host_exec_protocol;
+
+// backends group
 #[cfg(target_os = "linux")]
-pub mod ifreq;
-#[cfg(target_os = "linux")]
-pub mod vsock_util;
-
-#[cfg(unix)]
-pub mod raw_io;
-
-// FUSE-over-vsock VFS bridge (cross-platform). See
-// plan/cross-platform-fuse-vfs.md.
-pub mod vfs_backend;
-pub mod vfs_host;
-pub mod vfs_impls;
-pub mod vfs_protocol;
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-pub mod netstack;
-
-#[cfg(target_os = "linux")]
-pub mod linux;
+pub use backends::linux;
 #[cfg(target_os = "macos")]
-pub(crate) mod macos;
+pub(crate) use backends::macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use backends::shared as shared_backend;
+pub use backends::svc_protocol;
 #[cfg(target_os = "windows")]
-pub(crate) mod windows;
+pub(crate) use backends::windows;
 
+// net group
+pub use net::constants as net_constants;
+#[cfg(target_os = "linux")]
+pub use net::ifreq;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub use net::netstack;
+
+// util group
+pub use util::affinity;
+pub use util::fonts;
+#[cfg(unix)]
+pub use util::raw_io;
+pub use util::rootfs_init;
+pub use util::session_registry;
+pub use util::vm_dir;
+#[cfg(target_os = "linux")]
+pub use util::vsock_util;
+
+// ── Top-level re-exports from api/ ───────────────────────────────────────────
+pub use api::backend::SandboxBackend;
+pub use api::backend_kind::{ActiveBackend, SandboxBackendKind, detect_backend};
+pub use api::error::{Error, Result};
 pub use api::{
     ConfigureParams, Event, HostExecAction, HostExecCallback, HostExecCtx, JobId, Mount, NetworkPolicy,
     PortForwardSpec, Sandbox, SessionDetails, SessionSummary, ShellOpts,
 };
-pub use backend::SandboxBackend;
-pub use backend_kind::{ActiveBackend, SandboxBackendKind, detect_backend};
-pub use error::{Error, Result};
-pub use fonts::FontDir;
 #[cfg(target_os = "linux")]
-pub use linux::ch::probe::{ChProbeResult, probe_ch};
+pub use backends::linux::ch::probe::{ChProbeResult, probe_ch};
+pub use util::fonts::FontDir;
 
 #[cfg(target_os = "windows")]
-pub use windows::canonicalize_safe;
+pub use backends::windows::canonicalize_safe;

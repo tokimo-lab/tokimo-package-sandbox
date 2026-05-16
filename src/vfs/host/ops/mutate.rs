@@ -11,7 +11,7 @@ impl FuseHost {
     /// or device node). The kernel invokes `FUSE_MKNOD` here when an
     /// application calls `bind(2)` on an AF_UNIX socket whose path
     /// resides on this FUSE mount.
-    pub(in crate::vfs_host) async fn op_mknod(
+    pub(in crate::vfs::host) async fn op_mknod(
         &self,
         mount_id: u32,
         parent_nodeid: u64,
@@ -49,7 +49,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_unlink(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+    pub(in crate::vfs::host) async fn op_unlink(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -70,7 +70,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_rename(
+    pub(in crate::vfs::host) async fn op_rename(
         &self,
         mount_id: u32,
         old_parent: u64,
@@ -132,7 +132,7 @@ impl FuseHost {
         Res::Error(errno_for(&VfsError::NotImplemented("rename".into())))
     }
 
-    pub(in crate::vfs_host) async fn op_symlink(
+    pub(in crate::vfs::host) async fn op_symlink(
         &self,
         mount_id: u32,
         parent_nodeid: u64,

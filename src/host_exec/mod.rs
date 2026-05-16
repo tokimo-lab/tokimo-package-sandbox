@@ -44,6 +44,7 @@ use crate::api::{HostExecAction, HostExecCallback, HostExecCtx};
 use crate::host_exec_protocol::wire::blocking::{read_frame, write_frame};
 use crate::host_exec_protocol::{Frame, HOST_EXEC_PROTOCOL_VERSION};
 
+pub mod protocol;
 pub mod transport;
 
 #[cfg(target_os = "linux")]

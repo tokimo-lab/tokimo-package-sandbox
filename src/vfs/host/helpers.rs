@@ -14,7 +14,7 @@ use super::MountEntry;
 /// tokio task. Heavy ops (Read/Write/ReadDir/ReadDirPlus do bulk
 /// transfers or backend list/stat per entry) get spawned so they don't
 /// stall the read loop.
-pub(in crate::vfs_host) fn op_is_cheap(op: &Req) -> bool {
+pub(in crate::vfs::host) fn op_is_cheap(op: &Req) -> bool {
     matches!(
         op,
         Req::Forget { .. }
@@ -30,7 +30,7 @@ pub(in crate::vfs_host) fn op_is_cheap(op: &Req) -> bool {
 }
 
 #[cfg(unix)]
-pub(in crate::vfs_host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
+pub(in crate::vfs::host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
 }
@@ -56,7 +56,7 @@ pub(in crate::vfs_host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
 /// - Subsequent `stat` returns the fallback mode (0o755 for files/dirs,
 ///   0o777 for symlinks). The NTFS readonly bit is not touched here either.
 #[cfg(windows)]
-pub(in crate::vfs_host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
+pub(in crate::vfs::host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
     use crate::windows::ntfs_mode::{FileKind, volume_supports_ea, write_mode_ea};
 
     if !volume_supports_ea(path) {
@@ -75,9 +75,9 @@ pub(in crate::vfs_host) fn apply_host_mode(path: &std::path::Path, mode: u32) {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(in crate::vfs_host) fn apply_host_mode(_path: &std::path::Path, _mode: u32) {}
+pub(in crate::vfs::host) fn apply_host_mode(_path: &std::path::Path, _mode: u32) {}
 
-pub(in crate::vfs_host) fn attr_from(info: &VfsFileInfo) -> AttrOut {
+pub(in crate::vfs::host) fn attr_from(info: &VfsFileInfo) -> AttrOut {
     let kind = if info.is_symlink {
         NodeKind::Symlink
     } else if info.is_socket {
@@ -127,7 +127,7 @@ pub(in crate::vfs_host) fn attr_from(info: &VfsFileInfo) -> AttrOut {
     }
 }
 
-pub(in crate::vfs_host) async fn drain_staging_to_backend(
+pub(in crate::vfs::host) async fn drain_staging_to_backend(
     mount: &MountEntry,
     path: &Path,
     staging_path: &Path,

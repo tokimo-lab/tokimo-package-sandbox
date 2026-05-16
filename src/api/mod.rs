@@ -16,6 +16,11 @@
 //! traffic; the guest-side `tokimo.netdns=off` cmdline disables the DNS
 //! resolver). Pre-/post-spawn hooks and CA installation are still TODO.
 
+pub mod backend;
+pub mod backend_kind;
+pub mod error;
+pub mod platform;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

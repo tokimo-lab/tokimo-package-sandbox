@@ -9,7 +9,7 @@ use super::super::FuseHost;
 use super::super::helpers::{apply_host_mode, attr_from};
 
 impl FuseHost {
-    pub(in crate::vfs_host) async fn op_lookup(self: Arc<Self>, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+    pub(in crate::vfs::host) async fn op_lookup(self: Arc<Self>, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -31,7 +31,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_getattr(&self, mount_id: u32, nodeid: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_getattr(&self, mount_id: u32, nodeid: u64) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -45,7 +45,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_setattr(
+    pub(in crate::vfs::host) async fn op_setattr(
         &self,
         mount_id: u32,
         nodeid: u64,
@@ -125,7 +125,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_readlink(&self, mount_id: u32, nodeid: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_readlink(&self, mount_id: u32, nodeid: u64) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,

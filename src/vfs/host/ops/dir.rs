@@ -15,7 +15,7 @@ use super::super::id_table::FhEntry;
 use super::super::{DirSnapshot, FuseHost};
 
 impl FuseHost {
-    pub(in crate::vfs_host) async fn op_opendir(self: Arc<Self>, mount_id: u32, nodeid: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_opendir(self: Arc<Self>, mount_id: u32, nodeid: u64) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -49,7 +49,7 @@ impl FuseHost {
         Res::OpenOk { fh }
     }
 
-    pub(in crate::vfs_host) async fn op_readdir(&self, fh: u64, offset: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_readdir(&self, fh: u64, offset: u64) -> Res {
         // Snapshot under the lock, then build the response.
         let snap = self.id_table.with_fh_mut(fh, |entry| match entry {
             FhEntry::Dir {
@@ -108,7 +108,7 @@ impl FuseHost {
     /// FUSE READDIRPLUS: same iteration as [`op_readdir`](Self::op_readdir)
     /// but each entry carries full attrs and bumps the lookup count
     /// (kernel will [`Forget`](crate::vfs_protocol::Req::Forget) when evicting from cache).
-    pub(in crate::vfs_host) async fn op_readdirplus(&self, fh: u64, offset: u64) -> Res {
+    pub(in crate::vfs::host) async fn op_readdirplus(&self, fh: u64, offset: u64) -> Res {
         let snap = self.id_table.with_fh_mut(fh, |entry| match entry {
             FhEntry::Dir {
                 mount_id,
@@ -214,7 +214,7 @@ impl FuseHost {
     }
 
     #[cfg_attr(not(windows), allow(unused_variables))]
-    pub(in crate::vfs_host) async fn op_mkdir(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
+    pub(in crate::vfs::host) async fn op_mkdir(&self, mount_id: u32, parent_nodeid: u64, name: &str, mode: u32) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,
@@ -256,7 +256,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs_host) async fn op_rmdir(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
+    pub(in crate::vfs::host) async fn op_rmdir(&self, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
         let parent = match self.resolve_path(mount_id, parent_nodeid) {
             Ok(p) => p,
             Err(r) => return r,

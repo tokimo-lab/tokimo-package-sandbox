@@ -68,10 +68,10 @@ pub struct FuseHost {
 }
 
 #[derive(Clone)]
-pub(in crate::vfs_host) struct MountEntry {
+pub(in crate::vfs::host) struct MountEntry {
     name: String,
-    pub(in crate::vfs_host) backend: SharedVfsBackend,
-    pub(in crate::vfs_host) read_only: bool,
+    pub(in crate::vfs::host) backend: SharedVfsBackend,
+    pub(in crate::vfs::host) read_only: bool,
 }
 
 impl Default for FuseHost {
@@ -140,7 +140,7 @@ impl FuseHost {
             .map(|i| i as u32)
     }
 
-    pub(in crate::vfs_host) fn get_mount(&self, mount_id: u32) -> Option<MountEntry> {
+    pub(in crate::vfs::host) fn get_mount(&self, mount_id: u32) -> Option<MountEntry> {
         self.mounts.read().get(mount_id as usize).and_then(|slot| slot.clone())
     }
 
@@ -287,7 +287,7 @@ impl FuseHost {
 
     /// Translate `(mount_id, nodeid)` to a vfs-relative path. `nodeid==1`
     /// is always the export root `/`.
-    pub(in crate::vfs_host) fn resolve_path(&self, mount_id: u32, nodeid: u64) -> Result<PathBuf, Res> {
+    pub(in crate::vfs::host) fn resolve_path(&self, mount_id: u32, nodeid: u64) -> Result<PathBuf, Res> {
         if nodeid == 1 {
             return Ok(PathBuf::from("/"));
         }
@@ -303,7 +303,7 @@ impl FuseHost {
         Ok(n.path)
     }
 
-    pub(in crate::vfs_host) fn child_path(parent: &Path, name: &str) -> PathBuf {
+    pub(in crate::vfs::host) fn child_path(parent: &Path, name: &str) -> PathBuf {
         if parent == Path::new("/") {
             PathBuf::from(format!("/{name}"))
         } else {
