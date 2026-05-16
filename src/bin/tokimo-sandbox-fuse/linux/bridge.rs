@@ -315,16 +315,7 @@ impl Filesystem for FuseBridge {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn fallocate(
-        &mut self,
-        r: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        length: i64,
-        mode: i32,
-        reply: ReplyEmpty,
-    ) {
+    fn fallocate(&mut self, r: &Request, ino: u64, fh: u64, offset: i64, length: i64, mode: i32, reply: ReplyEmpty) {
         ops::file::fallocate(self, r, ino, fh, offset, length, mode, reply)
     }
 
@@ -342,7 +333,9 @@ impl Filesystem for FuseBridge {
         flags: u32,
         reply: ReplyWrite,
     ) {
-        ops::file::copy_file_range(self, r, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags, reply)
+        ops::file::copy_file_range(
+            self, r, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags, reply,
+        )
     }
 
     fn lseek(&mut self, r: &Request, ino: u64, fh: u64, offset: i64, whence: i32, reply: fuser::ReplyLseek) {

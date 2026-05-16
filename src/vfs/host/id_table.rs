@@ -48,10 +48,7 @@ impl NodeEntry {
     /// first inserted (oldest) path so the choice is stable across
     /// alias additions.
     pub fn resolve_path(&self) -> &Path {
-        self.paths
-            .first()
-            .map(|p| p.as_path())
-            .unwrap_or_else(|| Path::new(""))
+        self.paths.first().map(|p| p.as_path()).unwrap_or_else(|| Path::new(""))
     }
 }
 
@@ -401,10 +398,7 @@ impl IdTable {
             out.push(nid);
         }
         for (i, node) in inner.nodes.iter() {
-            if node.mount_id == mount_id
-                && node.inode_key == Some((dev, ino))
-                && !out.contains(&(i as u64 + 2))
-            {
+            if node.mount_id == mount_id && node.inode_key == Some((dev, ino)) && !out.contains(&(i as u64 + 2)) {
                 out.push(i as u64 + 2);
             }
         }

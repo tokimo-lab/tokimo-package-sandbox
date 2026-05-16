@@ -44,13 +44,7 @@ impl FuseHost {
         }
     }
 
-    pub(in crate::vfs::host) async fn op_getxattr(
-        &self,
-        mount_id: u32,
-        nodeid: u64,
-        name: &str,
-        size: u32,
-    ) -> Res {
+    pub(in crate::vfs::host) async fn op_getxattr(&self, mount_id: u32, nodeid: u64, name: &str, size: u32) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
             Err(r) => return r,

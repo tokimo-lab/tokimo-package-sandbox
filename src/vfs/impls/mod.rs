@@ -306,9 +306,7 @@ mod tests {
 
         let names = xa.list_xattr(Path::new("/x")).await.unwrap();
         // NUL-separated names — check presence of "user.foo".
-        let contains = names
-            .split(|b| *b == 0)
-            .any(|n| n == b"user.foo");
+        let contains = names.split(|b| *b == 0).any(|n| n == b"user.foo");
         assert!(contains, "names blob did not contain user.foo: {names:?}");
 
         xa.remove_xattr(Path::new("/x"), "user.foo").await.unwrap();

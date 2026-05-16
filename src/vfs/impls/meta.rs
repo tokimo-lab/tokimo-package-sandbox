@@ -143,7 +143,6 @@ pub(super) fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Me
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
             // Windows: number_of_links is unavailable on Metadata; FUSE
             // hosts on Windows don't expose link(2) as a fast path, so
             // a default of 1 is correct for non-hard-linked files.

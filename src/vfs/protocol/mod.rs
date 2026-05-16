@@ -444,9 +444,14 @@ pub enum Res {
     BmapBlock(u64),
     /// Ioctl reply: `result` is the integer return value, `data` is the
     /// out buffer (may be empty).
-    Ioctl { result: i32, data: Vec<u8> },
+    Ioctl {
+        result: i32,
+        data: Vec<u8>,
+    },
     /// Poll reply (response to [`Req::Poll`]).
-    Poll { revents: u32 },
+    Poll {
+        revents: u32,
+    },
 }
 
 /// Lock range / type used by [`Req::Getlk`] / [`Req::Setlk`] /

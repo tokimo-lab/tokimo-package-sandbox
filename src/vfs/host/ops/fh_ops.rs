@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use crate::vfs_backend::VfsError;
-use crate::vfs_protocol::{Errno, LockSpec, LockType, Res, WireError, errno_for};
+#[cfg(unix)]
+use crate::vfs_protocol::LockType;
+use crate::vfs_protocol::{Errno, LockSpec, Res, WireError, errno_for};
 
 use super::super::FuseHost;
 use super::super::id_table::FhEntry;
@@ -46,7 +48,7 @@ impl FuseHost {
                     if rc != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -69,13 +71,7 @@ impl FuseHost {
         Res::Ok
     }
 
-    pub(in crate::vfs::host) async fn op_fallocate(
-        &self,
-        fh: u64,
-        offset: i64,
-        length: i64,
-        mode: u32,
-    ) -> Res {
+    pub(in crate::vfs::host) async fn op_fallocate(&self, fh: u64, offset: i64, length: i64, mode: u32) -> Res {
         let Some(f) = self.host_file(fh) else {
             return Res::Error(errno_for(&VfsError::NotSupported("fallocate without host file".into())));
         };
@@ -177,7 +173,7 @@ impl FuseHost {
                 }
                 Ok(rc as u32)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(all(unix, not(target_os = "linux")))]
             {
                 // Userland fallback: read-then-write up to MAX_IO_CHUNK to
                 // give callers *something*.
@@ -190,6 +186,11 @@ impl FuseHost {
                 }
                 f_out.write_at(&buf[..n], off_out as u64)?;
                 Ok(n as u32)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (f_in, f_out, off_in, off_out, len);
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "copy_file_range"))
             }
         })
         .await;
@@ -209,19 +210,27 @@ impl FuseHost {
         let Some(f) = self.host_file(fh) else {
             return Res::Error(errno_for(&VfsError::NotSupported("lseek without host file".into())));
         };
-        let res = tokio::task::spawn_blocking(move || -> std::io::Result<i64> {
-            use std::os::fd::AsRawFd;
-            let rc = unsafe { libc::lseek(f.as_raw_fd(), offset as libc::off_t, whence as i32) };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error());
+        #[cfg(unix)]
+        {
+            let res = tokio::task::spawn_blocking(move || -> std::io::Result<i64> {
+                use std::os::fd::AsRawFd;
+                let rc = unsafe { libc::lseek(f.as_raw_fd(), offset as libc::off_t, whence as i32) };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(rc as i64)
+            })
+            .await;
+            match res {
+                Ok(Ok(off)) => Res::Offset(off),
+                Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
+                Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
             }
-            Ok(rc as i64)
-        })
-        .await;
-        match res {
-            Ok(Ok(off)) => Res::Offset(off),
-            Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
-            Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (f, offset, whence);
+            Res::Error(errno_for(&VfsError::NotSupported("lseek".into())))
         }
     }
 
@@ -268,11 +277,11 @@ impl FuseHost {
                 })
             })
             .await;
-            return match res {
+            match res {
                 Ok(Ok(spec)) => Res::Lock(spec),
                 Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
                 Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
-            };
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -314,11 +323,11 @@ impl FuseHost {
                 Ok(())
             })
             .await;
-            return match res {
+            match res {
                 Ok(Ok(())) => Res::Ok,
                 Ok(Err(e)) => Res::Error(errno_for(&VfsError::from(e))),
                 Err(e) => Res::Error(errno_for(&VfsError::Io(e.to_string()))),
-            };
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {

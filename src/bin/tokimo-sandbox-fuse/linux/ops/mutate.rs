@@ -117,14 +117,7 @@ pub(crate) fn symlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsSt
     }
 }
 
-pub(crate) fn link(
-    b: &mut FuseBridge,
-    _r: &Request,
-    ino: u64,
-    newparent: u64,
-    newname: &OsStr,
-    reply: ReplyEntry,
-) {
+pub(crate) fn link(b: &mut FuseBridge, _r: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
     let n = match newname.to_str() {
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),

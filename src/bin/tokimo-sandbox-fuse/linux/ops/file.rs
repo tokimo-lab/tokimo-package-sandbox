@@ -269,8 +269,8 @@ pub(crate) fn getlk(
 ) {
     use tokimo_package_sandbox::vfs_protocol::{LockSpec, LockType};
     let lt = match typ {
-        x if x == libc::F_RDLCK as i32 => LockType::Read,
-        x if x == libc::F_WRLCK as i32 => LockType::Write,
+        x if x == libc::F_RDLCK => LockType::Read,
+        x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
     match b.dispatcher.call(Req::Getlk {
@@ -286,9 +286,9 @@ pub(crate) fn getlk(
     }) {
         Res::Lock(s) => {
             let t = match s.typ {
-                LockType::Read => libc::F_RDLCK as i32,
-                LockType::Write => libc::F_WRLCK as i32,
-                LockType::Unlock => libc::F_UNLCK as i32,
+                LockType::Read => libc::F_RDLCK,
+                LockType::Write => libc::F_WRLCK,
+                LockType::Unlock => libc::F_UNLCK,
             };
             reply.locked(s.start, s.end, t, s.pid);
         }
@@ -313,8 +313,8 @@ pub(crate) fn setlk(
 ) {
     use tokimo_package_sandbox::vfs_protocol::{LockSpec, LockType};
     let lt = match typ {
-        x if x == libc::F_RDLCK as i32 => LockType::Read,
-        x if x == libc::F_WRLCK as i32 => LockType::Write,
+        x if x == libc::F_RDLCK => LockType::Read,
+        x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
     match b.dispatcher.call(Req::Setlk {

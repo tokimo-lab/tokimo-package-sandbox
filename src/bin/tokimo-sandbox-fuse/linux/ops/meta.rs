@@ -207,14 +207,7 @@ pub(crate) fn setxattr(
     }
 }
 
-pub(crate) fn getxattr(
-    b: &mut FuseBridge,
-    _r: &Request,
-    ino: u64,
-    name: &OsStr,
-    size: u32,
-    reply: fuser::ReplyXattr,
-) {
+pub(crate) fn getxattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsStr, size: u32, reply: fuser::ReplyXattr) {
     let n = match name.to_str() {
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),

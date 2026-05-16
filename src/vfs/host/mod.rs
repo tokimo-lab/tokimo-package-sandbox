@@ -384,7 +384,10 @@ impl FuseHost {
                 off_out,
                 len,
                 flags,
-            } => self.op_copy_file_range(fh_in, off_in, fh_out, off_out, len, flags).await,
+            } => {
+                self.op_copy_file_range(fh_in, off_in, fh_out, off_out, len, flags)
+                    .await
+            }
             Req::Getlk { fh, owner, lk } => self.op_getlk(fh, owner, lk).await,
             Req::Setlk { fh, owner, lk, sleep } => self.op_setlk(fh, owner, lk, sleep).await,
             Req::Lseek { fh, offset, whence } => self.op_lseek(fh, offset, whence).await,

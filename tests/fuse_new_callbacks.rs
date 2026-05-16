@@ -120,7 +120,10 @@ echo INO_OK
 "#,
     );
     assert!(captured.contains("INO_OK"), "captured = {captured}");
-    assert!(!captured.contains("BAD_") && !captured.contains("ALIASES_LOST"), "captured = {captured}");
+    assert!(
+        !captured.contains("BAD_") && !captured.contains("ALIASES_LOST"),
+        "captured = {captured}"
+    );
 }
 
 #[test]
@@ -223,7 +226,10 @@ echo ACCESS_OK
 "#,
     );
     assert!(captured.contains("ACCESS_OK"), "captured = {captured}");
-    assert!(!captured.contains("BAD_") && !captured.contains("FAIL"), "captured = {captured}");
+    assert!(
+        !captured.contains("BAD_") && !captured.contains("FAIL"),
+        "captured = {captured}"
+    );
 }
 
 #[test]
@@ -336,7 +342,10 @@ echo FLOCK_DONE
         captured.contains("LOCK2_BLOCKED_OK") || captured.contains("LOCK_NOTSUP_OK"),
         "captured = {captured}"
     );
-    assert!(!captured.contains("LOCK2_UNEXPECTED") && !captured.contains("BAD_ERRNO"), "captured = {captured}");
+    assert!(
+        !captured.contains("LOCK2_UNEXPECTED") && !captured.contains("BAD_ERRNO"),
+        "captured = {captured}"
+    );
 }
 
 #[test]
