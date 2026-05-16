@@ -311,7 +311,7 @@ impl VfsMknod for LocalDirVfs {
             // mknod(2) is blocking; offload to spawn_blocking.
             let host_cl = host.clone();
             let res = tokio::task::spawn_blocking(move || -> nix::Result<()> {
-                let m = Mode::from_bits_truncate(perm_bits);
+                let m = Mode::from_bits_truncate(perm_bits as nix::libc::mode_t);
                 nix_mknod(&host_cl, sflag, m, rdev as nix::libc::dev_t)
             })
             .await

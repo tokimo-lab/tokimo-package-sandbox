@@ -210,18 +210,15 @@ mod linux {
         };
         let mut opts = vec![
             MountOption::FSName(format!("tokimo-{}", args.mount_name)),
-            // NOTE: Intentionally NOT using `MountOption::DefaultPermissions`.
-            // The kernel's DAC check there compares the caller's fsuid against
-            // the inode's i_uid/i_gid in the *fuse superblock's* user_ns.
-            // When the fuse mount is performed via setuid `fusermount3`, the
-            // superblock's user_ns is `init_user_ns`. From an unprivileged
-            // bwrap user_ns the host caller (uid 1001 on CI) appears as nobody
-            // (65534), so even mode 0o777 doesn't help — the kernel rejects
-            // writes with EACCES. Without `DefaultPermissions` the kernel
-            // skips the DAC check and lets the FUSE server enforce policy.
-            // Our server is a passthrough that executes ops with the host
-            // caller's own credentials (which owns the backing dir), so this
-            // is the correct semantics for the sandbox workspace.
+            // `DefaultPermissions` makes the kernel perform DAC against the
+            // mode/uid/gid we report via getattr. Without it, the kernel
+            // runs a fallback permission check that rejects file creation
+            // (mknod/create) over FUSE inside an unprivileged user_ns with
+            // EACCES — even when the FUSE server would accept the op. With
+            // `DefaultPermissions`, the backing dir's mode (0o777 for the
+            // sandbox workspace) is honoured and AF_UNIX `bind()`, FIFO
+            // mknod, and regular file creates all succeed end-to-end.
+            MountOption::DefaultPermissions,
             MountOption::AllowOther,
             MountOption::NoAtime,
         ];
