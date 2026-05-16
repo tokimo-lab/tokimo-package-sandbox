@@ -372,7 +372,7 @@ impl FuseHost {
         }
         match mount.backend.stat(&path).await {
             Ok(info) => {
-                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                let (nodeid, _) = self.id_table.intern_with_inode(mount_id, path, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid,
                     generation: self.id_table.generation(),

@@ -57,20 +57,70 @@ ln a.txt b.txt
 # link reply's EntryOut, which carries the real post-link nlink=2.
 [ "$(stat -c %h b.txt)" = "2" ] || { echo "BAD_NLINK_B=$(stat -c %h b.txt)"; exit 1; }
 [ "$(cat b.txt)" = "payload" ] || { echo "BAD_CONTENT_B=$(cat b.txt)"; exit 1; }
+# Inode identity: after the (mount_id, dev, ino) dedup in the host
+# IdTable, both names share one nodeid → the kernel reports identical
+# st_ino, matching native (non-FUSE) hard-link semantics.
+ino_a=$(stat -c %i a.txt)
+ino_b=$(stat -c %i b.txt)
+[ "$ino_a" = "$ino_b" ] || { echo "BAD_INO ino_a=$ino_a ino_b=$ino_b"; exit 1; }
+# Cross-name content propagation: writing through one name must show
+# up through the other. This used to require FUSE_NOTIFY_INVAL_INODE
+# because each FUSE nodeid kept its own page cache; with inode dedup
+# both names resolve to the same nodeid + cache, so the new content
+# is visible immediately.
+echo mutated > a.txt
+[ "$(cat b.txt)" = "mutated" ] || { echo "BAD_CROSS_MUTATE=$(cat b.txt)"; exit 1; }
 # Unlinking the source must NOT delete the file — that's the defining
 # property of a hard link (vs a copy or a symlink).
 rm a.txt
 [ -f b.txt ] || { echo "B_MISSING_AFTER_UNLINK_A"; exit 1; }
-[ "$(cat b.txt)" = "payload" ] || { echo "BAD_CONTENT_2=$(cat b.txt)"; exit 1; }
-# (Cross-name content propagation after a write isn't asserted here:
-# each FUSE inode owns its own page cache, and host-side mutation
-# through one name doesn't auto-invalidate the other's cache without
-# FUSE_NOTIFY_INVAL_INODE, which we don't currently emit.)
+[ "$(cat b.txt)" = "mutated" ] || { echo "BAD_CONTENT_2=$(cat b.txt)"; exit 1; }
 echo LINK_OK
 "#,
     );
     assert!(captured.contains("LINK_OK"), "captured = {captured}");
     assert!(!captured.contains("BAD_"), "captured = {captured}");
+}
+
+#[test]
+fn hard_link_inode_identity() {
+    // Targeted regression test for the IdTable `(mount_id, dev, ino)`
+    // dedup pass: two paths to the same inode must share one nodeid,
+    // and dropping one name must keep the inode reachable through the
+    // other without losing kernel-side cache coherency.
+    let captured = run(
+        "fuse-link-ino",
+        r#"
+rm -rf ino_dir && mkdir ino_dir && cd ino_dir
+echo first > master.txt
+ln master.txt alias1.txt
+ln master.txt alias2.txt
+# All three names share the same on-host inode and, via dedup, the
+# same FUSE nodeid → identical st_ino.
+ino_m=$(stat -c %i master.txt)
+ino_1=$(stat -c %i alias1.txt)
+ino_2=$(stat -c %i alias2.txt)
+[ "$ino_m" = "$ino_1" ] && [ "$ino_1" = "$ino_2" ] \
+    || { echo "BAD_INO_TRIPLE m=$ino_m a1=$ino_1 a2=$ino_2"; exit 1; }
+# nlink reflects the real on-host count (3).
+[ "$(stat -c %h master.txt)" = "3" ] || { echo "BAD_NLINK_M=$(stat -c %h master.txt)"; exit 1; }
+# Unlink the source name; alias1 + alias2 must still resolve and
+# share an inode.
+rm master.txt
+[ -f alias1.txt ] && [ -f alias2.txt ] || { echo "ALIASES_LOST"; exit 1; }
+ino_1b=$(stat -c %i alias1.txt)
+ino_2b=$(stat -c %i alias2.txt)
+[ "$ino_1b" = "$ino_2b" ] || { echo "BAD_INO_AFTER_UNLINK a1=$ino_1b a2=$ino_2b"; exit 1; }
+[ "$(stat -c %h alias1.txt)" = "2" ] || { echo "BAD_NLINK_AFTER=$(stat -c %h alias1.txt)"; exit 1; }
+# Content propagation via cache invalidation: writing to alias1
+# is visible through alias2 (same nodeid, same page cache).
+echo updated > alias1.txt
+[ "$(cat alias2.txt)" = "updated" ] || { echo "BAD_PROPAGATE=$(cat alias2.txt)"; exit 1; }
+echo INO_OK
+"#,
+    );
+    assert!(captured.contains("INO_OK"), "captured = {captured}");
+    assert!(!captured.contains("BAD_") && !captured.contains("ALIASES_LOST"), "captured = {captured}");
 }
 
 #[test]

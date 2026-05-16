@@ -38,7 +38,7 @@ impl FuseHost {
         }
         match mount.backend.stat(&path).await {
             Ok(info) => {
-                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                let (nodeid, _) = self.id_table.intern_with_inode(mount_id, path, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid,
                     generation: self.id_table.generation(),
@@ -65,7 +65,15 @@ impl FuseHost {
         };
         let path = Self::child_path(&parent, name);
         match d.delete_file(&path).await {
-            Ok(()) => Res::Ok,
+            Ok(()) => {
+                // Drop just this path alias; the underlying inode (and
+                // therefore the nodeid) may still be reachable via
+                // other hard-linked names. `unbind_path` releases the
+                // nodeid only if both `paths` is empty and refcount is
+                // zero.
+                self.id_table.unbind_path(mount_id, &path);
+                Res::Ok
+            }
             Err(e) => Res::Error(errno_for(&e)),
         }
     }
@@ -158,7 +166,7 @@ impl FuseHost {
         }
         match mount.backend.stat(&path).await {
             Ok(info) => {
-                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                let (nodeid, _) = self.id_table.intern_with_inode(mount_id, path, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid,
                     generation: self.id_table.generation(),
@@ -201,7 +209,13 @@ impl FuseHost {
         }
         match mount.backend.stat(&dst).await {
             Ok(info) => {
-                let (nid, _) = self.id_table.intern(mount_id, dst);
+                // Inode-aware intern: `dst` now points at the same
+                // inode as `src`, so this collapses onto the existing
+                // nodeid via `by_inode` rather than allocating a fresh
+                // one. The kernel sees one nodeid + one page cache for
+                // both names (matching the bare-host hard-link
+                // semantics that `stat -c %i a == stat -c %i b`).
+                let (nid, _) = self.id_table.intern_with_inode(mount_id, dst, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid: nid,
                     generation: self.id_table.generation(),

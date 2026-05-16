@@ -54,6 +54,12 @@ pub struct DirSnapshot {
     pub mode: u32,
     pub mtime: i64,
     pub rdev: u32,
+    /// Underlying `(dev, ino)` pair, when the backend exposed it via
+    /// [`VfsFileInfo::dev`](crate::vfs_backend::VfsFileInfo::dev) /
+    /// [`VfsFileInfo::ino`](crate::vfs_backend::VfsFileInfo::ino). Used
+    /// to dedup hard-linked children at readdirplus time.
+    pub dev: u64,
+    pub ino: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +352,7 @@ impl FuseHost {
                 "nodeid/mount_id mismatch".into(),
             ))));
         }
-        Ok(n.path)
+        Ok(n.resolve_path().to_path_buf())
     }
 
     pub(in crate::vfs::host) fn child_path(parent: &Path, name: &str) -> PathBuf {

@@ -37,6 +37,8 @@ impl FuseHost {
                     mode: attr.mode,
                     mtime: attr.mtime,
                     rdev: attr.rdev,
+                    dev: info.dev,
+                    ino: info.ino,
                 };
                 (info.name, snap)
             })
@@ -187,9 +189,10 @@ impl FuseHost {
 
         for (i, (name, snap)) in entries.into_iter().enumerate().skip(off.saturating_sub(2)) {
             let child = Self::child_path(&dir_path, &name);
-            // intern() bumps lookup count — required for READDIRPLUS so
-            // the kernel's Forget pairs balance out.
-            let (nodeid, _) = self.id_table.intern(mount_id, child);
+            // intern_with_inode() bumps lookup count — required for
+            // READDIRPLUS so the kernel's Forget pairs balance out —
+            // and dedups hard-linked entries onto a single nodeid.
+            let (nodeid, _) = self.id_table.intern_with_inode(mount_id, child, snap.dev, snap.ino);
             out.push(WireDirEntryPlus {
                 offset: (i + 3) as u64,
                 name,
@@ -245,7 +248,7 @@ impl FuseHost {
         }
         match mount.backend.stat(&path).await {
             Ok(info) => {
-                let (nodeid, _) = self.id_table.intern(mount_id, path);
+                let (nodeid, _) = self.id_table.intern_with_inode(mount_id, path, info.dev, info.ino);
                 Res::Entry(EntryOut {
                     nodeid,
                     generation: self.id_table.generation(),
@@ -272,7 +275,10 @@ impl FuseHost {
         };
         let path = Self::child_path(&parent, name);
         match d.delete_dir(&path).await {
-            Ok(()) => Res::Ok,
+            Ok(()) => {
+                self.id_table.unbind_path(mount_id, &path);
+                Res::Ok
+            }
             Err(e) => Res::Error(errno_for(&e)),
         }
     }

@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
-use tokimo_package_sandbox::vfs_protocol::{Frame, Req, Res, WireError};
+use tokimo_package_sandbox::vfs_protocol::{Frame, Inval, Req, Res, WireError};
 
 use super::dup_fd;
 
@@ -25,6 +25,13 @@ pub(crate) struct Dispatcher {
     next_req_id: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<Res>>>,
     bound_mount_id: u32,
+    /// FUSE kernel notifier, attached after [`fuser::Session::new`]
+    /// returns. Set once; cloned per use. The reader thread snapshots
+    /// it on each `Frame::Notify` and silently drops the notification
+    /// if the notifier hasn't been installed yet (only possible during
+    /// the brief window between Dispatcher construction and the call
+    /// to [`Self::install_notifier`] in `linux/mod.rs::main`).
+    notifier: Mutex<Option<fuser::Notifier>>,
 }
 
 impl Dispatcher {
@@ -36,7 +43,17 @@ impl Dispatcher {
             next_req_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             bound_mount_id,
+            notifier: Mutex::new(None),
         })
+    }
+
+    /// Attach the FUSE kernel notifier obtained from
+    /// [`fuser::Session::notifier`] *after* the session has been
+    /// constructed. Required for the reader thread to translate
+    /// host-pushed [`Frame::Notify`] frames into actual kernel-side
+    /// cache invalidations.
+    pub(crate) fn install_notifier(&self, n: fuser::Notifier) {
+        *self.notifier.lock().unwrap() = Some(n);
     }
 
     /// Spawn the reader thread that demuxes frames from the host.
@@ -72,7 +89,26 @@ impl Dispatcher {
                             eprintln!("[tokimo-fuse] orphan response req_id={req_id}");
                         }
                     }
-                    Frame::Notify(_) => {}
+                    Frame::Notify(inval) => {
+                        let notifier = me.notifier.lock().unwrap().clone();
+                        match (notifier, inval) {
+                            (Some(n), Inval::Inode { nodeid, off, len }) => {
+                                // Best-effort: -ENOENT means the kernel
+                                // already forgot the inode, which is
+                                // fine for an invalidation hint.
+                                let _ = n.inval_inode(nodeid, off, len);
+                            }
+                            (Some(n), Inval::Entry { parent_nodeid, name }) => {
+                                let _ = n.inval_entry(parent_nodeid, std::ffi::OsStr::new(&name));
+                            }
+                            (None, _) => {
+                                // Notifier not yet installed: drop. In
+                                // practice this is impossible because
+                                // the host only emits Notify frames
+                                // long after `Session::new` returned.
+                            }
+                        }
+                    }
                     other => {
                         eprintln!("[tokimo-fuse] unexpected frame: {other:?}");
                     }

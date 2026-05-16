@@ -152,6 +152,16 @@ pub struct VfsFileInfo {
     /// backends read this from host metadata so `stat -c %h` reports the
     /// correct count after `link(2)`.
     pub nlink: u32,
+    /// Underlying filesystem inode number (`st_ino`). `0` means
+    /// "unknown / not exposed" — the FUSE host falls back to path-only
+    /// nodeid keying for such entries and cannot dedup hard links.
+    /// Passthrough backends (`LocalDirVfs`) populate this from host
+    /// metadata so that two paths pointing at the same inode resolve to
+    /// the same nodeid.
+    pub ino: u64,
+    /// Underlying filesystem device id (`st_dev`). Pairs with [`ino`](Self::ino)
+    /// to form the inode-dedup key. `0` for backends that don't expose it.
+    pub dev: u64,
 }
 
 impl VfsFileInfo {
@@ -173,6 +183,8 @@ impl VfsFileInfo {
             mode,
             rdev: 0,
             nlink: 1,
+            ino: 0,
+            dev: 0,
         }
     }
 }

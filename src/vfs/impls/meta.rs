@@ -155,6 +155,22 @@ pub(super) fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Me
             1
         }
     };
+    // (dev, ino) drive `(mount_id, dev, ino)` dedup in the host
+    // IdTable so two paths to the same inode (after `link(2)`) collapse
+    // to one nodeid + one kernel-side page cache. Path-only backends
+    // (Windows, MemFsVfs) leave both 0 and degrade to the legacy
+    // path-keyed behaviour.
+    let (ino, dev): (u64, u64) = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (md.ino(), md.dev())
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    };
     VfsFileInfo {
         name,
         size: md.len(),
@@ -168,5 +184,7 @@ pub(super) fn meta_to_info(name: String, path: &std::path::Path, md: std::fs::Me
         mode,
         rdev: kind_rdev,
         nlink,
+        ino,
+        dev,
     }
 }
