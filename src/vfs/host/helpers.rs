@@ -14,6 +14,16 @@ use super::MountEntry;
 /// tokio task. Heavy ops (Read/Write/ReadDir/ReadDirPlus do bulk
 /// transfers or backend list/stat per entry) get spawned so they don't
 /// stall the read loop.
+///
+/// We deliberately keep metadata mutators (Create/Mkdir/Unlink/Rename/
+/// Symlink/Link/Mknod/SetAttr/Setxattr/Removexattr) on the spawn path
+/// even though each one is a single syscall. Putting them inline was
+/// benchmarked (10.0.0.118 bwrap N=500) and caused -10% on sequential
+/// and **-32% on K=8 concurrent** because the read loop can no longer
+/// pump the next request while the syscall is in flight. tokio::spawn
+/// on a multi-threaded runtime is ~10µs of overhead, dwarfed by even a
+/// cache-warm `openat` (~30µs); the read-loop parallelism it buys back
+/// is worth far more under any concurrent FS load.
 pub(in crate::vfs::host) fn op_is_cheap(op: &Req) -> bool {
     matches!(
         op,
