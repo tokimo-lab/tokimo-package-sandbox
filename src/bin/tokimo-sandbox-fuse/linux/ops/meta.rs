@@ -19,7 +19,31 @@ pub(crate) fn init(_b: &mut FuseBridge, _req: &Request<'_>, config: &mut KernelC
             | consts::FUSE_AUTO_INVAL_DATA
             | consts::FUSE_DO_READDIRPLUS
             | consts::FUSE_ASYNC_READ
-            | consts::FUSE_BIG_WRITES,
+            | consts::FUSE_BIG_WRITES
+            // PARALLEL_DIROPS: by default the FUSE kernel
+            // serializes LOOKUP/READDIR within a single
+            // directory under the parent's i_rwsem. With this
+            // flag the kernel issues them concurrently. Our
+            // guest dispatcher already pumps replies through a
+            // 16-thread worker pool, so concurrent lookups
+            // translate directly into in-flight RTTs.
+            | consts::FUSE_PARALLEL_DIROPS
+            // CACHE_SYMLINKS: kernel keeps READLINK results in
+            // the page cache instead of re-issuing every
+            // traversal. Symlinks are effectively immutable in
+            // practice, so this is free latency for symlink-
+            // heavy trees (node_modules, .git/refs, ...).
+            | consts::FUSE_CACHE_SYMLINKS
+            // HANDLE_KILLPRIV: advertise that the FS itself
+            // clears suid/sgid/cap bits on write/chown/trunc.
+            // Without it the kernel sends an extra SETATTR
+            // after every write to a privileged file. Our
+            // LocalDirVfs already inherits the host kernel's
+            // standard killpriv semantics through pwrite(2),
+            // so we already conform — this just stops the
+            // kernel from generating the spurious follow-up
+            // RTT.
+            | consts::FUSE_HANDLE_KILLPRIV,
     );
     Ok(())
 }
