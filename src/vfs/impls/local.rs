@@ -525,4 +525,8 @@ impl VfsBackend for LocalDirVfs {
     fn as_access(&self) -> Option<&dyn VfsAccess> {
         Some(self)
     }
+
+    fn watch_root(&self) -> Option<std::path::PathBuf> {
+        Some(self.root.clone())
+    }
 }

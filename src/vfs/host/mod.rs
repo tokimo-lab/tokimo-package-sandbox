@@ -28,6 +28,7 @@
 mod helpers;
 pub mod id_table;
 mod ops;
+mod watcher;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,12 @@ pub(in crate::vfs::host) struct MountEntry {
     name: String,
     pub(in crate::vfs::host) backend: SharedVfsBackend,
     pub(in crate::vfs::host) read_only: bool,
+    /// External-mutation watcher (inotify/FSEvents/RDCW). Some when the
+    /// backend exposed a `watch_root()`. Wrapped in `Arc` so the
+    /// MountEntry can be `Clone` (`get_mount` returns owned copies);
+    /// only the originally-registered slot drops the inner handle when
+    /// removed, which stops the underlying OS subscription.
+    pub(in crate::vfs::host) watcher: Option<Arc<watcher::WatcherHandle>>,
 }
 
 impl Default for FuseHost {
@@ -132,25 +139,49 @@ impl FuseHost {
     /// Register a mount and return its `mount_id`. The id is stable for
     /// the lifetime of the slot; [`Self::remove_mount`] frees it for
     /// reuse.
-    pub fn register_mount(&self, name: impl Into<String>, backend: SharedVfsBackend, read_only: bool) -> u32 {
+    ///
+    /// If `backend.watch_root()` returns `Some`, this also spawns an
+    /// inotify/FSEvents/RDCW watcher whose lifetime is tied to the
+    /// mount slot — `remove_mount` stops it. Takes `&Arc<Self>` because
+    /// the watcher needs a weak reference back to the host to push
+    /// invalidation frames.
+    pub fn register_mount(
+        self: &Arc<Self>,
+        name: impl Into<String>,
+        backend: SharedVfsBackend,
+        read_only: bool,
+    ) -> u32 {
+        let watch_root = backend.watch_root();
         let mut mounts = self.mounts.write();
         // Prefer reusing a free slot.
-        for (i, slot) in mounts.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(MountEntry {
-                    name: name.into(),
-                    backend,
-                    read_only,
-                });
-                return i as u32;
+        let mount_id = if let Some((i, slot)) = mounts.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) {
+            *slot = Some(MountEntry {
+                name: name.into(),
+                backend,
+                read_only,
+                watcher: None,
+            });
+            i as u32
+        } else {
+            mounts.push(Some(MountEntry {
+                name: name.into(),
+                backend,
+                read_only,
+                watcher: None,
+            }));
+            (mounts.len() - 1) as u32
+        };
+        drop(mounts);
+
+        if let Some(root) = watch_root
+            && let Some(handle) = watcher::spawn_watcher(self.clone(), mount_id, root)
+        {
+            let mut mounts = self.mounts.write();
+            if let Some(Some(entry)) = mounts.get_mut(mount_id as usize) {
+                entry.watcher = Some(Arc::new(handle));
             }
         }
-        mounts.push(Some(MountEntry {
-            name: name.into(),
-            backend,
-            read_only,
-        }));
-        (mounts.len() - 1) as u32
+        mount_id
     }
 
     pub fn remove_mount(&self, mount_id: u32) -> Option<String> {
@@ -506,6 +537,52 @@ impl FuseHost {
                 name: name.to_string(),
             });
         }
+    }
+
+    // ---- Watcher-callable accessors --------------------------------
+    //
+    // The watcher module lives in a sibling submodule but logically
+    // belongs to FuseHost. Expose just the operations it needs (one
+    // by_path lookup + two raw frame pushes) rather than widening
+    // `pub(super)` on a bunch of internals.
+
+    pub(in crate::vfs::host) fn id_table_find_path(&self, mount_id: u32, path: &Path) -> Option<u64> {
+        self.id_table.find_path_nodeid(mount_id, path)
+    }
+
+    /// Push a single `Inval::Inode { nodeid }` to every notifier bound
+    /// to (or wildcard over) `mount_id`. Skips the alias-count check
+    /// that `notify_inode` enforces — the watcher already knows the
+    /// exact nodeid that changed.
+    pub(in crate::vfs::host) fn notify_inode_external(&self, mount_id: u32, nodeid: u64) {
+        let targets: Vec<_> = {
+            let guard = self.notifiers.read();
+            guard
+                .iter()
+                .filter(|e| e.mount_id.is_none_or(|m| m == mount_id))
+                .map(|e| e.tx.clone())
+                .collect()
+        };
+        for tx in targets {
+            // Two-shot invalidation: off = -1 drops the cached size +
+            // attrs (required so the next read sees the new EOF), and
+            // off = 0, len = 0 drops the page cache range so the read
+            // actually fetches fresh bytes. Both messages also flush
+            // attrs, so order is not critical.
+            let _ = tx.send(Inval::Inode {
+                nodeid,
+                off: -1,
+                len: 0,
+            });
+            let _ = tx.send(Inval::Inode { nodeid, off: 0, len: 0 });
+        }
+    }
+
+    /// Same wire-level effect as [`Self::notify_entry`]; exposed under
+    /// a distinct name purely to make the call sites in `watcher.rs`
+    /// self-documenting.
+    pub(in crate::vfs::host) fn notify_entry_external(&self, mount_id: u32, parent_nodeid: u64, name: &str) {
+        self.notify_entry(mount_id, parent_nodeid, name);
     }
 }
 

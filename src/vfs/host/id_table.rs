@@ -155,6 +155,19 @@ impl IdTable {
         inner.nodes.get(idx).cloned()
     }
 
+    /// Reverse-lookup: find an existing nodeid for `(mount_id, path)`.
+    /// Does *not* allocate, does *not* bump refcount. Returns `None`
+    /// if the path was never interned (i.e. the guest never `LOOKUP`'d
+    /// it — in which case the kernel can't have it cached either, so
+    /// no invalidation is required).
+    ///
+    /// Used by the host-side filesystem watcher to translate a path
+    /// it observed changing into the nodeid the guest knows it as.
+    pub fn find_path_nodeid(&self, mount_id: u32, path: &Path) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.by_path.get(&(mount_id, path.to_path_buf())).copied()
+    }
+
     /// Lookup or allocate a nodeid for `(mount_id, path)` *without*
     /// inode dedup. Prefer [`Self::intern_with_inode`] from any
     /// callsite that has already done a stat — this path-only variant

@@ -35,12 +35,7 @@ const DONE_MARKER: &str = "__TOKIMO_DONE_MARKER__";
 ///
 /// Expected: second `cat` prints `NEW_CONTENT_42`.
 /// Current (broken) behavior: prints `OLD`.
-///
-/// Marked `#[ignore]` until the host-side filesystem watcher lands.
-/// Run explicitly with `cargo test -- --ignored
-/// external_overwrite_visible_to_guest`.
 #[test]
-#[ignore = "fails until host-side inotify/FSEvents watcher pushes INVAL_INODE; see plan.md"]
 fn external_overwrite_visible_to_guest() {
     let label = "extinval-overwrite";
     let ws = workspace_dir(label);

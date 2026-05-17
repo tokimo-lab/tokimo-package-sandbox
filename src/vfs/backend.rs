@@ -381,6 +381,21 @@ pub trait VfsBackend: VfsReader {
     fn as_access(&self) -> Option<&dyn VfsAccess> {
         None
     }
+
+    /// If this backend mirrors a single on-host directory whose contents
+    /// may be mutated by processes outside the FUSE session, return that
+    /// directory. The host will spawn a filesystem watcher (inotify /
+    /// FSEvents / ReadDirectoryChangesW) on this path and translate
+    /// external mutations into `FUSE_NOTIFY_INVAL_ENTRY` /
+    /// `FUSE_NOTIFY_INVAL_INODE` frames so the guest kernel caches
+    /// never go stale inside our 60 s entry/attr TTL.
+    ///
+    /// Defaults to `None`. In-memory or fully-mediated backends (where
+    /// every mutation already flows through this `FuseHost`) should
+    /// keep the default.
+    fn watch_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Convenience alias used by the Sandbox API.
