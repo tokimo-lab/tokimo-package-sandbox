@@ -46,11 +46,11 @@ pub(crate) fn readdir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, offs
 }
 
 pub(crate) fn releasedir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-    b.dispatcher.call_async(Req::ReleaseDir { fh }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    // Same reasoning as `release` — the kernel does not propagate
+    // the result to userspace. Fire-and-forget saves one RTT per
+    // directory close.
+    b.dispatcher.call_async(Req::ReleaseDir { fh }, |_| {});
+    reply.ok();
 }
 
 pub(crate) fn readdirplus(

@@ -161,10 +161,6 @@ impl Dispatcher {
                     Frame::Response { req_id, result } => {
                         let cb = me.pending.lock().unwrap().remove(&req_id);
                         if let Some(cb) = cb {
-                            // Offload the FUSE reply (which calls
-                            // back into the kernel via /dev/fuse) to
-                            // a worker thread so the reader loop can
-                            // keep consuming responses concurrently.
                             me.pool.submit(move || cb(result));
                         } else {
                             eprintln!("[tokimo-fuse] orphan response req_id={req_id}");

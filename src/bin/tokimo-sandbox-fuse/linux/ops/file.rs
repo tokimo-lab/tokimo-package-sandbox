@@ -72,11 +72,14 @@ pub(crate) fn write(
 }
 
 pub(crate) fn flush(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-    b.dispatcher.call_async(Req::Flush { fh }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    // Fire-and-forget: ack the kernel immediately and let the host
+    // process the Req::Flush in the background. POSIX close()/flush
+    // semantics permit deferred errors (apps that care about write
+    // durability call fsync(2) explicitly, which IS still
+    // synchronous in our protocol). This saves one host RTT per
+    // file close — the dominant cost in small-file workloads.
+    b.dispatcher.call_async(Req::Flush { fh }, |_| {});
+    reply.ok();
 }
 
 pub(crate) fn release(
@@ -89,11 +92,13 @@ pub(crate) fn release(
     _flush: bool,
     reply: ReplyEmpty,
 ) {
-    b.dispatcher.call_async(Req::Release { fh }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    // Fire-and-forget: the kernel does not propagate the result of
+    // FUSE_RELEASE to userspace (close(2) returns immediately after
+    // delivering the request). Ack right away and let the host
+    // close its host_file in the background. Avoids one RTT per
+    // close.
+    b.dispatcher.call_async(Req::Release { fh }, |_| {});
+    reply.ok();
 }
 
 pub(crate) fn create(
