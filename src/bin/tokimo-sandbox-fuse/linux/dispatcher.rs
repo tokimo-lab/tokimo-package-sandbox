@@ -1,4 +1,17 @@
 //! Dispatcher: serialise wire writes, route responses by `req_id`.
+//!
+//! Concurrency model:
+//!   * `call_async(op, cb)` registers a per-request callback and
+//!     returns immediately. The reader thread demuxes responses and
+//!     hands each `(cb, res)` to a worker thread pool which invokes
+//!     the callback. This lets FUSE handlers complete without
+//!     blocking the `fuser::Session::run` read loop, allowing many
+//!     in-flight FUSE ops to overlap. Without this we cap at exactly
+//!     one in-flight op (one socket RTT per op) — a hard wall around
+//!     500-2000 ops/s depending on transport.
+//!   * `call(op)` is the legacy synchronous wrapper used by setup
+//!     code (init, etc.) that runs before any kernel ops; built on
+//!     top of `call_async`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -9,10 +22,50 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver as CbRecv, Sender as CbSend, unbounded};
 use tokimo_package_sandbox::vfs_protocol::wire::blocking as wire;
 use tokimo_package_sandbox::vfs_protocol::{Frame, Inval, Req, Res, WireError};
 
 use super::dup_fd;
+
+/// Worker pool that runs FUSE response callbacks off the reader thread.
+/// Sized once at dispatcher init (defaults to 16). 16 workers ≈ 16
+/// concurrent in-flight FUSE ops; the host `FuseHost` already runs
+/// each op in its own tokio task, so the only serialisation left is
+/// the single host-side socket writer (a `tokio::sync::Mutex<TX>`).
+struct WorkerPool {
+    tx: CbSend<Box<dyn FnOnce() + Send + 'static>>,
+    _handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl WorkerPool {
+    fn new(n: usize) -> Self {
+        let (tx, rx) = unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let rx: CbRecv<Box<dyn FnOnce() + Send + 'static>> = rx.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("tokimo-fuse-w{i}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            job();
+                        }
+                    })
+                    .expect("spawn worker"),
+            );
+        }
+        Self { tx, _handles: handles }
+    }
+
+    fn submit<F: FnOnce() + Send + 'static>(&self, f: F) {
+        // Channel is unbounded; only fails if all receivers dropped,
+        // which only happens during shutdown.
+        let _ = self.tx.send(Box::new(f));
+    }
+}
+
+type ResCb = Box<dyn FnOnce(Res) + Send + 'static>;
 
 pub(crate) struct Dispatcher {
     // Two `File`s wrapping `dup`'d fds of the same underlying socket.
@@ -23,33 +76,24 @@ pub(crate) struct Dispatcher {
     write_file: Mutex<File>,
     read_file: Mutex<Option<File>>,
     next_req_id: AtomicU64,
-    pending: Mutex<HashMap<u64, mpsc::Sender<Res>>>,
+    pending: Mutex<HashMap<u64, ResCb>>,
     bound_mount_id: u32,
-    /// FUSE kernel notifier, attached after [`fuser::Session::new`]
-    /// returns. Set once; cloned per use. The invalidator thread
-    /// snapshots it on each `Inval` and silently drops the notification
-    /// if the notifier hasn't been installed yet (only possible during
-    /// the brief window between Dispatcher construction and the call
-    /// to [`Self::install_notifier`] in `linux/mod.rs::main`).
     notifier: Mutex<Option<fuser::Notifier>>,
-    /// Channel that the reader thread pushes `Inval` items onto. A
-    /// dedicated invalidator thread drains it and calls
-    /// `Notifier::inval_entry` / `inval_inode`. We MUST decouple this
-    /// from the reader thread because `inval_entry` can block on the
-    /// kernel's parent-dir i_rwsem, which is held while the
-    /// corresponding `FUSE_RENAME` is still in flight. If we invoked
-    /// `inval_entry` directly from the reader, the reader would park
-    /// and stop delivering the rename response — which is exactly what
-    /// the rename worker is waiting for. Classic 1-thread reentrancy
-    /// deadlock; symptom is fuse_rename + fuse_symlink tests timing
-    /// out with empty captured output. See the rationale section of
-    /// commit 7357b87.
     inval_tx: Mutex<Option<mpsc::Sender<Inval>>>,
+    /// Pool that runs response callbacks (i.e. the `reply.xxx(...)`
+    /// side of each FUSE op). Sized to 16 workers; tune via
+    /// `TOKIMO_FUSE_WORKERS` env if needed.
+    pool: WorkerPool,
 }
 
 impl Dispatcher {
     pub(crate) fn new(fd: OwnedFd, bound_mount_id: u32) -> io::Result<Self> {
         let read_dup = dup_fd(&fd)?;
+        let workers = std::env::var("TOKIMO_FUSE_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16);
         Ok(Self {
             write_file: Mutex::new(File::from(fd)),
             read_file: Mutex::new(Some(File::from(read_dup))),
@@ -58,6 +102,7 @@ impl Dispatcher {
             bound_mount_id,
             notifier: Mutex::new(None),
             inval_tx: Mutex::new(None),
+            pool: WorkerPool::new(workers),
         })
     }
 
@@ -114,20 +159,18 @@ impl Dispatcher {
                 };
                 match frame {
                     Frame::Response { req_id, result } => {
-                        let tx = me.pending.lock().unwrap().remove(&req_id);
-                        if let Some(tx) = tx {
-                            let _ = tx.send(result);
+                        let cb = me.pending.lock().unwrap().remove(&req_id);
+                        if let Some(cb) = cb {
+                            // Offload the FUSE reply (which calls
+                            // back into the kernel via /dev/fuse) to
+                            // a worker thread so the reader loop can
+                            // keep consuming responses concurrently.
+                            me.pool.submit(move || cb(result));
                         } else {
                             eprintln!("[tokimo-fuse] orphan response req_id={req_id}");
                         }
                     }
                     Frame::Notify(inval) => {
-                        // Hand off to the dedicated invalidator thread.
-                        // Calling `Notifier::inval_entry` directly from
-                        // this thread can deadlock against an in-flight
-                        // rename whose response has not yet been
-                        // delivered (the rename worker is parked
-                        // waiting for our next `Frame::Response`).
                         let tx = me.inval_tx.lock().unwrap().clone();
                         if let Some(tx) = tx {
                             let _ = tx.send(inval);
@@ -140,45 +183,61 @@ impl Dispatcher {
             }
             // On reader exit, fail any pending requests.
             let pending = std::mem::take(&mut *me.pending.lock().unwrap());
-            for (_, tx) in pending {
-                let _ = tx.send(Res::Error(WireError {
+            for (_, cb) in pending {
+                let err = Res::Error(WireError {
                     errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
                     message: "host disconnected".into(),
-                }));
+                });
+                me.pool.submit(move || cb(err));
             }
         })
     }
 
-    /// Send a request and block waiting for the response.
-    pub(crate) fn call(&self, op: Req) -> Res {
+    /// Asynchronous send: register a callback to be invoked on a worker
+    /// thread when the host's response arrives. Returns immediately so
+    /// the caller (a FUSE handler running on `fuser::Session::run`'s
+    /// read loop) can return and let the loop fetch the next request.
+    pub(crate) fn call_async<F>(&self, op: Req, cb: F)
+    where
+        F: FnOnce(Res) + Send + 'static,
+    {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(req_id, tx);
+        self.pending.lock().unwrap().insert(req_id, Box::new(cb));
         let frame = Frame::Request {
             req_id,
             mount_id: self.bound_mount_id,
             op,
         };
-        {
-            let mut guard = self.write_file.lock().unwrap();
-            if let Err(e) = wire::write_frame(&mut *guard, &frame) {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Res::Error(WireError {
+        let mut guard = self.write_file.lock().unwrap();
+        if let Err(e) = wire::write_frame(&mut *guard, &frame) {
+            drop(guard);
+            // Remove the pending entry and invoke the callback with
+            // the wire error so callers don't leak FUSE replies.
+            if let Some(cb) = self.pending.lock().unwrap().remove(&req_id) {
+                let err = Res::Error(WireError {
                     errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
                     message: format!("send: {e}"),
                 });
+                self.pool.submit(move || cb(err));
             }
         }
-        // Block on response. 30s budget to avoid deadlock if reader died.
+    }
+
+    /// Synchronous wrapper, retained for setup paths that prefer
+    /// blocking semantics. Currently unused but kept around so the
+    /// dispatcher stays self-contained for tests.
+    #[allow(dead_code)]
+    pub(crate) fn call(&self, op: Req) -> Res {
+        let (tx, rx) = mpsc::channel();
+        self.call_async(op, move |r| {
+            let _ = tx.send(r);
+        });
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(r) => r,
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&req_id);
-                Res::Error(WireError {
-                    errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
-                    message: "timeout".into(),
-                })
-            }
+            Err(_) => Res::Error(WireError {
+                errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
+                message: "timeout".into(),
+            }),
         }
     }
 }

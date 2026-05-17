@@ -8,10 +8,10 @@ use tokimo_package_sandbox::vfs_protocol::{Req, Res};
 use super::super::bridge::{FuseBridge, TTL, entry_to_attr, errno_of};
 
 pub(crate) fn open(b: &mut FuseBridge, _r: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-    match b.dispatcher.call(Req::Open {
+    b.dispatcher.call_async(Req::Open {
         nodeid: ino,
         flags: flags as u32,
-    }) {
+    }, move |__res| match __res {
         // FOPEN_KEEP_CACHE: kernel keeps page cache across opens
         // — subsequent reads of the same file hit the cache
         // without ever consulting FUSE userspace. Combined with
@@ -21,7 +21,7 @@ pub(crate) fn open(b: &mut FuseBridge, _r: &Request, ino: u64, flags: i32, reply
         Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_KEEP_CACHE),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,15 +36,15 @@ pub(crate) fn read(
     _lock: Option<u64>,
     reply: ReplyData,
 ) {
-    match b.dispatcher.call(Req::Read {
+    b.dispatcher.call_async(Req::Read {
         fh,
         offset: offset.max(0) as u64,
         size,
-    }) {
+    }, move |__res| match __res {
         Res::Bytes(bytes) => reply.data(&bytes),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,23 +60,23 @@ pub(crate) fn write(
     _lock: Option<u64>,
     reply: ReplyWrite,
 ) {
-    match b.dispatcher.call(Req::Write {
+    b.dispatcher.call_async(Req::Write {
         fh,
         offset: offset.max(0) as u64,
         data: data.to_vec(),
-    }) {
+    }, move |__res| match __res {
         Res::Written { size } => reply.written(size),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn flush(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-    match b.dispatcher.call(Req::Flush { fh }) {
+    b.dispatcher.call_async(Req::Flush { fh }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn release(
@@ -89,11 +89,11 @@ pub(crate) fn release(
     _flush: bool,
     reply: ReplyEmpty,
 ) {
-    match b.dispatcher.call(Req::Release { fh }) {
+    b.dispatcher.call_async(Req::Release { fh }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn create(
@@ -106,69 +106,46 @@ pub(crate) fn create(
     flags: i32,
     reply: ReplyCreate,
 ) {
-    // Two-step: lookup-or-create via Mkdir-style? VFS protocol
-    // doesn't have a separate `create`; use Mkdir for dirs and
-    // for regular files we synthesise:
-    //   1. Open the file with O_CREAT semantics — requires the
-    //      backend to honour `flags & O_CREAT`. Our protocol's
-    //      Open already does this when the mount is writable.
-    //   2. After successful Open, the host should have a node
-    //      for the new file; do a Lookup to resolve it.
-    //
-    // For correctness across backends we emulate touch-then-open:
-    // this is rare on the hot path.
     let n = match name.to_str() {
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    // First Lookup; if not found, fall through to write a 0-byte
-    // file via SetAttr-truncate-after-Open by issuing an Open
-    // with the O_CREAT bit set.
-    match b.dispatcher.call(Req::Lookup {
-        parent_nodeid: parent,
-        name: n.clone(),
-    }) {
-        Res::Entry(e) => {
-            // Already exists; just open.
-            let nodeid = e.nodeid;
-            let attr = entry_to_attr(&e);
-            let gen_ = e.generation;
-            match b.dispatcher.call(Req::Open {
-                nodeid,
-                flags: flags as u32,
-            }) {
-                Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
-                Res::Error(we) => reply.error(errno_of(&we)),
-                _ => reply.error(libc::EIO),
-            }
-        }
+    // Lookup → if found Open; else Create then Open. Each step
+    // hops through call_async so the FUSE reader loop never
+    // blocks waiting on the wire.
+    fn do_open(
+        disp: std::sync::Arc<super::super::dispatcher::Dispatcher>,
+        e: tokimo_package_sandbox::vfs_protocol::EntryOut,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let nodeid = e.nodeid;
+        let attr = entry_to_attr(&e);
+        let gen_ = e.generation;
+        disp.call_async(Req::Open { nodeid, flags: flags as u32 }, move |__res| match __res {
+            Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        });
+    }
+    let disp = b.dispatcher.clone();
+    let n2 = n.clone();
+    let disp_for_create = disp.clone();
+    disp.call_async(Req::Lookup { parent_nodeid: parent, name: n }, move |__res| match __res {
+        Res::Entry(e) => do_open(disp_for_create, e, flags, reply),
         Res::Error(_) => {
-            // Not found: ask the host to create an empty file,
-            // then open it for the caller.
-            match b.dispatcher.call(Req::Create {
-                parent_nodeid: parent,
-                name: n.clone(),
-                mode,
-            }) {
-                Res::Entry(e) => {
-                    let nodeid = e.nodeid;
-                    let attr = entry_to_attr(&e);
-                    let gen_ = e.generation;
-                    match b.dispatcher.call(Req::Open {
-                        nodeid,
-                        flags: flags as u32,
-                    }) {
-                        Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
-                        Res::Error(we) => reply.error(errno_of(&we)),
-                        _ => reply.error(libc::EIO),
-                    }
-                }
-                Res::Error(we) => reply.error(errno_of(&we)),
-                _ => reply.error(libc::EIO),
-            }
+            let disp_again = disp_for_create.clone();
+            disp_for_create.call_async(
+                Req::Create { parent_nodeid: parent, name: n2, mode },
+                move |__res| match __res {
+                    Res::Entry(e) => do_open(disp_again, e, flags, reply),
+                    Res::Error(we) => reply.error(errno_of(&we)),
+                    _ => reply.error(libc::EIO),
+                },
+            );
         }
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +153,11 @@ pub(crate) fn create(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn fsync(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-    match b.dispatcher.call(Req::Fsync { fh, datasync }) {
+    b.dispatcher.call_async(Req::Fsync { fh, datasync }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,16 +171,16 @@ pub(crate) fn fallocate(
     mode: i32,
     reply: ReplyEmpty,
 ) {
-    match b.dispatcher.call(Req::Fallocate {
+    b.dispatcher.call_async(Req::Fallocate {
         fh,
         offset,
         length,
         mode: mode as u32,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,18 +197,18 @@ pub(crate) fn copy_file_range(
     flags: u32,
     reply: fuser::ReplyWrite,
 ) {
-    match b.dispatcher.call(Req::CopyFileRange {
+    b.dispatcher.call_async(Req::CopyFileRange {
         fh_in,
         off_in,
         fh_out,
         off_out,
         len,
         flags,
-    }) {
+    }, move |__res| match __res {
         Res::Written { size } => reply.written(size),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn lseek(
@@ -243,15 +220,15 @@ pub(crate) fn lseek(
     whence: i32,
     reply: fuser::ReplyLseek,
 ) {
-    match b.dispatcher.call(Req::Lseek {
+    b.dispatcher.call_async(Req::Lseek {
         fh,
         offset,
         whence: whence as u32,
-    }) {
+    }, move |__res| match __res {
         Res::Offset(o) => reply.offset(o),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,7 +250,7 @@ pub(crate) fn getlk(
         x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
-    match b.dispatcher.call(Req::Getlk {
+    b.dispatcher.call_async(Req::Getlk {
         fh,
         owner,
         lk: LockSpec {
@@ -283,7 +260,7 @@ pub(crate) fn getlk(
             end,
             pid,
         },
-    }) {
+    }, move |__res| match __res {
         Res::Lock(s) => {
             let t = match s.typ {
                 LockType::Read => libc::F_RDLCK,
@@ -294,7 +271,7 @@ pub(crate) fn getlk(
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,7 +294,7 @@ pub(crate) fn setlk(
         x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
-    match b.dispatcher.call(Req::Setlk {
+    b.dispatcher.call_async(Req::Setlk {
         fh,
         owner,
         lk: LockSpec {
@@ -328,11 +305,11 @@ pub(crate) fn setlk(
             pid,
         },
         sleep,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,16 +324,16 @@ pub(crate) fn ioctl(
     out_size: u32,
     reply: fuser::ReplyIoctl,
 ) {
-    match b.dispatcher.call(Req::Ioctl {
+    b.dispatcher.call_async(Req::Ioctl {
         fh,
         cmd,
         arg: 0,
         in_data: in_data.to_vec(),
         out_size,
         flags,
-    }) {
+    }, move |__res| match __res {
         Res::Ioctl { result, data } => reply.ioctl(result, &data),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }

@@ -8,20 +8,20 @@ use tokimo_package_sandbox::vfs_protocol::{NodeKind, Req, Res};
 use super::super::bridge::{FuseBridge, TTL, entry_to_attr, errno_of};
 
 pub(crate) fn opendir(b: &mut FuseBridge, _r: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-    match b.dispatcher.call(Req::OpenDir { nodeid: ino }) {
+    b.dispatcher.call_async(Req::OpenDir { nodeid: ino }, move |__res| match __res {
         // FOPEN_CACHE_DIR: kernel may cache directory contents
         // across opens, eliding repeated readdir round-trips.
         Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_CACHE_DIR),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn readdir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
-    match b.dispatcher.call(Req::ReadDir {
+    b.dispatcher.call_async(Req::ReadDir {
         fh,
         offset: offset.max(0) as u64,
-    }) {
+    }, move |__res| match __res {
         Res::DirEntries(entries) => {
             for e in entries {
                 let kind = match e.kind {
@@ -42,15 +42,15 @@ pub(crate) fn readdir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, offs
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn releasedir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-    match b.dispatcher.call(Req::ReleaseDir { fh }) {
+    b.dispatcher.call_async(Req::ReleaseDir { fh }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn readdirplus(
@@ -61,10 +61,10 @@ pub(crate) fn readdirplus(
     offset: i64,
     mut reply: ReplyDirectoryPlus,
 ) {
-    match b.dispatcher.call(Req::ReadDirPlus {
+    b.dispatcher.call_async(Req::ReadDirPlus {
         fh,
         offset: offset.max(0) as u64,
-    }) {
+    }, move |__res| match __res {
         Res::DirEntriesPlus(entries) => {
             for e in entries {
                 let attr = entry_to_attr(&e.entry);
@@ -83,7 +83,7 @@ pub(crate) fn readdirplus(
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn mkdir(
@@ -99,18 +99,18 @@ pub(crate) fn mkdir(
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Mkdir {
+    b.dispatcher.call_async(Req::Mkdir {
         parent_nodeid: parent,
         name: n,
         mode,
-    }) {
+    }, move |__res| match __res {
         Res::Entry(e) => {
             let attr = entry_to_attr(&e);
             reply.entry(&TTL, &attr, e.generation);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn rmdir(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -118,12 +118,12 @@ pub(crate) fn rmdir(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr,
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Rmdir {
+    b.dispatcher.call_async(Req::Rmdir {
         parent_nodeid: parent,
         name: n,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }

@@ -22,19 +22,19 @@ pub(crate) fn mknod(
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Mknod {
+    b.dispatcher.call_async(Req::Mknod {
         parent_nodeid: parent,
         name: n,
         mode,
         rdev,
-    }) {
+    }, move |__res| match __res {
         Res::Entry(e) => {
             let attr = entry_to_attr(&e);
             reply.entry(&TTL, &attr, e.generation);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn unlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -42,14 +42,14 @@ pub(crate) fn unlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Unlink {
+    b.dispatcher.call_async(Req::Unlink {
         parent_nodeid: parent,
         name: n,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn rename(
@@ -70,12 +70,12 @@ pub(crate) fn rename(
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Rename {
+    b.dispatcher.call_async(Req::Rename {
         old_parent: parent,
         old_name: on.clone(),
         new_parent: newparent,
         new_name: nn.clone(),
-    }) {
+    }, move |__res| match __res {
         // The kernel auto-invalidates the source dentry on a
         // successful FUSE_RENAME. It does NOT invalidate any
         // cached *negative* dentry for the destination name,
@@ -90,7 +90,7 @@ pub(crate) fn rename(
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn symlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
@@ -103,18 +103,18 @@ pub(crate) fn symlink(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsSt
     // are virtually always UTF-8, and lossy conversion only
     // affects exotic locale encodings nobody uses today.
     let target = link.to_string_lossy().into_owned();
-    match b.dispatcher.call(Req::Symlink {
+    b.dispatcher.call_async(Req::Symlink {
         parent_nodeid: parent,
         name: n,
         target,
-    }) {
+    }, move |__res| match __res {
         Res::Entry(e) => {
             let attr = entry_to_attr(&e);
             reply.entry(&TTL, &attr, e.generation);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn link(b: &mut FuseBridge, _r: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
@@ -122,27 +122,27 @@ pub(crate) fn link(b: &mut FuseBridge, _r: &Request, ino: u64, newparent: u64, n
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Link {
+    b.dispatcher.call_async(Req::Link {
         nodeid: ino,
         new_parent: newparent,
         new_name: n,
-    }) {
+    }, move |__res| match __res {
         Res::Entry(e) => {
             let attr = entry_to_attr(&e);
             reply.entry(&TTL, &attr, e.generation);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn access(b: &mut FuseBridge, _r: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
-    match b.dispatcher.call(Req::Access {
+    b.dispatcher.call_async(Req::Access {
         nodeid: ino,
         mask: mask as u32,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }

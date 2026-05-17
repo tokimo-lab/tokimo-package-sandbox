@@ -29,10 +29,10 @@ pub(crate) fn lookup(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Lookup {
+    b.dispatcher.call_async(Req::Lookup {
         parent_nodeid: parent,
         name: n,
-    }) {
+    }, move |__res| match __res {
         Res::Entry(e) => {
             let attr = entry_to_attr(&e);
             reply.entry(&TTL, &attr, e.generation);
@@ -81,23 +81,23 @@ pub(crate) fn lookup(b: &mut FuseBridge, _r: &Request, parent: u64, name: &OsStr
             }
         }
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn forget(b: &mut FuseBridge, _r: &Request, ino: u64, nlookup: u64) {
     // Forget is fire-and-forget — we don't wait for a response.
-    let _ = b.dispatcher.call(Req::Forget { nodeid: ino, nlookup });
+    b.dispatcher.call_async(Req::Forget { nodeid: ino, nlookup }, |_| {});
 }
 
 pub(crate) fn getattr(b: &mut FuseBridge, _r: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-    match b.dispatcher.call(Req::GetAttr { nodeid: ino }) {
+    b.dispatcher.call_async(Req::GetAttr { nodeid: ino }, move |__res| match __res {
         Res::Attr(a) => {
             let fa = attr_to_fileattr(&a, ino);
             reply.attr(&TTL, &fa);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -123,33 +123,33 @@ pub(crate) fn setattr(
         TimeOrNow::SpecificTime(s) => s.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
         TimeOrNow::Now => now_systime_to_secs(),
     };
-    match b.dispatcher.call(Req::SetAttr {
+    b.dispatcher.call_async(Req::SetAttr {
         nodeid: ino,
         mode,
         size,
         atime: atime.map(to_secs),
         mtime: mtime.map(to_secs),
-    }) {
+    }, move |__res| match __res {
         Res::Attr(a) => {
             let fa = attr_to_fileattr(&a, ino);
             reply.attr(&TTL, &fa);
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn readlink(b: &mut FuseBridge, _r: &Request, ino: u64, reply: ReplyData) {
-    match b.dispatcher.call(Req::Readlink { nodeid: ino }) {
+    b.dispatcher.call_async(Req::Readlink { nodeid: ino }, move |__res| match __res {
         Res::Linkname(s) => reply.data(s.as_bytes()),
         Res::Bytes(bytes) => reply.data(&bytes),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn statfs(b: &mut FuseBridge, _r: &Request, ino: u64, reply: ReplyStatfs) {
-    match b.dispatcher.call(Req::Statfs { nodeid: ino }) {
+    b.dispatcher.call_async(Req::Statfs { nodeid: ino }, move |__res| match __res {
         Res::Statfs(s) => {
             let StatfsOut {
                 blocks,
@@ -165,7 +165,7 @@ pub(crate) fn statfs(b: &mut FuseBridge, _r: &Request, ino: u64, reply: ReplySta
         }
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +173,11 @@ pub(crate) fn statfs(b: &mut FuseBridge, _r: &Request, ino: u64, reply: ReplySta
 // ---------------------------------------------------------------------------
 
 pub(crate) fn fsyncdir(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
-    match b.dispatcher.call(Req::Fsyncdir { fh, datasync }) {
+    b.dispatcher.call_async(Req::Fsyncdir { fh, datasync }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,16 +195,16 @@ pub(crate) fn setxattr(
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Setxattr {
+    b.dispatcher.call_async(Req::Setxattr {
         nodeid: ino,
         name: n,
         value: value.to_vec(),
         flags: flags as u32,
-    }) {
+    }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn getxattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsStr, size: u32, reply: fuser::ReplyXattr) {
@@ -212,25 +212,25 @@ pub(crate) fn getxattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsStr,
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Getxattr {
+    b.dispatcher.call_async(Req::Getxattr {
         nodeid: ino,
         name: n,
         size,
-    }) {
+    }, move |__res| match __res {
         Res::XattrSize(sz) => reply.size(sz),
         Res::Bytes(data) => reply.data(&data),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn listxattr(b: &mut FuseBridge, _r: &Request, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-    match b.dispatcher.call(Req::Listxattr { nodeid: ino, size }) {
+    b.dispatcher.call_async(Req::Listxattr { nodeid: ino, size }, move |__res| match __res {
         Res::XattrSize(sz) => reply.size(sz),
         Res::XattrList(data) => reply.data(&data),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn removexattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
@@ -238,21 +238,21 @@ pub(crate) fn removexattr(b: &mut FuseBridge, _r: &Request, ino: u64, name: &OsS
         Some(s) => s.to_string(),
         None => return reply.error(libc::EINVAL),
     };
-    match b.dispatcher.call(Req::Removexattr { nodeid: ino, name: n }) {
+    b.dispatcher.call_async(Req::Removexattr { nodeid: ino, name: n }, move |__res| match __res {
         Res::Ok => reply.ok(),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
 
 pub(crate) fn bmap(b: &mut FuseBridge, _r: &Request, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
-    match b.dispatcher.call(Req::Bmap {
+    b.dispatcher.call_async(Req::Bmap {
         nodeid: ino,
         blocksize,
         idx,
-    }) {
+    }, move |__res| match __res {
         Res::BmapBlock(block) => reply.bmap(block),
         Res::Error(we) => reply.error(errno_of(&we)),
         _ => reply.error(libc::EIO),
-    }
+    });
 }
