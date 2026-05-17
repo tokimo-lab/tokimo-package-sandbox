@@ -8,20 +8,23 @@ use tokimo_package_sandbox::vfs_protocol::{Req, Res};
 use super::super::bridge::{FuseBridge, TTL, entry_to_attr, errno_of};
 
 pub(crate) fn open(b: &mut FuseBridge, _r: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-    b.dispatcher.call_async(Req::Open {
-        nodeid: ino,
-        flags: flags as u32,
-    }, move |__res| match __res {
-        // FOPEN_KEEP_CACHE: kernel keeps page cache across opens
-        // — subsequent reads of the same file hit the cache
-        // without ever consulting FUSE userspace. Combined with
-        // FUSE_AUTO_INVAL_DATA and our 60s entry/attr TTL the
-        // cache is safe for sandbox-local FS where no external
-        // process mutates files behind our back.
-        Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_KEEP_CACHE),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Open {
+            nodeid: ino,
+            flags: flags as u32,
+        },
+        move |__res| match __res {
+            // FOPEN_KEEP_CACHE: kernel keeps page cache across opens
+            // — subsequent reads of the same file hit the cache
+            // without ever consulting FUSE userspace. Combined with
+            // FUSE_AUTO_INVAL_DATA and our 60s entry/attr TTL the
+            // cache is safe for sandbox-local FS where no external
+            // process mutates files behind our back.
+            Res::OpenOk { fh } => reply.opened(fh, consts::FOPEN_KEEP_CACHE),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,15 +39,18 @@ pub(crate) fn read(
     _lock: Option<u64>,
     reply: ReplyData,
 ) {
-    b.dispatcher.call_async(Req::Read {
-        fh,
-        offset: offset.max(0) as u64,
-        size,
-    }, move |__res| match __res {
-        Res::Bytes(bytes) => reply.data(&bytes),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Read {
+            fh,
+            offset: offset.max(0) as u64,
+            size,
+        },
+        move |__res| match __res {
+            Res::Bytes(bytes) => reply.data(&bytes),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,15 +66,18 @@ pub(crate) fn write(
     _lock: Option<u64>,
     reply: ReplyWrite,
 ) {
-    b.dispatcher.call_async(Req::Write {
-        fh,
-        offset: offset.max(0) as u64,
-        data: data.to_vec(),
-    }, move |__res| match __res {
-        Res::Written { size } => reply.written(size),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Write {
+            fh,
+            offset: offset.max(0) as u64,
+            data: data.to_vec(),
+        },
+        move |__res| match __res {
+            Res::Written { size } => reply.written(size),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 pub(crate) fn flush(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
@@ -127,30 +136,46 @@ pub(crate) fn create(
         let nodeid = e.nodeid;
         let attr = entry_to_attr(&e);
         let gen_ = e.generation;
-        disp.call_async(Req::Open { nodeid, flags: flags as u32 }, move |__res| match __res {
-            Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
-            Res::Error(we) => reply.error(errno_of(&we)),
-            _ => reply.error(libc::EIO),
-        });
+        disp.call_async(
+            Req::Open {
+                nodeid,
+                flags: flags as u32,
+            },
+            move |__res| match __res {
+                Res::OpenOk { fh } => reply.created(&TTL, &attr, gen_, fh, 0),
+                Res::Error(we) => reply.error(errno_of(&we)),
+                _ => reply.error(libc::EIO),
+            },
+        );
     }
     let disp = b.dispatcher.clone();
     let n2 = n.clone();
     let disp_for_create = disp.clone();
-    disp.call_async(Req::Lookup { parent_nodeid: parent, name: n }, move |__res| match __res {
-        Res::Entry(e) => do_open(disp_for_create, e, flags, reply),
-        Res::Error(_) => {
-            let disp_again = disp_for_create.clone();
-            disp_for_create.call_async(
-                Req::Create { parent_nodeid: parent, name: n2, mode },
-                move |__res| match __res {
-                    Res::Entry(e) => do_open(disp_again, e, flags, reply),
-                    Res::Error(we) => reply.error(errno_of(&we)),
-                    _ => reply.error(libc::EIO),
-                },
-            );
-        }
-        _ => reply.error(libc::EIO),
-    });
+    disp.call_async(
+        Req::Lookup {
+            parent_nodeid: parent,
+            name: n,
+        },
+        move |__res| match __res {
+            Res::Entry(e) => do_open(disp_for_create, e, flags, reply),
+            Res::Error(_) => {
+                let disp_again = disp_for_create.clone();
+                disp_for_create.call_async(
+                    Req::Create {
+                        parent_nodeid: parent,
+                        name: n2,
+                        mode,
+                    },
+                    move |__res| match __res {
+                        Res::Entry(e) => do_open(disp_again, e, flags, reply),
+                        Res::Error(we) => reply.error(errno_of(&we)),
+                        _ => reply.error(libc::EIO),
+                    },
+                );
+            }
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -158,11 +183,12 @@ pub(crate) fn create(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn fsync(b: &mut FuseBridge, _r: &Request, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-    b.dispatcher.call_async(Req::Fsync { fh, datasync }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher
+        .call_async(Req::Fsync { fh, datasync }, move |__res| match __res {
+            Res::Ok => reply.ok(),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,16 +202,19 @@ pub(crate) fn fallocate(
     mode: i32,
     reply: ReplyEmpty,
 ) {
-    b.dispatcher.call_async(Req::Fallocate {
-        fh,
-        offset,
-        length,
-        mode: mode as u32,
-    }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Fallocate {
+            fh,
+            offset,
+            length,
+            mode: mode as u32,
+        },
+        move |__res| match __res {
+            Res::Ok => reply.ok(),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,18 +231,21 @@ pub(crate) fn copy_file_range(
     flags: u32,
     reply: fuser::ReplyWrite,
 ) {
-    b.dispatcher.call_async(Req::CopyFileRange {
-        fh_in,
-        off_in,
-        fh_out,
-        off_out,
-        len,
-        flags,
-    }, move |__res| match __res {
-        Res::Written { size } => reply.written(size),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::CopyFileRange {
+            fh_in,
+            off_in,
+            fh_out,
+            off_out,
+            len,
+            flags,
+        },
+        move |__res| match __res {
+            Res::Written { size } => reply.written(size),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 pub(crate) fn lseek(
@@ -225,15 +257,18 @@ pub(crate) fn lseek(
     whence: i32,
     reply: fuser::ReplyLseek,
 ) {
-    b.dispatcher.call_async(Req::Lseek {
-        fh,
-        offset,
-        whence: whence as u32,
-    }, move |__res| match __res {
-        Res::Offset(o) => reply.offset(o),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Lseek {
+            fh,
+            offset,
+            whence: whence as u32,
+        },
+        move |__res| match __res {
+            Res::Offset(o) => reply.offset(o),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,28 +290,31 @@ pub(crate) fn getlk(
         x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
-    b.dispatcher.call_async(Req::Getlk {
-        fh,
-        owner,
-        lk: LockSpec {
-            typ: lt,
-            whence: 0,
-            start,
-            end,
-            pid,
+    b.dispatcher.call_async(
+        Req::Getlk {
+            fh,
+            owner,
+            lk: LockSpec {
+                typ: lt,
+                whence: 0,
+                start,
+                end,
+                pid,
+            },
         },
-    }, move |__res| match __res {
-        Res::Lock(s) => {
-            let t = match s.typ {
-                LockType::Read => libc::F_RDLCK,
-                LockType::Write => libc::F_WRLCK,
-                LockType::Unlock => libc::F_UNLCK,
-            };
-            reply.locked(s.start, s.end, t, s.pid);
-        }
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+        move |__res| match __res {
+            Res::Lock(s) => {
+                let t = match s.typ {
+                    LockType::Read => libc::F_RDLCK,
+                    LockType::Write => libc::F_WRLCK,
+                    LockType::Unlock => libc::F_UNLCK,
+                };
+                reply.locked(s.start, s.end, t, s.pid);
+            }
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,22 +337,25 @@ pub(crate) fn setlk(
         x if x == libc::F_WRLCK => LockType::Write,
         _ => LockType::Unlock,
     };
-    b.dispatcher.call_async(Req::Setlk {
-        fh,
-        owner,
-        lk: LockSpec {
-            typ: lt,
-            whence: 0,
-            start,
-            end,
-            pid,
+    b.dispatcher.call_async(
+        Req::Setlk {
+            fh,
+            owner,
+            lk: LockSpec {
+                typ: lt,
+                whence: 0,
+                start,
+                end,
+                pid,
+            },
+            sleep,
         },
-        sleep,
-    }, move |__res| match __res {
-        Res::Ok => reply.ok(),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+        move |__res| match __res {
+            Res::Ok => reply.ok(),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -329,16 +370,19 @@ pub(crate) fn ioctl(
     out_size: u32,
     reply: fuser::ReplyIoctl,
 ) {
-    b.dispatcher.call_async(Req::Ioctl {
-        fh,
-        cmd,
-        arg: 0,
-        in_data: in_data.to_vec(),
-        out_size,
-        flags,
-    }, move |__res| match __res {
-        Res::Ioctl { result, data } => reply.ioctl(result, &data),
-        Res::Error(we) => reply.error(errno_of(&we)),
-        _ => reply.error(libc::EIO),
-    });
+    b.dispatcher.call_async(
+        Req::Ioctl {
+            fh,
+            cmd,
+            arg: 0,
+            in_data: in_data.to_vec(),
+            out_size,
+            flags,
+        },
+        move |__res| match __res {
+            Res::Ioctl { result, data } => reply.ioctl(result, &data),
+            Res::Error(we) => reply.error(errno_of(&we)),
+            _ => reply.error(libc::EIO),
+        },
+    );
 }
