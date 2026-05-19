@@ -81,6 +81,13 @@ struct BackendState {
     /// `start_vm` time. After start_vm, replacement goes through the
     /// bridge directly.
     host_exec_pending_callback: Option<crate::api::HostExecCallback>,
+    /// Long-lived "keeper" thread that performed the bwrap spawn.
+    /// It parks itself until shutdown so bwrap's PR_SET_PDEATHSIG
+    /// (via --die-with-parent) doesn't fire prematurely when the
+    /// caller's thread (e.g. tokio blocking pool worker) returns.
+    bwrap_keeper: Option<thread::JoinHandle<()>>,
+    /// Signal flag flipped to true by stop_vm to release the keeper.
+    bwrap_keeper_shutdown: Option<Arc<AtomicBool>>,
 }
 
 struct JobSpawnInfo {
@@ -112,6 +119,8 @@ impl Default for BackendState {
             host_exec_bridge: None,
             host_exec_commands: HashSet::new(),
             host_exec_pending_callback: None,
+            bwrap_keeper: None,
+            bwrap_keeper_shutdown: None,
         }
     }
 }
@@ -520,8 +529,14 @@ impl SandboxBackend for LinuxBackend {
         args.insert(insert_at + 1, init_dir.display().to_string());
         args.insert(insert_at + 2, init_dir.display().to_string());
 
-        // 4. Spawn bwrap. In pre_exec, clear CLOEXEC on the child end(s)
-        //    so bwrap → init inherits them.
+        // 4. Spawn bwrap in a long-lived keeper thread so that
+        //    bwrap's --die-with-parent (PR_SET_PDEATHSIG) tracks a
+        //    thread that stays alive for the full session lifetime,
+        //    not the transient tokio blocking-pool worker that called
+        //    start_vm.
+        let keeper_shutdown = Arc::new(AtomicBool::new(false));
+        let keeper_shutdown_arc = Arc::clone(&keeper_shutdown);
+        let (spawn_tx, spawn_rx) = std::sync::mpsc::sync_channel::<std::io::Result<Child>>(1);
         let mut cmd = Command::new(bwrap_path);
         cmd.args(&args)
             .stdin(Stdio::null())
@@ -548,7 +563,23 @@ impl SandboxBackend for LinuxBackend {
                 Ok(())
             });
         }
-        let child = cmd.spawn().map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
+        let keeper_handle = thread::Builder::new()
+            .name("tokimo-bwrap-keeper".into())
+            .spawn(move || {
+                let result = cmd.spawn();
+                let _ = spawn_tx.send(result);
+                // Park until shutdown; keeps the parent thread alive so
+                // bwrap's --die-with-parent (PR_SET_PDEATHSIG) doesn't fire.
+                while !keeper_shutdown.load(Ordering::Relaxed) {
+                    thread::park_timeout(Duration::from_secs(60));
+                }
+            })
+            .map_err(|e| Error::other(format!("spawn bwrap keeper: {e}")))?;
+
+        let child = spawn_rx
+            .recv()
+            .map_err(|_| Error::other("bwrap keeper channel closed"))?
+            .map_err(|e| Error::other(format!("spawn bwrap: {e}")))?;
 
         // 5. Drop our copy of the child ends. host_end is the active
         //    control fd; net_host_end (if any) feeds the netstack thread.
@@ -559,6 +590,8 @@ impl SandboxBackend for LinuxBackend {
         let bwrap_pid = child.id();
         g.bwrap_child = Some(child);
         g.bwrap_pid = Some(bwrap_pid);
+        g.bwrap_keeper = Some(keeper_handle);
+        g.bwrap_keeper_shutdown = Some(keeper_shutdown_arc);
         drop(g);
 
         // 5b. Userspace netstack — always spawn (see comment above
@@ -845,6 +878,20 @@ impl SandboxBackend for LinuxBackend {
 
         // 4. Join the pump thread.
         if let Some(handle) = self.event_pump.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // 5. Signal the bwrap keeper thread to exit and join it.
+        // Must happen AFTER bwrap_child has been killed/waited above,
+        // so the keeper isn't holding open a parent-thread that ought
+        // to have triggered --die-with-parent.
+        let keeper_shutdown = self.state.lock().unwrap().bwrap_keeper_shutdown.take();
+        let keeper_handle = self.state.lock().unwrap().bwrap_keeper.take();
+        if let Some(flag) = keeper_shutdown {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = keeper_handle {
+            handle.thread().unpark();
             let _ = handle.join();
         }
 
@@ -1326,6 +1373,14 @@ impl SandboxBackend for LinuxBackend {
             g.host_exec_pending_callback = Some(cb);
         }
         Ok(())
+    }
+}
+
+impl Drop for LinuxBackend {
+    fn drop(&mut self) {
+        if self.running.load(Ordering::Relaxed) {
+            let _ = self.stop_vm();
+        }
     }
 }
 
