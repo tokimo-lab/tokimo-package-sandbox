@@ -256,7 +256,7 @@ impl SandboxBackend for LinuxBackend {
         crate::rootfs_init::ensure_rootfs(&config.base_rootfs, &config.vm_dir)?;
         let rootfs = config.vm_dir.join("rootfs");
         let rootfs_str = |sub: &str| -> String { rootfs.join(sub).to_string_lossy().into_owned() };
-        for sub in ["usr", "bin", "sbin", "lib", "lib64"] {
+        for sub in ["usr", "bin", "sbin", "lib", "etc", "root", "home"] {
             if !rootfs.join(sub).is_dir() {
                 return Err(Error::other(format!(
                     "rootfs is missing /{sub}: {}",
@@ -264,23 +264,30 @@ impl SandboxBackend for LinuxBackend {
                 )));
             }
         }
-        let mut args: Vec<String> = vec![
-            "--bind".to_string(),
-            rootfs_str("usr"),
-            "/usr".to_string(),
-            "--bind".to_string(),
-            rootfs_str("bin"),
-            "/bin".to_string(),
-            "--bind".to_string(),
-            rootfs_str("sbin"),
-            "/sbin".to_string(),
-            "--bind".to_string(),
-            rootfs_str("lib"),
-            "/lib".to_string(),
-            "--bind".to_string(),
-            rootfs_str("lib64"),
-            "/lib64".to_string(),
-        ];
+        for f in ["etc/passwd", "etc/group"] {
+            if !rootfs.join(f).is_file() {
+                return Err(Error::other(format!(
+                    "rootfs is missing /{f}: {}",
+                    rootfs.join(f).display()
+                )));
+            }
+        }
+        let mut args: Vec<String> = Vec::new();
+        // Drop the host environment so VSCode / WSL / dev-shell variables
+        // (PYTHONSTARTUP, VSCODE_*, WAYLAND_DISPLAY, …) don't leak into the
+        // sandbox. The guest gets a fresh env: PATH/HOME/USER/etc. are
+        // populated by /etc/profile.d/tokimo_env.sh when bash -l starts.
+        args.push("--clearenv".to_string());
+        // Whole rootfs top-level into the sandbox as read-write — matches
+        // VM-mode (CH) semantics where the guest sees a fully writable
+        // Debian filesystem.
+        for dir in [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "opt", "srv", "var", "root", "home",
+        ] {
+            if rootfs.join(dir).is_dir() {
+                args.extend(["--bind".to_string(), rootfs_str(dir), format!("/{dir}")]);
+            }
+        }
         // /sys handling depends on network policy:
         //   - AllowAll: bind-mount host's /sys so the guest sees the same
         //     NIC list as the host (the netns is shared).
@@ -292,27 +299,6 @@ impl SandboxBackend for LinuxBackend {
         // The actual mount is appended below inside the network-policy
         // match block so the two modes stay symmetric.
 
-        // /etc/alternatives — use rootfs version when present so symlinks
-        // resolve against the packaged binary set. Falls back gracefully.
-        if rootfs.join("etc/alternatives").is_dir() {
-            args.extend([
-                "--bind".to_string(),
-                rootfs_str("etc/alternatives"),
-                "/etc/alternatives".to_string(),
-            ]);
-        }
-        // /etc/passwd + /etc/group — always from rootfs so the sandbox
-        // user table is independent of the host.
-        for f in ["etc/passwd", "etc/group"] {
-            if rootfs.join(f).is_file() {
-                args.extend(["--bind".to_string(), rootfs_str(f), format!("/{f}")]);
-            } else {
-                return Err(Error::other(format!(
-                    "rootfs is missing /{f}: {}",
-                    rootfs.join(f).display()
-                )));
-            }
-        }
         // /etc/resolv.conf: write a fresh one pointing at the gateway so the
         // userspace netstack handles DNS (matches VM-mode init.sh behavior).
         // Host's resolv.conf is intentionally NOT bind-mounted — that would
@@ -330,18 +316,6 @@ impl SandboxBackend for LinuxBackend {
             ]);
             tmp
         };
-        // Other network/DNS/CA/runtime config — still from the host (only if present).
-        for p in [
-            "/etc/hosts",
-            "/etc/nsswitch.conf",
-            "/etc/ssl",
-            "/etc/ca-certificates",
-            "/etc/pki",
-        ] {
-            if Path::new(p).exists() {
-                args.extend(["--ro-bind".to_string(), p.into(), p.into()]);
-            }
-        }
         // FUSE needs user_allow_other so any UID inside the sandbox can
         // access the mount (the guest shell may not run as root).
         let _fuse_conf_file = {
@@ -390,12 +364,10 @@ impl SandboxBackend for LinuxBackend {
                 "--dev-bind-try",
                 "/dev/fuse",
                 "/dev/fuse",
-                // fusermount3 needs /etc/mtab (→ /proc/self/mounts) and
-                // /etc/passwd (for username lookup). /proc is mounted
-                // below, so the symlink resolves correctly.
-                "--symlink",
-                "/proc/self/mounts",
-                "/etc/mtab",
+                // /etc/mtab is provided by the rootfs (symlink →
+                // ../proc/self/mounts); attempting to recreate it here
+                // would fail with "existing destination" since /etc is
+                // bind-mounted from the rootfs.
                 "--symlink",
                 "/proc/self/fd",
                 "/dev/fd",
@@ -764,7 +736,7 @@ impl SandboxBackend for LinuxBackend {
         }
 
         let shell_info = init_client
-            .open_shell(&["/bin/bash".to_string()], &[], None)
+            .open_shell(&["/bin/bash".to_string(), "-l".to_string()], &[], None)
             .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
 
         let init_client = Arc::new(init_client);
