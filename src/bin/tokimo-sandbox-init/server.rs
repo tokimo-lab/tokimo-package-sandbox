@@ -928,15 +928,12 @@ fn handle_mount_fuse(
         {
             return Err(ErrorReply::new(ErrorCode::Internal, format!("mkdir {target}: {e}")));
         }
-        let exe = if std::path::Path::new("/run/tokimo/bin/tokimo-sandbox-fuse").exists() {
-            "/run/tokimo/bin/tokimo-sandbox-fuse".to_string()
-        } else if std::path::Path::new("/bin/tokimo-sandbox-fuse").exists() {
-            "/bin/tokimo-sandbox-fuse".to_string()
-        } else if std::path::Path::new("/usr/bin/tokimo-sandbox-fuse").exists() {
-            "/usr/bin/tokimo-sandbox-fuse".to_string()
-        } else {
-            "tokimo-sandbox-fuse".to_string()
-        };
+        let exe = find_fuse_binary().ok_or_else(|| {
+            ErrorReply::new(
+                ErrorCode::Internal,
+                "tokimo-sandbox-fuse binary not found in /run/tokimo/bin, /bin, /usr/bin, or next to tokimo-sandbox-init",
+            )
+        })?;
         let mut cmd = std::process::Command::new(&exe);
         // Owner uid/gid the kernel sees on every inode in this mount.
         //  * Bwrap mode: init runs at the runner's uid (the only uid mapped
@@ -1111,6 +1108,31 @@ fn find_host_exec_binary() -> Option<String> {
         && let Some(parent) = exe.parent()
     {
         let cand = parent.join("tokimo-host-exec");
+        if cand.exists() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn find_fuse_binary() -> Option<String> {
+    for p in [
+        "/run/tokimo/bin/tokimo-sandbox-fuse",
+        "/bin/tokimo-sandbox-fuse",
+        "/usr/bin/tokimo-sandbox-fuse",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    // Also try the directory containing this init binary — that dir is
+    // bind-mounted into the bwrap container as a unit (see
+    // `linux/sandbox.rs --ro-bind {init_dir} {init_dir}`), so siblings
+    // of tokimo-sandbox-init are reachable at the same path.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let cand = parent.join("tokimo-sandbox-fuse");
         if cand.exists() {
             return Some(cand.to_string_lossy().into_owned());
         }
