@@ -89,6 +89,16 @@ jobs:
       - name: Build guest binaries needed by bwrap (init/fuse/tun-pump/host-exec)
         run: cargo build --bin tokimo-sandbox-init --bin tokimo-sandbox-fuse --bin tokimo-tun-pump --bin tokimo-host-exec
 
+      - name: Stage host binaries into .vm/base/host-bin/ (bwrap backend)
+        run: |
+          mkdir -p .vm/base/host-bin
+          cp target/debug/tokimo-sandbox-init \
+             target/debug/tokimo-sandbox-fuse \
+             target/debug/tokimo-host-exec \
+             .vm/base/host-bin/
+          chmod +x .vm/base/host-bin/*
+          ls -la .vm/base/host-bin/
+
       - name: Disk usage before tests
         run: df -h /
 
