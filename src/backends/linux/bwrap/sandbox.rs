@@ -736,7 +736,7 @@ impl SandboxBackend for LinuxBackend {
         }
 
         let shell_info = init_client
-            .open_shell(&["/bin/bash".to_string(), "-l".to_string()], &[], None)
+            .open_shell(&["/bin/bash".to_string()], &[], None)
             .map_err(|e| Error::other(format!("init open_shell failed: {e}")))?;
 
         let init_client = Arc::new(init_client);
