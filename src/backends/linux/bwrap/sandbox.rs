@@ -331,6 +331,40 @@ impl SandboxBackend for LinuxBackend {
             ]);
             tmp
         };
+        // apt's download sandbox tries to seteuid(_apt=42)/setgroups(nogroup=65534)
+        // before fetching, which fails inside our single-slot user_ns
+        // (uid_map only maps host_uid → 0; uid 42 isn't mapped, and bwrap
+        // forces /proc/self/setgroups=deny in unprivileged user_ns mode).
+        // Disable that drop entirely — the whole sandbox is already an
+        // isolation boundary, so apt running as root here is fine. Mirrors
+        // the standard fix used in docker/podman base images.
+        let _apt_sandbox_conf_file = {
+            let mut tmp = tempfile::NamedTempFile::new()
+                .map_err(|e| Error::other(format!("create apt sandbox conf tmpfile: {e}")))?;
+            use std::io::Write;
+            tmp.write_all(b"APT::Sandbox::User \"root\";\n")
+                .map_err(|e| Error::other(format!("write apt sandbox conf: {e}")))?;
+            args.extend([
+                "--ro-bind".to_string(),
+                tmp.path().to_string_lossy().into_owned(),
+                "/etc/apt/apt.conf.d/00tokimo-no-sandbox".to_string(),
+            ]);
+            tmp
+        };
+
+        // Map the host uid/gid to 0 inside the user_ns so the guest shell
+        // (and anything spawned by tokimo-sandbox-init) runs as root. The
+        // base rootfs is provisioned by packaging/vm-base/build.sh under
+        // the explicit assumption that bwrap mode == "you are root inside
+        // the ns"; without this mapping:
+        //   * apt / dpkg refuse to write /var/lib/apt/lists (EIO/EACCES)
+        //   * files owned by root in the rootfs appear as nobody/65534
+        //   * sudo can't help because bwrap forces PR_SET_NO_NEW_PRIVS,
+        //     which makes the setuid bit a no-op
+        // VM-based backends (ch/macos/windows) get real root inside their
+        // guest kernel and bypass this entirely.
+        args.extend(["--uid", "0", "--gid", "0"].iter().map(|s| s.to_string()));
+
         args.extend(
             [
                 "--proc",
