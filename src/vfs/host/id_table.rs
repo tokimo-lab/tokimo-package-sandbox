@@ -510,6 +510,34 @@ impl IdTable {
         let idx = (fh - 1) as usize;
         inner.fhs.get_mut(idx).map(f)
     }
+
+    /// Find any open `host_file` (LocalDirVfs fastpath) belonging to the
+    /// given `(mount_id, nodeid)`. Used by path-based attribute ops (stat
+    /// / setattr) as a fallback when the file has been unlinked but
+    /// remains reachable via an open fh — POSIX guarantees the inode is
+    /// still alive in this case, so `fstat` on the held `Arc<File>` is
+    /// the correct fallback. Without this, [`super::FuseHost::resolve_path`]
+    /// would return the empty path for a nodeid whose `paths` vec was
+    /// drained by `unbind_path`, and the backend would stat the export
+    /// root by mistake — causing the kernel to think the inode flipped
+    /// from regular file to directory and refuse subsequent writes.
+    pub fn find_open_host_file(&self, mount_id: u32, nodeid: u64) -> Option<Arc<std::fs::File>> {
+        let inner = self.inner.lock().unwrap();
+        for (_idx, entry) in inner.fhs.iter() {
+            if let FhEntry::File {
+                mount_id: mid,
+                nodeid: nid,
+                host_file: Some(hf),
+                ..
+            } = entry
+                && *mid == mount_id
+                && *nid == nodeid
+            {
+                return Some(hf.clone());
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

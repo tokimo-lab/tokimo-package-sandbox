@@ -441,6 +441,17 @@ impl FuseHost {
 
     /// Translate `(mount_id, nodeid)` to a vfs-relative path. `nodeid==1`
     /// is always the export root `/`.
+    ///
+    /// Returns `Res::Error(ENOENT)` when the nodeid is alive (e.g. still
+    /// held by an open fh) but all its path aliases were dropped by
+    /// `unbind_path` (the file was unlinked). Callers that have a fh
+    /// fallback (op_getattr / op_setattr) should handle this and reply
+    /// via `fstat` on the open `host_file` — POSIX guarantees the inode
+    /// is still alive. Without this, [`NodeEntry::resolve_path`] would
+    /// return `""` and the backend would happily stat the export root
+    /// instead, returning directory attrs that flip the kernel's view of
+    /// the inode from regular file to directory and break subsequent
+    /// writes with EIO (apt's mkstemp+unlink+write pattern).
     pub(in crate::vfs::host) fn resolve_path(&self, mount_id: u32, nodeid: u64) -> Result<PathBuf, Res> {
         if nodeid == 1 {
             return Ok(PathBuf::from("/"));
@@ -453,6 +464,9 @@ impl FuseHost {
             return Err(Res::Error(errno_for(&VfsError::InvalidArgument(
                 "nodeid/mount_id mismatch".into(),
             ))));
+        }
+        if n.paths.is_empty() {
+            return Err(Res::Error(errno_for(&VfsError::NotFound)));
         }
         Ok(n.resolve_path().to_path_buf())
     }

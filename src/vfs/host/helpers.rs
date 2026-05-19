@@ -146,6 +146,49 @@ pub(in crate::vfs::host) fn attr_from(info: &VfsFileInfo) -> AttrOut {
     }
 }
 
+/// Build an `AttrOut` directly from `fstat` on an open `Arc<File>` —
+/// used as a fallback when the file has been unlinked (so path-based
+/// stat would ENOENT) but a fh is still open. POSIX keeps the inode
+/// alive as long as any fd references it, so `metadata()` on the held
+/// `Arc<File>` returns the real attributes (size grows as you write,
+/// nlink == 0, mode preserved).
+///
+/// We always tag the result as a regular file: only regular files can
+/// be unlinked while open (directories require `rmdir` + empty-dir,
+/// other inode types are similar enough that we don't surface them via
+/// this fallback path in practice).
+pub(in crate::vfs::host) fn attr_from_fstat(file: &std::fs::File) -> std::io::Result<AttrOut> {
+    let md = file.metadata()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    #[cfg(target_os = "linux")]
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    #[cfg(not(target_os = "linux"))]
+    let (uid, gid) = (0u32, 0u32);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    Ok(AttrOut {
+        size: md.len(),
+        blocks: md.len().div_ceil(512),
+        mtime,
+        mode,
+        nlink: 1,
+        uid,
+        gid,
+        kind: NodeKind::File,
+        rdev: 0,
+    })
+}
+
 pub(in crate::vfs::host) async fn drain_staging_to_backend(
     mount: &MountEntry,
     path: &Path,

@@ -6,7 +6,7 @@ use crate::vfs_backend::VfsError;
 use crate::vfs_protocol::{EntryOut, Res, errno_for};
 
 use super::super::FuseHost;
-use super::super::helpers::{apply_host_mode, attr_from};
+use super::super::helpers::{apply_host_mode, attr_from, attr_from_fstat};
 
 impl FuseHost {
     pub(in crate::vfs::host) async fn op_lookup(self: Arc<Self>, mount_id: u32, parent_nodeid: u64, name: &str) -> Res {
@@ -34,7 +34,19 @@ impl FuseHost {
     pub(in crate::vfs::host) async fn op_getattr(&self, mount_id: u32, nodeid: u64) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
-            Err(r) => return r,
+            Err(r) => {
+                // File was unlinked while a fh is still open: POSIX says
+                // the inode is still alive. Reply via fstat on the open
+                // host_file so the kernel keeps its regular-file view of
+                // the inode (instead of mistakenly believing it flipped
+                // to a directory, which kills subsequent writes with EIO).
+                if let Some(hf) = self.id_table.find_open_host_file(mount_id, nodeid)
+                    && let Ok(attr) = attr_from_fstat(&hf)
+                {
+                    return Res::Attr(attr);
+                }
+                return r;
+            }
         };
         let Some(mount) = self.get_mount(mount_id) else {
             return Res::Error(errno_for(&VfsError::NotFound));
@@ -56,7 +68,29 @@ impl FuseHost {
     ) -> Res {
         let path = match self.resolve_path(mount_id, nodeid) {
             Ok(p) => p,
-            Err(r) => return r,
+            Err(r) => {
+                // Unlinked-but-open file: fall back to operating on the
+                // open fh. Truncate goes through `set_len` on the held
+                // `Arc<File>`, chmod is a no-op (the dentry is gone), and
+                // attribute reply comes from `fstat`. This is the path
+                // that fixes apt's mkstemp+unlink+write+ftruncate flow.
+                if let Some(hf) = self.id_table.find_open_host_file(mount_id, nodeid) {
+                    if let Some(sz) = size
+                        && let Err(e) = hf.set_len(sz)
+                    {
+                        return Res::Error(errno_for(&VfsError::from(e)));
+                    }
+                    // mode change on an unlinked file is a no-op — there's
+                    // no path to apply it to and the open fd already
+                    // captured its access mode at open() time.
+                    let _ = mode;
+                    return match attr_from_fstat(&hf) {
+                        Ok(attr) => Res::Attr(attr),
+                        Err(e) => Res::Error(errno_for(&VfsError::from(e))),
+                    };
+                }
+                return r;
+            }
         };
         let Some(mount) = self.get_mount(mount_id) else {
             return Res::Error(errno_for(&VfsError::NotFound));
