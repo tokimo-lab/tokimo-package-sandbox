@@ -234,7 +234,7 @@ impl SandboxBackend for LinuxBackend {
         let he_child_fd_raw = he_child_end.as_raw_fd();
 
         // 2. Find the init binary.
-        let init_path = find_init_binary()?;
+        let init_path = find_init_binary(&config.base_rootfs)?;
         let bwrap_path = find_bwrap()?;
 
         // 3. Build bwrap args.
@@ -1490,36 +1490,13 @@ fn find_bwrap() -> Result<PathBuf> {
     Err(Error::other("bwrap not found in PATH or /usr/bin"))
 }
 
-fn find_init_binary() -> Result<PathBuf> {
-    // 1. Check if tokimo-sandbox-init is in PATH.
-    if let Ok(path) = env::var("PATH") {
-        for dir in path.split(':') {
-            let candidate = PathBuf::from(dir).join("tokimo-sandbox-init");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+fn find_init_binary(base_rootfs: &Path) -> Result<PathBuf> {
+    let init = base_rootfs.join("host-bin").join("tokimo-sandbox-init");
+    if !init.is_file() {
+        return Err(Error::other(format!(
+            "tokimo-sandbox-init not found at {}; populate <base_rootfs>/host-bin/ from the tokimo-sandbox-host-linux-<arch>-musl.tar.zst release asset",
+            init.display()
+        )));
     }
-
-    // 2. Check relative to current_exe (for dev builds).
-    if let Ok(exe) = env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        let candidate = parent.join("tokimo-sandbox-init");
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    // 3. Check /usr/bin or /usr/local/bin.
-    for candidate in ["/usr/bin/tokimo-sandbox-init", "/usr/local/bin/tokimo-sandbox-init"] {
-        let p = PathBuf::from(candidate);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-
-    Err(Error::other(
-        "tokimo-sandbox-init not found in PATH, next to exe, or /usr/bin",
-    ))
+    Ok(init)
 }
