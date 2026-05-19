@@ -7,45 +7,14 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use common::{SandboxGuard, drain_until};
-use tokimo_package_sandbox::{ConfigureParams, Mount, NetworkPolicy, Sandbox};
+use common::{SandboxGuard, config, drain_until};
+use tokimo_package_sandbox::Sandbox;
 
 #[test]
 fn write_after_unlink_through_fuse_mount() {
-    let cwd = std::env::current_dir().unwrap();
-    let repo_root = cwd
-        .ancestors()
-        .find(|p| p.join(".data").is_dir())
-        .expect("walk up to .data/")
-        .to_path_buf();
-
-    let base = repo_root.join(".data/vm/base");
-    let vm = repo_root.join(".data/vm/data");
-    assert!(base.join("rootfs").is_dir(), "base rootfs missing");
-
-    let host_share = PathBuf::from(format!("/tmp/tokimo-fuse-unlink-{}", std::process::id()));
-    std::fs::create_dir_all(&host_share).ok();
-
-    let cfg = ConfigureParams {
-        user_data_name: "fuse-unlink-repro".into(),
-        base_rootfs: base,
-        vm_dir: vm,
-        memory_mb: 1024,
-        cpu_count: 2,
-        mounts: vec![Mount {
-            name: "ws".into(),
-            host_path: host_share.clone(),
-            guest_path: "/mnt/ws".into(),
-            read_only: false,
-            create_host_dir: true,
-        }],
-        network: NetworkPolicy::Blocked,
-        session_id: format!("fuse-unlink-{}", std::process::id()),
-        ..Default::default()
-    };
+    let cfg = config("fuse-unlink");
 
     let sb = Sandbox::connect().expect("connect");
     sb.configure(cfg).expect("configure");
@@ -59,12 +28,10 @@ fn write_after_unlink_through_fuse_mount() {
     sb.write_stdin(
         &shell,
         b"set +e\n\
-          echo --- mount ---\n\
-          df -T /mnt/ws\n\
-          echo --- python open+unlink+write ---\n\
-          python3 -c \"\n\
+          cd /tmp/tokimo-share\n\
+          python3 - <<'PY' 2>&1\n\
 import os, tempfile\n\
-fd, p = tempfile.mkstemp(prefix='probe.', dir='/mnt/ws')\n\
+fd, p = tempfile.mkstemp(prefix='probe.', dir='/tmp/tokimo-share')\n\
 print('opened', p)\n\
 os.unlink(p)\n\
 print('unlinked')\n\
@@ -72,7 +39,7 @@ n = os.write(fd, b'hello world' * 100)\n\
 print('wrote', n)\n\
 os.close(fd)\n\
 print('closed-ok')\n\
-\" 2>&1\n\
+PY\n\
           echo END_TAG\n",
     )
     .unwrap();
