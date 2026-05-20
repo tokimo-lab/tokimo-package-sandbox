@@ -261,10 +261,14 @@ impl HostExecBridge {
 
         match action {
             HostExecAction::Reject { exit_code, message } => {
+                // SpawnAck must come first — guest read_frame strictly expects it
+                // as the first reply after Spawn. Stderr before SpawnAck is treated
+                // as "unexpected spawn reply" and the message bytes get Debug-printed
+                // as a raw Vec<u8>.
+                let _ = write_frame(&mut rw, &Frame::SpawnAck { ok: true, error: None });
                 if let Some(msg) = message.as_ref() {
                     let _ = write_frame(&mut rw, &Frame::Stderr(msg.as_bytes().to_vec()));
                 }
-                let _ = write_frame(&mut rw, &Frame::SpawnAck { ok: true, error: None });
                 let _ = write_frame(
                     &mut rw,
                     &Frame::Exit {
