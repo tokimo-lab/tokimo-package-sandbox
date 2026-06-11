@@ -190,7 +190,7 @@ fn current_user_in_kvm_group() -> bool {
         return false;
     }
     #[cfg_attr(not(unix), allow(unused_variables))]
-    let kvm_gid = kvm_gid.unwrap();
+    let kvm_gid = kvm_gid.expect("kvm_gid is Some — checked above");
 
     // Check primary group first
     #[cfg(unix)]

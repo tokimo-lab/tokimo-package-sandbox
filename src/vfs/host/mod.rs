@@ -613,10 +613,16 @@ mod parking_lot_compat {
             Self(StdRwLock::new(t))
         }
         pub fn read(&self) -> RwLockReadGuard<'_, T> {
-            self.0.read().unwrap()
+            self.0.read().unwrap_or_else(|e| {
+                tracing::warn!("rwlock poisoned, recovering: {e}");
+                e.into_inner()
+            })
         }
         pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-            self.0.write().unwrap()
+            self.0.write().unwrap_or_else(|e| {
+                tracing::warn!("rwlock poisoned, recovering: {e}");
+                e.into_inner()
+            })
         }
     }
 }

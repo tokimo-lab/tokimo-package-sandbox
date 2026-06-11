@@ -149,7 +149,10 @@ fn run() -> u8 {
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = Frame::Stdin(buf[..n].to_vec());
-                    let mut w = writer_in.lock().unwrap();
+                    let mut w = writer_in.lock().unwrap_or_else(|e| {
+                        tracing::warn!("mutex poisoned, recovering: {e}");
+                        e.into_inner()
+                    });
                     if blocking::write_frame(&mut *w, &frame).is_err() {
                         break;
                     }

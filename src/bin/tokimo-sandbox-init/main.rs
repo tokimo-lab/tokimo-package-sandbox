@@ -93,7 +93,7 @@ fn load_kernel_module(path: &str) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let empty = CString::new("").unwrap();
+    let empty = CString::new("").expect("empty string has no interior nulls");
     let r = unsafe { libc::syscall(libc::SYS_finit_module, f.as_raw_fd(), empty.as_ptr(), 0i32) };
     if r == 0 {
         return Ok(());
@@ -437,7 +437,7 @@ fn bind_unix() -> Result<OwnedFd, String> {
     .map_err(|e| format!("socket(SEQPACKET): {e}"))?;
     let addr = UnixAddr::new(&sock_path).map_err(|e| format!("UnixAddr: {e}"))?;
     bind(fd.as_raw_fd(), &addr).map_err(|e| format!("bind {sock_path:?}: {e}"))?;
-    listen(&fd, Backlog::new(8).unwrap()).map_err(|e| format!("listen: {e}"))?;
+    listen(&fd, Backlog::new(8).expect("valid backlog value")).map_err(|e| format!("listen: {e}"))?;
     Ok(fd)
 }
 
@@ -595,7 +595,7 @@ fn load_one_module(path: &str) -> Result<(), String> {
 /// Chroot and chdir to the given path.
 #[cfg(target_os = "linux")]
 fn chroot(path: &str) -> Result<(), String> {
-    let p = std::ffi::CString::new(path).unwrap();
+    let p = std::ffi::CString::new(path).map_err(|e| format!("CString: {e}"))?;
     if unsafe { libc::chdir(p.as_ptr()) } != 0 {
         return Err(format!("chdir {path}: {}", std::io::Error::last_os_error()));
     }
@@ -625,10 +625,10 @@ fn ensure_tokimo_home() -> std::io::Result<()> {
 /// Tiny mount wrapper — panics are fine here (init is PID 1, no one to recover).
 #[cfg(target_os = "linux")]
 fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> Result<(), String> {
-    let src = std::ffi::CString::new(source).unwrap();
-    let tgt = std::ffi::CString::new(target).unwrap();
-    let fst = std::ffi::CString::new(fstype).unwrap();
-    let dat = std::ffi::CString::new(data).unwrap();
+    let src = std::ffi::CString::new(source).map_err(|e| format!("CString source: {e}"))?;
+    let tgt = std::ffi::CString::new(target).map_err(|e| format!("CString target: {e}"))?;
+    let fst = std::ffi::CString::new(fstype).map_err(|e| format!("CString fstype: {e}"))?;
+    let dat = std::ffi::CString::new(data).map_err(|e| format!("CString data: {e}"))?;
     let _ = std::fs::create_dir_all(target);
     let rc = unsafe {
         libc::mount(

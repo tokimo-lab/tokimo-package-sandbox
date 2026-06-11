@@ -95,7 +95,10 @@ impl<B: SandboxBackend> SharedBackend<B> {
     /// * Otherwise         → create via the factory, insert into the
     ///   registry, return.
     fn resolve(&self, session_id: &str) -> Result<Arc<B>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if let Some(b) = inner.as_ref() {
             return Ok(Arc::clone(b));
         }
@@ -103,7 +106,10 @@ impl<B: SandboxBackend> SharedBackend<B> {
         let backend = if session_id.is_empty() {
             (self.factory)()?
         } else {
-            let mut reg = self.registry.lock().unwrap();
+            let mut reg = self.registry.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             if let Some(existing) = reg.get(session_id) {
                 Arc::clone(existing)
             } else {
@@ -114,7 +120,10 @@ impl<B: SandboxBackend> SharedBackend<B> {
         };
 
         *inner = Some(Arc::clone(&backend));
-        *self.bound_session.lock().unwrap() = if session_id.is_empty() {
+        *self.bound_session.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = if session_id.is_empty() {
             None
         } else {
             Some(session_id.to_string())
@@ -123,17 +132,41 @@ impl<B: SandboxBackend> SharedBackend<B> {
     }
 
     fn get(&self) -> Result<Arc<B>> {
-        self.inner.lock().unwrap().clone().ok_or(Error::NotConfigured)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .clone()
+            .ok_or(Error::NotConfigured)
     }
 
     /// Tear down this handle's binding without touching VM state.  Used
     /// after `stop_vm()` so subsequent `configure()` on the same handle
     /// produces a clean, fresh session.
     fn drop_binding(&self) {
-        if let Some(sid) = self.bound_session.lock().unwrap().take() {
-            self.registry.lock().unwrap().remove(&sid);
+        if let Some(sid) = self
+            .bound_session
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .take()
+        {
+            self.registry
+                .lock()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                })
+                .remove(&sid);
         }
-        *self.inner.lock().unwrap() = None;
+        *self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = None;
     }
 
     /// Number of sessions currently tracked in this registry.  Test-only.

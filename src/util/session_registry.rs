@@ -63,7 +63,10 @@ impl<S: SessionState> SessionRegistry<S> {
     where
         S: Default,
     {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         map.entry(session_id.to_string())
             .or_insert_with(|| {
                 Arc::new(SharedSession {
@@ -75,7 +78,14 @@ impl<S: SessionState> SessionRegistry<S> {
 
     /// Look up an existing session.  Returns `None` if the ID is unknown.
     pub fn get(&self, session_id: &str) -> Option<Arc<SharedSession<S>>> {
-        self.sessions.lock().unwrap().get(session_id).cloned()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .get(session_id)
+            .cloned()
     }
 
     /// Remove a session from the registry.
@@ -83,17 +93,35 @@ impl<S: SessionState> SessionRegistry<S> {
     /// The returned `Arc` may still be held by connection threads; the
     /// session is only truly dropped when all references are gone.
     pub fn remove(&self, session_id: &str) -> Option<Arc<SharedSession<S>>> {
-        self.sessions.lock().unwrap().remove(session_id)
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .remove(session_id)
     }
 
     /// Number of sessions currently tracked (running or not).
     pub fn len(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .len()
     }
 
     /// Returns `true` when no sessions are tracked.
     pub fn is_empty(&self) -> bool {
-        self.sessions.lock().unwrap().is_empty()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .is_empty()
     }
 
     /// Snapshot of all `(session_id, SharedSession)` pairs currently
@@ -101,7 +129,10 @@ impl<S: SessionState> SessionRegistry<S> {
     pub fn entries(&self) -> Vec<(String, Arc<SharedSession<S>>)> {
         self.sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect()

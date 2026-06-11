@@ -137,7 +137,13 @@ impl IdTable {
     }
 
     pub fn generation(&self) -> u64 {
-        self.inner.lock().unwrap().generation
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .generation
     }
 
     /// Resolve a `nodeid` to its mount + path. `nodeid == 1` is the
@@ -150,7 +156,10 @@ impl IdTable {
             // Caller's responsibility — they know the mount_id.
             return None;
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let idx = (nodeid - 2) as usize;
         inner.nodes.get(idx).cloned()
     }
@@ -164,7 +173,10 @@ impl IdTable {
     /// Used by the host-side filesystem watcher to translate a path
     /// it observed changing into the nodeid the guest knows it as.
     pub fn find_path_nodeid(&self, mount_id: u32, path: &Path) -> Option<u64> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         inner.by_path.get(&(mount_id, path.to_path_buf())).copied()
     }
 
@@ -179,7 +191,10 @@ impl IdTable {
     /// Bumps refcount on hit, allocates on miss. Returns the nodeid and
     /// `true` if it was newly allocated.
     pub fn intern(&self, mount_id: u32, path: PathBuf) -> (u64, bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
             let idx = (nodeid - 2) as usize;
             inner.nodes[idx].refcount += 1;
@@ -220,7 +235,10 @@ impl IdTable {
         if dev == 0 && ino == 0 {
             return self.intern(mount_id, path);
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         // 1. Exact (mount, path) hit.
         if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
@@ -270,7 +288,10 @@ impl IdTable {
     /// the nodeid stays in the table until a real `Lookup` + `Forget`
     /// cycle releases it.
     pub fn intern_peek(&self, mount_id: u32, path: PathBuf) -> (u64, bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if let Some(&nodeid) = inner.by_path.get(&(mount_id, path.clone())) {
             return (nodeid, false);
         }
@@ -326,7 +347,10 @@ impl IdTable {
         if nodeid < 2 {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let idx = (nodeid - 2) as usize;
         let Some(node) = inner.nodes.get_mut(idx) else {
             return;
@@ -368,7 +392,10 @@ impl IdTable {
     ///
     /// No-op if the path isn't currently bound.
     pub fn unbind_path(&self, mount_id: u32, path: &Path) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let Some(nodeid) = inner.by_path.remove(&(mount_id, path.to_path_buf())) else {
             return;
         };
@@ -401,7 +428,10 @@ impl IdTable {
         if dev == 0 && ino == 0 {
             return Vec::new();
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         // Fast path: by_inode has at most one entry per key (dedup
         // collapses on that key), but a path-only-interned alias may
         // hold a parallel nodeid with no inode_key. Sweep `nodes` to
@@ -426,7 +456,10 @@ impl IdTable {
     /// Also drops any existing node bound to `to` (overwritten by the
     /// rename target) so it won't shadow the renamed entry.
     pub fn rename_path(&self, mount_id: u32, from: &std::path::Path, to: &std::path::Path) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         // Drop any existing destination binding first — the rename
         // overwrites it. The destination path may be one alias of a
         // multi-link inode; pull just that alias out of its entry.
@@ -482,7 +515,10 @@ impl IdTable {
     }
 
     pub fn alloc_fh(&self, fh: FhEntry) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let idx = inner.fhs.insert(fh);
         idx as u64 + 1
     }
@@ -491,7 +527,10 @@ impl IdTable {
         if fh == 0 {
             return None;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let idx = (fh - 1) as usize;
         if inner.fhs.contains(idx) {
             Some(inner.fhs.remove(idx))
@@ -506,7 +545,10 @@ impl IdTable {
         if fh == 0 {
             return None;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let idx = (fh - 1) as usize;
         inner.fhs.get_mut(idx).map(f)
     }
@@ -522,7 +564,10 @@ impl IdTable {
     /// root by mistake — causing the kernel to think the inode flipped
     /// from regular file to directory and refuse subsequent writes.
     pub fn find_open_host_file(&self, mount_id: u32, nodeid: u64) -> Option<Arc<std::fs::File>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         for (_idx, entry) in inner.fhs.iter() {
             if let FhEntry::File {
                 mount_id: mid,

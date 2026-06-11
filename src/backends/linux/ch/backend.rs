@@ -92,7 +92,10 @@ impl ChBackend {
     }
 
     fn emit_event(&self, event: Event) {
-        let mut senders = self.event_senders.lock().unwrap();
+        let mut senders = self.event_senders.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         senders.retain(|tx| tx.send(event.clone()).is_ok());
     }
 }
@@ -103,7 +106,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn configure(&self, params: ConfigureParams) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Empty | State::Configured { .. } | State::Stopped => {
                 *state = State::Configured { params };
@@ -118,7 +124,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn start_vm(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let params = match &*state {
             State::Configured { params } => params.clone(),
             State::Empty => return Err(Error::NotConfigured),
@@ -298,7 +307,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn stop_vm(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let prev = std::mem::replace(&mut *state, State::Stopped);
         match prev {
             State::Running(rs) => {
@@ -337,7 +349,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn is_running(&self) -> Result<bool> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Running(rs) => Ok(!rs.init.is_dead()),
             _ => Ok(false),
@@ -349,7 +364,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn is_process_running(&self, id: &JobId) -> Result<bool> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Running(rs) => Ok(rs.init.take_exit(id.as_str()).is_none()),
             _ => Err(Error::VmNotRunning),
@@ -357,7 +375,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn shell_id(&self) -> Result<JobId> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Running(rs) => Ok(JobId(rs.shell_id.clone())),
             _ => Err(Error::VmNotRunning),
@@ -365,7 +386,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn spawn_shell(&self, opts: ShellOpts) -> Result<JobId> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -390,7 +414,10 @@ impl SandboxBackend for ChBackend {
 
     fn close_shell(&self, id: &JobId) -> Result<()> {
         let init = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             let rs = match &mut *state {
                 State::Running(rs) => rs,
                 _ => return Err(Error::VmNotRunning),
@@ -402,7 +429,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn list_shells(&self) -> Result<Vec<JobId>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Running(rs) => Ok(rs.shells.iter().cloned().map(JobId).collect()),
             _ => Err(Error::VmNotRunning),
@@ -411,7 +441,10 @@ impl SandboxBackend for ChBackend {
 
     fn write_stdin(&self, id: &JobId, data: &[u8]) -> Result<()> {
         let init = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             match &*state {
                 State::Running(rs) => rs.init.clone(),
                 _ => return Err(Error::VmNotRunning),
@@ -422,7 +455,10 @@ impl SandboxBackend for ChBackend {
 
     fn signal_shell(&self, id: &JobId, sig: i32) -> Result<()> {
         let init = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             match &*state {
                 State::Running(rs) => rs.init.clone(),
                 _ => return Err(Error::VmNotRunning),
@@ -433,7 +469,10 @@ impl SandboxBackend for ChBackend {
 
     fn resize_shell(&self, id: &JobId, rows: u16, cols: u16) -> Result<()> {
         let init = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             match &*state {
                 State::Running(rs) => rs.init.clone(),
                 _ => return Err(Error::VmNotRunning),
@@ -444,7 +483,10 @@ impl SandboxBackend for ChBackend {
 
     fn subscribe(&self) -> Result<Receiver<Event>> {
         let (tx, rx) = channel();
-        let mut senders = self.event_senders.lock().unwrap();
+        let mut senders = self.event_senders.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         senders.push(tx);
         Ok(rx)
     }
@@ -454,13 +496,19 @@ impl SandboxBackend for ChBackend {
     }
 
     fn set_debug_logging(&self, enabled: bool) -> Result<()> {
-        let mut debug = self.debug_logging.lock().unwrap();
+        let mut debug = self.debug_logging.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         *debug = enabled;
         Ok(())
     }
 
     fn is_debug_logging_enabled(&self) -> Result<bool> {
-        let debug = self.debug_logging.lock().unwrap();
+        let debug = self.debug_logging.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         Ok(*debug)
     }
 
@@ -473,7 +521,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn on_host_exec(&self, cb: crate::api::HostExecCallback) -> Result<()> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         match &*state {
             State::Running(rs) => {
                 if let Some(bridge) = &rs.host_exec_bridge {
@@ -485,14 +536,20 @@ impl SandboxBackend for ChBackend {
             }
             _ => {
                 drop(state);
-                *self.pending_host_exec_cb.lock().unwrap() = Some(cb);
+                *self.pending_host_exec_cb.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                }) = Some(cb);
                 Ok(())
             }
         }
     }
 
     fn add_host_command(&self, name: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -508,7 +565,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn remove_host_command(&self, name: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -522,7 +582,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn set_host_commands(&self, names: &[String]) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -535,7 +598,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn list_host_commands(&self) -> Result<Vec<String>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &*state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -546,7 +612,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn add_mount(&self, share: Mount) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -594,7 +663,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn remove_mount(&self, name: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         let rs = match &mut *state {
             State::Running(rs) => rs,
             _ => return Err(Error::VmNotRunning),
@@ -620,7 +692,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         Ok(match &*state {
             State::Empty | State::Stopped => Vec::new(),
             State::Configured { params } => vec![crate::SessionSummary {
@@ -643,7 +718,10 @@ impl SandboxBackend for ChBackend {
     }
 
     fn session_info(&self, name: &str) -> Result<Option<crate::SessionDetails>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         Ok(match &*state {
             State::Empty | State::Stopped => None,
             State::Configured { params } if session_name(params) == name => Some(crate::SessionDetails {
@@ -679,7 +757,10 @@ impl SandboxBackend for ChBackend {
 
     fn stop_session(&self, name: &str) -> Result<()> {
         let matches = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             match &*state {
                 State::Running(rs) => session_name(&rs.params) == name,
                 _ => false,
@@ -753,7 +834,10 @@ fn event_pump_loop(init: Arc<ChInitClient>, event_senders: Arc<Mutex<Vec<Sender<
                     id: JobId(child_id.clone()),
                     data: chunk,
                 };
-                let mut senders = event_senders.lock().unwrap();
+                let mut senders = event_senders.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                });
                 senders.retain(|tx| tx.send(event.clone()).is_ok());
             }
             for chunk in init.drain_stderr(&child_id) {
@@ -761,7 +845,10 @@ fn event_pump_loop(init: Arc<ChInitClient>, event_senders: Arc<Mutex<Vec<Sender<
                     id: JobId(child_id.clone()),
                     data: chunk,
                 };
-                let mut senders = event_senders.lock().unwrap();
+                let mut senders = event_senders.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                });
                 senders.retain(|tx| tx.send(event.clone()).is_ok());
             }
             if !seen_exit.contains(&child_id)
@@ -772,7 +859,10 @@ fn event_pump_loop(init: Arc<ChInitClient>, event_senders: Arc<Mutex<Vec<Sender<
                     exit_code: code,
                     signal: sig,
                 };
-                let mut senders = event_senders.lock().unwrap();
+                let mut senders = event_senders.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                });
                 senders.retain(|tx| tx.send(event.clone()).is_ok());
                 seen_exit.insert(child_id);
             }
@@ -785,7 +875,10 @@ fn event_pump_loop(init: Arc<ChInitClient>, event_senders: Arc<Mutex<Vec<Sender<
     }
 
     let event = Event::GuestConnected { connected: false };
-    let mut senders = event_senders.lock().unwrap();
+    let mut senders = event_senders.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     senders.retain(|tx| tx.send(event.clone()).is_ok());
 }
 

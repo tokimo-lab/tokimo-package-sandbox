@@ -817,7 +817,10 @@ impl SandboxBackend for LinuxBackend {
                 event_pump_loop(pump_client, pump_stop, backend_state_ptr);
             })
             .map_err(|e| Error::other(format!("spawn event pump: {e}")))?;
-        *self.event_pump.lock().unwrap() = Some(pump);
+        *self.event_pump.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = Some(pump);
 
         self.running.store(true, Ordering::Relaxed);
 
@@ -883,7 +886,15 @@ impl SandboxBackend for LinuxBackend {
         self.running.store(false, Ordering::Relaxed);
 
         // 4. Join the pump thread.
-        if let Some(handle) = self.event_pump.lock().unwrap().take() {
+        if let Some(handle) = self
+            .event_pump
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .take()
+        {
             let _ = handle.join();
         }
 
@@ -891,8 +902,24 @@ impl SandboxBackend for LinuxBackend {
         // Must happen AFTER bwrap_child has been killed/waited above,
         // so the keeper isn't holding open a parent-thread that ought
         // to have triggered --die-with-parent.
-        let keeper_shutdown = self.state.lock().unwrap().bwrap_keeper_shutdown.take();
-        let keeper_handle = self.state.lock().unwrap().bwrap_keeper.take();
+        let keeper_shutdown = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .bwrap_keeper_shutdown
+            .take();
+        let keeper_handle = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .bwrap_keeper
+            .take();
         if let Some(flag) = keeper_shutdown {
             flag.store(true, Ordering::Relaxed);
         }

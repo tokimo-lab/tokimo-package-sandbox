@@ -453,7 +453,10 @@ fn pipe_server_loop(console_mode: bool) {
     // Teardown all running sessions so Hyper-V VMs are not orphaned.
     slog!("[svc] shutting down — tearing down all sessions");
     for (id, shared) in sessions.entries() {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if st.running {
             slog!("[svc] tearing down session {id}");
             teardown_session(&mut st);
@@ -611,13 +614,19 @@ impl InflightTracker {
 
     /// Called by the reader thread before spawning a handler.
     fn begin(&self) {
-        let mut g = self.state.lock().unwrap();
+        let mut g = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         g.0 += 1;
     }
 
     /// Called by each handler thread when it finishes.
     fn end(&self) {
-        let mut g = self.state.lock().unwrap();
+        let mut g = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         g.0 -= 1;
         if g.0 == 0 && g.1 {
             self.cv.notify_all();
@@ -626,7 +635,10 @@ impl InflightTracker {
 
     /// Called by the reader thread when it exits (EOF / error).
     fn mark_reader_done(&self) {
-        let mut g = self.state.lock().unwrap();
+        let mut g = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         g.1 = true;
         if g.0 == 0 {
             self.cv.notify_all();
@@ -635,7 +647,10 @@ impl InflightTracker {
 
     /// Block until all in-flight handlers complete and the reader is done.
     fn drain(&self) {
-        let mut g = self.state.lock().unwrap();
+        let mut g = self.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         while g.0 > 0 || !g.1 {
             g = self.cv.wait(g).unwrap();
         }
@@ -648,7 +663,10 @@ impl InflightTracker {
 
 /// Look up the [`SharedSession`] bound to this connection.
 fn get_session(conn: &Connection, sessions: &WindowsRegistry) -> Result<Arc<SharedSession<SessionState>>, RpcError> {
-    let key = conn.session_id.lock().unwrap();
+    let key = conn.session_id.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     let key = key
         .as_ref()
         .ok_or_else(|| RpcError::new("not_configured", "call configure first"))?;
@@ -842,19 +860,36 @@ fn dispatch(
         method::IS_RUNNING => {
             let shared = get_session(conn, sessions)?;
             Ok(json!(BoolValue {
-                value: shared.state.lock().unwrap().running
+                value: shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("mutex poisoned, recovering: {e}");
+                        e.into_inner()
+                    })
+                    .running
             }))
         }
         method::IS_GUEST_CONNECTED => {
             let shared = get_session(conn, sessions)?;
             Ok(json!(BoolValue {
-                value: shared.state.lock().unwrap().guest_connected
+                value: shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("mutex poisoned, recovering: {e}");
+                        e.into_inner()
+                    })
+                    .guest_connected
             }))
         }
         method::IS_PROCESS_RUNNING => {
             let p: IdParams = serde_json::from_value(params).map_err(|e| RpcError::new("bad_params", e.to_string()))?;
             let shared = get_session(conn, sessions)?;
-            let st = shared.state.lock().unwrap();
+            let st = shared.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             let alive = st
                 .children
                 .get(&p.id)
@@ -960,7 +995,10 @@ fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsReg
 
     // If the VM is already running for this session, just bind and return.
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if st.running {
             slog!("[svc] reusing existing session {key}");
             // Refresh owner_pid for the rebind so management RPCs and
@@ -969,27 +1007,39 @@ fn handle_configure(conn: &Arc<Connection>, params: Value, sessions: &WindowsReg
             if conn.owner_pid.is_some() {
                 st.owner_pid = conn.owner_pid;
             }
-            *conn.session_id.lock().unwrap() = Some(key);
+            *conn.session_id.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }) = Some(key);
             return Ok(json!({}));
         }
     }
 
     // Not running — store config.
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.config = Some(cfg);
         st.owner_pid = conn.owner_pid;
     }
 
     // Bind this connection to the session.
-    *conn.session_id.lock().unwrap() = Some(key);
+    *conn.session_id.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    }) = Some(key);
     Ok(json!({}))
 }
 
 fn handle_list_sessions(sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let mut out = Vec::new();
     for (name, shared) in sessions.entries() {
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         out.push(summarize_session(&name, &st));
     }
     serde_json::to_value(ListSessionsResult { sessions: out }).map_err(|e| RpcError::new("encode", e.to_string()))
@@ -999,7 +1049,10 @@ fn handle_session_info(sessions: &WindowsRegistry, p: SessionNameParams) -> Resu
     let details = match sessions.get(&p.name) {
         None => None,
         Some(shared) => {
-            let st = shared.state.lock().unwrap();
+            let st = shared.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             Some(tokimo_package_sandbox::SessionDetails {
                 summary: summarize_session(&p.name, &st),
                 owner_pid: st.owner_pid,
@@ -1025,7 +1078,10 @@ fn handle_stop_session(
     // session whose owner is still running so this admin override is
     // visible in svc logs.
     let owner_alive = {
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.owner_pid.map(is_pid_alive).unwrap_or(false)
     };
     if owner_alive {
@@ -1035,7 +1091,10 @@ fn handle_stop_session(
         );
     }
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         teardown_session(&mut st);
     }
     sessions.remove(&p.name);
@@ -1058,7 +1117,10 @@ fn is_pid_alive(pid: u32) -> bool {
 
 fn handle_create_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
-    let st = shared.state.lock().unwrap();
+    let st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     if st.config.is_none() {
         return Err(RpcError::new(
             "not_configured",
@@ -1073,7 +1135,10 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     // Take a snapshot of config without holding the state lock during
     // the long-running boot path (we re-acquire to install state).
     let cfg = {
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if st.running {
             // Idempotent: a second handle that joined this session via
             // configure() may legitimately call start_vm again. The VM
@@ -1510,7 +1575,10 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
     let init_arc = Arc::new(init);
 
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.hcs = Some((api.clone(), cs, vm_id.clone()));
         st.init = Some(Arc::clone(&init_arc));
         st.vhdx = Some(lease);
@@ -1546,7 +1614,10 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
             let stop_w = Arc::clone(&disp_stop);
             thread::spawn(move || dispatcher_loop(conn_w, init_w, shared_w, stop_w))
         };
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.dispatcher = Some(DispatcherHandle {
             stop: disp_stop,
             _join: disp_join,
@@ -1562,7 +1633,10 @@ fn handle_start_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
 
 fn handle_stop_vm(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
-    let mut st = shared.state.lock().unwrap();
+    let mut st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     teardown_session(&mut st);
     Ok(json!({}))
 }
@@ -1645,7 +1719,15 @@ fn handle_add_host_command(
     init.add_host_command(&p.name)
         .map_err(|e| RpcError::new("init_add_host_command", e.to_string()))?;
     let shared = get_session(conn, sessions)?;
-    shared.state.lock().unwrap().host_exec_commands.insert(p.name);
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+        .host_exec_commands
+        .insert(p.name);
     Ok(json!({}))
 }
 
@@ -1658,7 +1740,15 @@ fn handle_remove_host_command(
     init.remove_host_command(&p.name)
         .map_err(|e| RpcError::new("init_remove_host_command", e.to_string()))?;
     let shared = get_session(conn, sessions)?;
-    shared.state.lock().unwrap().host_exec_commands.remove(&p.name);
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+        .host_exec_commands
+        .remove(&p.name);
     Ok(json!({}))
 }
 
@@ -1671,14 +1761,20 @@ fn handle_set_host_commands(
     init.set_host_commands(&p.names)
         .map_err(|e| RpcError::new("init_set_host_commands", e.to_string()))?;
     let shared = get_session(conn, sessions)?;
-    let mut st = shared.state.lock().unwrap();
+    let mut st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     st.host_exec_commands = p.names.into_iter().collect();
     Ok(json!({}))
 }
 
 fn handle_list_host_commands(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
-    let st = shared.state.lock().unwrap();
+    let st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     let names: Vec<String> = st.host_exec_commands.iter().cloned().collect();
     serde_json::to_value(ListHostCommandsResult { names }).map_err(|e| RpcError::new("encode", e.to_string()))
 }
@@ -1705,7 +1801,10 @@ fn handle_write_stdin(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
 
 fn handle_shell_id(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
-    let st = shared.state.lock().unwrap();
+    let st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     let id = st
         .shell_child_id
         .as_ref()
@@ -1720,7 +1819,10 @@ fn handle_signal_shell(conn: &Arc<Connection>, params: Value, sessions: &Windows
     {
         // Validate that the JobId refers to a registered child.
         let shared = get_session(conn, sessions)?;
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if !st.children.contains_key(&p.id) {
             return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
         }
@@ -1757,7 +1859,10 @@ fn handle_spawn_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
 
     {
         let shared = get_session(conn, sessions)?;
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.children.insert(
             child_id.clone(),
             ChildEntry {
@@ -1774,7 +1879,10 @@ fn handle_resize_shell(conn: &Arc<Connection>, params: Value, sessions: &Windows
     let init = require_init(conn, sessions)?;
     {
         let shared = get_session(conn, sessions)?;
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if !st.children.contains_key(&p.id) {
             return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
         }
@@ -1790,7 +1898,10 @@ fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
     let init = require_init(conn, sessions)?;
     {
         let shared = get_session(conn, sessions)?;
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if !st.children.contains_key(&p.id) {
             return Err(RpcError::new("unknown_job", format!("no such shell: {}", p.id)));
         }
@@ -1800,7 +1911,10 @@ fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
     let _ = init.signal(&p.id, 15, true);
     {
         let shared = get_session(conn, sessions)?;
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.children.remove(&p.id);
         if st.shell_child_id.as_deref() == Some(p.id.as_str()) {
             st.shell_child_id = None;
@@ -1811,7 +1925,10 @@ fn handle_close_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
 
 fn handle_list_shells(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
     let shared = get_session(conn, sessions)?;
-    let st = shared.state.lock().unwrap();
+    let st = shared.state.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     // Every entry in `st.children` is a shell (boot or spawn_shell).
     // Order is unspecified per trait contract.
     let ids: Vec<String> = st.children.keys().cloned().collect();
@@ -1835,7 +1952,10 @@ fn dispatcher_loop(
 
         // Snapshot child IDs; release lock before blocking.
         let ids: HashSet<String> = {
-            let st = shared.state.lock().unwrap();
+            let st = shared.state.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             st.children.keys().cloned().collect()
         };
 
@@ -1896,7 +2016,10 @@ fn handle_add_mount(conn: &Arc<Connection>, p: AddMountParams, sessions: &Window
     }
     let shared = get_session(conn, sessions)?;
     let (fuse_host, fuse_port, init) = {
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if !st.running {
             return Err(RpcError::new(
                 "vm_not_running",
@@ -1936,7 +2059,10 @@ fn handle_add_mount(conn: &Arc<Connection>, p: AddMountParams, sessions: &Window
     }
 
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.fuse_mount_names.insert(share.name.clone(), mount_id);
     }
 
@@ -1955,7 +2081,10 @@ fn handle_remove_mount(
 
     let shared = get_session(conn, sessions)?;
     let (fuse_host, init) = {
-        let st = shared.state.lock().unwrap();
+        let st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if !st.running {
             return Err(RpcError::new(
                 "vm_not_running",
@@ -1993,7 +2122,10 @@ fn handle_remove_mount(
     }
 
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         st.fuse_mount_names.remove(&name);
     }
 
@@ -2008,7 +2140,10 @@ fn require_init(
     shared
         .state
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
         .init
         .clone()
         .ok_or_else(|| RpcError::new("vm_not_running", "VM is not running"))
@@ -2033,7 +2168,10 @@ fn read_frame(pipe: HANDLE) -> std::io::Result<Frame> {
 
 fn send_frame(conn: &Arc<Connection>, frame: &Frame) -> std::io::Result<()> {
     let bytes = encode_frame(frame)?;
-    let _g = conn.write_lock.lock().unwrap();
+    let _g = conn.write_lock.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned, recovering: {e}");
+        e.into_inner()
+    });
     write_all(conn.pipe, &bytes)
 }
 
@@ -2250,7 +2388,14 @@ fn owner_pid_waiter(pid: u32, conn: Arc<Connection>, sessions: WindowsRegistry) 
     unsafe { WaitForSingleObject(proc_h, u32::MAX) };
     let _ = unsafe { CloseHandle(proc_h) };
 
-    let bound = conn.session_id.lock().unwrap().clone();
+    let bound = conn
+        .session_id
+        .lock()
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+        .clone();
     let Some(key) = bound else {
         slog!("[svc] owner-waiter: pid {pid} exited; no session bound — nothing to do");
         return;
@@ -2261,7 +2406,10 @@ fn owner_pid_waiter(pid: u32, conn: Arc<Connection>, sessions: WindowsRegistry) 
     };
     slog!("[svc] owner-waiter: pid {pid} exited; tearing down session {key}");
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         teardown_session(&mut st);
     }
     sessions.remove(&key);

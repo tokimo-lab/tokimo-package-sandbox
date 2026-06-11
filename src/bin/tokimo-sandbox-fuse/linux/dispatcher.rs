@@ -113,9 +113,15 @@ impl Dispatcher {
     /// the kernel. Returns the thread join handle so the caller can
     /// keep it alive for the lifetime of the bridge.
     pub(crate) fn install_notifier(self: &Arc<Self>, n: fuser::Notifier) -> thread::JoinHandle<()> {
-        *self.notifier.lock().unwrap() = Some(n.clone());
+        *self.notifier.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = Some(n.clone());
         let (tx, rx) = mpsc::channel::<Inval>();
-        *self.inval_tx.lock().unwrap() = Some(tx);
+        *self.inval_tx.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = Some(tx);
         thread::Builder::new()
             .name("tokimo-fuse-inval".into())
             .spawn(move || {
@@ -137,7 +143,15 @@ impl Dispatcher {
     pub(crate) fn spawn_reader(self: Arc<Self>) -> thread::JoinHandle<()> {
         let me = self;
         thread::spawn(move || {
-            let mut read_file = match me.read_file.lock().unwrap().take() {
+            let mut read_file = match me
+                .read_file
+                .lock()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                })
+                .take()
+            {
                 Some(f) => f,
                 None => {
                     eprintln!("[tokimo-fuse] reader: no read fd");
@@ -159,7 +173,14 @@ impl Dispatcher {
                 };
                 match frame {
                     Frame::Response { req_id, result } => {
-                        let cb = me.pending.lock().unwrap().remove(&req_id);
+                        let cb = me
+                            .pending
+                            .lock()
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("mutex poisoned, recovering: {e}");
+                                e.into_inner()
+                            })
+                            .remove(&req_id);
                         if let Some(cb) = cb {
                             me.pool.submit(move || cb(result));
                         } else {
@@ -167,7 +188,14 @@ impl Dispatcher {
                         }
                     }
                     Frame::Notify(inval) => {
-                        let tx = me.inval_tx.lock().unwrap().clone();
+                        let tx = me
+                            .inval_tx
+                            .lock()
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("mutex poisoned, recovering: {e}");
+                                e.into_inner()
+                            })
+                            .clone();
                         if let Some(tx) = tx {
                             let _ = tx.send(inval);
                         }
@@ -178,7 +206,10 @@ impl Dispatcher {
                 }
             }
             // On reader exit, fail any pending requests.
-            let pending = std::mem::take(&mut *me.pending.lock().unwrap());
+            let pending = std::mem::take(&mut *me.pending.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }));
             for (_, cb) in pending {
                 let err = Res::Error(WireError {
                     errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
@@ -198,18 +229,35 @@ impl Dispatcher {
         F: FnOnce(Res) + Send + 'static,
     {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.lock().unwrap().insert(req_id, Box::new(cb));
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .insert(req_id, Box::new(cb));
         let frame = Frame::Request {
             req_id,
             mount_id: self.bound_mount_id,
             op,
         };
-        let mut guard = self.write_file.lock().unwrap();
+        let mut guard = self.write_file.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         if let Err(e) = wire::write_frame(&mut *guard, &frame) {
             drop(guard);
             // Remove the pending entry and invoke the callback with
             // the wire error so callers don't leak FUSE replies.
-            if let Some(cb) = self.pending.lock().unwrap().remove(&req_id) {
+            if let Some(cb) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                })
+                .remove(&req_id)
+            {
                 let err = Res::Error(WireError {
                     errno: tokimo_package_sandbox::vfs_protocol::Errno::Eio as i32,
                     message: format!("send: {e}"),

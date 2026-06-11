@@ -84,7 +84,10 @@ impl SandboxBackend for WindowsBackend {
         // Build the bridge with either the pre-registered callback or a
         // default no-op (which can be replaced later via `on_host_exec`).
         let cb: HostExecCallback = {
-            let mut g = self.pending_host_exec_cb.lock().unwrap();
+            let mut g = self.pending_host_exec_cb.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             g.take().unwrap_or_else(|| {
                 Arc::new(|_ctx| crate::api::HostExecAction::Reject {
                     exit_code: 127,
@@ -93,7 +96,10 @@ impl SandboxBackend for WindowsBackend {
             })
         };
         let bridge = Arc::new(HostExecBridge::new(cb));
-        *self.host_exec_bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+        *self.host_exec_bridge.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = Some(Arc::clone(&bridge));
 
         // Ensure Winsock is initialized in this process so the
         // duplicated SOCKET handles can be used as TcpStreams.
@@ -147,7 +153,10 @@ impl SandboxBackend for WindowsBackend {
                 // broadcaster will GC the dead sender on next event.
             })
             .expect("spawn host-exec-subscriber");
-        *self.host_exec_subscriber.lock().unwrap() = Some(handle);
+        *self.host_exec_subscriber.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        }) = Some(handle);
 
         Ok(())
     }
@@ -156,10 +165,26 @@ impl SandboxBackend for WindowsBackend {
         // Signal the subscriber thread to exit, then tear down the
         // bridge so subsequent calls to `on_host_exec` store the
         // callback in `pending_host_exec_cb` again.
-        if let Some(bridge) = self.host_exec_bridge.lock().unwrap().take() {
+        if let Some(bridge) = self
+            .host_exec_bridge
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .take()
+        {
             bridge.shutdown();
         }
-        if let Some(h) = self.host_exec_subscriber.lock().unwrap().take() {
+        if let Some(h) = self
+            .host_exec_subscriber
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .take()
+        {
             let _ = h.join();
         }
 
@@ -356,10 +381,21 @@ impl SandboxBackend for WindowsBackend {
 
     fn on_host_exec(&self, cb: HostExecCallback) -> Result<()> {
         // If the bridge is already live, update its callback directly.
-        if let Some(bridge) = self.host_exec_bridge.lock().unwrap().as_ref() {
+        if let Some(bridge) = self
+            .host_exec_bridge
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            })
+            .as_ref()
+        {
             bridge.set_callback(cb);
         } else {
-            *self.pending_host_exec_cb.lock().unwrap() = Some(cb);
+            *self.pending_host_exec_cb.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }) = Some(cb);
         }
         Ok(())
     }

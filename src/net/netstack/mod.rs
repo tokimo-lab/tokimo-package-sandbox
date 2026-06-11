@@ -560,7 +560,10 @@ fn run(
     let writer_thread = Arc::clone(&writer);
     thread::Builder::new().name("netstack-tx".into()).spawn(move || {
         while let Ok(frame) = tx_out_rx.recv() {
-            let mut w = writer_thread.lock().unwrap();
+            let mut w = writer_thread.lock().unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             if let Err(e) = write_frame(&mut *w, &frame) {
                 eprintln!("[netstack-tx] write end: {e}");
                 break;
