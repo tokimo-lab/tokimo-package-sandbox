@@ -656,7 +656,7 @@ fn bind_vsock(port: u32) -> Result<OwnedFd, String> {
 
     let addr = VsockAddr::new(libc::VMADDR_CID_ANY, port);
     bind(lfd.as_raw_fd(), &addr).map_err(|e| format!("bind VSOCK port {port}: {e}"))?;
-    listen(&lfd, Backlog::new(1).unwrap()).map_err(|e| format!("listen VSOCK: {e}"))?;
+    listen(&lfd, Backlog::new(1).expect("valid backlog value")).map_err(|e| format!("listen VSOCK: {e}"))?;
 
     eprintln!("[tokimo-sandbox-init] listening on VSOCK port {port}, waiting for host...");
 
@@ -727,10 +727,10 @@ fn spawn_host_exec_listener(relay_fd_raw: i32) -> Result<(), String> {
         .map_err(|e| format!("socket(host-exec): {e}"))?;
     let addr = UnixAddr::new(SOCK_PATH).map_err(|e| format!("UnixAddr {SOCK_PATH}: {e}"))?;
     bind(listener.as_raw_fd(), &addr).map_err(|e| format!("bind {SOCK_PATH}: {e}"))?;
-    listen(&listener, Backlog::new(32).unwrap()).map_err(|e| format!("listen: {e}"))?;
+    listen(&listener, Backlog::new(32).expect("valid backlog value")).map_err(|e| format!("listen: {e}"))?;
     // Make the socket world-accessible — the bridged commands run as whatever
     // uid the user selected, not necessarily root.
-    let cpath = std::ffi::CString::new(SOCK_PATH).unwrap();
+    let cpath = std::ffi::CString::new(SOCK_PATH).expect("SOCK_PATH has no interior nulls");
     unsafe {
         libc::chmod(cpath.as_ptr(), 0o666);
     }
