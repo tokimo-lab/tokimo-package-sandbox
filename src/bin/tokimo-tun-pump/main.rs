@@ -176,7 +176,7 @@ mod imp {
         std::fs::create_dir_all("/dev/net").map_err(|e| format!("mkdir /dev/net: {e}"))?;
         // tun major=10, minor=200.
         let dev: libc::dev_t = libc::makedev(10, 200);
-        let path = std::ffi::CString::new("/dev/net/tun").unwrap();
+        let path = std::ffi::CString::new("/dev/net/tun").expect("literal has no interior nulls");
         let r = unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, dev) };
         if r != 0 {
             let errno = unsafe { *libc::__errno_location() };

@@ -1386,9 +1386,9 @@ fn register_udp_flow(
 fn make_udp_subflow(io: &mut IoCtx<'_>, dns_rewrite: Option<SocketAddr>, lkey: UdpListenerKey) -> Option<UdpSubFlow> {
     let upstream_dst = dns_rewrite.unwrap_or_else(|| SocketAddr::new(ipaddr_to_std(lkey.dst_ip), lkey.dst_port));
     let bind_addr: SocketAddr = if upstream_dst.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
+        "0.0.0.0:0".parse().expect("valid IPv4 socket address")
     } else {
-        "[::]:0".parse().unwrap()
+        "[::]:0".parse().expect("valid IPv6 socket address")
     };
     let mut upstream = match MioUdpSocket::bind(bind_addr) {
         Ok(s) => s,

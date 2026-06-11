@@ -206,7 +206,7 @@ fn run_loop_inner(
     // already a single connected stream — same shape as Serial.
     let mut listener_opt = Some(listener);
     if transport == Transport::Serial || transport == Transport::Vsock || preconnected_seqpacket {
-        let l = listener_opt.take().unwrap();
+        let l = listener_opt.take().expect("listener_opt is Some in this branch");
         let raw = l.as_raw_fd();
         let slot = state.client_slots.len();
         let token = Token(TOK_CLIENT_BASE + slot);

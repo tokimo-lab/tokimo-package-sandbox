@@ -652,7 +652,10 @@ impl InflightTracker {
             e.into_inner()
         });
         while g.0 > 0 || !g.1 {
-            g = self.cv.wait(g).unwrap();
+            g = self.cv.wait(g).unwrap_or_else(|e| {
+                tracing::warn!("condvar wait mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
         }
     }
 }
@@ -1809,7 +1812,7 @@ fn handle_shell_id(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Result
         .shell_child_id
         .as_ref()
         .ok_or_else(|| RpcError::new("not_running", "VM not started or shell not available"))?;
-    Ok(serde_json::to_value(JobIdResult { id: id.clone() }).unwrap())
+    Ok(serde_json::to_value(JobIdResult { id: id.clone() }).expect("JobIdResult is always serializable"))
 }
 
 fn handle_signal_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
@@ -1870,7 +1873,7 @@ fn handle_spawn_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsR
             },
         );
     }
-    Ok(serde_json::to_value(JobIdResult { id: child_id }).unwrap())
+    Ok(serde_json::to_value(JobIdResult { id: child_id }).expect("JobIdResult is always serializable"))
 }
 
 fn handle_resize_shell(conn: &Arc<Connection>, params: Value, sessions: &WindowsRegistry) -> Result<Value, RpcError> {
@@ -1932,7 +1935,7 @@ fn handle_list_shells(conn: &Arc<Connection>, sessions: &WindowsRegistry) -> Res
     // Every entry in `st.children` is a shell (boot or spawn_shell).
     // Order is unspecified per trait contract.
     let ids: Vec<String> = st.children.keys().cloned().collect();
-    Ok(serde_json::to_value(JobIdListResult { ids }).unwrap())
+    Ok(serde_json::to_value(JobIdListResult { ids }).expect("JobIdListResult is always serializable"))
 }
 
 /// Single per-session dispatch thread: waits for any child event, drains all

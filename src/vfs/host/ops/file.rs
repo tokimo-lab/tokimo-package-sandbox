@@ -218,7 +218,7 @@ impl FuseHost {
                 });
                 Ok(path)
             } else {
-                Ok(staging.as_ref().unwrap().path.clone())
+                Ok(staging.as_ref().expect("staging is Some in else branch").path.clone())
             }
         }) {
             Some(Ok(p)) => p,
